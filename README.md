@@ -54,4 +54,4 @@ print(arrow.get(dict(values[-1])['date']))
 
 # ChangeLog
 - [@2023-10-21 15:57:35] v0.1.0
-
+- [@2023-10-23 15:37:25] v0.1.1 Add `TStoTSx1000`-like and `KTStoTSx1000`-like partition

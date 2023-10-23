@@ -76,6 +76,21 @@ def test_partition():
     start_dt, end_dt = get_part_range('2015', 'toYYYY(date)')
     print(start_dt, end_dt)
 
+    part = int(arrow.get('2000-01-01 00:00:00').timestamp()//3600)
+    start_dt, end_dt = get_part_range(part, 'TStoTSx3600(date)')
+    print(f'{part=}')
+    print(f'{start_dt=}, {end_dt=}')
+
+    part = int(arrow.get('2000-01-01 00:00:00').timestamp()//3600)
+    start_dt, end_dt = get_part_range(part, 'TStoTSx3600(date)')
+
+    data = [
+            {'date': 10000},
+            {'date': 20000},
+            {'date': 30000}
+           ]
+    pdata, column = partition_data(data, 'TStoTSx100000(date)')
+    print(pdata)
 
 if __name__ == '__main__':
     if 1:

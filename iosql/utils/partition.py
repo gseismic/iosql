@@ -4,13 +4,11 @@ import arrow
 
 
 def get_part_range(part, partition):
-    print('partition', partition)
     fn_name, column = parse_partition(partition)
     start_dt, end_dt = None, None
     if fn_name is None:
         return start_dt, end_dt
 
-    print(fn_name)
     if fn_name in ['toYYYY', 'TStoYYYY', 'KTStoYYYY']:
         start_dt, end_dt = arrow.get(f'{part}-01').span('year')
     elif fn_name in ['TStoYYYYWW', 'KTStoYYYYWW']:
@@ -23,6 +21,13 @@ def get_part_range(part, partition):
         start_dt, end_dt = arrow.get( f'{part[:4]}-{part[4:6]}-{part[6:8]}').span('day')
     elif fn_name == 'toYYYYMMDDHH' or fn_name in ['TStoYYYYMMDDHH', 'KTStoYYYYMMDDHH'] :
         start_dt, end_dt = arrow.get(f'{part[:4]}-{part[4:6]}-{part[6:8]}-{part[8:10]}').span('hour')
+    elif fn_name.startswith('TStoTSx') or fn_name.startswith('KTStoTSx'):
+        multi = int(fn_name.split('x')[1])
+        start_dt = arrow.get(int(part) * multi)
+        end_dt = arrow.get(int(part) * multi + multi - 1/1000000.0)
+    else:
+        raise Exception(f'unknown partition `{partition}`')
+
     return start_dt, end_dt
 
 
@@ -47,6 +52,10 @@ def parse_partition(partition):
     column = partition[p1+1:p2].strip('"').strip("'").strip()
     return fn_name, column
 
+def _partition_timestamp_div(partition, ts):
+    # partition, KTStoTSx{1000}
+    multi = int(partition.split('x')[1])
+    return int(ts) // multi
 
 def _partition_timestamp(partition, ts):
     dt = datetime.fromtimestamp(ts)
@@ -69,7 +78,6 @@ def _partition_timestamp(partition, ts):
         }[partition]
 
 
-# 2015-10-10 01:01:01
 _BUILTIN_PARTITION_FN_DICT = {
     'toYYYY': lambda d: '%s' % d[:4],
     'toYYYYMM': lambda d: '%s%s' % (d[:4], d[5:7]),
@@ -109,7 +117,12 @@ def get_partition_fn(partition, use_builtin=True):
     fn_name, column = parse_partition(partition)
 
     if use_builtin:
-        fn = _BUILTIN_PARTITION_FN_DICT[fn_name]
+        if fn_name.startswith('TStoTSx'):
+            fn = lambda d: _partition_timestamp_div(fn_name, d)
+        elif fn_name.startswith('KTStoTSx'):
+            fn = lambda d: _partition_timestamp_div(fn_name, d//1000)
+        else:
+            fn = _BUILTIN_PARTITION_FN_DICT[fn_name]
     else:
         if fn_name in ['toYYYY', 'toYYYYMM', 'toYYYYMMDD', 'toYYYYMMDDHH', 'toYYYYMMDDHHmm']:
             _name = fn_name[2:]
