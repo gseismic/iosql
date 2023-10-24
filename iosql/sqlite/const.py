@@ -1,5 +1,4 @@
 
-
 _DB_META_FILE = 'meta.sqlite3'
 _DB_META_TABLE_NAME = 'meta'
 

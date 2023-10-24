@@ -192,6 +192,14 @@ class Table(BaseTable):
 
         return data
 
+    def create_index(self, column, order='asc', exist_ok=True):
+        table_parts = self.table_parts()
+        for table_part in table_parts:
+            part_dbfile = self._get_part_dbfile(table_part)
+            part_db = self.get_part_db(part_dbfile, auto_commit=True)
+            # print(f'create index for {part_dbfile=}: {column=}')
+            part_db[_PART_DATA_TABLE_NAME].create_index(column, order, exist_ok=exist_ok)
+
     def update(self, kv, where):
         raise NotImplementedError()
 
