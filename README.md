@@ -49,6 +49,9 @@ print(arrow.get(dict(values[0])['date']))
 print(arrow.get(dict(values[-1])['date']))
 ```
 
+## Notes
+- 被作为partition关键字的时间必须以timestamp*1000方式表示输入, `[{'datatime': arrow.utcnow().timestamp()*1000, ...}]`
+
 ## TODOs
 - better data-query design
 

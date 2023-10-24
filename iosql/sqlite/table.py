@@ -141,8 +141,7 @@ class Table(BaseTable):
         for info in infos:
             part = info['part']
             # cc
-            unit = 1000000
-            print('info', info)
+            unit = 1000
             if info['column'] == case.field:
                 # min max 2020-01-02 01:00:00 2020-01-01 23:00:00
                 # info {'table_name': 'demo', 'part': '20200101', 'column': 'date', 'column_min': '2020-01-01 00:00:00', 'column_max': '2020-01-01 23:59:59'}
