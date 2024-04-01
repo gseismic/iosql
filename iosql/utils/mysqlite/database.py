@@ -21,10 +21,12 @@ class Database(object):
     留意应对
     OSError: [Errno 24] Too many open files
     """
-    _lock = threading.Lock()
+    # _lock = threading.Lock()
+    # [@2024-04-02 02:37:10] rm lock, 发现wal后一直等待
     def __init__(self, db_file, auto_commit=True, verbose=1,
-                 pragma_dict=None, **kwargs):
+                 pragma_dict=None, wal=True, **kwargs):
         # auto_commit: 命名一致原则
+        # self._lock = threading.Lock()
         self.db_file = db_file
         self.verbose = verbose
         self.auto_commit = auto_commit
@@ -35,6 +37,8 @@ class Database(object):
         # https://www.sqlite.org/pragma.html#pragma_cache_size
         # 10M 
         self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
+        # [@2024-04-02 02:33:33] new
+        self.enable_wal()
 
     def enable_wal(self, enable=True):
         # PRAGMA journal_mode=WAL
@@ -97,8 +101,8 @@ class Database(object):
         if self.verbose >= 2:
             logger.debug(f'{self.db_file}: Execute: {sql}')
 
-        with self._lock:
-            self.conn.execute(sql)
+        #with self._lock:
+        self.conn.execute(sql)
 
     def commit(self):
         self.conn.commit()
