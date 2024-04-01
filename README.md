@@ -52,6 +52,9 @@ print(arrow.get(dict(values[-1])['date']))
 ## Notes
 - 被作为partition关键字的时间必须以timestamp*1000方式表示输入, `[{'datatime': arrow.utcnow().timestamp()*1000, ...}]`
 
+## KnownIssue
+- 时间戳转为YYYYMMDDHH后，如果写入地和读取地时区不一致，可能导致错误的partition分区，应该放弃这种数据分区方法
+
 ## TODOs
 - better data-query design
 

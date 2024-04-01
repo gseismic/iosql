@@ -1,6 +1,7 @@
 from collections import defaultdict
 from datetime import datetime
 import arrow
+import warnings
 
 
 def get_part_range(part, partition):
@@ -126,6 +127,7 @@ def get_partition_fn(partition, use_builtin=True):
         elif fn_name.startswith('KTStoTSx'):
             fn = lambda d: _partition_timestamp_div(fn_name, d//1000)
         else:
+            warnings.warn('时间戳转为YYYYMMDDHH-like后，如果写入地和读取地时区不一致，可能导致错误的partition分区，应该放弃这种数据分区方法')
             fn = _BUILTIN_PARTITION_FN_DICT[fn_name]
     else:
         if fn_name in ['toYYYY', 'toYYYYMM', 'toYYYYMMDD', 'toYYYYMMDDHH', 'toYYYYMMDDHHmm']:
