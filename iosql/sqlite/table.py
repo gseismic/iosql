@@ -187,6 +187,7 @@ class Table(BaseTable):
             part_table_name = _PART_DATA_TABLE_NAME
             db = self.get_part_db(part_dbfile, auto_commit=False)
             # part_data = db[part_table_name].query(sql, to_dict=True)
+
             part_data = db[part_table_name].query(sql)
             data.extend(part_data)
 
