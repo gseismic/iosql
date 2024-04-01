@@ -11,3 +11,11 @@ class NoSuchColumn(OperationalError):
 
 class DuplicateColumn(OperationalError):
     pass
+
+
+class TableAlreadyExists(OperationalError):
+    pass
+
+
+class UnKnownOperationalError(OperationalError):
+    pass

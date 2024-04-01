@@ -6,9 +6,9 @@ import arrow
 from collections import Counter
 # from itertools import chain
 from collections import  OrderedDict
-# from ..utils.mysqlite import Database as MyDatabase
-from mysqlite import Database as MyDatabase
-from mysqlite.exception import (
+from ..utils.mysqlite import Database as MyDatabase
+# from mysqlite import Database as MyDatabase
+from ..utils.mysqlite.exception import (
     NoSuchColumn, 
     NoSuchTable,
     DuplicateColumn
@@ -197,7 +197,6 @@ class Table(BaseTable):
         for table_part in table_parts:
             part_dbfile = self._get_part_dbfile(table_part)
             part_db = self.get_part_db(part_dbfile, auto_commit=True)
-            # print(f'create index for {part_dbfile=}: {column=}')
             part_db[_PART_DATA_TABLE_NAME].create_index(column, order, exist_ok=exist_ok)
 
     def update(self, kv, where):
@@ -256,6 +255,7 @@ class Table(BaseTable):
             part_db[part_table_name].insert_all(
                 part_data, replace=replace, ignore=ignore,
                 batch_size=batch_size, commit=commit,
+                #ensure_table=True # [@2024-03-30 21:34:30] FIXED
                 ensure_table=False
             )
         except NoSuchTable:
@@ -282,7 +282,8 @@ class Table(BaseTable):
             part_db[part_table_name].insert_all(
                 part_data, replace=replace, ignore=ignore,
                 batch_size=batch_size, commit=commit,
-                ensure_table=False
+                ensure_table=False# [@2024-03-30 21:34:46]
+                # ensure_table=False
             )
         except NoSuchColumn as e:
             # add column for all partition-table

@@ -7,6 +7,7 @@ import sqlite3
 from .exception import (
     NoSuchColumn, 
     NoSuchTable,
+    TableAlreadyExists,
     DuplicateColumn
 )
 from collections import OrderedDict
@@ -113,7 +114,10 @@ class Table(object):
         try:
             self.execute(sql, commit=True)
             table_created = True
-        except Exception as e:
+        except DuplicateColumn as e:
+            logger.error(f'DuplicateColumn: `{e}`')
+            raise e
+        except TableAlreadyExists as e:
             if exist_ok:
                 if not exist_no_warn:
                     logger.info(f'Table `{self._table_name}` already exist, Not created')
@@ -203,6 +207,9 @@ class Table(object):
         elif str_e.find('no such table') != -1:
             _table = re.findall(r'no such table: (\w+)', str_e)[0]
             raise NoSuchTable(_table)
+        elif str_e.find('already exists') != -1:
+            _table = re.findall(r'table (\w+) already exists', str_e)[0]
+            raise TableAlreadyExists(_table)
         elif str_e.find('duplicate column') != -1:
             column = re.findall(r'duplicate column name: (\w+)', str_e)[0]
             raise DuplicateColumn(column)

@@ -10,7 +10,8 @@ def get_part_range(part, partition):
         return start_dt, end_dt
 
     if fn_name in ['toYYYY', 'TStoYYYY', 'KTStoYYYY']:
-        start_dt, end_dt = arrow.get(f'{part}-01').span('year')
+        # start_dt, end_dt = arrow.get(f'{part}-01').span('year')
+        start_dt, end_dt = arrow.get(f'{part}').span('year')
     elif fn_name in ['TStoYYYYWW', 'KTStoYYYYWW']:
         year, week = int(part[:4]), int(part[4:6])
         start_dt = arrow.get(datetime.fromisocalendar(year, week, 1))
@@ -20,7 +21,9 @@ def get_part_range(part, partition):
     elif fn_name == 'toYYYYMMDD' or fn_name in ['TStoYYYYMMDD', 'KTStoYYYYMMDD'] or fn_name.endswith('byDay'):
         start_dt, end_dt = arrow.get( f'{part[:4]}-{part[4:6]}-{part[6:8]}').span('day')
     elif fn_name == 'toYYYYMMDDHH' or fn_name in ['TStoYYYYMMDDHH', 'KTStoYYYYMMDDHH'] :
-        start_dt, end_dt = arrow.get(f'{part[:4]}-{part[4:6]}-{part[6:8]}-{part[8:10]}').span('hour')
+        start_dt, end_dt = arrow.get(f'{part[:4]}-{part[4:6]}-{part[6:8]} {part[8:10]}').span('hour')
+    elif fn_name == 'toYYYYMMDDHHmm' or fn_name in ['TStoYYYYMMDDHHmm', 'KTStoYYYYMMDDHHmm'] :
+        start_dt, end_dt = arrow.get(f'{part[:4]}-{part[4:6]}-{part[6:8]} {part[8:10]}:{part[11:13]}').span('minute')
     elif fn_name.startswith('TStoTSx') or fn_name.startswith('KTStoTSx'):
         multi = int(fn_name.split('x')[1])
         start_dt = arrow.get(int(part) * multi)

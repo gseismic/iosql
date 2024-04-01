@@ -55,6 +55,9 @@ print(arrow.get(dict(values[-1])['date']))
 ## TODOs
 - better data-query design
 
+## KnownIssues
+- [@2024-03-30 22:24:07] 不能自动区分大小写，应检测{'u': 1, 'U': 2}
+
 # ChangeLog
 - [@2023-10-21 15:57:35] v0.1.0
 - [@2023-10-23 15:37:25] v0.1.1 Add `TStoTSx1000`-like and `KTStoTSx1000`-like partition
