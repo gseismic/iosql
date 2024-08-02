@@ -276,6 +276,8 @@ class Table(object):
         return self.query(self, sql, to_dict=True)
 
     def query(self, sql, to_dict=False):
+        #print(self.database.db_file)
+        #print(sql)
         self.execute(sql)
         data = self.fetchall()
         if to_dict and data:

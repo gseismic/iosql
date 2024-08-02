@@ -38,7 +38,9 @@ class Database(object):
         # 10M 
         self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
         # [@2024-04-02 02:33:33] new
-        self.enable_wal()
+        # self.enable_wal()
+        # [@2024-04-02 03:00:25] add
+        # self.connect() # with 时才connect
 
     def enable_wal(self, enable=True):
         # PRAGMA journal_mode=WAL
@@ -72,8 +74,10 @@ class Database(object):
 
     def __getitem__(self, table_name):
         if table_name not in self._tables:
+            logger.debug(f'Create table {self.db_file}: {table_name}')
             _table = table.Table(self, table_name=table_name)
             self._tables[table_name] = _table
+        # print(f'Use table {self.db_file}: {table_name}')
         return self._tables[table_name]
 
     def connect(self):
@@ -87,6 +91,10 @@ class Database(object):
                 logger.debug('Making database dir: %s ...' % db_dirname)
             # exist_ok: in case of multithread
             os.makedirs(db_dirname, exist_ok=True)
+
+        if self._conn is not None:
+            logger.info(f'Already Connected .. {self.db_file}, ignored.')
+            return
 
         self._conn = sqlite3.connect(self.db_file, **self._kwargs)
         self._conn.row_factory = sqlite3.Row
@@ -129,6 +137,7 @@ class Database(object):
 
     def get_cursor(self):
         if not self._cursor:
+            # print(f'Create conn .. {self.db_file}')
             assert self._conn is None
             self.connect()
         return self._cursor
