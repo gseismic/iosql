@@ -15,18 +15,42 @@ def quoted_sql_text(s):
     return '"' + s.replace('"', '""') + '"'
 
 
+# def _union_fields_of_dictlist(data):
+#     '''扫描全部字段，获得key union 和type
+#     '''
+#     fields = OrderedDict()
+#     _set_fields = set()
+#     for item in data:
+#         print(item)
+#         print(fields)
+#         new = [k for k in item if k not in _set_fields]
+#         if new:
+#             _set_fields |= set(new)
+#             for f in new:
+#                 fields[f] = suggest_value_type(item[f])
+#             # fields.extend(new)
+#     return fields
+
+
 def _union_fields_of_dictlist(data):
     '''扫描全部字段，获得key union 和type
+        && 要求获得的type不能为None
     '''
     fields = OrderedDict()
-    _set_fields = set()
     for item in data:
-        new = [k for k in item if k not in _set_fields]
-        if new:
-            _set_fields |= set(new)
-            for f in new:
-                fields[f] = suggest_value_type(item[f])
-            # fields.extend(new)
+        for k, v in item.items():
+            type_ = suggest_value_type(v)
+            if k in fields:
+                cur_type = fields[k]
+                # 如果已经不为None，则
+                if cur_type is None:
+                    fields[k] = type_ 
+                else:
+                    assert type_ is None or type_ == cur_type, f'{k, type_, cur_type, v=}, {item=}'
+            else:
+                # add field
+                fields[k] = type_ 
+
     return fields
 
 
