@@ -200,8 +200,31 @@ class Table(BaseTable):
             part_db = self.get_part_db(part_dbfile, auto_commit=True)
             part_db[_PART_DATA_TABLE_NAME].create_index(column, order, exist_ok=exist_ok)
 
-    def update(self, kv, where):
-        raise NotImplementedError()
+    def upsert_all(self, kv_list, pk, where=None, partition=None, commit=True, **kwargs):
+        if isinstance(kv_list, dict):
+            kv_list = [kv_list]
+        elif not isinstance(kv_list, (list, tuple, set)):
+            raise Exception(f'update: `list/tuple/set` required for `kv_list`')
+
+        data = self.select('*', where=where, to_dict=True)
+        # print('old:', data)
+
+        data = {tuple([item[k] for k in pk]): item for item in data}
+        # 即使kv_list中有None，也直接覆盖，如果不这样设计，将无法把当前数值重置为None
+        for dic in kv_list:
+            key = tuple([dic[k] for k in pk])
+            if key in data:
+                data[key] = {**data[key], **dic}
+            else:
+                # 数据不变
+                pass
+        
+        # print('new:', data.values())
+        self.insert_all(list(data.values()), pk=pk, replace=True, alter=True,
+                        partition=partition, commit=commit, **kwargs)
+        # def insert_all(self, data, pk=None, extra_data=None, partition=None, 
+        #                replace=False, ignore=False, commit=True, **kwargs):
+        # raise NotImplementedError()
 
     def delete(self, where):
         raise NotImplementedError()
