@@ -3,7 +3,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='iosql', 
-    version='0.1.2', 
+    version='0.1.3', 
     packages=find_packages(),
     description='Partitioned-Sqlite Library',
     install_requires = ['arrow'],
