@@ -1,17 +1,15 @@
 import shutil
-import config
-import pytest
 import random
 import time
 import arrow
 import logging
-from finhub.iosql.v1 import Database
+from iosql import Database
 import sqlite3
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')
-#logging.getLogger("iosql").setLevel(logging.WARNING)
-#logging.getLogger("iosql").setLevel(logging.INFO)
+#logging.getLogger("iosql").setLevel(logging.WARNING) 
+#logging.getLogger("iosql").setLevel(logging.INFO) 
 
 
 db = None

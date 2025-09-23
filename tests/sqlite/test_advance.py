@@ -1,4 +1,3 @@
-import config
 import shutil
 import time
 import arrow

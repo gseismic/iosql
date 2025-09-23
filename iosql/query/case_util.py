@@ -9,6 +9,9 @@ def sorted_cases(cases):
 
 
 def get_case_range(case):
+    """
+    Get the range of a case
+    """
     case_min, case_max = None, None
     op = case.op
     value = case.value['value']
@@ -29,6 +32,9 @@ def get_case_range(case):
 
 
 def unique_or_and_cases(list_cases: 'List[List[Case]]'):
+    """
+    Remove duplicate cases from a list of cases
+    """
     # Or[And[..]..]
     # 去除重复的
     # And[..] 已经通过unique_and_cases 去重
@@ -74,6 +80,9 @@ def unique_or_and_cases(list_cases: 'List[List[Case]]'):
 
 
 def flatten_expression(expression):
+    """
+    Flatten an expression
+    """
     # 内部使用，有必有吗？
     # note: 先运算，再统一排序，防止复杂表达式的过早排序
     # [@2021-11-26 05:52:28] cc
@@ -104,11 +113,20 @@ def flatten_expression(expression):
 
 
 def _flatten_expression_tree(op, left, right):
-    '''[or [and..] [and..]]
+    """
+    Flatten an expression tree
+    Args:
+        op: the operator of the expression
+        left: the left operand of the expression
+        right: the right operand of the expression
+    Returns:
+        A list of cases
+
+    [or [and..] [and..]]
 
     c1*(c20+c21+c23) --> c1*c20 + c1*c21 + c1*c23
     更复杂的还有化简，这里不再做了，由用户层面自己控制
-    '''
+    """
     assert op in ['and', 'or']
     if isinstance(left, Case) and isinstance(right, Case):
         # cc

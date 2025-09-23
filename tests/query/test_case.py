@@ -1,4 +1,3 @@
-import config
 import time
 import arrow
 import logging
@@ -14,10 +13,10 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')
 def test_case():
     case1 = Case(field='date', op='>', value=111)
     print(case1)
-
+    
     case2 = Case(field='date', op='>', value='[[open]]')
     print(case2)
-
+    
     case3 = Case(field='date', op='>', value={'value': 'open', 'type':
                                              'variable'})
     print(case3)
@@ -27,14 +26,15 @@ def test_case():
                                              'variable'})
     print(case5)
 
-    print(f'{Case.unique_cases([case1,case1])=}')
-    print(f'{Case.unique_cases([case1,case1, case2,case2, case3])=}')
+    # print(f'{Case.unique_cases([case1,case1])=}')   
+    # print(f'{Case.unique_cases([case1,case1, case2,case2, case3])=}')
     print(f'{unique_or_and_cases([[case1],[case2]])=}')
     print(f'{unique_or_and_cases([[case1],[case1,case3], [case1]])=}')
     print(f'{unique_or_and_cases([[case1],[case1,case3], [case2,case3], [case1]])=}')
 
     where = Where(case1)
     print(f'{where.or_and_cases=}')
+    print(where)
     where = Where([case1, case1])
     print(f'{where.or_and_cases=}')
 

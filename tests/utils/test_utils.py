@@ -6,6 +6,7 @@ from iosql.utils.column import (
     sqlite_types_of_data,
     sqlite_type_of_value
 )
+
 from iosql.utils.createtable import reorder_by_column_order
 from iosql.utils.partition import (
     get_part_range,

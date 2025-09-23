@@ -119,7 +119,10 @@ _BUILTIN_PARTITION_FN_DICT = {
 def get_partition_fn(partition, use_builtin=True):
     fn = None
     fn_name, column = parse_partition(partition)
-    assert partition[:3] == 'KTS'
+    # assert partition[:3] == 'KTS'
+    if partition[:3] != 'KTS':
+        import warnings
+        warnings.warn('KTS partition is recommended')
 
     if use_builtin:
         if fn_name.startswith('TStoTSx'):

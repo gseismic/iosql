@@ -2,9 +2,12 @@
 * 接口稳定，增量增加
 * 所有抽象类都不应放根目录(开发可以) Database 可放根目录
 
+## 文件结构
+spaces源码级别区分不同版本，长期来看并不明智，改用类pypi不同安装版本区分
+
 ## 数据格式
 date[timestamp]: int(timestamp * 1000 * 1000)
-date[timestamp-1M]
+date[timestamp-1M] 
 
 ## Partition设计
 timestamp -> date(YYYY): 2020    [2020-01-01 00:00:00, 2020-01-02:00:00)

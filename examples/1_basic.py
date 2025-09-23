@@ -1,5 +1,5 @@
 import arrow
-from iosql import Database
+from iosql.spaces.alpha import Database
 
 
 def run():
@@ -16,7 +16,7 @@ def run():
 
     db['demo'].insert_all(data, pk=['id','date'], 
                            replace=True, 
-                           partition='TStoYYYYMMDD(date)')
+                           partition='KTStoYYYYMMDD(date)')
     print(f"{db['demo'].table_parts()=}")
     # assert len(db['demo'].table_parts()) == 3
 

@@ -130,7 +130,9 @@ class Case(object):
 
 
 class CaseExpression(object):
-
+    """
+    An expression of cases
+    """
     def __init__(self, op, left, right):
         assert op in ['or', 'and']
         assert isinstance(left, (Case, CaseExpression))
@@ -140,6 +142,9 @@ class CaseExpression(object):
         self.right = right
 
     def __rmul__(self, other):
+        """
+        Right multiply
+        """
         return CaseExpression('and', other, self)
 
     def __mul__(self, other):
