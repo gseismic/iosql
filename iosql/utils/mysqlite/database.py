@@ -6,6 +6,9 @@ import threading
 import contextlib
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
+import sqlite3
+from contextlib import contextmanager
+from .connection_pool import DatabaseConnectionPool
 from . import table
 from .logger import logger
 from .const import _DEFAULT_PRAGMA 
@@ -32,7 +35,8 @@ class Database(object):
     """
     
     def __init__(self, db_file: str, auto_commit: bool = True, verbose: int = 1,
-                 pragma_dict: Optional[Dict[str, Any]] = None, wal: bool = True, 
+                 pragma_dict: Optional[Dict[str, Any]] = None, 
+                 wal: bool = True, max_connections: int = 10, 
                  timeout: float = 5.0, **kwargs):
         """
         初始化数据库实例
@@ -43,6 +47,7 @@ class Database(object):
             verbose: 详细级别 (0=静默, 1=信息, 2=调试)
             pragma_dict: 自定义PRAGMA设置
             wal: 启用WAL模式
+            max_connections: 最大连接数
             timeout: 连接超时时间（秒）
             **kwargs: 其他连接参数
         """
@@ -52,12 +57,19 @@ class Database(object):
         self._kwargs = kwargs
         self._kwargs.setdefault('timeout', timeout)
         self._tables = {}
-        self._conn: Optional[sqlite3.Connection] = None
-        self._cursor: Optional[sqlite3.Cursor] = None
-        self._lock = threading.RLock()  # 使用RLock支持嵌套锁定
-        self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
-        self._is_connected = False
         
+        # 添加连接池
+        self._pool = DatabaseConnectionPool(
+            str(self.db_file), 
+            max_connections=max_connections,
+            timeout=timeout,
+            **kwargs
+        )
+        
+        # 简化锁的使用
+        self._lock = threading.Lock()  # 只用于关键配置操作
+        self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
+
         # 如果请求则启用WAL模式
         if wal:
             self.enable_wal()
@@ -66,24 +78,15 @@ class Database(object):
         """启用或禁用WAL模式"""
         if enable:
             self._pragma_dict['journal_mode'] = 'wal'
-            if self._is_connected:
-                self._ensure_pragma('journal_mode', 'wal')
         else:
             self._pragma_dict['journal_mode'] = 'delete'
-            if self._is_connected:
-                self._ensure_pragma('journal_mode', 'delete')
 
     def _pragma_one(self, key: str, value: Optional[str] = None, ensure: bool = False) -> None:
         """设置单个PRAGMA值"""
         value = value or ''
-        if ensure:
-            self._ensure_pragma(key, value)
-        else:
-            current_value = self._pragma_dict.get(key.lower(), '')
-            if str(value).lower() != current_value.lower():
-                self._pragma_dict[key.lower()] = str(value)
-                if self._is_connected:
-                    self._ensure_pragma(key, value)
+        current_value = self._pragma_dict.get(key.lower(), '')
+        if str(value).lower() != current_value.lower():
+            self._pragma_dict[key.lower()] = str(value)
 
     def pragma(self, key_or_dict: Union[str, Dict[str, Any]], value: Optional[str] = None, 
                ensure: bool = False) -> None:
@@ -98,16 +101,12 @@ class Database(object):
 
     def __enter__(self):
         """上下文管理器入口"""
-        self.connect()
         return self
 
     def __exit__(self, exc_type, exc_value, exc_tb):
         """上下文管理器退出，进行适当的清理"""
-        try:
-            if exc_type is not None:
-                self.rollback()
-        finally:
-            self.close()
+        # 连接池会自动管理连接，无需手动清理
+        pass
 
     def __getitem__(self, table_name: str) -> 'table.Table':
         """通过名称获取表，如果不存在则创建"""
@@ -118,139 +117,81 @@ class Database(object):
             self._tables[table_name] = _table
         return self._tables[table_name]
 
-    def connect(self) -> None:
-        """建立数据库连接，包含适当的错误处理"""
-        with self._lock:
-            if self._is_connected:
-                if self.verbose >= 2:
-                    logger.debug(f'已连接到 {self.db_file}')
-                return
-
-            try:
-                # 确保目录存在
-                db_dirname = self.db_file.parent
-                if self.verbose >= 2:
-                    logger.debug(f'数据库数据目录: {db_dirname}')
-                
-                if not db_dirname.exists():
-                    if self.verbose >= 1:
-                        logger.debug(f'创建数据库目录: {db_dirname} ...')
-                    db_dirname.mkdir(parents=True, exist_ok=True)
-
-                # 创建连接
-                self._conn = sqlite3.connect(str(self.db_file), **self._kwargs)
-                self._conn.row_factory = sqlite3.Row
-                self._cursor = self._conn.cursor()
-                self._is_connected = True
-                
-                # 应用PRAGMA设置
-                self._ensure_all_pragma()
-                
-                if self.verbose >= 1:
-                    logger.debug(f'已连接到 {self.db_file}')
-                    
-            except sqlite3.Error as e:
-                self._cleanup_connection()
-                raise DatabaseConnectionError(f"Failed to connect to {self.db_file}: {e}") from e
-            except OSError as e:
-                self._cleanup_connection()
-                raise DatabaseConnectionError(f"Failed to create database directory: {e}") from e
-
-    def _cleanup_connection(self) -> None:
-        """清理连接资源"""
-        try:
-            if self._cursor:
-                self._cursor.close()
-        except Exception:
-            pass
-        finally:
-            self._cursor = None
+    @contextmanager
+    def get_connection(self):
+        """获取数据库连接的上下文管理器"""
+        # 确保目录存在
+        db_dirname = self.db_file.parent
+        if not db_dirname.exists():
+            if self.verbose >= 1:
+                logger.debug(f'创建数据库目录: {db_dirname} ...')
+            db_dirname.mkdir(parents=True, exist_ok=True)
             
-        try:
-            if self._conn:
-                self._conn.close()
-        except Exception:
-            pass
-        finally:
-            self._conn = None
-            
-        self._is_connected = False
+        with self._pool.get_connection() as conn:
+            # 确保连接配置正确
+            self._apply_pragma_to_connection(conn)
+            yield conn
+    
+    def _apply_pragma_to_connection(self, conn: sqlite3.Connection) -> None:
+        """为单个连接应用PRAGMA设置"""
+        cursor = conn.cursor()
+        for key, value in self._pragma_dict.items():
+            cursor.execute(f'PRAGMA {key}={value};')
+        cursor.close()
+        
+
 
     def execute(self, sql: str) -> None:
         """执行SQL语句，包含适当的错误处理"""
         if self.verbose >= 2:
             logger.debug(f'{self.db_file}: 执行: {sql}')
 
-        with self._lock:
-            if not self._is_connected:
-                self.connect()
-            
+        with self.get_connection() as conn:
             try:
-                self._conn.execute(sql)
+                conn.execute(sql)
+                if self.auto_commit:
+                    conn.commit()
             except sqlite3.Error as e:
                 logger.error(f"SQL execution failed: {sql}")
+                conn.rollback()
                 raise DatabaseError(f"SQL execution failed: {e}") from e
 
     def commit(self) -> None:
-        """提交当前事务"""
-        with self._lock:
-            if not self._is_connected:
-                raise DatabaseError("Cannot commit: not connected")
-            
-            try:
-                self._conn.commit()
-                if self.verbose >= 2:
-                    logger.debug(f'已提交事务 {self.db_file}')
-            except sqlite3.Error as e:
-                raise DatabaseError(f"Commit failed: {e}") from e
+        """提交当前事务 - 注意：在连接池模式下，每个操作都是自动提交的"""
+        if self.verbose >= 2:
+            logger.debug(f'连接池模式下事务自动提交 {self.db_file}')
 
     def rollback(self) -> None:
-        """回滚当前事务"""
-        with self._lock:
-            if not self._is_connected:
-                return  # 无需回滚
-            
-            try:
-                self._conn.rollback()
-                if self.verbose >= 2:
-                    logger.debug(f'已回滚事务 {self.db_file}')
-            except sqlite3.Error as e:
-                logger.warning(f"Rollback failed: {e}")
+        """回滚当前事务 - 注意：在连接池模式下，每个操作都是自动提交的"""
+        if self.verbose >= 2:
+            logger.debug(f'连接池模式下无法回滚已提交的事务 {self.db_file}')
 
     def close(self) -> None:
-        """关闭数据库连接"""
-        with self._lock:
-            self._cleanup_connection()
-            if self.verbose >= 1:
-                logger.debug(f'已关闭连接 {self.db_file}')
+        """关闭数据库连接池"""
+        if self.verbose >= 1:
+            logger.debug(f'连接池会自动管理连接 {self.db_file}')
 
     def is_closed(self) -> bool:
-        """检查连接是否已关闭"""
-        return not self._is_connected
+        """检查连接是否已关闭 - 连接池模式下总是可用"""
+        return False
 
     def get_conn(self) -> sqlite3.Connection:
-        """获取数据库连接，必要时进行连接"""
-        with self._lock:
-            if not self._is_connected:
-                self.connect()
-            return self._conn
+        """获取数据库连接 - 不推荐在连接池模式下直接使用"""
+        raise DatabaseError("在连接池模式下请使用 get_connection() 上下文管理器")
 
     def get_cursor(self) -> sqlite3.Cursor:
-        """获取数据库游标，必要时进行连接"""
-        with self._lock:
-            if not self._is_connected:
-                self.connect()
-            return self._cursor
+        """获取数据库游标 - 不推荐在连接池模式下直接使用"""
+        raise DatabaseError("在连接池模式下请使用 get_connection() 上下文管理器")
 
     @property
     def conn(self) -> sqlite3.Connection:
-        """获取数据库连接"""
-        return self.get_conn()
+        """获取数据库连接 - 不推荐在连接池模式下直接使用"""
+        raise DatabaseError("在连接池模式下请使用 get_connection() 上下文管理器")
 
     @property
     def cursor(self) -> sqlite3.Cursor:
-        """获取数据库游标"""
-        return self.get_cursor()
+        """获取数据库游标 - 不推荐在连接池模式下直接使用"""
+        raise DatabaseError("在连接池模式下请使用 get_connection() 上下文管理器")
 
     def __table_names(self) -> List[str]:
         """获取所有表名（已弃用，请使用get_all_tables）"""
@@ -258,30 +199,32 @@ class Database(object):
 
     def get_all_tables(self) -> List[str]:
         """获取数据库中所有表名"""
-        with self._lock:
-            try:
-                cursor = self.conn.cursor()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
                 cursor.execute('SELECT name FROM sqlite_master WHERE type="table"')
                 table_names = [row[0] for row in cursor.fetchall()]
+                cursor.close()
                 return table_names
-            except sqlite3.Error as e:
-                raise DatabaseError(f"Failed to get table names: {e}") from e
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to get table names: {e}") from e
 
     def get_table_indices(self, table_name: str, exclude_autoindex: bool = True) -> List[str]:
         """获取指定表的所有索引"""
-        with self._lock:
-            try:
-                cursor = self.conn.cursor()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
                 sql = ("SELECT name FROM sqlite_master " 
                        "WHERE type = 'index' AND tbl_name = ?")
                 cursor.execute(sql, (table_name,))
                 indices = [row[0] for row in cursor.fetchall()]
+                cursor.close()
                 
                 if exclude_autoindex:
                     indices = self._exclude_autoindex(indices)
                 return indices
-            except sqlite3.Error as e:
-                raise DatabaseError(f"Failed to get indices for table {table_name}: {e}") from e
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to get indices for table {table_name}: {e}") from e
 
     def _exclude_autoindex(self, indices: List[str]) -> List[str]:
         """过滤掉自动生成的索引"""
@@ -289,17 +232,18 @@ class Database(object):
 
     def get_all_indices(self, exclude_autoindex: bool = True) -> List[str]:
         """获取数据库中所有索引"""
-        with self._lock:
-            try:
-                cursor = self.conn.cursor()
+        try:
+            with self.get_connection() as conn:
+                cursor = conn.cursor()
                 cursor.execute('SELECT name FROM sqlite_master WHERE type="index"')
                 indices = [row[0] for row in cursor.fetchall()]
+                cursor.close()
                 
                 if exclude_autoindex:
                     indices = self._exclude_autoindex(indices)
                 return indices
-            except sqlite3.Error as e:
-                raise DatabaseError(f"Failed to get all indices: {e}") from e
+        except sqlite3.Error as e:
+            raise DatabaseError(f"Failed to get all indices: {e}") from e
 
     def drop_table(self, table_name: Union[str, List[str], tuple]) -> None:
         """删除一个或多个表"""
@@ -310,15 +254,14 @@ class Database(object):
         else:
             raise ValueError('table_name must be str, list, or tuple')
 
-        with self._lock:
-            for tbl in table_names:
-                try:
-                    sql = f'DROP TABLE IF EXISTS {tbl}'
-                    if self.verbose >= 1:
-                        logger.info(f'删除表: {sql}')
-                    self.execute(sql)
-                except sqlite3.Error as e:
-                    raise DatabaseError(f"Failed to drop table {tbl}: {e}") from e
+        for tbl in table_names:
+            try:
+                sql = f'DROP TABLE IF EXISTS {tbl}'
+                if self.verbose >= 1:
+                    logger.info(f'删除表: {sql}')
+                self.execute(sql)
+            except sqlite3.Error as e:
+                raise DatabaseError(f"Failed to drop table {tbl}: {e}") from e
 
     def drop_index(self, index_or_indices: Union[str, List[str], tuple]) -> None:
         """删除一个或多个索引"""
@@ -329,15 +272,14 @@ class Database(object):
         else:
             raise ValueError('index_or_indices must be str, list, or tuple')
 
-        with self._lock:
-            for index in indices:
-                try:
-                    sql = f'DROP INDEX IF EXISTS {index}'
-                    if self.verbose >= 1:
-                        logger.info(f'删除索引: {sql}')
-                    self.execute(sql)
-                except sqlite3.Error as e:
-                    raise DatabaseError(f"Failed to drop index {index}: {e}") from e
+        for index in indices:
+            try:
+                sql = f'DROP INDEX IF EXISTS {index}'
+                if self.verbose >= 1:
+                    logger.info(f'删除索引: {sql}')
+                self.execute(sql)
+            except sqlite3.Error as e:
+                raise DatabaseError(f"Failed to drop index {index}: {e}") from e
 
     def drop_all_indices(self, exclude_autoindex: bool = True) -> None:
         """删除数据库中所有索引"""

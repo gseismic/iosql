@@ -110,10 +110,15 @@ class Table:
     def pragma(self, key: str, value: Optional[str] = None) -> None:
         # https://www.programcreek.com/python/?CodeExample=set+sqlite+pragma
         value = value or ''
-        if value:
-            self.cursor.execute(f'PRAGMA {key}={value};')
-        else:
-            self.cursor.execute(f'PRAGMA {key};')
+        with self.database.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                if value:
+                    cursor.execute(f'PRAGMA {key}={value};')
+                else:
+                    cursor.execute(f'PRAGMA {key};')
+            finally:
+                cursor.close()
 
     def table_exists(self) -> bool:
         sql = getsql_query_table(self._table_name, name_only=True)
@@ -266,12 +271,16 @@ class Table:
     def execute(self, sql: str, commit: Optional[bool] = None) -> None:
         if self.verbose >= 2:
             logger.info(f'SQL: {sql}')
-        try:
-            self.cursor.execute(sql)
-        except sqlite3.OperationalError as e:
-            self._handle_error(e)
-
-        self._try_commit(commit)
+        
+        with self.database.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(sql)
+                self._try_commit(commit, conn)
+            except sqlite3.OperationalError as e:
+                self._handle_error(e)
+            finally:
+                cursor.close()
 
     def executemany(self, sql: str, list_values: List[Tuple], commit: Optional[bool] = None) -> None:
         '''SQL简单封装
@@ -282,21 +291,25 @@ class Table:
         if not list_values:
             return
 
-        try:
-            self.cursor.executemany(sql, list_values)
-        except sqlite3.OperationalError as e:
-            self._handle_error(e)
-        except sqlite3.ProgrammingError as e:
-            raise e
-
-        self._try_commit(commit)
+        with self.database.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.executemany(sql, list_values)
+                self._try_commit(commit, conn)
+            except sqlite3.OperationalError as e:
+                self._handle_error(e)
+            except sqlite3.ProgrammingError as e:
+                raise e
+            finally:
+                cursor.close()
 
     def fetchall(self) -> List[Tuple]:
-        # 读取数据可能需要以前的游标，而不是重建
-        return self.cursor.fetchall()
+        # 在连接池模式下，fetchall需要在execute的同一个上下文中调用
+        raise NotImplementedError("在连接池模式下，请在execute的同一个连接上下文中使用cursor.fetchall()")
 
     def fetchone(self) -> Optional[Tuple]:
-        return self.cursor.fetchone()
+        # 在连接池模式下，fetchone需要在execute的同一个上下文中调用
+        raise NotImplementedError("在连接池模式下，请在execute的同一个连接上下文中使用cursor.fetchone()")
 
     def _update(self, kv: Dict[str, Any], where: Optional[str], commit: Optional[bool] = None) -> None:
         # Use f-strings for better performance
@@ -504,33 +517,39 @@ class Table:
         self.execute(sql, commit=True)
 
     def commit(self, rollback_if_err: bool = True) -> None:
-        try:
-            self.conn.commit()
-        except Exception as e:
-            logger.error(f'Error {str(e)}')
-            if rollback_if_err:
-                self.conn.rollback()
+        # 在连接池模式下，commit应该在具体的连接上下文中进行
+        raise NotImplementedError("在连接池模式下，请在具体的连接上下文中调用conn.commit()")
 
-    def _try_commit(self, commit: Optional[bool]) -> None:
+    def _try_commit(self, commit: Optional[bool], conn: sqlite3.Connection = None) -> None:
         if commit is None:
-            if self.auto_commit:
-                self.commit()
-        elif commit:
-            self.commit()
+            if self.auto_commit and conn:
+                try:
+                    conn.commit()
+                except Exception as e:
+                    logger.error(f'Error {str(e)}')
+                    conn.rollback()
+        elif commit and conn:
+            try:
+                conn.commit()
+            except Exception as e:
+                logger.error(f'Error {str(e)}')
+                conn.rollback()
 
     def close(self) -> None:
-        if self.cursor:
-            self.cursor.close()
-            self.cursor = None
+        # 在连接池模式下，不需要手动关闭cursor
+        # 连接池会自动管理连接的生命周期
+        pass
 
     @property
     def cursor(self) -> sqlite3.Cursor:
-        # 如果conn 已经关闭，可以自动连接
-        return self.database.cursor
+        # 连接池模式下，每次需要时创建新的cursor
+        # 注意：这个cursor需要在使用后手动关闭
+        raise NotImplementedError("在连接池模式下，请使用 database.get_connection() 上下文管理器获取连接和cursor")
 
     @property
     def conn(self) -> sqlite3.Connection:
-        return self.database.conn
+        # 连接池模式下，不再提供直接的连接访问
+        raise NotImplementedError("在连接池模式下，请使用 database.get_connection() 上下文管理器获取连接")
 
     @property
     def database(self) -> "my_database.Database":
@@ -545,8 +564,13 @@ class Table:
         if self._table_info_cache is None:
             table = self.table_name
             sql = f"PRAGMA table_info({quoted_sql_text(table)})"
-            rows = self.conn.execute(sql)
-            self._table_info_cache = [dict(item) for item in rows.fetchall()]
+            with self.database.get_connection() as conn:
+                cursor = conn.cursor()
+                try:
+                    cursor.execute(sql)
+                    self._table_info_cache = [dict(item) for item in cursor.fetchall()]
+                finally:
+                    cursor.close()
         return self._table_info_cache
 
     def default_values(self) -> Dict[str, Any]:
