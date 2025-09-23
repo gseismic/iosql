@@ -57,7 +57,7 @@ def parse_partition(partition):
     return fn_name, column
 
 def _partition_timestamp_div(partition, ts):
-    # partition, KTStoTSx{1000}
+    # partition, KTStoTSx{1000, 3600, 86400}
     multi = int(partition.split('x')[1])
     return int(ts) // multi
 
@@ -117,19 +117,24 @@ _BUILTIN_PARTITION_FN_DICT = {
 
 # https://xin053.github.io/2016/07/04/arrow%E6%97%B6%E9%97%B4%E5%BA%93%E4%BD%BF%E7%94%A8%E8%AF%A6%E8%A7%A3/
 def get_partition_fn(partition, use_builtin=True):
+    if not use_builtin:
+        raise Exception(f'Not supported partition: {use_builtin=}')
     fn = None
+    # KTStoTSx{86400}
     fn_name, column = parse_partition(partition)
-    # assert partition[:3] == 'KTS'
+    assert partition[:3] == 'KTS'
     if partition[:3] != 'KTS':
         import warnings
-        warnings.warn('KTS partition is recommended')
+        warnings.warn('KTS/TS-type partition is recommended')
 
     if use_builtin:
+        # 默认为真
         if fn_name.startswith('TStoTSx'):
             fn = lambda d: _partition_timestamp_div(fn_name, d)
         elif fn_name.startswith('KTStoTSx'):
             fn = lambda d: _partition_timestamp_div(fn_name, d//1000)
         else:
+            import warnings
             warnings.warn('时间戳转为YYYYMMDDHH-like后，如果写入地和读取地时区不一致，可能导致错误的partition分区，应该放弃这种数据分区方法')
             fn = _BUILTIN_PARTITION_FN_DICT[fn_name]
     else:

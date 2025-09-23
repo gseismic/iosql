@@ -5,6 +5,7 @@ import arrow
 import logging
 from iosql import Database
 import sqlite3
+import pytest
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')

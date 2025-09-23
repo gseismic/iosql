@@ -3,20 +3,48 @@ import threading
 import queue
 import sqlite3
 from contextlib import contextmanager
+from .logger import logger 
 
 class DatabaseConnectionPool:
-    def __init__(self, db_file: str, max_connections: int = 10, **kwargs):
+    def __init__(self, db_file: str, max_connections: int = 10, pragma_dict: dict = None, **kwargs):
         self.db_file = db_file
         self.max_connections = max_connections
         self.kwargs = kwargs
+        self.pragma_dict = pragma_dict or {}
         self._pool = queue.Queue(maxsize=max_connections)
         self._created_connections = 0
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._pragma_lock = threading.Lock()  # 专门用于PRAGMA设置的锁
+        self._pragma_applied_connections = set()  # 跟踪已应用PRAGMA的连接
         
     def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_file, **self.kwargs)
+        # 在连接参数中设置一些基本的PRAGMA
+        kwargs = self.kwargs.copy()
+        kwargs.setdefault('timeout', 30.0)  # 设置超时时间
+        
+        conn = sqlite3.connect(self.db_file, **kwargs)
         conn.row_factory = sqlite3.Row
+        
+        # 只设置最关键的PRAGMA，避免锁定问题
+        try:
+            conn.execute('PRAGMA journal_mode=WAL;')
+            conn.execute('PRAGMA busy_timeout=30000;')
+        except sqlite3.OperationalError:
+            # 如果设置失败，继续使用连接
+            pass
+            
         return conn
+    
+    def _apply_pragma_to_connection(self, conn: sqlite3.Connection) -> None:
+        """为单个连接应用PRAGMA设置"""
+        # 使用专门的锁来确保PRAGMA设置的原子性
+        with self._pragma_lock:
+            cursor = conn.cursor()
+            try:
+                for key, value in self.pragma_dict.items():
+                    cursor.execute(f'PRAGMA {key}={value};')
+            finally:
+                cursor.close()
     
     def _is_connection_alive(self, conn: sqlite3.Connection) -> bool:
         """检查连接是否仍然有效
@@ -41,10 +69,12 @@ class DatabaseConnectionPool:
         conn = None
         try:
             # 尝试从池中获取连接
+            logger.debug('get_connection')
             conn = self._pool.get_nowait()
-            # 检查连接是否仍然有效
+            # 检查连接是否仍然有效 
             # 这一步很重要：池中的连接可能因为长时间未使用或外部因素而失效
             if not self._is_connection_alive(conn):
+                logger.debug('create new connection ...')
                 conn.close()  # 关闭失效的连接
                 conn = self._create_connection()  # 创建新的有效连接
         except queue.Empty:

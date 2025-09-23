@@ -4,6 +4,7 @@ import json
 import sqlite3
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union, Any, Tuple, TYPE_CHECKING
+from contextlib import contextmanager
 
 import arrow
 
@@ -80,6 +81,20 @@ class Table:
         self._default_values_cache = None
         self._pk_cache = None
     
+    @contextmanager
+    def _get_cursor(self):
+        """获取游标的上下文管理器
+        
+        Returns:
+            tuple: (cursor, connection) 游标和连接对象
+        """
+        with self.database.get_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                yield cursor, conn
+            finally:
+                cursor.close()
+    
     def _execute_with_fallback(self, sql: str, commit: Optional[bool], data: Dict[str, Any], 
                               ensure_table: bool, ensure_column: bool, **kwargs) -> None:
         """Execute SQL with fallback handling for missing table/column"""
@@ -100,31 +115,20 @@ class Table:
                 self.execute(sql, commit=commit)
             else:
                 raise e
-        # self._fields = [item['name'] for item in self._table_fields]
-        # 使用SqliteDatabase 因为可以自动维护conn
-        # 同时考虑: 因为fetchall需要，所以设计一个SqliteTable只有一个
-        # 固定的cursor
-        # self.cursor = self._database.conn.cursor()
-        # self._cursor = self.get_cursor()
 
     def pragma(self, key: str, value: Optional[str] = None) -> None:
         # https://www.programcreek.com/python/?CodeExample=set+sqlite+pragma
         value = value or ''
-        with self.database.get_connection() as conn:
-            cursor = conn.cursor()
-            try:
-                if value:
-                    cursor.execute(f'PRAGMA {key}={value};')
-                else:
-                    cursor.execute(f'PRAGMA {key};')
-            finally:
-                cursor.close()
+        with self._get_cursor() as (cursor, conn):
+            if value:
+                cursor.execute(f'PRAGMA {key}={value};')
+            else:
+                cursor.execute(f'PRAGMA {key};')
 
     def table_exists(self) -> bool:
         sql = getsql_query_table(self._table_name, name_only=True)
-        self.execute(sql)
-        # rv {'type': 'table', 'name': 'not_exist2', 'tbl_name': 'not_exist2', 'rootpage': 11, 'sql': 'CREATE TABLE not_exist2(\n\tid integer,\n\tname5 text,\n\tname6 text)'}
-        rv = self.fetchone()
+        # 使用新的fetchone方法，它会自动处理execute和fetch
+        rv = self.fetchone(sql)
         return bool(rv)
 
     def create_table_like(self, dic: Dict[str, Any], columns: Optional[List[Dict]] = None, 
@@ -268,19 +272,67 @@ class Table:
         else:
             raise e
 
+    def _handle_error_on_connection(self, e: Exception, conn: sqlite3.Connection) -> None:
+        """处理特定连接上的异常，包含回滚逻辑"""
+        conn.rollback()
+        str_e = str(e)
+        if 'no column named' in str_e:
+            match = _COLUMN_NAME_PATTERN.search(str_e)
+            if match:
+                raise NoSuchColumn(match.group(1))
+        elif 'no such table' in str_e:
+            match = _TABLE_NAME_PATTERN.search(str_e)
+            if match:
+                raise NoSuchTable(match.group(1))
+        elif 'already exists' in str_e:
+            match = _TABLE_EXISTS_PATTERN.search(str_e)
+            if match:
+                raise TableAlreadyExists(match.group(1))
+        elif 'duplicate column' in str_e:
+            match = _DUPLICATE_COLUMN_PATTERN.search(str_e)
+            if match:
+                raise DuplicateColumn(match.group(1))
+        else:
+            raise e
+
+    def _execute_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection, 
+                              sql: str, commit: Optional[bool] = None) -> None:
+        """在指定连接上执行SQL语句"""
+        if self.verbose >= 2:
+            logger.info(f'SQL: {sql}')
+        
+        try:
+            cursor.execute(sql)
+            self._try_commit_on_connection(conn, commit)
+        except sqlite3.OperationalError as e:
+            self._handle_error_on_connection(e, conn)
+
+    def _executemany_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
+                                  sql: str, list_values: List[Tuple], 
+                                  commit: Optional[bool] = None) -> None:
+        """在指定连接上执行批量SQL语句"""
+        if self.verbose >= 2:
+            logger.info(f'executemany SQL: {sql}: len={len(list_values)}')
+
+        if not list_values:
+            return
+
+        try:
+            cursor.executemany(sql, list_values)
+            self._try_commit_on_connection(conn, commit)
+        except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
+            self._handle_error_on_connection(e, conn)
+
     def execute(self, sql: str, commit: Optional[bool] = None) -> None:
         if self.verbose >= 2:
             logger.info(f'SQL: {sql}')
         
-        with self.database.get_connection() as conn:
-            cursor = conn.cursor()
+        with self._get_cursor() as (cursor, conn):
             try:
                 cursor.execute(sql)
-                self._try_commit(commit, conn)
+                self._try_commit_on_connection(conn, commit)
             except sqlite3.OperationalError as e:
-                self._handle_error(e)
-            finally:
-                cursor.close()
+                self._handle_error_on_connection(e, conn)
 
     def executemany(self, sql: str, list_values: List[Tuple], commit: Optional[bool] = None) -> None:
         '''SQL简单封装
@@ -291,25 +343,46 @@ class Table:
         if not list_values:
             return
 
-        with self.database.get_connection() as conn:
-            cursor = conn.cursor()
+        with self._get_cursor() as (cursor, conn):
             try:
                 cursor.executemany(sql, list_values)
-                self._try_commit(commit, conn)
+                self._try_commit_on_connection(conn, commit)
+            except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
+                self._handle_error_on_connection(e, conn)
+
+    def fetchall(self, sql: str) -> List[Tuple]:
+        """执行查询并返回所有结果"""
+        with self._get_cursor() as (cursor, conn):
+            try:
+                cursor.execute(sql)
+                return cursor.fetchall()
             except sqlite3.OperationalError as e:
-                self._handle_error(e)
-            except sqlite3.ProgrammingError as e:
-                raise e
-            finally:
-                cursor.close()
+                self._handle_error_on_connection(e, conn)
 
-    def fetchall(self) -> List[Tuple]:
-        # 在连接池模式下，fetchall需要在execute的同一个上下文中调用
-        raise NotImplementedError("在连接池模式下，请在execute的同一个连接上下文中使用cursor.fetchall()")
-
-    def fetchone(self) -> Optional[Tuple]:
-        # 在连接池模式下，fetchone需要在execute的同一个上下文中调用
-        raise NotImplementedError("在连接池模式下，请在execute的同一个连接上下文中使用cursor.fetchone()")
+    def fetchone(self, sql: str) -> Optional[Tuple]:
+        """执行查询并返回单个结果"""
+        with self._get_cursor() as (cursor, conn):
+            try:
+                cursor.execute(sql)
+                return cursor.fetchone()
+            except sqlite3.OperationalError as e:
+                self._handle_error_on_connection(e, conn)
+    
+    def _try_commit_on_connection(self, conn: sqlite3.Connection, commit: Optional[bool]) -> None:
+        """在指定连接上尝试提交
+        
+        这个方法替代了原来的_try_commit方法，直接在给定的连接上操作，
+        避免了对self.conn的依赖，更适合连接池模式。
+        
+        Args:
+            conn: 数据库连接对象
+            commit: 是否提交事务，None表示根据auto_commit决定
+        """
+        if commit is None:
+            if self.auto_commit:
+                conn.commit()
+        elif commit:
+            conn.commit()
 
     def _update(self, kv: Dict[str, Any], where: Optional[str], commit: Optional[bool] = None) -> None:
         # Use f-strings for better performance
@@ -334,8 +407,7 @@ class Table:
     def query(self, sql: str, to_dict: bool = False) -> Union[List[Tuple], List[Dict]]:
         #print(self.database.db_file)
         #print(sql)
-        self.execute(sql)
-        data = self.fetchall()
+        data = self.fetchall(sql)
         if to_dict and data:
             data = [dict(item) for item in data]
         return data
@@ -408,48 +480,158 @@ class Table:
                 # self.ensure_columns_like(batch_data[0])
                 self.executemany(sql, list_values, commit=commit)
             else:
+                 raise e
+
+    def _insert_one_batch_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
+                                       batch_data: List[Dict[str, Any]], 
+                                       replace: bool = False, ignore: bool = False,
+                                       ensure_table: bool = False, 
+                                       ensure_column: bool = False, **kwargs) -> None:
+        """在指定连接上执行单批次插入"""
+        if not batch_data:
+            return
+
+        default_values = self.default_values()
+        od_fields, list_values = getarg_diclist_insertmany(batch_data, default_values)
+        fields = list(od_fields.keys())
+        sql = getsqlarg_dict_insertmany(self._table_name, fields, replace=replace, ignore=ignore)
+        
+        try:
+            self._executemany_on_connection(cursor, conn, sql, list_values)
+        except NoSuchTable as e:
+            if ensure_table:
+                # Note 这里忽略了not_null等参数, 用了默认数值
+                # 用户能传的只有 columns(包含了not_null等信息), pk
+                columns = suggest_columns(od_fields)
+                self.create_table(columns, **kwargs)
+                self._executemany_on_connection(cursor, conn, sql, list_values)
+            else:
                 raise e
+        except NoSuchColumn as e:
+            if ensure_column:
+                self.ensure_columns(od_fields)
+                # self.ensure_columns_like(batch_data[0])
+                self._executemany_on_connection(cursor, conn, sql, list_values)
+            else:
+                 raise e
+
+
+    def _create_table_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
+                                   columns: List[Dict], pk: Optional[Union[str, List[str]]] = None, 
+                                   exist_ok: bool = True, save_meta: bool = True, 
+                                   table_comment: Optional[str] = None, exist_no_warn: bool = False,
+                                   **kwargs) -> None:
+        """在指定连接上创建表"""
+        table_created = False
+        sql, meta = getsql_create_table(self._table_name, columns, pk, if_not_exists=False)
+        try:
+            cursor.execute(sql)
+            table_created = True
+        except DuplicateColumn as e:
+            logger.error(f'DuplicateColumn: `{e}`')
+            raise e
+        except TableAlreadyExists as e:
+            if exist_ok:
+                if not exist_no_warn:
+                    logger.info(f'Table `{self._table_name}` already exist, Not created')
+            else:
+                raise e
+
+        if not table_created or not save_meta:
+            return
+
+        # save meta - 在同一个连接上创建元数据表和插入元数据
+        meta_columns = [ 
+            {'name': 'table_name', 'type': 'text', 'not_null': True},
+            {'name': 'columns', 'type': 'text', 'not_null': True},
+            {'name': 'pk', 'type': 'text'},
+            {'name': 'table_comment', 'type': 'text'},
+            {'name': 'author', 'type': 'text'},
+            {'name': 'author_email', 'type': 'text'},
+            {'name': 'created_at', 'type': 'text'},
+            {'name': 'license', 'type': 'text'}
+        ]
+        meta_table_name = META_TABLE_NAME
+        _sql, _ = getsql_create_table(
+            meta_table_name, meta_columns, 
+            pk=['table_name'],
+            if_not_exists=True
+        )
+        cursor.execute(_sql)
+
+        __sql, _ = getsqlarg_dict_insert(
+            meta_table_name, {
+                'table_name': self._table_name,
+                'columns': json.dumps(columns).replace('"', '""'),
+                'pk': ','.join(pk) if isinstance(pk, (list,tuple)) else pk,
+                'table_comment': table_comment,
+                'author': kwargs.get('author'),
+                'author_email': kwargs.get('author_email'),
+                'created_at': arrow.now().format('YYYY-MM-DD HH:mm:ss'),
+                'license': kwargs.get('license')
+            },
+            replace=True
+        )
+        cursor.execute(__sql)
+        logger.debug(f'Table {self._table_name} meta info Created.')
+
+    def _ensure_columns_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection, 
+                                     od_fields: Dict[str, Any]) -> None:
+        """在指定连接上确保列存在"""
+        for column_name, value in od_fields.items():
+            try:
+                type_ = suggest_value_type(value)
+                sql = getsql_add_column(self._table_name, column_name, type_)
+                cursor.execute(sql)
+                self._invalidate_cache()
+                if self.verbose >= 1:
+                    logger.info(f'{self._table_name}: Added column {column_name} {type_}')
+            except DuplicateColumn:
+                pass
 
     def insert_all(self, list_kv: List[Dict[str, Any]], replace: bool = False, 
                    ignore: bool = False, batch_size: int = 5000, commit: bool = True, 
                    ensure_table: bool = False, ensure_column: bool = False, **kwargs) -> None:
+        """批量插入数据，使用单个连接进行整个批量操作以提高性能"""
         # 要求keys一致: 但并不检验
         if not list_kv:
             return
-        # fields = list(list_kv[0].keys())
-        # sql = getsqlarg_dict_insertmany(self._table_name, fields, replace=replace, ignore=ignore)
+        
         n = len(list_kv)
         n_batch = math.ceil(n / batch_size)
+        
+        # 使用单个连接进行整个批量操作
+        with self._get_cursor() as (cursor, conn):
+            try:
+                # 开始事务
+                conn.execute('BEGIN IMMEDIATE;')
+                
+                for i in range(n_batch):
+                    start_idx = i * batch_size
+                    end_idx = min(start_idx + batch_size, n)
+                    batch_data = list_kv[start_idx:end_idx]
+                    
+                    if self.verbose >= 2:
+                        logger.info(f'Write batch_size: {i+1}/{n_batch} ..')
+                    
+                    # 在同一个连接上执行批量操作
+                    self._insert_one_batch_on_connection(
+                        cursor, conn, batch_data,
+                        replace=replace, ignore=ignore,
+                        ensure_table=ensure_table,
+                        ensure_column=ensure_column, **kwargs
+                    )
+                
+                # 提交整个事务
+                if commit:
+                    conn.commit()
+                    
+            except Exception as e:
+                conn.rollback()
+                raise e
 
-        self.conn.execute('BEGIN IMMEDIATE;')
-        commit_size = 5000
-        written_size = 0 
-        for i in range(n_batch):
-            start_idx = i * batch_size
-            end_idx = min(start_idx + batch_size, n)
-            batch_data = list_kv[start_idx:end_idx]
-            
-            if self.verbose >= 2:
-                logger.info(f'Write batch_size: {i+1}/{n_batch} ..')
 
-            written_size += len(batch_data)
-            my_commit = False
-            if commit and written_size >= commit_size:
-                my_commit = True
-                written_size = 0
-
-            self._insert_one_batch(
-                batch_data, 
-                replace=replace, ignore=ignore,
-                commit=my_commit, 
-                ensure_table=ensure_table, 
-                ensure_column=ensure_column, **kwargs
-            )
-
-        self._try_commit(commit)
-
-
-    def __list_insertmany(self, list_values: List[Tuple], replace: bool = False, ignore: bool = False,
+    def _list_insertmany(self, list_values: List[Tuple], replace: bool = False, ignore: bool = False,
                         batch_size: int = 50000, commit: bool = True) -> None:
         '''要求字段完全匹配
 
@@ -564,13 +746,9 @@ class Table:
         if self._table_info_cache is None:
             table = self.table_name
             sql = f"PRAGMA table_info({quoted_sql_text(table)})"
-            with self.database.get_connection() as conn:
-                cursor = conn.cursor()
-                try:
-                    cursor.execute(sql)
-                    self._table_info_cache = [dict(item) for item in cursor.fetchall()]
-                finally:
-                    cursor.close()
+            with self._get_cursor() as (cursor, conn):
+                cursor.execute(sql)
+                self._table_info_cache = [dict(item) for item in cursor.fetchall()]
         return self._table_info_cache
 
     def default_values(self) -> Dict[str, Any]:
@@ -602,4 +780,5 @@ class Table:
         # print(table_info)
         # table_info['column_type'] = OrderedDict([tuple(item['name'], item['type'] for item in infos]
         # https://stackoverflow.com/questions/54412977/sqlite3-python-get-list-of-primary-and-foreign-keys
-        # rows = self.conn.execute("PRAGMA foreign_key_list({})".format(quoted_sql_text(table)))
+        # 在连接池模式下，需要使用 with self._get_cursor() as (cursor, conn): 来获取连接
+        # rows = cursor.execute("PRAGMA foreign_key_list({})".format(quoted_sql_text(table)))

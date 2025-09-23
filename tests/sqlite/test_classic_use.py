@@ -26,11 +26,11 @@ def test_select():
     for i in range(min_id, max_id):
         date = d.shift(minutes=i)
         dic = {'id': i, 'date': date.timestamp()*1000, 'iii': i*i*i}
-        print(i, dic)
+        # print(i, dic)
         data.append(dic)
 
     db['demo'].insert_all(data, pk=['id','date'], 
-                           replace=True, 
+                           replace=True, ensure_table=True,
                            partition='KTStoYYYYMMDD(date)')
     print(db['demo'].table_parts())
     # assert len(db['demo'].table_parts()) == 3

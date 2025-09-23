@@ -7,7 +7,7 @@ META_TABLE_NAME = '_meta'
 # }
 
 # https://poe.com/chat/usbncsnenrdbemi8r6
-# 在 const.py 中优化默认PRAGMA设置
+# 在 const.py 中优化默认PRAGMA设置，针对多线程环境优化
 _DEFAULT_PRAGMA = {
     "foreign_keys": "on",
     "journal_mode": "wal",

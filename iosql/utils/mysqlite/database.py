@@ -58,17 +58,17 @@ class Database(object):
         self._kwargs.setdefault('timeout', timeout)
         self._tables = {}
         
+        # 简化锁的使用
+        self._lock = threading.Lock()  # 只用于关键配置操作
+        self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
+        
         # 添加连接池
         self._pool = DatabaseConnectionPool(
             str(self.db_file), 
             max_connections=max_connections,
-            timeout=timeout,
-            **kwargs
+            pragma_dict=self._pragma_dict,
+            **self._kwargs
         )
-        
-        # 简化锁的使用
-        self._lock = threading.Lock()  # 只用于关键配置操作
-        self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
 
         # 如果请求则启用WAL模式
         if wal:
@@ -128,18 +128,8 @@ class Database(object):
             db_dirname.mkdir(parents=True, exist_ok=True)
             
         with self._pool.get_connection() as conn:
-            # 确保连接配置正确
-            self._apply_pragma_to_connection(conn)
             yield conn
     
-    def _apply_pragma_to_connection(self, conn: sqlite3.Connection) -> None:
-        """为单个连接应用PRAGMA设置"""
-        cursor = conn.cursor()
-        for key, value in self._pragma_dict.items():
-            cursor.execute(f'PRAGMA {key}={value};')
-        cursor.close()
-        
-
 
     def execute(self, sql: str) -> None:
         """执行SQL语句，包含适当的错误处理"""
