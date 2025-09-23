@@ -4,9 +4,9 @@
 
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
-**/*.sqlite3
-*.db
-*.iosql
+**/*.sqlite3 
+*.db 
+*.iosql 
 all.md 
 
 __pycache__/

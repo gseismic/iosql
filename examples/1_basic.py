@@ -1,9 +1,9 @@
 import arrow
-from iosql.spaces.alpha import Database
+from iosql import Database
 
 
 def run():
-    db = Database('sqlite://database/finance.sqlite3')
+    db = Database('sqlite://database/finance.iosql')
     d = arrow.get('2020-01-01')
     min_id, max_id = 0, 60*12*2*3
 
@@ -37,13 +37,15 @@ def run():
     values = db['demo'].select(
         'id,date', 
         where={'field': 'date', 'op': 'between_and', 
-               'value':
+               'value': 
                [arrow.get('2020-01-02 00').timestamp(),
                 arrow.get('2020-01-02 01').timestamp()]}
     )
+    # print(values)
+    # raise 
     print([dict(item) for item in values], len(values))
-    print(arrow.get(dict(values[0])['date']))
-    print(arrow.get(dict(values[-1])['date']))
+    print(arrow.get(dict(values[0])['date'])) 
+    print(arrow.get(dict(values[-1])['date'])) 
 
 
 if __name__ == '__main__':
