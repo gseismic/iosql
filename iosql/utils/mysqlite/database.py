@@ -4,6 +4,8 @@ import logging
 import copy
 import threading
 import contextlib
+import signal
+import atexit
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 import sqlite3
@@ -22,6 +24,40 @@ class DatabaseError(Exception):
 class DatabaseConnectionError(DatabaseError):
     """数据库连接错误"""
     pass
+
+
+# 全局数据库实例注册表，用于程序退出时的自动清理
+_active_databases = set()
+_cleanup_registered = False
+
+
+def _cleanup_all_databases():
+    """清理所有活跃的数据库连接"""
+    global _active_databases
+    if _active_databases:
+        logger.info(f'程序退出，清理 {len(_active_databases)} 个数据库实例')
+        for db in list(_active_databases):
+            try:
+                db.force_close_all_connections()
+            except Exception as e:
+                logger.error(f'清理数据库 {db.db_file} 时出错: {e}')
+        _active_databases.clear()
+
+
+def _register_cleanup():
+    """注册程序退出时的清理函数"""
+    global _cleanup_registered
+    if not _cleanup_registered:
+        atexit.register(_cleanup_all_databases)
+        # 注册信号处理器
+        def signal_handler(signum, frame):
+            logger.info(f'收到信号 {signum}，开始清理数据库连接')
+            _cleanup_all_databases()
+            exit(0)
+        
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+        _cleanup_registered = True
 
 
 class Database(object):
@@ -73,6 +109,10 @@ class Database(object):
         # 如果请求则启用WAL模式
         if wal:
             self.enable_wal()
+        
+        # 注册到全局数据库实例注册表，用于程序退出时的自动清理
+        _register_cleanup()
+        _active_databases.add(self)
 
     def enable_wal(self, enable: bool = True) -> None:
         """启用或禁用WAL模式"""
@@ -105,8 +145,11 @@ class Database(object):
 
     def __exit__(self, exc_type, exc_value, exc_tb):
         """上下文管理器退出，进行适当的清理"""
-        # 连接池会自动管理连接，无需手动清理
-        pass
+        # 在异常情况下强制清理连接池，防止文件句柄泄露
+        if exc_type is not None:
+            logger.warning(f'数据库操作异常，强制清理连接池: {exc_type.__name__}: {exc_value}')
+            self.force_close_all_connections()
+        # 正常情况下连接池会自动管理连接
 
     def __getitem__(self, table_name: str) -> 'table.Table':
         """通过名称获取表，如果不存在则创建"""
@@ -160,6 +203,40 @@ class Database(object):
         """关闭数据库连接池"""
         if self.verbose >= 1:
             logger.debug(f'连接池会自动管理连接 {self.db_file}')
+    
+    def force_close_all_connections(self) -> None:
+        """强制关闭所有数据库连接
+        
+        这个方法用于紧急情况下的资源清理，防止文件句柄泄露。
+        调用后连接池将不可用，需要重新创建Database实例。
+        """
+        if hasattr(self, '_pool'):
+            self._pool.force_close_all_connections()
+            if self.verbose >= 1:
+                logger.info(f'已数据库 {self.db_file} 的所有连接')
+        
+        # 从全局注册表中移除
+        _active_databases.discard(self)
+    
+    def get_connection_pool_status(self) -> dict:
+        """获取连接池状态信息
+        
+        Returns:
+            dict: 包含连接池状态信息的字典
+        """
+        if hasattr(self, '_pool'):
+            return self._pool.get_pool_status()
+        return {'error': '连接池未初始化'}
+    
+    def is_connection_pool_healthy(self) -> bool:
+        """检查连接池是否健康
+        
+        Returns:
+            bool: True表示连接池健康，False表示可能存在问题
+        """
+        if hasattr(self, '_pool'):
+            return self._pool.is_pool_healthy()
+        return False
 
     def is_closed(self) -> bool:
         """检查连接是否已关闭 - 连接池模式下总是可用"""

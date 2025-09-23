@@ -1,5 +1,4 @@
 import shutil
-import config
 import pytest
 import time
 import arrow

@@ -46,8 +46,7 @@ def test_select():
                          use_builtin_partition=use_builtin_partition)
     delta_t1 = time.time() - t
     print('Not use builtin_partition end insert', delta_t1)
-    print(f'Speedup: {delta_t1/delta_t2=}')
-
+    print(f'Speedup: {delta_t1/delta_t2=}') 
 
 
 def test_multithread():

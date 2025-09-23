@@ -64,6 +64,67 @@ class DatabaseConnectionPool:
         except sqlite3.Error:
             return False
     
+    def force_close_all_connections(self) -> None:
+        """强制关闭连接池中的所有连接
+        
+        这个方法用于紧急情况下的资源清理，比如：
+        1. 应用异常退出时的清理
+        2. 防止文件句柄泄露
+        3. 内存压力下的强制清理
+        
+        注意：调用此方法后，连接池将不可用，需要重新创建Database实例
+        """
+        logger.info(f'强制关闭连接池中的所有连接 (当前连接数: {self._created_connections})')
+        
+        with self._lock:
+            # 关闭池中的所有连接
+            closed_count = 0
+            while not self._pool.empty():
+                try:
+                    conn = self._pool.get_nowait()
+                    try:
+                        conn.close()
+                        closed_count += 1
+                    except sqlite3.Error as e:
+                        logger.warning(f'关闭连接时出错: {e}')
+                except queue.Empty:
+                    break
+            
+            # 重置连接计数
+            self._created_connections = 0
+            
+        logger.info(f'已强制关闭 {closed_count} 个连接')
+    
+    def get_pool_status(self) -> dict:
+        """获取连接池状态信息
+        
+        Returns:
+            dict: 包含连接池状态信息的字典
+        """
+        with self._lock:
+            return {
+                'max_connections': self.max_connections,
+                'created_connections': self._created_connections,
+                'available_connections': self._pool.qsize(),
+                'db_file': self.db_file
+            }
+    
+    def is_pool_healthy(self) -> bool:
+        """检查连接池是否健康
+        
+        Returns:
+            bool: True表示连接池健康，False表示可能存在问题
+        """
+        status = self.get_pool_status()
+        # 检查是否有连接泄露（创建数远大于可用数）
+        if status['created_connections'] > status['max_connections']:
+            return False
+        # 检查是否有太多连接在使用中
+        in_use = status['created_connections'] - status['available_connections']
+        if in_use > status['max_connections'] * 0.8:  # 80%阈值
+            logger.warning(f'连接池使用率过高: {in_use}/{status["max_connections"]}')
+        return True
+
     @contextmanager
     def get_connection(self):
         conn = None
