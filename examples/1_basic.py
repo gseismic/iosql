@@ -9,8 +9,8 @@ def run():
 
     data = []
     for i in range(min_id, max_id):
-        date = d.shift(minutes=i)
-        dic = {'id': i, 'date': date.timestamp(), 'iii': i*i*i}
+        date = d.shift(minutes=i) 
+        dic = {'id': i, 'date': date.timestamp()*1000, 'iii': i*i*i}
         # print(i, dic)
         data.append(dic)
 
@@ -26,11 +26,13 @@ def run():
         to_dict=True
     )
     print(values, len(values))
+    # raise
+    print(values, len(values))
     assert len(values) == 3
 
     values = db['demo'].select(
         'id,date', 
-        where={'field': 'date', 'op': '<', 'value': arrow.get('2020-01-02').timestamp()}
+        where={'field': 'date', 'op': '<', 'value': arrow.get('2020-01-02').timestamp()*1000}
     )
     print([dict(item) for item in values], len(values))
 
@@ -38,8 +40,8 @@ def run():
         'id,date', 
         where={'field': 'date', 'op': 'between_and', 
                'value': 
-               [arrow.get('2020-01-02 00').timestamp(),
-                arrow.get('2020-01-02 01').timestamp()]}
+               [arrow.get('2020-01-02 00').timestamp()*1000,
+                arrow.get('2020-01-02 01').timestamp()*1000]}
     )
     # print(values)
     # raise 
