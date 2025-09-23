@@ -8,9 +8,9 @@ class Cache(object):
     def get(self, key):
         pass
 
-    def set(self, key, value):
-        if self.cache_full():
-            self.try_release_cache()
+    def set(self, key, value): 
+        if self.cache_full(): 
+            self.try_release_cache() 
 
     def cache_full(self):
         pass
