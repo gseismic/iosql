@@ -33,7 +33,7 @@ class Database(object):
     
     def __init__(self, db_file: str, auto_commit: bool = True, verbose: int = 1,
                  pragma_dict: Optional[Dict[str, Any]] = None, wal: bool = True, 
-                 timeout: float = 30.0, **kwargs):
+                 timeout: float = 5.0, **kwargs):
         """
         初始化数据库实例
         

@@ -408,7 +408,7 @@ class Table:
         n = len(list_kv)
         n_batch = math.ceil(n / batch_size)
 
-        # self.conn.execute('BEGIN IMMEDIATE;')
+        self.conn.execute('BEGIN IMMEDIATE;')
         commit_size = 5000
         written_size = 0 
         for i in range(n_batch):

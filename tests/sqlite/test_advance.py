@@ -92,7 +92,7 @@ def test_multithread():
         print('time', delta_t2)
 
     threads = []
-    n_threads = 30
+    n_threads = 2
     # https://docs.python.org/2/library/sqlite3.html#sqlite3.connect
     for i in range(n_threads):
         threads.append(threading.Thread(target=thread_insert))

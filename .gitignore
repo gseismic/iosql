@@ -5,6 +5,7 @@
 # Byte-compiled / optimized / DLL files
 **/__pycache__/
 **/*.sqlite3
+*.db
 
 __pycache__/
 *.py[cod]
