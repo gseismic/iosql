@@ -7,15 +7,15 @@ import arrow
 from iosql import Database
 
 db = Database('sqlite://database/finance.sqlite3')
-d = arrow.get('2020-01-01')
-min_id, max_id = 0, 60*12*2*3
+d = arrow.get('2020-01-01') 
+min_id, max_id = 0, 60*12*2*3 
 
-data = []
-for i in range(min_id, max_id):
-    date = d.shift(minutes=i)
-    dic = {'id': i, 'date': date.timestamp(), 'iii': i*i*i}
-    # print(i, dic)
-    data.append(dic)
+data = [] 
+for i in range(min_id, max_id): 
+    date = d.shift(minutes=i) 
+    dic = {'id': i, 'date': date.timestamp(), 'iii': i*i*i} 
+    # print(i, dic) 
+    data.append(dic) 
 
 db['demo'].insert_all(data, pk=['id','date'], 
                        replace=True, 
