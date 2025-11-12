@@ -57,6 +57,7 @@ print(arrow.get(dict(values[-1])['date']))
 
 ## TODOs
 - better data-query design
+- [ ] 字典中包含列表字段，应该设置一个选项，json方式写入还是附表方式写入
 
 ## KnownIssues
 - [@2024-03-30 22:24:07] 不能自动区分大小写，应检测{'u': 1, 'U': 2}
