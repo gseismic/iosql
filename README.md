@@ -66,3 +66,4 @@ print(arrow.get(dict(values[-1])['date']))
 - [@2023-10-21 15:57:35] v0.1.0
 - [@2023-10-23 15:37:25] v0.1.1 Add `TStoTSx1000`-like and `KTStoTSx1000`-like partition
 - [@2023-10-25 00:45:58] v0.1.2 db[table].create_index
+- [@2025-11-18 00:00:00] 修复句柄耗尽错误
