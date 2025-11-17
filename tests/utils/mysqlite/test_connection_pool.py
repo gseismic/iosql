@@ -215,5 +215,5 @@ def test_pool_full_handling(connection_pool):
     if extra_context and extra_conn:
         extra_context.__exit__(None, None, None)
         
-# if __name__ == '__main__':
-    # pytest.main()
+if __name__ == '__main__':
+    pytest.main()

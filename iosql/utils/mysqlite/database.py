@@ -106,6 +106,9 @@ class Database(object):
             **self._kwargs
         )
 
+        # closed flag
+        self._closed = False
+        
         # 如果请求则启用WAL模式
         if wal:
             self.enable_wal()
@@ -146,10 +149,20 @@ class Database(object):
     def __exit__(self, exc_type, exc_value, exc_tb):
         """上下文管理器退出，进行适当的清理"""
         # 在异常情况下强制清理连接池，防止文件句柄泄露
-        if exc_type is not None:
-            logger.warning(f'数据库操作异常，强制清理连接池: {exc_type.__name__}: {exc_value}')
-            self.force_close_all_connections()
+        # if exc_type is not None:
+        #     logger.warning(f'数据库操作异常，强制清理连接池: {exc_type.__name__}: {exc_value}')
+        #     self.force_close_all_connections()
         # 正常情况下连接池会自动管理连接
+        # 无论是否有异常，都尝试优雅关闭（或至少释放资源）
+        try:
+            if exc_type is not None:
+                logger.warning(f'数据库操作异常，退出上下文: {exc_type.__name__}: {exc_value}')
+        finally:
+            # 始终尝试关闭/释放资源（不破坏外部接口）
+            try:
+                self.close()
+            except Exception as e:
+                logger.error(f'__exit__ 调用 close 时出错: {e}')
 
     def __getitem__(self, table_name: str) -> 'table.Table':
         """通过名称获取表，如果不存在则创建"""
@@ -200,23 +213,58 @@ class Database(object):
             logger.debug(f'连接池模式下无法回滚已提交的事务 {self.db_file}')
 
     def close(self) -> None:
-        """关闭数据库连接池"""
+        """关闭数据库连接池并标记实例为已关闭"""
+        # 防止重复关闭
+        if getattr(self, '_closed', False):
+            if self.verbose >= 2:
+                logger.debug(f'Database {self.db_file} 已经关闭，忽略重复 close() 调用')
+            return
+
         if self.verbose >= 1:
-            logger.debug(f'连接池会自动管理连接 {self.db_file}')
+            logger.debug(f'关闭数据库连接池并释放资源 {self.db_file}')
+
+        # 强制关闭底层连接池（如果存在）
+        if hasattr(self, '_pool') and self._pool is not None:
+            try:
+                self._pool.force_close_all_connections()
+            except Exception as e:
+                logger.warning(f'force_close_all_connections 出错: {e}')
+
+        # 标记已关闭，并从全局注册表移除
+        self._closed = True
+        _active_databases.discard(self)
+
+        if self.verbose >= 2:
+            logger.debug(f'已关闭数据库实例 {self.db_file}')
+
     
-    def force_close_all_connections(self) -> None:
-        """强制关闭所有数据库连接
+    # def force_close_all_connections(self) -> None:
+    #     """强制关闭所有数据库连接
         
-        这个方法用于紧急情况下的资源清理，防止文件句柄泄露。
-        调用后连接池将不可用，需要重新创建Database实例。
-        """
+    #     这个方法用于紧急情况下的资源清理，防止文件句柄泄露。
+    #     调用后连接池将不可用，需要重新创建Database实例。
+    #     """
+    #     if hasattr(self, '_pool'):
+    #         self._pool.force_close_all_connections()
+    #         if self.verbose >= 1:
+    #             logger.info(f'已数据库 {self.db_file} 的所有连接')
+        
+    #     # 从全局注册表中移除
+    #     _active_databases.discard(self)
+    def force_close_all_connections(self) -> None:
+        """强制关闭所有数据库连接（并标记实例为已关闭）"""
         if hasattr(self, '_pool'):
-            self._pool.force_close_all_connections()
+            try:
+                self._pool.force_close_all_connections()
+            except Exception as e:
+                logger.warning(f'force_close_all_connections 出错: {e}')
             if self.verbose >= 1:
                 logger.info(f'已数据库 {self.db_file} 的所有连接')
-        
-        # 从全局注册表中移除
+
+        # 标记并移除
+        self._closed = True
         _active_databases.discard(self)
+
     
     def get_connection_pool_status(self) -> dict:
         """获取连接池状态信息
@@ -239,8 +287,11 @@ class Database(object):
         return False
 
     def is_closed(self) -> bool:
-        """检查连接是否已关闭 - 连接池模式下总是可用"""
-        return False
+        # """检查连接是否已关闭 - 连接池模式下总是可用"""
+        # return False
+        """检查连接是否已关闭 - 连接池模式下返回真实关闭状态"""
+        return getattr(self, '_closed', False)
+
 
     def get_conn(self) -> sqlite3.Connection:
         """获取数据库连接 - 不推荐在连接池模式下直接使用"""
