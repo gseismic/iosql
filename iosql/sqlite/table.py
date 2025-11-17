@@ -243,7 +243,7 @@ class Table(BaseTable):
         _t1 = time.time()
         logger.debug(f'Partition Time: {_t1 - _t0}') 
         for part, part_data in partitioned_data.items(): 
-            print('insert part ..............', part) 
+            # print('insert part ..............', part) 
             self._do_insert_part(part, part_column, part_data, pk, 
                                 partition=partition, 
                                 replace=replace, ignore=ignore,
@@ -588,7 +588,7 @@ class Table(BaseTable):
     def get_part_db(self, part_dbfile, auto_commit=True):
         # 只有查询时，auto_commit 才为False
         c = Counter(self._db_parts_status.values())
-        print(self._db_parts_status)
+        # print(self._db_parts_status)
 
         if c.get(True, 0) >= self._num_opened_max_allowed:
             # logger.debug('TOO MANY open Handles, safe closing..')
