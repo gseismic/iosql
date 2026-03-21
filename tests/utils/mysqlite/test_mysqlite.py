@@ -190,3 +190,57 @@ class TestIndex:
 
         with pytest.raises(NoSuchTable):
             db['data'].select('*', to_dict=True)
+
+
+class TestSchemaless:
+    def test_insert_without_creating_table(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['users'].insert({'id': 1, 'name': 'Alice', 'age': 30}, ensure_table=True)
+        assert db['users'].table_exists()
+
+        result = db['users'].select_all('*')
+        assert len(result) == 1
+        assert result[0]['name'] == 'Alice'
+
+    def test_insert_all_without_creating_table(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        data = [{'id': i, 'name': f'user_{i}'} for i in range(5)]
+        db['users'].insert_all(data, ensure_table=True)
+
+        assert db['users'].table_exists()
+        assert db['users'].count() == 5
+
+    def test_insert_without_creating_table_raises(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        with pytest.raises(NoSuchTable):
+            db['users'].insert({'id': 1, 'name': 'Alice'})
+
+    def test_dynamic_columns_with_ensure_column(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['events'].insert({'id': 1, 'type': 'click'}, ensure_table=True)
+        db['events'].insert({'id': 2, 'type': 'scroll', 'duration': 1.5}, ensure_column=True)
+
+        columns = list(db['events'].column_info()['column_type'].keys())
+        assert 'duration' in columns
+
+        result = db['events'].select_all('*')
+        assert len(result) == 2
+        assert result[1]['duration'] == 1.5
+
+    def test_insert_with_replace(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['items'].insert({'id': 1, 'name': 'first'}, pk='id', ensure_table=True)
+        db['items'].insert({'id': 1, 'name': 'updated'}, replace=True)
+
+        result = db['items'].select_all('*')
+        assert len(result) == 1
+        assert result[0]['name'] == 'updated'
+
+    def test_insert_with_ignore(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['items'].insert({'id': 1, 'name': 'first'}, pk='id', ensure_table=True)
+        db['items'].insert({'id': 1, 'name': 'ignored'}, ignore=True)
+
+        result = db['items'].select_all('*')
+        assert len(result) == 1
+        assert result[0]['name'] == 'first'
