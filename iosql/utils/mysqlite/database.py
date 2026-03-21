@@ -173,6 +173,10 @@ class Database(object):
             self._tables[table_name] = _table
         return self._tables[table_name]
 
+    def tables(self) -> List[str]:
+        """获取数据库中所有表名"""
+        return self.get_all_tables()
+
     @contextmanager
     def get_connection(self):
         """获取数据库连接的上下文管理器"""
@@ -266,26 +270,6 @@ class Database(object):
         _active_databases.discard(self)
 
     
-    def get_connection_pool_status(self) -> dict:
-        """获取连接池状态信息
-        
-        Returns:
-            dict: 包含连接池状态信息的字典
-        """
-        if hasattr(self, '_pool'):
-            return self._pool.get_pool_status()
-        return {'error': '连接池未初始化'}
-    
-    def is_connection_pool_healthy(self) -> bool:
-        """检查连接池是否健康
-        
-        Returns:
-            bool: True表示连接池健康，False表示可能存在问题
-        """
-        if hasattr(self, '_pool'):
-            return self._pool.is_pool_healthy()
-        return False
-
     def is_closed(self) -> bool:
         # """检查连接是否已关闭 - 连接池模式下总是可用"""
         # return False

@@ -215,12 +215,18 @@ class Table:
         logger.debug(f'Table {self._table_name} meta info Created.')
 
     def add_column(self, column_name: str, definition: str) -> None:
-        # logger.info(f'Table {self._table_name}: Added Column `{column_name}: {type_}`')
         sql = getsql_add_column(self._table_name, column_name, definition)
         self.execute(sql, commit=True)
         self._invalidate_cache()
 
-    def ensure_column(self, column_name: str, definition: str) -> bool:
+    def ensure_column(self, column_name: str, column_type: str, 
+                      default: Optional[Any] = None) -> bool:
+        definition = column_type
+        if default is not None:
+            if isinstance(default, str):
+                definition += f" DEFAULT '{default}'"
+            else:
+                definition += f" DEFAULT {default}"
         try:
             self.add_column(column_name, definition)
             return True
@@ -230,7 +236,7 @@ class Table:
 
     def ensure_columns(self, columns: Dict[str, str]) -> None:
         for column_name, type_ in columns.items():
-            is_added = self.ensure_column(column_name, definition=type_)
+            is_added = self.ensure_column(column_name, column_type=type_)
             if is_added and self.verbose >= 1:
                 logger.info(f'{self._table_name}: Added column {column_name} {type_}')
 
@@ -393,13 +399,14 @@ class Table:
         self.execute(sql, commit=commit)
 
     def select_one(self, fields: Optional[Union[str, List[str]]], where: Optional[str] = None, 
-                   option: Optional[str] = None) -> Optional[Dict]:
-        rv = self.select(fields, where, option=option, limit=1, to_dict=True)
+                   order_by: Optional[str] = None, option: Optional[str] = None) -> Optional[Dict]:
+        rv = self.select(fields, where, order_by=order_by, option=option, limit=1, to_dict=True)
         return rv[0] if rv else None
 
     def select_all(self, fields: Optional[Union[str, List[str]]], where: Optional[str] = None, 
-                   option: Optional[str] = None, limit: Optional[int] = None) -> List[Dict]:
-        return self.select(fields, where, option=option, limit=limit, to_dict=True)
+                   order_by: Optional[str] = None, option: Optional[str] = None, 
+                   limit: Optional[int] = None) -> List[Dict]:
+        return self.select(fields, where, order_by=order_by, option=option, limit=limit, to_dict=True)
 
     def query_all(self, sql: str) -> List[Dict]:
         return self.query(sql, to_dict=True)
@@ -413,7 +420,8 @@ class Table:
         return data
 
     def select(self, fields: Optional[Union[str, List[str]]], where: Optional[str] = None, 
-               option: Optional[str] = None, limit: Optional[int] = None, to_dict: bool = False) -> Union[List[Tuple], List[Dict]]:
+               order_by: Optional[str] = None, option: Optional[str] = None, 
+               limit: Optional[int] = None, to_dict: bool = False) -> Union[List[Tuple], List[Dict]]:
         if fields is None:
             field_string = '*'
         elif isinstance(fields, (tuple, list)):
@@ -423,10 +431,11 @@ class Table:
         else:
             raise Exception('BadFields')
 
-        # Use f-strings for better performance
         sql = f'SELECT {field_string} FROM {self._table_name}'
         if where:
             sql += f' WHERE {where}'
+        if order_by:
+            sql += f' ORDER BY {order_by}'
         if option:
             sql += f' {option}'
         if limit:
@@ -649,16 +658,32 @@ class Table:
         sql = f'DELETE FROM {self._table_name} WHERE {where}'
         self.execute(sql, commit=True)
 
+    def update(self, kv: Dict[str, Any], where: str) -> None:
+        kv_string = ','.join([f'{k}=?' for k in kv.keys()])
+        values = list(kv.values())
+        sql = f'UPDATE {self._table_name} SET {kv_string} WHERE {where}'
+        with self._get_cursor() as (cursor, conn):
+            try:
+                cursor.execute(sql, values)
+                self._try_commit_on_connection(conn, True)
+            except sqlite3.OperationalError as e:
+                self._handle_error_on_connection(e, conn)
+
+    def count(self, where: Optional[str] = None) -> int:
+        sql = f'SELECT COUNT(*) FROM {self._table_name}'
+        if where:
+            sql += f' WHERE {where}'
+        result = self.fetchone(sql)
+        return result[0] if result else 0
+
     def delete_all(self) -> None:
         # commit 字段无效
         sql = f'DELETE FROM {self._table_name}'
         self.execute(sql, commit=True)
 
     def get_all_index(self, full_info: bool = False) -> Union[List[str], List[Dict]]:
-        # 获取当前已经被创建的index
         sql = f"SELECT * FROM sqlite_master WHERE type == 'index' AND tbl_name == \"{self._table_name}\""
-        self.execute(sql)
-        data = self.fetchall()
+        data = self.fetchall(sql)
         if full_info:
             return [dict(item) for item in data]
         else:
