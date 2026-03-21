@@ -41,6 +41,9 @@ class Database(object):
         engine = None
         if uri_schema in ['sqlite', 'sqlite3']:
             engine = sqlite.Table
+        elif uri_schema == 'postgresql':
+            from . import postgresql
+            engine = postgresql.Table
 
         if not engine:
             raise EngineNotExist(uri)

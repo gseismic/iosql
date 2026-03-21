@@ -34,6 +34,7 @@ from .const import (
 )
 from ..exception import InvalidUriSchema 
 from ..query import Where, get_case_range
+from ..partition import Partition, DurationPartition, CalendarPartition
 
 
 class Table(BaseTable):
@@ -50,7 +51,11 @@ class Table(BaseTable):
         self._db_parts_status = OrderedDict()
         # 一般情况下，这个part写完，一般就意味这写完了，可以关闭了
         self._num_opened_max_allowed = 5
+        # New partition system
+        self._partition = None
         super().__init__(*args, **kwargs)
+        # Load partition from metadata after initialization
+        self._partition = self._load_partition()
 
     def connect(self):
         '''连接
@@ -81,6 +86,35 @@ class Table(BaseTable):
         for _, db in self._db_parts.items():
             if db and not db.is_closed():
                 db.close()
+
+    def _load_partition(self) -> Partition | None:
+        """Load partition from table metadata.
+        
+        Returns:
+            Partition object if partition info exists, None otherwise
+        """
+        meta = self.get_table_meta()
+        if meta and 'partition' in meta and meta['partition']:
+            partition_meta = meta['partition']
+            if isinstance(partition_meta, dict) and 'type' in partition_meta:
+                return Partition.from_meta(partition_meta)
+        return None
+
+    @property
+    def partition(self) -> Partition | None:
+        """Get the partition object for this table."""
+        return self._partition
+
+    def _get_part_dbfile(self, part_key):
+        """Get the file path for a partition key.
+        
+        Args:
+            part_key: Partition key (int for DurationPartition, str for CalendarPartition)
+            
+        Returns:
+            Full path to the partition file
+        """
+        return os.path.join(self.table_part_path, f'{part_key}.sqlite3')
 
     def select_all(self, fields, where, limit=None, order_by=None, to_dict=False, **kwargs):
         return self.select(fields, where, limit=limit, order_by=order_by, to_dict=True, **kwargs)
@@ -233,19 +267,38 @@ class Table(BaseTable):
 
     def do_insert_all(self, data, pk, partition=None, replace=False, 
                       ignore=False, commit=True, **kwargs):
-        # params cc
-        # 11: partition
-        # alter = False
-        use_builtin_partition = kwargs.get('use_builtin_partition', True)
+        # Use new partition system
         _t0 = time.time()
-        partitioned_data, part_column = partition_data(data, partition,
-                                                       use_builtin=use_builtin_partition)
+        
+        # Determine which partition to use:
+        # 1. If partition is explicitly passed, use it
+        # 2. If _partition is already loaded from metadata, use it
+        # 3. If neither, no partitioning (single table)
+        part_obj = partition
+        if part_obj is None:
+            part_obj = self._partition
+        
+        if part_obj is None:
+            # No partitioning - put all data in a single partition
+            partitioned_data = {None: data}
+        else:
+            # Partition data by key
+            partitioned_data = {}
+            for row in data:
+                key = part_obj.get_key(row)
+                if key not in partitioned_data:
+                    partitioned_data[key] = []
+                partitioned_data[key].append(row)
+        
         _t1 = time.time()
         logger.debug(f'Partition Time: {_t1 - _t0}') 
-        for part, part_data in partitioned_data.items(): 
-            # print('insert part ..............', part) 
-            self._do_insert_part(part, part_column, part_data, pk, 
-                                partition=partition, 
+        
+        # Get ts_col for range calculation (needed for metadata)
+        ts_col = part_obj.TS_COL if part_obj else None
+        
+        for part_key, part_data in partitioned_data.items():
+            self._do_insert_part(part_key, ts_col, part_data, pk, 
+                                partition=part_obj, 
                                 replace=replace, ignore=ignore,
                                 commit=commit, **kwargs) 
         _t2 = time.time()
@@ -270,9 +323,12 @@ class Table(BaseTable):
         if current_meta and set(current_meta['pk'] or []) != set(pk or []):
             raise Exception((f'PrimaryKeyCanNotChange: supplied pk={pk}, '
                              f'table {current_meta["pk"]}'))
-        if current_meta and current_meta['partition'] != partition:
-            prev_p = current_meta['partition'] 
-            raise Exception(f'PartitionCanNotChange: prev={prev_p} curr={partition}')
+        # Compare partition meta dicts - only check if table already exists
+        prev_partition_meta = current_meta.get('partition') if current_meta else None
+        curr_partition_meta = partition.to_meta() if partition else None
+        # Only raise if previous partition existed and is different from current
+        if prev_partition_meta is not None and prev_partition_meta != curr_partition_meta:
+            raise Exception(f'PartitionCanNotChange: prev={prev_partition_meta} curr={curr_partition_meta}')
 
         part_dbfile = self._get_part_dbfile(part)
         part_db = self.get_part_db(part_dbfile, auto_commit=True)
@@ -349,29 +405,27 @@ class Table(BaseTable):
                 ensure_table=False
             )
 
-    def _update_meta(self, part, part_column, partition, createtable_meta):
+    def _update_meta(self, part_key, ts_col, partition, createtable_meta):
         # 更新table创建的meta信息，直接覆盖
+        # Store partition info in createtable_meta if it exists
+        if partition is not None:
+            createtable_meta['partition'] = partition.to_meta()
         self._overwrite_table_meta(createtable_meta)
 
         # 增加table_part信息, 设置更新时间，方便今后缓存访问
         _t0 = time.time()
         updated_at = arrow.now().format('YYYY-MM-DD HH:mm:ss')
-        self.upsert_part_info(part, updated_at)
+        self.upsert_part_info(part_key, updated_at)
         _t1 = time.time()
         logger.debug(f'upsert_part_info Time: {_t1 - _t0}')
 
-        # update 各个列的最大最小数值
-        # 这里默认只支持基于时间的partition
-        start_dt, end_dt = get_part_range(part, partition)
+        # Update partition column ranges using new partition system
         column_min, column_max = None, None
-        # CHANGED
-        if start_dt:
-            # column_min = start_dt.format('YYYY-MM-DD HH:mm:ss')
-            column_min = int(start_dt.timestamp()*1000000)
-        if end_dt:
-            # column_max = end_dt.format('YYYY-MM-DD HH:mm:ss')
-            column_max = int(end_dt.timestamp() * 1000000)
-        self.upsert_part_column_range(part, part_column, column_min, column_max)
+        if partition is not None:
+            start_ms, end_ms = partition.get_range(part_key)
+            column_min = start_ms
+            column_max = end_ms
+        self.upsert_part_column_range(part_key, ts_col, column_min, column_max)
         _t2 = time.time()
         logger.debug(f'upsert_part_column_range Time: {_t2 - _t1}')
 
@@ -477,9 +531,6 @@ class Table(BaseTable):
             to_dict=True
         )
         return infos
-
-    def _get_part_dbfile(self, part):
-        return os.path.join(self.table_part_path, f'{part}.sqlite3')
 
     def _add_columns_for_all_partitions(self, data_suggested_types):
         '''
