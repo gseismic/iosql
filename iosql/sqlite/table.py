@@ -758,6 +758,8 @@ class Table(BaseTable):
             if str(e).find("Too many open files") != -1:
                 raise e
             raise e
+        finally:
+            db.close()
 
     @property
     def table_meta_db(self):
