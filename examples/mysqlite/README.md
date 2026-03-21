@@ -21,6 +21,25 @@ db['users'].insert({'id': 1, 'name': 'Alice', 'age': 30}, ensure_table=True)
 4. [Queries](#queries) - Select with filters
 5. [Table Management](#table-management) - Create, drop, indexes
 6. [Connection Pool](#connection-pool) - Thread-safe connections
+7. [Composite Primary Key](#composite-primary-key) - Multiple primary keys
+8. [Default Values](#default-values) - How defaults work
+9. [Dynamic Columns](#dynamic-columns) - Schema grows with data
+
+---
+
+## Example Files
+
+| File | Description |
+|------|-------------|
+| `00_schemaless.py` | Schemaless mode - no table creation needed |
+| `01_basic_crud.py` | Basic CRUD operations |
+| `02_batch_insert.py` | Batch insert |
+| `03_queries.py` | Queries with filters |
+| `04_table_management.py` | Table/column/index management |
+| `05_connection_pool.py` | Connection pool usage |
+| `06_composite_pk.py` | Composite primary keys |
+| `07_demo_basic.py` | Basic demo with defaults |
+| `08_demo_advanced.py` | Advanced demo with replace/ignore |
 
 ---
 
@@ -163,6 +182,49 @@ records = [
     for i in range(100)
 ]
 db['scores'].insert_all(records, ensure_table=True)
+```
+
+---
+
+## Default Values
+
+```python
+db['users'].create_table([
+    {'name': 'id', 'type': 'TEXT'},
+    {'name': 'name', 'type': 'TEXT', 'default': 'default_name'},
+    {'name': 'value', 'type': 'REAL', 'default': -1}
+], pk='id')
+
+# default_values shows column defaults
+db['users'].default_values()  # {'id': None, 'name': 'default_name', 'value': '-1'}
+
+# Insert without specifying name - uses default
+db['users'].insert({'id': '1', 'value': '123'})
+# Result: {'id': '1', 'name': 'default_name', 'value': 123.0}
+
+# Insert with None - uses default (None is treated as default marker)
+db['users'].insert({'id': '2', 'name': None, 'value': '456'})
+# Result: {'id': '2', 'name': 'default_name', 'value': 456.0}
+
+# Insert with empty string - uses empty string (not default)
+db['users'].insert({'id': '3', 'name': '', 'value': '789'})
+# Result: {'id': '3', 'name': '', 'value': 789.0}
+```
+
+---
+
+## Dynamic Columns
+
+```python
+# Schema grows with data using ensure_column
+db['events'].insert({'id': 1, 'type': 'click'}, ensure_table=True)
+db['events'].insert({'id': 2, 'type': 'scroll', 'delta_y': 300}, ensure_column=True)
+db['events'].insert({'id': 3, 'type': 'keypress', 'key': 'Enter', 'modifiers': 'ctrl'}, ensure_column=True)
+
+# All columns exist, missing fields are NULL
+# {'id': 1, 'type': 'click', 'delta_y': None, 'key': None, 'modifiers': None}
+# {'id': 2, 'type': 'scroll', 'delta_y': 300, 'key': None, 'modifiers': None}
+# {'id': 3, 'type': 'keypress', 'delta_y': None, 'key': 'Enter', 'modifiers': 'ctrl'}
 ```
 
 ---
