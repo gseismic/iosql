@@ -172,6 +172,10 @@ class Table(BaseTable):
     def _excluded_parts_by_case(self, infos, case):
         op, case_min, case_max = get_case_range(case)
         excluded_parts = set()
+        if case_min is not None and isinstance(case_min, str):
+            return excluded_parts
+        if case_max is not None and isinstance(case_max, str):
+            return excluded_parts
         for info in infos:
             part = info['part']
             if info['column'] == case.field:
