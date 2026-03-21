@@ -23,40 +23,46 @@ def cleanup():
 def test_connection():
     cleanup()
 
-    data = []
-    for i in range(0, 5):
-        dic = {'id': i, 'i0': i}
-        # print(dic)
-        data.append(dic)
-
-    with Database('sqlite://database/finance.iosql', verbose=1) as db:
+    # First insert: 5 rows with id, name, and value
+    data = [
+        {'id': 1, 'name': 'Alice', 'value': 100},
+        {'id': 2, 'name': 'Bob', 'value': 200},
+        {'id': 3, 'name': 'Carol', 'value': 300},
+    ]
+    with Database('sqlite://database/finance.iosql', verbose=0) as db:
         t = db['lrb']
         t.insert_all(data, pk=['id'])
         print(t.table_parts())
 
-    for i in range(0, 5):
-        dic = {'id': i, 'ii0': i*i}
-        # print(dic)
-        data.append(dic)
-
-    with Database('sqlite://database/finance.iosql', verbose=1) as db:
+    # Second: update existing rows (id 1-3) with new value
+    # Each row has id and value - will be merged with existing name
+    update_data = [
+        {'id': 1, 'value': 150},
+        {'id': 2, 'value': 250},
+    ]
+    with Database('sqlite://database/finance.iosql', verbose=0) as db:
         t = db['lrb']
-        ensure_column = True
-        # print(f'-----------{ensure_column=}')
-        t.upsert_all(data, pk=['id'])
-        # print(t.table_parts())
+        t.upsert_all(update_data, pk=['id'])
 
-    for i in range(0, 6):
-        dic = {'id': i, 'iii0': i*i*i}
-        # print(dic)
-        data.append(dic)
-
-    with Database('sqlite://database/finance.iosql', verbose=1) as db:
+    # Third: add NEW row (id=4) with same column structure
+    new_data = [{'id': 4, 'name': 'Dave', 'value': 400}]
+    with Database('sqlite://database/finance.iosql', verbose=0) as db:
         t = db['lrb']
-        ensure_column = True
-        # print(f'-----------{ensure_column=}')
-        t.upsert_all(data, pk=['id'])
-        # print(t.table_parts())
+        t.upsert_all(new_data, pk=['id'])
+
+    # Verify: should have 4 rows (id 1-4)
+    with Database('sqlite://database/finance.iosql', verbose=0) as db:
+        t = db['lrb']
+        result = t.select_all('*', where=None)
+        assert len(result) == 4, f"Expected 4 rows, got {len(result)}"
+        # Verify updated values
+        result_dict = {r['id']: r for r in result}
+        assert result_dict[1]['value'] == 150  # Updated
+        assert result_dict[1]['name'] == 'Alice'  # Preserved
+        assert result_dict[2]['value'] == 250  # Updated
+        assert result_dict[2]['name'] == 'Bob'  # Preserved
+        assert result_dict[3]['value'] == 300  # Unchanged
+        assert result_dict[4]['name'] == 'Dave'  # New row
 
 if __name__ == '__main__':
     if 1:
