@@ -244,3 +244,23 @@ class TestSchemaless:
         result = db['items'].select_all('*')
         assert len(result) == 1
         assert result[0]['name'] == 'first'
+
+    def test_composite_primary_key(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['order_items'].create_table([
+            {'name': 'order_id', 'type': 'INTEGER'},
+            {'name': 'product_id', 'type': 'INTEGER'},
+            {'name': 'quantity', 'type': 'INTEGER'},
+        ], pk=['order_id', 'product_id'])
+
+        assert db['order_items'].pk() == ['order_id', 'product_id']
+
+        db['order_items'].insert({'order_id': 1, 'product_id': 100, 'quantity': 2})
+        db['order_items'].insert({'order_id': 1, 'product_id': 101, 'quantity': 1})
+        db['order_items'].insert({'order_id': 2, 'product_id': 100, 'quantity': 5})
+        assert db['order_items'].count() == 3
+
+        db['order_items'].insert({'order_id': 1, 'product_id': 100, 'quantity': 99}, replace=True)
+        assert db['order_items'].count() == 3
+        result = db['order_items'].select_one('*', where="order_id=1 AND product_id=100")
+        assert result['quantity'] == 99
