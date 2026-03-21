@@ -103,6 +103,25 @@ class Table(BaseTable):
         """Get the partition object for this table."""
         return self._partition
 
+    @partition.setter
+    def partition(self, value: Partition | None):
+        """Set the partition object for this table and persist to metadata.
+
+        Args:
+            value: Partition object (DurationPartition, CalendarPartition) or None
+
+        Raises:
+            Exception: If partition type changes after table has data
+        """
+        self._partition = value
+
+        meta = self.get_table_meta()
+        if meta is None:
+            return
+
+        meta["partition"] = value.to_meta() if value else None
+        self._overwrite_table_meta(meta)
+
     def _get_part_dbfile(self, part_key):
         """Get the file path for a partition key.
 

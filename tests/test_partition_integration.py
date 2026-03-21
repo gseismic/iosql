@@ -579,3 +579,219 @@ class TestDelete:
 
         remaining = db['kline'].select_all('*', where=None)
         assert len(remaining) == 1
+
+
+class TestTablePartitionSetter:
+    """Test that table.partition setter works correctly."""
+
+    def test_partition_setter_and_persistence(self):
+        """Set partition on table, verify it's persisted and auto-detected."""
+        import shutil
+        shutil.rmtree(TEST_DB_DIR, ignore_errors=True)
+
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+        db['kline'].partition = partition
+
+        base_ts = 1705276800000  # 2024-01-15
+        data = [
+            {'timestamp': base_ts, 'symbol': 'AAPL', 'close': 185.0},
+            {'timestamp': base_ts + 86400000, 'symbol': 'AAPL', 'close': 186.0},
+        ]
+        db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
+
+        db.close()
+
+        db2 = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+        loaded_partition = db2['kline'].partition
+        assert loaded_partition is not None
+        assert isinstance(loaded_partition, DurationPartition)
+        assert loaded_partition.interval_ms == 86400000
+
+    def test_insert_all_without_partition_uses_table_partition(self):
+        """insert_all without partition param should use table's partition."""
+        import shutil
+        shutil.rmtree(TEST_DB_DIR, ignore_errors=True)
+
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+        db['kline'].partition = partition
+
+        base_ts = 1705276800000
+        data = [
+            {'timestamp': base_ts, 'symbol': 'AAPL', 'close': 185.0},
+            {'timestamp': base_ts + 86400000, 'symbol': 'AAPL', 'close': 186.0},
+            {'timestamp': base_ts + 2 * 86400000, 'symbol': 'AAPL', 'close': 187.0},
+        ]
+
+        db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
+
+        parts = db['kline'].table_parts()
+        assert len(parts) == 3
+
+        result = db['kline'].select_all('*', where=None)
+        assert len(result) == 3
+
+
+class TestLargeData:
+    """Large scale data tests with 200K rows."""
+
+    def test_large_data_200k_rows_20_batches(self):
+        """Test inserting 200K rows in 20 batches, then query."""
+        import shutil
+        import time
+        shutil.rmtree(TEST_DB_DIR, ignore_errors=True)
+
+        partition = DurationPartition(interval_ms='1hour', ts_col='timestamp')
+
+        db = Database(f'sqlite:///{TEST_DB_DIR}/kline.sqlite3')
+        db['kline'].partition = partition
+
+        base_ts = 1705276800000  # 2024-01-15 00:00:00 UTC
+        total_rows = 200000
+        batch_size = 10000
+        num_batches = total_rows // batch_size
+
+        print(f'\nInserting {total_rows} rows in {num_batches} batches...')
+        insert_start = time.time()
+
+        for batch in range(num_batches):
+            data = []
+            for i in range(batch_size):
+                ts = base_ts + (batch * batch_size + i) * 60000
+                data.append({
+                    'timestamp': ts,
+                    'symbol': f'SYM{batch % 100}',
+                    'close': 100.0 + (batch * batch_size + i) % 50,
+                    'volume': (batch * batch_size + i) * 100,
+                })
+
+            db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
+            if (batch + 1) % 5 == 0:
+                print(f'  Batch {batch + 1}/{num_batches} done ({len(data)} rows)')
+
+        insert_end = time.time()
+        print(f'Insert completed in {insert_end - insert_start:.2f}s')
+
+        parts = db['kline'].table_parts()
+        print(f'Number of partitions: {len(parts)}')
+
+        result = db['kline'].select_all('*', where=None)
+        print(f'Total rows after insert: {len(result)}')
+        assert len(result) == total_rows, f'Expected {total_rows}, got {len(result)}'
+
+        query_start = time.time()
+        t1 = base_ts + 86400000
+        t2 = base_ts + 2 * 86400000
+        result = db['kline'].select(
+            '*',
+            where={'field': 'timestamp', 'op': 'between_and', 'value': [t1, t2]}
+        )
+        query_end = time.time()
+        print(f'Query completed in {query_end - query_start:.4f}s')
+        print(f'Rows in time range: {len(result)}')
+
+        for row in result:
+            assert t1 <= row['timestamp'] <= t2
+
+        db.close()
+        print('Test passed!')
+
+    def test_large_data_multiple_partitions_query(self):
+        """Test querying across multiple partitions."""
+        import shutil
+        import time
+        shutil.rmtree(TEST_DB_DIR, ignore_errors=True)
+
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+        db['data'].partition = partition
+
+        base_ts = 1705276800000  # 2024-01-15
+        num_days = 10
+        rows_per_day = 10000
+
+        print(f'\nInserting {num_days * rows_per_day} rows across {num_days} days...')
+        insert_start = time.time()
+
+        for day in range(num_days):
+            data = []
+            day_ts = base_ts + day * 86400000
+            for i in range(rows_per_day):
+                data.append({
+                    'timestamp': day_ts + i * 8640,
+                    'value': day * 1000 + i,
+                })
+            db['data'].insert_all(data, pk=['timestamp'])
+
+        insert_end = time.time()
+        print(f'Insert completed in {insert_end - insert_start:.2f}s')
+
+        parts = db['data'].table_parts()
+        print(f'Number of partitions: {len(parts)}')
+        assert len(parts) == num_days
+
+        result = db['data'].select_all('*', where=None)
+        assert len(result) == num_days * rows_per_day
+
+        query_start = time.time()
+        t1 = base_ts + 2 * 86400000
+        t2 = base_ts + 4 * 86400000 + 86400000 - 1  # End of day 4 (inclusive)
+        result = db['data'].select(
+            '*',
+            where={'field': 'timestamp', 'op': 'between_and', 'value': [t1, t2]}
+        )
+        query_end = time.time()
+        print(f'Query (3 days range) completed in {query_end - query_start:.4f}s')
+        print(f'Rows returned: {len(result)}')
+
+        expected_rows = 3 * rows_per_day
+        assert len(result) == expected_rows, f'Expected {expected_rows}, got {len(result)}'
+
+        db.close()
+        print('Test passed!')
+
+    def test_upsert_large_data(self):
+        """Test upsert_all with large data."""
+        import shutil
+        import time
+        shutil.rmtree(TEST_DB_DIR, ignore_errors=True)
+
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+        db['kline'].partition = partition
+
+        base_ts = 1705276800000
+        initial_rows = 10000
+        update_rows = 5000
+
+        print(f'\nInserting {initial_rows} initial rows...')
+        data = [
+            {'timestamp': base_ts + i * 86400000, 'symbol': f'SYM{i % 100}', 'close': 100.0 + i}
+            for i in range(initial_rows)
+        ]
+        db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
+
+        print(f'Updating {update_rows} rows via upsert...')
+        upsert_data = [
+            {'timestamp': base_ts + i * 86400000, 'symbol': f'SYM{i % 100}', 'close': 200.0 + i}
+            for i in range(update_rows)
+        ]
+
+        upsert_start = time.time()
+        db['kline'].upsert_all(upsert_data, pk=['timestamp', 'symbol'])
+        upsert_end = time.time()
+        print(f'Upsert completed in {upsert_end - upsert_start:.2f}s')
+
+        result = db['kline'].select_all('*', where=None)
+        assert len(result) == initial_rows
+
+        for row in result[:update_rows]:
+            assert row['close'] == 200.0 + (row['timestamp'] - base_ts) / 86400000
+
+        db.close()
+        print('Test passed!')
