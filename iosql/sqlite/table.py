@@ -234,22 +234,25 @@ class Table(BaseTable):
             )
 
     def upsert_all(
-        self, kv_list, pk, where=None, partition=None, commit=True, **kwargs
+        self, kv_list, pk, partition=None, commit=True, **kwargs
     ):
         """Update or insert rows based on primary key.
 
+        Upsert semantics:
+        - For each item in kv_list with pk that exists in table: UPDATE (merge fields)
+        - For each item in kv_list with pk that doesn't exist: INSERT
+
         Logic:
-        1. SELECT existing rows matching WHERE clause
+        1. SELECT all existing rows (no WHERE - pk determines what to update)
         2. Build a dict keyed by pk for fast lookup
         3. For each item in kv_list:
-           - If pk exists in existing data: MERGE (update fields with new values)
+           - If pk exists: MERGE (update fields with new values)
            - If pk is NEW: INSERT the new row
-        4. INSERT all rows with REPLACE (upsert behavior)
+        4. INSERT all rows with REPLACE
 
         Args:
             kv_list: List of dicts with values to update/insert
             pk: Primary key columns
-            where: Optional WHERE clause to filter existing rows
             partition: Partition object (auto-loaded if not provided)
             commit: Whether to commit transaction
         """
@@ -261,8 +264,8 @@ class Table(BaseTable):
         if not kv_list:
             return
 
-        # Step 1: SELECT existing rows matching WHERE
-        data = self.select("*", where=where, to_dict=True)
+        # Step 1: SELECT all existing rows (no WHERE - pk is the identity)
+        data = self.select("*", where=None, to_dict=True)
 
         # Step 2: Build dict keyed by pk for O(1) lookup
         # Format: {(pk1, pk2, ...): {full_row_dict}}

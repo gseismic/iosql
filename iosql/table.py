@@ -86,7 +86,7 @@ class BaseTable(metaclass=ABCMeta):
         raise NotImplementedError()
 
     @abstractmethod
-    def upsert_all(self, kv_list, pk, where=None, partition=None, commit=True, **kwargs):
+    def upsert_all(self, kv_list, pk, partition=None, commit=True, **kwargs):
         raise NotImplementedError()
 
     @abstractmethod
