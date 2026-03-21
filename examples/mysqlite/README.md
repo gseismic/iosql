@@ -126,6 +126,26 @@ db['users'].count()              # total count
 db['users'].count(where='age > 25')  # with filter
 ```
 
+### Composite Primary Key
+
+```python
+# Multiple primary keys - useful for junction tables
+db['order_items'].create_table([
+    {'name': 'order_id', 'type': 'INTEGER'},
+    {'name': 'product_id', 'type': 'INTEGER'},
+    {'name': 'quantity', 'type': 'INTEGER'},
+], pk=['order_id', 'product_id'])
+
+db['order_items'].insert({'order_id': 1, 'product_id': 100, 'quantity': 2})
+db['order_items'].insert({'order_id': 1, 'product_id': 101, 'quantity': 1})
+db['order_items'].insert({'order_id': 2, 'product_id': 100, 'quantity': 5})
+
+# Replace by composite key
+db['order_items'].insert({'order_id': 1, 'product_id': 100, 'quantity': 99}, replace=True)
+
+# Primary keys: ['order_id', 'product_id']
+```
+
 ---
 
 ## Batch Operations
