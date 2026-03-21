@@ -174,16 +174,10 @@ class Table(BaseTable):
         excluded_parts = set()
         for info in infos:
             part = info['part']
-            # cc
-            unit = 1000
             if info['column'] == case.field:
-                # min max 2020-01-02 01:00:00 2020-01-01 23:00:00
-                # info {'table_name': 'demo', 'part': '20200101', 'column': 'date', 'column_min': '2020-01-01 00:00:00', 'column_max': '2020-01-01 23:59:59'}
-                # print(repr(case_max))
-                # print('unit', repr(unit))
-                if case_max and math.ceil(case_max * unit) < info['column_min']:
+                if case_max and case_max < info['column_min']:
                     excluded_parts.add(part)
-                if case_min and math.floor(case_min * unit) > info['column_max']:
+                if case_min and case_min > info['column_max']:
                     excluded_parts.add(part)
         return excluded_parts
 

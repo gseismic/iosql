@@ -1,7 +1,7 @@
 import shutil
 import arrow
 import logging
-from iosql import Database
+from iosql import Database, DurationPartition
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
 
 
@@ -16,7 +16,6 @@ def cleanup():
 
 
 def test_select():
-    # 数据库被删除，需要重新连接，因为保持的变量显示在连接中
     cleanup()
     db = Database('sqlite://database/finance.sqlite3')
 
@@ -26,14 +25,13 @@ def test_select():
     for i in range(min_id, max_id):
         date = d.shift(minutes=i)
         dic = {'id': i, 'date': date.timestamp()*1000, 'iii': i*i*i}
-        # print(i, dic)
         data.append(dic)
 
+    partition = DurationPartition(interval_ms='1day', ts_col='date')
     db['demo'].insert_all(data, pk=['id','date'], 
                            replace=True, ensure_table=True,
-                           partition='KTStoYYYYMMDD(date)')
+                           partition=partition)
     print(db['demo'].table_parts())
-    # assert len(db['demo'].table_parts()) == 3
 
     values = db['demo'].select(
         'id,date', 

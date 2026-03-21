@@ -12,6 +12,7 @@ def cleanup():
     logging.info('Test: Clear database ...')
     shutil.rmtree('./database', ignore_errors=True)
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_simple():
     cleanup()
     with Database('sqlite://database/finance.sqlite3', verbose=3) as db:
@@ -41,6 +42,7 @@ def test_simple():
                              replace=True, alter=True, ensure_column=True,
                              partition=partition)
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_create_table():
     cleanup()
     db = Database('sqlite://database/finance.sqlite3', verbose=1)

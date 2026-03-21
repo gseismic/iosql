@@ -1,6 +1,7 @@
 import time
 import arrow
 import logging
+import pytest
 from iosql import Database
 from iosql.query.where import Where
 from iosql.query.case import Case
@@ -10,6 +11,7 @@ from iosql.query.case_util import flatten_expression, unique_or_and_cases
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')
 
 
+@pytest.mark.skip(reason="Deprecated: list of Cases no longer supported in Where")
 def test_case():
     case1 = Case(field='date', op='>', value=111)
     print(case1)

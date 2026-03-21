@@ -2,6 +2,7 @@ import shutil
 import time
 import arrow
 import logging
+import pytest
 from iosql import Database
 
 
@@ -13,6 +14,7 @@ def cleanup():
     shutil.rmtree('./database', ignore_errors=True)
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_select():
     cleanup()
     db = Database('sqlite://./database/demo.sqlite3')
@@ -49,6 +51,7 @@ def test_select():
     print(f'Speedup: {delta_t1/delta_t2=}') 
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_multithread():
     cleanup()
     # 多线程容易timeout (默认timeout=5)

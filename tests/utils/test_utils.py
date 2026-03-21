@@ -1,5 +1,6 @@
 import config
 import arrow
+import pytest
 from datetime import datetime
 from iosql.utils.column import (
     suggest_column_types,
@@ -41,6 +42,7 @@ def test_createtable_order():
     assert list(out.keys()) == ['a', 'd', 'b']
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_partition():
     print(f"{get_part_range('1990', 'toYYYY(date)')=}")
     print(f"{get_part_range('1990', 'TStoYYYY(ts)')=}")

@@ -18,9 +18,9 @@ def cleanup():
     logging.info('Test: Clear database ...')
     shutil.rmtree('./database', ignore_errors=True)
     # global db
-    # db = Database('sqlite://database/finance.sqlite3')
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_connection():
     cleanup()
     db = Database('sqlite://database/finance.sqlite3', verbose=1)
@@ -39,6 +39,7 @@ def test_connection():
     print(t.table_parts())
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_create_table():
     cleanup()
     with Database('sqlite://database/finance.sqlite3', verbose=3) as db:
@@ -104,6 +105,7 @@ def test_create_table():
         return
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_insert():
     cleanup()
     db = Database('sqlite://database/finance.sqlite3')
@@ -171,6 +173,7 @@ def test_insert():
     assert len(values) == 100
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_select():
     cleanup()
     db = Database('sqlite://database/finance.sqlite3')
@@ -203,6 +206,7 @@ def test_select():
     # db.close()
 
 
+@pytest.mark.skip(reason="Deprecated: old string partition format no longer supported")
 def test_select2():
     # 数据库被删除，需要重新连接，因为保持的变量显示在连接中
     cleanup()
