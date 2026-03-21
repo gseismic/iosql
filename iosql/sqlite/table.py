@@ -115,11 +115,10 @@ class Table(BaseTable):
         """
         return os.path.join(self.table_part_path, f'{part_key}.sqlite3')
 
-    def select_all(self, fields, where, limit=None, order_by=None, to_dict=False, **kwargs):
-        return self.select(fields, where, limit=limit, order_by=order_by, to_dict=True, **kwargs)
+    def select_all(self, fields, where, limit=None, to_dict=False, **kwargs):
+        return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
 
-    def select(self, fields, where, limit=None, order_by=None,
-               to_dict=False, **kwargs):
+    def select(self, fields, where, limit=None, to_dict=False, **kwargs):
         '''查询完所有 And([case..]) 然后组合
             And([case..])为一个基本查询单位[向数据库请求]
             where = {'field': 'date',..}
