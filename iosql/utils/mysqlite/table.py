@@ -213,6 +213,7 @@ class Table:
         )
         self.execute(__sql, commit=True)
         logger.debug(f'Table {self._table_name} meta info Created.')
+        self._invalidate_cache()
 
     def add_column(self, column_name: str, definition: str) -> None:
         sql = getsql_add_column(self._table_name, column_name, definition)

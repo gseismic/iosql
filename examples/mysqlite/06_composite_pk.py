@@ -8,32 +8,35 @@ if os.path.exists(DB_FILE):
 
 db = Database(DB_FILE, auto_commit=True)
 
-print("=== Composite Primary Key (Multiple PKs) ===\n")
+print("=== Composite Primary Key in insert_all ===\n")
 
-db['order_items'].create_table([
-    {'name': 'order_id', 'type': 'INTEGER'},
-    {'name': 'product_id', 'type': 'INTEGER'},
-    {'name': 'quantity', 'type': 'INTEGER'},
-    {'name': 'price', 'type': 'REAL'},
-], pk=['order_id', 'product_id'])
+print("1. Set pk directly in insert_all (no need to create table first):")
+db['order_items'].insert_all([
+    {'order_id': 1, 'product_id': 100, 'qty': 2},
+    {'order_id': 1, 'product_id': 101, 'qty': 1},
+    {'order_id': 2, 'product_id': 100, 'qty': 5},
+], ensure_table=True, pk=['order_id', 'product_id'])
 
-db['order_items'].insert({'order_id': 1, 'product_id': 100, 'quantity': 2, 'price': 9.99})
-db['order_items'].insert({'order_id': 1, 'product_id': 101, 'quantity': 1, 'price': 19.99})
-db['order_items'].insert({'order_id': 2, 'product_id': 100, 'quantity': 5, 'price': 9.99})
+print(f"   pk: {db['order_items'].pk()}")
+print(f"   rows: {db['order_items'].count()}")
 
-print("Order items (order #1 has 2 products, order #2 has 1 product):")
+print("\n2. Replace by composite key:")
+db['order_items'].insert_all([
+    {'order_id': 1, 'product_id': 100, 'qty': 99},
+], ensure_table=True, pk=['order_id', 'product_id'], replace=True)
+
+print("   After replacing qty=99 for order_id=1, product_id=100:")
 for r in db['order_items'].select_all('*'):
-    print(f"  Order {r['order_id']}, Product {r['product_id']}: qty={r['quantity']}, price={r['price']}")
+    print(f"   {r}")
 
-print(f"\nTotal rows: {db['order_items'].count()}")
+print("\n3. Same composite key with ignore:")
+db['order_items'].insert_all([
+    {'order_id': 1, 'product_id': 100, 'qty': 999},
+], ensure_table=True, pk=['order_id', 'product_id'], ignore=True)
 
-print("\nUsing replace to update quantity (same order_id + product_id):")
-db['order_items'].insert({'order_id': 1, 'product_id': 100, 'quantity': 10, 'price': 9.99}, replace=True)
-print("After replace (order 1, product 100 qty changed from 2 to 10):")
-for r in db['order_items'].select_all('*'):
-    print(f"  Order {r['order_id']}, Product {r['product_id']}: qty={r['quantity']}")
-
-print("\nPrimary keys:", db['order_items'].pk())
+print("   After ignore (should still be qty=99):")
+result = db['order_items'].select_one('*', where='order_id=1 AND product_id=100')
+print(f"   qty = {result['qty']}")
 
 print("\nDone!")
 os.remove(DB_FILE)
