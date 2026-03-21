@@ -16,10 +16,9 @@ from ..utils.mysqlite.exception import (
 
 from ..table import BaseTable
 from ..logger import default_logger as logger
-from ..utils.partition import partition_data, get_part_range
 from ..utils.column import suggest_sqlite_column_types
 from ..utils.createtable import build_createtable_meta
-from .query_util import build_select_cases_sql
+from .query_util import build_select_cases_sql, build_delete_sql
 from .const import (
     _TABLE_META_FILE, 
     _PART_DATA_TABLE_NAME,
@@ -261,7 +260,48 @@ class Table(BaseTable):
         # raise NotImplementedError()
 
     def delete(self, where):
-        raise NotImplementedError()
+        """Delete rows matching the where clause from all relevant partitions.
+        
+        Args:
+            where: Dict format where clause, e.g. {'field': 'id', 'op': '>', 'value': 10}
+        """
+        meta = self.get_table_meta()
+        if not meta:
+            return 0
+        
+        column_types = {key: item['type'] for key, item in
+                       meta['column_info'].items()}
+        
+        w = Where(where)
+        
+        total_deleted = 0
+        for cases in w.or_and_cases:
+            deleted = self._delete_and_cases(cases, column_types)
+            total_deleted += deleted
+        
+        return total_deleted
+    
+    def _delete_and_cases(self, cases, column_types):
+        """Delete rows matching And[Case..] from all relevant partitions."""
+        need_parts = self._get_select_parts(cases)
+        total_deleted = 0
+        
+        for part in need_parts:
+            part_dbfile = self._get_part_dbfile(part)
+            db = self.get_part_db(part_dbfile, auto_commit=True)
+            part_table = db[_PART_DATA_TABLE_NAME]
+            
+            select_sql = build_select_cases_sql(_PART_DATA_TABLE_NAME, 'COUNT(*)', cases, column_types)
+            count_before = part_table.query(select_sql)
+            count = dict(count_before[0])['COUNT(*)'] if count_before else 0
+            
+            if count > 0:
+                delete_sql = build_delete_sql(_PART_DATA_TABLE_NAME, cases, column_types)
+                logger.debug(f'{part_dbfile}: DELETE: {delete_sql}')
+                db.execute(delete_sql)
+                total_deleted += count
+        
+        return total_deleted
 
     def do_insert_all(self, data, pk, partition=None, replace=False, 
                       ignore=False, commit=True, **kwargs):

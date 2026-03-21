@@ -74,3 +74,10 @@ def build_select_cases_sql(part_table_name, fields, cases, column_types):
     sql = f'select {field_str} from {part_table_name} '
     subsql = build_and_cases_subsql(cases, column_types)
     return sql + subsql + ';'
+
+
+def build_delete_sql(part_table_name, cases, column_types):
+    """Build DELETE SQL from cases."""
+    sql = f'DELETE FROM {part_table_name} '
+    subsql = build_and_cases_subsql(cases, column_types)
+    return sql + subsql + ';'

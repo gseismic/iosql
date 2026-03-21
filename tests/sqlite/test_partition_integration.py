@@ -519,3 +519,63 @@ class TestDurationPartitionIntervals:
         # ts=1705276800000, ts+300000=1705277100000, ts+600000=1705277400000
         # All are at different 5-minute boundaries
         assert len(parts) == 3
+
+
+class TestDelete:
+    """Test delete functionality with partitions."""
+
+    def test_delete_with_partition_pruning(self):
+        """Delete should only hit relevant partitions."""
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+
+        base_ts = 1705276800000  # 2024-01-15
+        data = [
+            {'timestamp': base_ts, 'symbol': 'AAPL', 'close': 185.0},
+            {'timestamp': base_ts + 86400000, 'symbol': 'AAPL', 'close': 186.0},
+            {'timestamp': base_ts + 2 * 86400000, 'symbol': 'AAPL', 'close': 187.0},
+        ]
+        db['kline'].insert_all(data, pk=['timestamp', 'symbol'], partition=partition)
+
+        result = db['kline'].select_all('*', where=None)
+        assert len(result) == 3
+
+        db['kline'].delete({'field': 'timestamp', 'op': '>', 'value': base_ts + 86400000})
+
+        remaining = db['kline'].select_all('*', where=None)
+        assert len(remaining) == 2
+        for row in remaining:
+            assert row['timestamp'] <= base_ts + 86400000
+
+    def test_delete_all_from_partition(self):
+        """Delete all rows from a specific partition."""
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+
+        base_ts = 1705276800000  # 2024-01-15
+        data = [
+            {'timestamp': base_ts, 'symbol': 'AAPL', 'close': 185.0},
+            {'timestamp': base_ts + 86400000, 'symbol': 'AAPL', 'close': 186.0},
+        ]
+        db['kline'].insert_all(data, pk=['timestamp', 'symbol'], partition=partition)
+
+        db['kline'].delete({'field': 'timestamp', 'op': '==', 'value': base_ts})
+
+        remaining = db['kline'].select_all('*', where=None)
+        assert len(remaining) == 1
+        assert remaining[0]['timestamp'] == base_ts + 86400000
+
+    def test_delete_nonexistent(self):
+        """Delete with no matching rows should not error."""
+        db = Database(f'sqlite:///{TEST_DB_DIR}/test.sqlite3')
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+
+        base_ts = 1705276800000
+        data = [{'timestamp': base_ts, 'symbol': 'AAPL', 'close': 185.0}]
+        db['kline'].insert_all(data, pk=['timestamp', 'symbol'], partition=partition)
+
+        deleted = db['kline'].delete({'field': 'timestamp', 'op': '>', 'value': 2000000000000})
+        assert deleted == 0
+
+        remaining = db['kline'].select_all('*', where=None)
+        assert len(remaining) == 1
