@@ -639,12 +639,16 @@ class TestLargeData:
     """Large scale data tests with 200K rows."""
 
     def test_large_data_200k_rows_20_batches(self):
-        """Test inserting 200K rows in 20 batches, then query."""
+        """Test inserting 200K rows in 20 batches, then query.
+        
+        Note: Uses 1day partitions to avoid too many open file handles.
+        200K rows with 1min intervals spans ~139 days = ~139 partitions (1day each).
+        """
         import shutil
         import time
         shutil.rmtree(TEST_DB_DIR, ignore_errors=True)
 
-        partition = DurationPartition(interval_ms='1hour', ts_col='timestamp')
+        partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
 
         db = Database(f'sqlite:///{TEST_DB_DIR}/kline.sqlite3')
         db['kline'].partition = partition
@@ -671,6 +675,7 @@ class TestLargeData:
             db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
             if (batch + 1) % 5 == 0:
                 print(f'  Batch {batch + 1}/{num_batches} done ({len(data)} rows)')
+                db['kline'].close()
 
         insert_end = time.time()
         print(f'Insert completed in {insert_end - insert_start:.2f}s')

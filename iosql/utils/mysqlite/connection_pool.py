@@ -49,9 +49,13 @@ class DatabaseConnectionPool:
 
     def force_close_all_connections(self):
         with self._lock:
-            for conn in self._thread_conns.values():
+            for tid, conn in list(self._thread_conns.items()):
                 try:
                     conn.close()
                 except Exception:
                     pass
+                # Note: Do NOT release semaphore here
+                # The semaphore is released when connections are normally closed
+                # via the get_connection() finally block
+                # Releasing here would cause "Semaphore released too many times"
             self._thread_conns.clear()
