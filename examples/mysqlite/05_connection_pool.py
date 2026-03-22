@@ -1,16 +1,21 @@
-import os
+from pathlib import Path
+import shutil
+
 import threading
 import time
 from iosql.utils.mysqlite.connection_pool import DatabaseConnectionPool
 
-DB_FILE = 'examples/runtime/mysqlite/pool_demo.sqlite3'
-os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+DB_DIR = Path('examples/runtime/mysqlite/connection_pool')
+DB_FILE = DB_DIR / 'pool_demo.sqlite3'
 
 
-if os.path.exists(DB_FILE):
-    os.remove(DB_FILE)
+def _reset_db():
+    shutil.rmtree(DB_DIR, ignore_errors=True)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
 
-pool = DatabaseConnectionPool(DB_FILE, max_connections=5)
+
+_reset_db()
+pool = DatabaseConnectionPool(str(DB_FILE), max_connections=5)
 
 print("Creating table...")
 with pool.get_connection() as conn:
@@ -51,3 +56,4 @@ print("\nForce closing all connections...")
 pool.force_close_all_connections()
 
 print("\nDone!")
+_reset_db()

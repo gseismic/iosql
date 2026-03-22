@@ -1,14 +1,19 @@
-import os
+from pathlib import Path
+import shutil
+
 from iosql.utils.mysqlite import Database
 
-DB_FILE = 'examples/runtime/mysqlite/schemaless_demo.sqlite3'
-os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+DB_DIR = Path('examples/runtime/mysqlite/schemaless')
+DB_FILE = DB_DIR / 'schemaless_demo.sqlite3'
 
 
-if os.path.exists(DB_FILE):
-    os.remove(DB_FILE)
+def _reset_db():
+    shutil.rmtree(DB_DIR, ignore_errors=True)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
 
-db = Database(DB_FILE, auto_commit=True)
+
+_reset_db()
+db = Database(str(DB_FILE), auto_commit=True)
 
 print("=== Schemaless Mode: No need to create table first ===\n")
 
@@ -52,4 +57,4 @@ print(f"   Count (should be 1): {len(result)}")
 print(f"   ts value (should be 123456): {result[0]['ts']}")
 
 print("\nDone!")
-os.remove(DB_FILE)
+_reset_db()
