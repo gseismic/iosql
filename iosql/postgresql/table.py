@@ -263,14 +263,16 @@ class Table(BaseTable):
         os.makedirs(os.path.dirname(partition_file), exist_ok=True)
         
         db = MySQLiteDB(partition_file, auto_commit=True)
-        
-        # Ensure table exists
-        if len(data) > 0:
-            columns = list(data[0].keys())
-            col_defs = [{'name': col, 'type': 'TEXT'} for col in columns]  # Simplified - could infer types
-            
-            db[self._table_name].create_table(col_defs)
-            db[self._table_name].insert_all(data, replace=replace, ignore=ignore)
+        try:
+            # Ensure table exists
+            if len(data) > 0:
+                columns = list(data[0].keys())
+                col_defs = [{'name': col, 'type': 'TEXT'} for col in columns]  # Simplified - could infer types
+                
+                db[self._table_name].create_table(col_defs)
+                db[self._table_name].insert_all(data, replace=replace, ignore=ignore)
+        finally:
+            db.close()
     
     def _get_partition_file_path(self, part_key) -> str:
         """Get the file path for a file-per-partition."""
