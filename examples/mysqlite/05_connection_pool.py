@@ -3,7 +3,9 @@ import threading
 import time
 from iosql.utils.mysqlite.connection_pool import DatabaseConnectionPool
 
-DB_FILE = 'examples/data/pool_demo.sqlite3'
+DB_FILE = 'examples/runtime/mysqlite/pool_demo.sqlite3'
+os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+
 
 if os.path.exists(DB_FILE):
     os.remove(DB_FILE)
@@ -21,12 +23,13 @@ with pool.get_connection() as conn:
     ''')
     conn.execute("INSERT INTO items VALUES (1, 'first', 1.0)")
     conn.execute("INSERT INTO items VALUES (2, 'second', 2.0)")
+    conn.commit()
 
 print("Reading from connection pool:")
 with pool.get_connection() as conn:
     result = conn.execute("SELECT * FROM items").fetchall()
     for row in result:
-        print(f"  {row}")
+        print(f"  {dict(row)}")
 
 print("\nEach thread reads independently (thread-bound connections):")
 def worker(thread_id):

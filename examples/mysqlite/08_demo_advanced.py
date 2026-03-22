@@ -1,7 +1,9 @@
 import os
 from iosql.utils.mysqlite import Database
 
-DB_FILE = 'examples/data/demo_advanced.sqlite3'
+DB_FILE = 'examples/runtime/mysqlite/demo_advanced.sqlite3'
+os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
+
 
 if os.path.exists(DB_FILE):
     os.remove(DB_FILE)
