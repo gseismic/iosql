@@ -616,7 +616,7 @@ class Table(BaseTable):
         return (value is None, value)
 
     def _excluded_parts_by_case(self, infos, case):
-        op, case_min, case_max = get_case_range(case)
+        op, case_min, case_max = self._case_partition_range(case)
         excluded_parts = set()
         for info in infos:
             part = info["part"]
@@ -643,6 +643,58 @@ class Table(BaseTable):
                 ):
                     excluded_parts.add(part)
         return excluded_parts
+
+    def _case_partition_range(self, case):
+        op, case_min, case_max = get_case_range(case)
+        table_spec = self.spec()
+        if (
+            not table_spec
+            or not table_spec.time
+            or table_spec.time.unit != 'date'
+            or case.field != table_spec.time.name
+        ):
+            return op, case_min, case_max
+
+        value = case.value['value']
+        try:
+            return self._date_case_partition_range(table_spec.time, op, value)
+        except (TypeError, ValueError, arrow.parser.ParserError):
+            return op, case_min, case_max
+
+    def _date_case_partition_range(self, time_column, op, value):
+        if op in ['between_and', 'range']:
+            start_ms, _ = self._date_value_partition_bounds(time_column, value[0])
+            _, end_ms = self._date_value_partition_bounds(time_column, value[1])
+            return op, start_ms, end_ms - 1
+        if op in ['eq', '==', '=']:
+            start_ms, end_ms = self._date_value_partition_bounds(time_column, value)
+            return op, start_ms, end_ms - 1
+        if op in ['gt', '>']:
+            _, end_ms = self._date_value_partition_bounds(time_column, value)
+            return op, end_ms, None
+        if op in ['ge', '>=']:
+            start_ms, _ = self._date_value_partition_bounds(time_column, value)
+            return op, start_ms, None
+        if op in ['lt', '<']:
+            start_ms, _ = self._date_value_partition_bounds(time_column, value)
+            return op, None, start_ms - 1
+        if op in ['le', '<=']:
+            _, end_ms = self._date_value_partition_bounds(time_column, value)
+            return op, None, end_ms - 1
+        return op, None, None
+
+    def _date_value_partition_bounds(self, time_column, value):
+        normalized = time_column.normalize_value(value)
+        start = arrow.get(
+            normalized,
+            'YYYY-MM-DD',
+            tzinfo=time_column.timezone,
+        ).to('UTC')
+        end = start.shift(days=1)
+        return (
+            int(start.timestamp() * 1000),
+            int(end.timestamp() * 1000),
+        )
 
     def _is_numeric_range(self, case_min, case_max, column_min, column_max):
         values = [

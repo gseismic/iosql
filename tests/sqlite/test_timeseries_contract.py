@@ -96,6 +96,109 @@ def test_partition_spec_inherits_time_column_timezone():
     assert partition.tz == "Asia/Shanghai"
 
 
+def test_timeseries_supports_calendar_date_unit_and_prunes(tmp_path):
+    db = Database(_uri(tmp_path))
+    reports = db.timeseries(
+        "reports",
+        time="published_date",
+        time_unit="date",
+        partition_kind="calendar",
+        partition_every="1day",
+        timezone="Asia/Shanghai",
+        primary_key=["symbol", "published_date", "statement"],
+        columns={
+            "symbol": "text",
+            "published_date": "text",
+            "statement": "text",
+            "revenue": "float",
+        },
+    )
+    reports.write([
+        {
+            "symbol": "AAPL",
+            "published_date": "2026-01-05",
+            "statement": "income",
+            "revenue": 100.0,
+        },
+        {
+            "symbol": "AAPL",
+            "published_date": "2026-01-06",
+            "statement": "income",
+            "revenue": 101.0,
+        },
+        {
+            "symbol": "MSFT",
+            "published_date": "2026-01-07",
+            "statement": "income",
+            "revenue": 102.0,
+        },
+    ])
+
+    plan = reports.query(date="2026-01-06").explain()
+    assert plan.candidate_partitions == ["20260105", "20260106", "20260107"]
+    assert plan.scanned_partitions == ["20260106"]
+    assert plan.skipped_partitions == ["20260105", "20260107"]
+
+    rows = reports.query(
+        symbols="AAPL",
+        start="2026-01-06",
+        end="2026-01-06",
+    ).to_list()
+    assert rows == [{
+        "symbol": "AAPL",
+        "published_date": "2026-01-06",
+        "statement": "income",
+        "revenue": 101.0,
+    }]
+
+
+def test_calendar_date_range_query_scans_only_overlapping_partitions(tmp_path):
+    db = Database(_uri(tmp_path))
+    announcements = db.timeseries(
+        "announcements",
+        time="published_date",
+        time_unit="date",
+        partition_kind="calendar",
+        partition_every="1day",
+        timezone="Asia/Shanghai",
+        primary_key=["symbol", "published_date", "announcement_id"],
+        columns={
+            "symbol": "text",
+            "published_date": "text",
+            "announcement_id": "text",
+            "title": "text",
+        },
+    )
+    announcements.write([
+        {
+            "symbol": "AAPL",
+            "published_date": "2026-02-01",
+            "announcement_id": "a1",
+            "title": "board update",
+        },
+        {
+            "symbol": "AAPL",
+            "published_date": "2026-02-02",
+            "announcement_id": "a2",
+            "title": "earnings date",
+        },
+        {
+            "symbol": "AAPL",
+            "published_date": "2026-02-03",
+            "announcement_id": "a3",
+            "title": "dividend",
+        },
+    ])
+
+    plan = announcements.query(
+        start="2026-02-02",
+        end="2026-02-03",
+    ).explain()
+
+    assert plan.scanned_partitions == ["20260202", "20260203"]
+    assert plan.skipped_partitions == ["20260201"]
+
+
 def test_layout_report_flags_oversized_partition(tmp_path):
     db = Database(_uri(tmp_path))
     ticks = db.timeseries(

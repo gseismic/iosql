@@ -35,13 +35,16 @@ class Database(object):
                    schema_policy='evolve', symbol_column='symbol',
                    target_rows_per_file=400_000,
                    min_rows_per_file=300_000,
-                   max_rows_per_file=500_000):
+                   max_rows_per_file=500_000,
+                   time_unit='ms', partition_kind='duration'):
         spec = TableSpec.timeseries(
             time=time,
             primary_key=primary_key,
             columns=columns,
             partition_every=partition_every,
             timezone=timezone,
+            time_unit=time_unit,
+            partition_kind=partition_kind,
             schema_policy=schema_policy,
             symbol_column=symbol_column,
             target_rows_per_file=target_rows_per_file,

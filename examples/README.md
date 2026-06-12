@@ -11,6 +11,17 @@
 | `03_buffered_ingest_and_query_plan.py` | 进阶 | 使用 `write_buffer()` 批量写入，并通过 `query().explain()` 查看分区裁剪。 |
 | `04_layout_report_and_repartition.py` | 高级 | 使用 `layout_report()` 诊断分区行数，并用 `repartition_to()` 生成新布局。 |
 
+## 金融示例
+
+金融场景示例放在 `examples/finance/`：
+
+| 文件 | 场景 |
+| --- | --- |
+| `finance/01_kline_bars.py` | K 线 OHLCV 写入和时间窗口查询。 |
+| `finance/02_orderbook_snapshots.py` | orderbook 快照批量写入和复合主键。 |
+| `finance/03_financial_reports.py` | 财报日期字段、月度日历分区和日期范围查询。 |
+| `finance/04_news_announcements.py` | 新闻/公告事件按时间和类型过滤。 |
+
 ## 运行
 
 先在仓库根目录安装开发版本：
@@ -26,6 +37,7 @@ python examples/01_quickstart_timeseries.py
 python examples/02_calendar_events.py
 python examples/03_buffered_ingest_and_query_plan.py
 python examples/04_layout_report_and_repartition.py
+PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
 ## 运行时数据

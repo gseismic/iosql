@@ -76,6 +76,8 @@ table = db.timeseries(
     primary_key=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
     partition_every="1hour",
+    time_unit="ms",
+    partition_kind="duration",
     timezone="UTC",
 )
 ```
@@ -108,22 +110,32 @@ plan = table.query(start=1735689600000, end=1735776000000).explain()
 
 ### 日历分区
 
-`Database.timeseries()` 默认适合毫秒时间戳。如果数据使用日期字符串，可以直接声明 `TableSpec`：
+`Database.timeseries()` 默认适合毫秒时间戳。如果数据使用日期字符串，可以声明 `time_unit="date"` 和 `partition_kind="calendar"`：
 
 ```python
-from iosql import Database, PartitionSpec, TableSpec, TimeColumn
-
-spec = TableSpec(
+events = db.timeseries(
+    "events",
+    time="event_date",
+    time_unit="date",
+    partition_kind="calendar",
+    partition_every="1day",
+    timezone="Asia/Shanghai",
     primary_key=["event_date", "name"],
-    time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
-    partition=PartitionSpec.by_time("event_date", every="1day", kind="calendar"),
     columns={"event_date": "text", "name": "text", "city": "text"},
 )
 
-events = Database("sqlite://database/events.iosql").table("events", spec=spec)
 events.write({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
 rows = events.query(date="2026-01-06").to_list()
 ```
+
+### 金融数据建议
+
+| 数据类型 | 时间字段 | 推荐分区 | 主键示例 |
+| --- | --- | --- | --- |
+| K 线 | `ts` 毫秒时间戳 | `1day` duration | `symbol, timeframe, ts` |
+| orderbook | `ts` 毫秒时间戳 | `1hour` duration | `symbol, venue, ts, side, level` |
+| 财报 | `published_date` 日期字符串 | `1month` calendar | `symbol, fiscal_period, statement` |
+| 新闻/公告 | `event_ts` 毫秒时间戳或 `published_date` 日期 | duration 或 calendar | `symbol, event_ts, event_id` |
 
 ### 布局诊断和重分区
 
@@ -147,10 +159,20 @@ print(result.rows_copied, result.partitions_created)
 | `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入和查询计划。 |
 | `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
 
+金融场景示例位于 `examples/finance/`：
+
+| 文件 | 场景 |
+| --- | --- |
+| `01_kline_bars.py` | K 线 OHLCV 写入和时间窗口查询。 |
+| `02_orderbook_snapshots.py` | orderbook 快照批量写入和复合主键。 |
+| `03_financial_reports.py` | 财报日期字段、月度日历分区和日期范围查询。 |
+| `04_news_announcements.py` | 新闻/公告事件按时间和类型过滤。 |
+
 运行：
 
 ```bash
 python examples/01_quickstart_timeseries.py
+PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
 ## 存储结构

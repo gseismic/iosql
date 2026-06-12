@@ -322,13 +322,18 @@ class TableSpec:
                    symbol_column: str = "symbol",
                    target_rows_per_file: int = 400_000,
                    min_rows_per_file: int = 300_000,
-                   max_rows_per_file: int = 500_000) -> "TableSpec":
-        time_column = TimeColumn(time, unit="ms", timezone=timezone)
+                   max_rows_per_file: int = 500_000,
+                   time_unit: str = "ms",
+                   partition_kind: str = "duration") -> "TableSpec":
+        time_column = TimeColumn(time, unit=time_unit, timezone=timezone)
         return cls(
             primary_key=primary_key,
             time=time_column,
             partition=PartitionSpec.by_time(
-                time, every=partition_every, timezone=timezone
+                time,
+                every=partition_every,
+                timezone=timezone,
+                kind=partition_kind,
             ),
             columns=columns or {},
             schema_policy=schema_policy,
