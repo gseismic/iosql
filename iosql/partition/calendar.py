@@ -58,7 +58,7 @@ class CalendarPartition(Partition):
         Returns:
             Tuple of (start_timestamp_ms, end_timestamp_ms)
         """
-        start_dt = arrow.get(key, self.fmt).to('UTC')
+        start_dt = arrow.get(key, self.fmt, tzinfo=self.tz).to('UTC')
         end_dt = start_dt.shift(**self.FMT_SHIFT_MAP.get(self.fmt, {'days': 1}))
         return (
             int(start_dt.timestamp() * 1000),

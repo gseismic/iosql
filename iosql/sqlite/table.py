@@ -2,16 +2,35 @@ import json
 import math
 import os
 import time
+import warnings
 
 # from itertools import chain
 from collections import Counter, OrderedDict
 
 import arrow
 
-from ..exception import InvalidUriSchema
+from ..exception import (
+    BadArgument,
+    InvalidUriSchema,
+    MissingPrimaryKey,
+    MissingTimeColumn,
+    SchemaConflict,
+    TableSpecConflict,
+    UnsafeOperation,
+)
 from ..logger import default_logger as logger
 from ..partition import CalendarPartition, DurationPartition, Partition
-from ..query import Where, get_case_range
+from ..query import CaseExpression, Where, get_case_range
+from ..spec import (
+    LayoutReport,
+    PartitionStats,
+    PhysicalLayout,
+    QueryPlan,
+    QuerySpec,
+    RepartitionResult,
+    TableSpec,
+    WriteResult,
+)
 from ..table import BaseTable
 from ..utils.column import suggest_sqlite_column_types
 from ..utils.createtable import build_createtable_meta
@@ -34,6 +53,73 @@ from .const import (
 from .query_util import build_delete_sql, build_select_cases_sql
 
 
+class _TableQuery:
+    def __init__(self, table, query_spec):
+        self._table = table
+        self._query_spec = query_spec
+
+    def explain(self):
+        return self._table._build_query_plan(self._query_spec)
+
+    def to_list(self):
+        where = self._table._compile_query_where(self._query_spec)
+        return self._table.select(
+            self._query_spec.columns,
+            where=where,
+            order_by=self._query_spec.order_by,
+            limit=self._query_spec.limit,
+            to_dict=True,
+        )
+
+    def iter_rows(self):
+        return iter(self.to_list())
+
+    def spec(self):
+        return self._query_spec
+
+
+class _BufferedWriter:
+    def __init__(self, table, mode='upsert', max_rows=10_000, **write_kwargs):
+        self._table = table
+        self._mode = mode
+        self._max_rows = int(max_rows)
+        self._write_kwargs = write_kwargs
+        self._buffer = []
+        self._results = []
+        if self._max_rows <= 0:
+            raise BadArgument('max_rows must be positive')
+
+    def append(self, rows):
+        if isinstance(rows, dict):
+            rows = [rows]
+        self._buffer.extend(list(rows))
+        if len(self._buffer) >= self._max_rows:
+            self.flush()
+        return self
+
+    def flush(self):
+        if not self._buffer:
+            return WriteResult()
+        rows = self._buffer
+        self._buffer = []
+        result = self._table.write(rows, mode=self._mode, **self._write_kwargs)
+        self._results.append(result)
+        return result
+
+    def close(self):
+        return self.flush()
+
+    def results(self):
+        return list(self._results)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        if exc_type is None:
+            self.flush()
+
+
 class Table(BaseTable):
     """
     定位：有状态的Table
@@ -46,6 +132,7 @@ class Table(BaseTable):
         self._table_meta_db = None
         self._db_parts = OrderedDict()
         self._db_parts_status = OrderedDict()
+        self._declared_spec = None
         # 一般情况下，这个part写完，一般就意味这写完了，可以关闭了
         self._num_opened_max_allowed = 5
         # New partition system
@@ -122,6 +209,273 @@ class Table(BaseTable):
         meta["partition"] = value.to_meta() if value else None
         self._overwrite_table_meta(meta)
 
+    def use_spec(self, spec):
+        spec = TableSpec.ensure(spec)
+        current_spec = self.spec()
+        if current_spec:
+            self._ensure_spec_compatible(current_spec, spec)
+        self._declared_spec = spec
+        self._partition = spec.to_partition()
+        return self
+
+    def spec(self):
+        stored_spec = TableSpec.from_table_meta(self.get_table_meta())
+        if stored_spec:
+            return stored_spec
+        return self._declared_spec
+
+    def _ensure_spec_compatible(self, current_spec, new_spec):
+        if list(current_spec.primary_key) != list(new_spec.primary_key):
+            raise TableSpecConflict(
+                f'Primary key conflict: current={current_spec.primary_key} '
+                f'new={new_spec.primary_key}'
+            )
+
+        current_partition = current_spec.to_partition()
+        new_partition = new_spec.to_partition()
+        current_meta = current_partition.to_meta() if current_partition else None
+        new_meta = new_partition.to_meta() if new_partition else None
+        if current_meta != new_meta:
+            raise TableSpecConflict(
+                f'Partition conflict: current={current_meta} new={new_meta}'
+            )
+        self._ensure_spec_columns_compatible(current_spec, new_spec)
+
+    def _ensure_spec_columns_compatible(self, current_spec, new_spec):
+        current_columns = {
+            key: str(value).lower()
+            for key, value in current_spec.columns.items()
+            if value is not None
+        }
+        new_columns = {
+            key: str(value).lower()
+            for key, value in new_spec.columns.items()
+            if value is not None
+        }
+        for column, type_ in new_columns.items():
+            if column in current_columns and current_columns[column] != type_:
+                raise SchemaConflict(
+                    f'Column `{column}` type conflict: '
+                    f'current={current_columns[column]} new={type_}'
+                )
+
+    def write(self, rows, mode='upsert', commit=True, **kwargs):
+        if isinstance(rows, dict):
+            rows = [rows]
+        elif not isinstance(rows, (list, tuple, set)):
+            raise BadArgument('write: `list/tuple/set/dict` required for rows')
+        rows = list(rows)
+        if not rows:
+            return WriteResult()
+
+        spec = self.spec()
+        if not spec:
+            raise BadArgument('write requires a TableSpec')
+        if not spec.primary_key:
+            raise MissingPrimaryKey('write requires TableSpec.primary_key')
+
+        mode = str(mode).lower()
+        if mode not in ['append', 'upsert', 'replace', 'ignore']:
+            raise BadArgument(f'Unsupported write mode `{mode}`')
+
+        before_parts = set(self.table_parts())
+        before_meta = self.get_table_meta()
+        partition = spec.to_partition()
+        self._partition = partition
+        partitions_touched = spec.parts_for(rows)
+
+        column_type = dict(spec.columns)
+        column_type.update(kwargs.pop('column_type', {}) or {})
+        alter = kwargs.pop('alter', spec.schema_policy == 'evolve')
+        replace = mode in ['upsert', 'replace']
+        ignore = mode == 'ignore'
+
+        self.insert_all(
+            rows,
+            pk=spec.primary_key,
+            partition=partition,
+            replace=replace,
+            ignore=ignore,
+            commit=commit,
+            alter=alter,
+            column_type=column_type,
+            table_spec=spec.to_dict(),
+            **kwargs,
+        )
+
+        after_parts = set(self.table_parts())
+        after_meta = self.get_table_meta()
+        layout_warnings = self._layout_warnings_for_parts(spec, partitions_touched)
+        return WriteResult(
+            rows_seen=len(rows),
+            rows_written=None if mode == 'ignore' else len(rows),
+            partitions_touched=partitions_touched,
+            partitions_created=sorted(after_parts - before_parts),
+            schema_changed=self._schema_changed(before_meta, after_meta),
+            layout_warnings=layout_warnings,
+        )
+
+    def write_buffer(self, mode='upsert', max_rows=10_000, **write_kwargs):
+        return _BufferedWriter(self, mode=mode, max_rows=max_rows, **write_kwargs)
+
+    def query(self, symbols=None, start=None, end=None, date=None,
+              columns='*', where=None, order_by=None, limit=None):
+        spec = QuerySpec(
+            table=self._table_name,
+            columns=columns,
+            symbols=symbols,
+            start=start,
+            end=end,
+            date=date,
+            where=where,
+            order_by=order_by,
+            limit=limit,
+        )
+        return _TableQuery(self, spec)
+
+    def _schema_changed(self, before_meta, after_meta):
+        if before_meta is None:
+            return after_meta is not None
+        before_columns = before_meta.get('column_info') or {}
+        after_columns = (after_meta or {}).get('column_info') or {}
+        return before_columns != after_columns
+
+    def _layout_warnings_for_parts(self, spec, parts):
+        warnings_ = []
+        max_rows = spec.physical_layout.max_rows_per_file
+        for part in parts:
+            row_count = self._partition_row_count(part)
+            if row_count > max_rows:
+                warnings_.append(
+                    f'partition {part} has {row_count} rows; '
+                    f'max_rows_per_file={max_rows}'
+                )
+        return warnings_
+
+    def _compile_query_where(self, query_spec):
+        generated = []
+        table_spec = self.spec()
+
+        if query_spec.symbols is not None:
+            symbol_column = table_spec.symbol_column if table_spec else 'symbol'
+            symbols = query_spec.symbols
+            if isinstance(symbols, str) or not isinstance(symbols, (list, tuple, set)):
+                symbols = [symbols]
+            symbols = list(symbols)
+            if len(symbols) == 1:
+                generated.append({
+                    'field': symbol_column,
+                    'op': '=',
+                    'value': symbols[0],
+                })
+            elif symbols:
+                generated.append({
+                    'field': symbol_column,
+                    'op': 'in',
+                    'value': symbols,
+                })
+
+        if query_spec.date is not None:
+            time_column = self._query_time_column(table_spec)
+            start, end = time_column.normalize_date_range(query_spec.date)
+            if time_column.unit == 'date':
+                generated.append({
+                    'field': time_column.name,
+                    'op': '=',
+                    'value': start,
+                })
+            else:
+                generated.extend([
+                    {'field': time_column.name, 'op': '>=', 'value': start},
+                    {'field': time_column.name, 'op': '<=', 'value': end},
+                ])
+
+        if query_spec.start is not None or query_spec.end is not None:
+            time_column = self._query_time_column(table_spec)
+            if query_spec.start is not None:
+                generated.append({
+                    'field': time_column.name,
+                    'op': '>=',
+                    'value': time_column.normalize_value(query_spec.start),
+                })
+            if query_spec.end is not None:
+                generated.append({
+                    'field': time_column.name,
+                    'op': '<=',
+                    'value': time_column.normalize_value(query_spec.end),
+                })
+
+        return self._combine_query_where(query_spec.where, generated)
+
+    def _query_time_column(self, table_spec):
+        if not table_spec or not table_spec.time:
+            raise MissingTimeColumn('query start/end/date requires TableSpec.time')
+        return table_spec.time
+
+    def _combine_query_where(self, where, generated):
+        if not generated:
+            return where
+        if where is None:
+            return generated
+        if isinstance(where, dict):
+            return [where] + generated
+        if isinstance(where, (list, tuple)):
+            if any(isinstance(item, (list, tuple)) for item in where):
+                combined = []
+                for item in where:
+                    if isinstance(item, (list, tuple)):
+                        combined.append(list(item) + generated)
+                    else:
+                        combined.append([item] + generated)
+                return combined
+            return list(where) + generated
+        if isinstance(where, CaseExpression):
+            raise BadArgument(
+                'query() cannot combine CaseExpression with symbols/start/end; '
+                'use select() for complex expressions'
+            )
+        return [where] + generated
+
+    def _build_query_plan(self, query_spec):
+        compiled_where = self._compile_query_where(query_spec)
+        all_parts = list(self.table_parts())
+        if not all_parts:
+            return QueryPlan(
+                table=self._table_name,
+                columns=query_spec.columns,
+                where=compiled_where,
+                order_by=query_spec.order_by,
+                limit=query_spec.limit,
+            )
+
+        w = Where(compiled_where)
+        scanned = set()
+        if not w.or_and_cases:
+            scanned.update(all_parts)
+        else:
+            for cases in w.or_and_cases:
+                scanned.update(self._get_select_parts(cases))
+
+        scanned_partitions = [part for part in all_parts if part in scanned]
+        skipped_partitions = [part for part in all_parts if part not in scanned]
+        skip_reasons = {
+            part: 'pruned_by_partition_range'
+            for part in skipped_partitions
+        }
+        return QueryPlan(
+            table=self._table_name,
+            columns=query_spec.columns,
+            where=compiled_where,
+            order_by=query_spec.order_by,
+            limit=query_spec.limit,
+            candidate_partitions=all_parts,
+            scanned_partitions=scanned_partitions,
+            skipped_partitions=skipped_partitions,
+            skip_reasons=skip_reasons,
+            requires_global_sort=bool(query_spec.order_by and len(scanned_partitions) > 1),
+            requires_python_limit=bool(query_spec.limit is not None and len(scanned_partitions) > 1),
+        )
+
     def _get_part_dbfile(self, part_key):
         """Get the file path for a partition key.
 
@@ -136,7 +490,7 @@ class Table(BaseTable):
     def select_all(self, fields, where, limit=None, to_dict=False, **kwargs):
         return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
 
-    def select(self, fields, where, limit=None, to_dict=False, **kwargs):
+    def select(self, fields, where, limit=None, order_by=None, to_dict=False, **kwargs):
         """查询完所有 And([case..]) 然后组合
             And([case..])为一个基本查询单位[向数据库请求]
             where = {'field': 'date',..}
@@ -161,10 +515,10 @@ class Table(BaseTable):
             }
         else:
             # No such table
-            column_types = None
-            return None
+            return []
 
         w = Where(where)
+        limit = self._normalize_limit(limit)
 
         full_data = []
         if not w.or_and_cases:
@@ -182,25 +536,120 @@ class Table(BaseTable):
                 if data:
                     full_data.extend(data)
         # full_data = list(chain(*full_data))
+        full_data = self._apply_order_by(full_data, order_by)
+        if limit is not None:
+            full_data = full_data[:limit]
         if to_dict:
             full_data = [dict(item) for item in full_data]
         return full_data
 
+    def _normalize_limit(self, limit):
+        if limit is None:
+            return None
+        limit = int(limit)
+        if limit < 0:
+            raise BadArgument('limit must be non-negative')
+        return limit
+
+    def _parse_order_by(self, order_by):
+        if not order_by:
+            return []
+
+        items = order_by
+        if isinstance(order_by, str):
+            items = [item.strip() for item in order_by.split(',') if item.strip()]
+        elif not isinstance(order_by, (list, tuple)):
+            raise BadArgument('order_by must be a string/list/tuple')
+
+        specs = []
+        for item in items:
+            if isinstance(item, str):
+                parts = item.strip().split()
+                if len(parts) == 1:
+                    field, direction = parts[0], 'asc'
+                elif len(parts) == 2:
+                    field, direction = parts
+                else:
+                    raise BadArgument(f'Bad order_by item `{item}`')
+            elif isinstance(item, (list, tuple)) and len(item) == 2:
+                field, direction = item
+            else:
+                raise BadArgument(f'Bad order_by item `{item}`')
+
+            direction = str(direction).lower()
+            if direction not in ['asc', 'desc']:
+                raise BadArgument(f'Bad order direction `{direction}`')
+            field = str(field).strip().strip('"').strip("'")
+            if not field:
+                raise BadArgument('order_by field is empty')
+            specs.append((field, direction == 'desc'))
+        return specs
+
+    def _apply_order_by(self, rows, order_by):
+        specs = self._parse_order_by(order_by)
+        if not specs or not rows:
+            return rows
+
+        ordered = list(rows)
+        for field, reverse in reversed(specs):
+            try:
+                ordered = sorted(
+                    ordered,
+                    key=lambda row: self._row_sort_value(row, field),
+                    reverse=reverse,
+                )
+            except TypeError:
+                ordered = sorted(
+                    ordered,
+                    key=lambda row: str(self._row_sort_value(row, field)),
+                    reverse=reverse,
+                )
+        return ordered
+
+    def _row_sort_value(self, row, field):
+        try:
+            value = row[field]
+        except (KeyError, IndexError) as e:
+            raise BadArgument(
+                f'order_by field `{field}` must be included in selected fields'
+            ) from e
+        return (value is None, value)
+
     def _excluded_parts_by_case(self, infos, case):
         op, case_min, case_max = get_case_range(case)
         excluded_parts = set()
-        if case_min is not None and isinstance(case_min, str):
-            return excluded_parts
-        if case_max is not None and isinstance(case_max, str):
-            return excluded_parts
         for info in infos:
             part = info["part"]
             if info["column"] == case.field:
-                if case_max and case_max < info["column_min"]:
+                column_min = info.get("column_min")
+                column_max = info.get("column_max")
+                if not self._is_numeric_range(
+                    case_min, case_max, column_min, column_max
+                ):
+                    continue
+                if (
+                    case_max is not None
+                    and column_min is not None
+                    and (
+                        case_max < column_min
+                        or (op in ['lt', '<'] and case_max <= column_min)
+                    )
+                ):
                     excluded_parts.add(part)
-                if case_min and case_min > info["column_max"]:
+                if (
+                    case_min is not None
+                    and column_max is not None
+                    and case_min >= column_max
+                ):
                     excluded_parts.add(part)
         return excluded_parts
+
+    def _is_numeric_range(self, case_min, case_max, column_min, column_max):
+        values = [
+            item for item in [case_min, case_max, column_min, column_max]
+            if item is not None
+        ]
+        return all(isinstance(item, (int, float)) for item in values)
 
     def _excluded_parts_by_cases(self, infos, cases):
         excluded_parts = set()
@@ -325,6 +774,14 @@ class Table(BaseTable):
         Args:
             where: Dict format where clause, e.g. {'field': 'id', 'op': '>', 'value': 10}
         """
+        if where is None:
+            warnings.warn(
+                'delete(None) is deprecated; use truncate(confirm=True)',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return self._delete_all_count()
+
         meta = self.get_table_meta()
         if not meta:
             return 0
@@ -339,6 +796,20 @@ class Table(BaseTable):
             total_deleted += deleted
 
         return total_deleted
+
+    def truncate(self, confirm=False):
+        if not confirm:
+            raise UnsafeOperation('truncate requires confirm=True')
+        partitions = list(self.table_parts())
+        self._delete_all_count()
+        return WriteResult(partitions_touched=partitions)
+
+    def _delete_all_count(self):
+        meta = self.get_table_meta()
+        if not meta:
+            return 0
+        column_types = {key: item["type"] for key, item in meta["column_info"].items()}
+        return self._delete_and_cases(None, column_types)
 
     def _delete_and_cases(self, cases, column_types):
         """Delete rows matching And[Case..] from all relevant partitions."""
@@ -587,14 +1058,13 @@ class Table(BaseTable):
         pass
 
     def table_names(self):
-        return os.listdir(self.db_path)
-        try:
-            items = self.table_meta_db[_TABLE_META_TABLE_NAME].select(
-                "table_name", where=None, to_dict=True
-            )
-        except NoSuchTable:
+        if not os.path.isdir(self.db_path):
             return []
-        return sorted(list(set([item["table_name"] for item in items])))
+        return sorted([
+            item for item in os.listdir(self.db_path)
+            if os.path.isdir(os.path.join(self.db_path, item))
+            and not item.startswith('__')
+        ])
 
     def _overwrite_table_meta(self, createtable_meta):
         """table 创建信息"""
@@ -644,10 +1114,12 @@ class Table(BaseTable):
 
     def table_parts(self):
         # table_meta_db = MyDatabase(self.table_meta_path)
-        parts = set()
-        parts = self.table_meta_db[_TABLE_PART_TABLE_NAME].select(
-            "*", where=f'table_name="{self._table_name}"', to_dict=True
-        )
+        try:
+            parts = self.table_meta_db[_TABLE_PART_TABLE_NAME].select(
+                "*", where=f'table_name="{self._table_name}"', to_dict=True
+            )
+        except NoSuchTable:
+            return []
         return sorted([item["part"] for item in parts])
 
     def upsert_part_column_range(self, part, column, column_min, column_max):
@@ -674,10 +1146,130 @@ class Table(BaseTable):
         _tblname = _TABLE_PART_COLUMN_RANGE_TABLE_NAME
         if table_name is None:
             table_name = self._table_name
-        infos = self.table_meta_db[_tblname].select(
-            "*", where=f'table_name="{table_name}"', to_dict=True
-        )
+        try:
+            infos = self.table_meta_db[_tblname].select(
+                "*", where=f'table_name="{table_name}"', to_dict=True
+            )
+        except NoSuchTable:
+            return []
         return infos
+
+    def _rows_from_part_dbfile(self, part_dbfile):
+        if not os.path.isfile(part_dbfile):
+            return []
+        db = MyDatabase(part_dbfile, auto_commit=False)
+        try:
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].select('*', where=None, to_dict=True)
+            except NoSuchTable:
+                return []
+            return [dict(row) for row in rows]
+        finally:
+            db.close()
+
+    def _part_rows(self, part):
+        return self._rows_from_part_dbfile(self._get_part_dbfile(part))
+
+    def _partition_row_count(self, part):
+        part_dbfile = self._get_part_dbfile(part)
+        if not os.path.isfile(part_dbfile):
+            return 0
+        db = self.get_part_db(part_dbfile, auto_commit=False)
+        try:
+            rows = db[_PART_DATA_TABLE_NAME].query(
+                f'select COUNT(*) from {_PART_DATA_TABLE_NAME};'
+            )
+        except NoSuchTable:
+            return 0
+        if not rows:
+            return 0
+        return dict(rows[0]).get('COUNT(*)', 0)
+
+    def _partition_time_range(self, part, rows=None):
+        spec = self.spec()
+        if not spec or not spec.time:
+            return None, None
+        rows = self._part_rows(part) if rows is None else rows
+        values = [
+            row.get(spec.time.name)
+            for row in rows
+            if row.get(spec.time.name) is not None
+        ]
+        if not values:
+            return None, None
+        return min(values), max(values)
+
+    def layout_report(self):
+        spec = self.spec()
+        layout = spec.physical_layout if spec else PhysicalLayout()
+        stats = []
+        for part in self.table_parts():
+            rows = self._part_rows(part)
+            row_count = len(rows)
+            time_min, time_max = self._partition_time_range(part, rows=rows)
+            stats.append(PartitionStats(
+                partition_id=part,
+                path=self._get_part_dbfile(part),
+                row_count=row_count,
+                time_min=time_min,
+                time_max=time_max,
+                oversized=row_count > layout.max_rows_per_file,
+                undersized=(
+                    row_count < layout.min_rows_per_file
+                    and row_count > 0
+                    and len(self.table_parts()) > 1
+                ),
+            ))
+
+        recommendation = 'layout_ok'
+        if any(item.oversized for item in stats):
+            recommendation = (
+                'repartition_to a smaller time interval or a row-aware layout'
+            )
+        elif len(stats) > 1 and all(item.undersized for item in stats):
+            recommendation = 'repartition_to a larger time interval'
+
+        return LayoutReport(
+            table=self._table_name,
+            target_rows_per_file=layout.target_rows_per_file,
+            min_rows_per_file=layout.min_rows_per_file,
+            max_rows_per_file=layout.max_rows_per_file,
+            partitions=stats,
+            recommendation=recommendation,
+        )
+
+    def repartition_to(self, target_uri, table_name=None, spec=None,
+                       mode='upsert', batch_size=10_000):
+        table_name = table_name or self._table_name
+        if target_uri == self._uri and table_name == self._table_name:
+            raise BadArgument('repartition_to requires a different target uri or table')
+
+        target_spec = TableSpec.ensure(spec) if spec is not None else self.spec()
+        if not target_spec:
+            raise BadArgument('repartition_to requires a TableSpec')
+
+        from ..database import Database
+
+        target_db = Database(target_uri, verbose=self.verbose)
+        target_table = target_db.table(table_name, spec=target_spec)
+        rows_copied = 0
+        for part in self.table_parts():
+            rows = self._part_rows(part)
+            for start in range(0, len(rows), batch_size):
+                batch = rows[start:start + batch_size]
+                if batch:
+                    target_table.write(batch, mode=mode)
+                    rows_copied += len(batch)
+
+        partitions_created = target_table.table_parts()
+        target_db.close()
+        return RepartitionResult(
+            source_uri=self._uri,
+            target_uri=target_uri,
+            table=table_name,
+            rows_copied=rows_copied,
+            partitions_created=partitions_created,
+        )
 
     def _add_columns_for_all_partitions(self, data_suggested_types):
         """

@@ -51,18 +51,34 @@ class Where(object):
             self.where = where
         elif isinstance(where, dict):
             self.where = Case.from_dict(where)
-        #elif isinstance(where, (list, tuple)):
-        #    cases = []
-        #    for w in where:
-        #        cases.append(ensure_case(w))
-        #    self.where = cases
+        elif isinstance(where, (list, tuple)):
+            self.where = where
+            self._or_and_cases = self._parse_sequence_where(where)
+            return
         elif isinstance(where, CaseExpression):
             self.where = where
         else:
             raise BadArgument(f'{type(where)} Not supported')
-        
+
         self._or_and_cases = flatten_expression(self.where)
 
     @property
     def or_and_cases(self):
         return self._or_and_cases
+
+    def _parse_sequence_where(self, where):
+        """把列表条件解析为 Or[And[Case]]。"""
+        if not where:
+            return []
+        if all(not isinstance(item, (list, tuple)) for item in where):
+            cases = [ensure_case(item) for item in where]
+            return [Case.unique_and_cases(cases)]
+
+        parsed = []
+        for item in where:
+            if isinstance(item, (list, tuple)):
+                cases = [ensure_case(case) for case in item]
+            else:
+                cases = [ensure_case(item)]
+            parsed.append(Case.unique_and_cases(cases))
+        return parsed

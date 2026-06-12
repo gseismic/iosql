@@ -25,7 +25,7 @@ def get_case_range(case):
         case_min = value
     elif op in ['lt', 'le', '<', '<=']:
         case_max = value
-    elif op in ['eq', '==']:
+    elif op in ['eq', '==', '=']:
         case_min = value
         case_max = value
     return op, case_min, case_max

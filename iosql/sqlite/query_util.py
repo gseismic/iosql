@@ -1,4 +1,44 @@
-# from ..query import Where
+from ..exception import BadArgument
+
+
+def _quote_sql_value(value):
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return value
+    value = str(value).replace('"', '""')
+    return f'"{value}"'
+
+
+def _quote_sql_identifier(name):
+    name = str(name).replace('"', '""')
+    return f'"{name}"'
+
+
+def _column_type(column_types, field):
+    try:
+        type_ = column_types[field]
+    except KeyError as e:
+        raise BadArgument(f'Unknown field `{field}`') from e
+    if isinstance(type_, str):
+        return type_.lower()
+    return type_
+
+
+def _case_value_needs_quote(case, column_types):
+    if case.value['type'] == 'variable':
+        return False
+
+    type_ = _column_type(column_types, case.field)
+    return type_ not in [int, float, bool, 'integer', 'float', 'bool']
+
+
+def _format_case_value(value, to_quoted_str):
+    if to_quoted_str:
+        return _quote_sql_value(value)
+    if isinstance(value, bool):
+        return int(value)
+    return value
 
 
 def build_case_subsql(case, column_types):
@@ -7,35 +47,23 @@ def build_case_subsql(case, column_types):
     field = case.field
     op = case.op
     value = case.value['value']
-    # 以系统的指示为准
-    # 用户提供的int类型, 1235, 系统中完全可能是str
-    if case.value['type'] == 'const':
-        if column_types[field] in [int, float, bool, 'integer', 'float', 'bool']:
-            to_quoted_str = False
-            value = value
-        else:
-            to_quoted_str = True
-    elif case.value['type'] == 'variable':
-        to_quoted_str = False
-        assert isinstance(value, str)
+    field_sql = _quote_sql_identifier(field)
+    to_quoted_str = _case_value_needs_quote(case, column_types)
 
     if op in ['between_and', 'in']:
         assert isinstance(value, (list, tuple))
-        if to_quoted_str:
-            _value = [f'"{str(v)}"' for v in value]
-        else:
-            _value = value
+        _value = [_format_case_value(v, to_quoted_str) for v in value]
         if op == 'between_and':
-            subsql = (f' between {_value[0]} and {_value[1]}')      
-        # elif op == 'range':
-            # subsql = (f' {_value[0]} and {_value[1]}')
+            subsql = f' between {_value[0]} and {_value[1]}'
         elif op == 'in':
-            subsql = f' in {_value[0]} and {_value[1]}'
+            value_sql = ','.join(str(v) for v in _value)
+            subsql = f' in ({value_sql})'
     else:
-        if to_quoted_str:
-            # [@2021-12-01 17:16:32] FIXED
-            # value = '"{str(value)}"'
-            value = f'"{str(value)}"'
+        if case.value['type'] == 'variable':
+            assert isinstance(value, str)
+            value = _quote_sql_identifier(value)
+        else:
+            value = _format_case_value(value, to_quoted_str)
         if op in ['gt', '>']:
             subsql = f' > {value}'
         elif op in ['ge', '>=']:
@@ -48,8 +76,10 @@ def build_case_subsql(case, column_types):
             subsql = f' == {value}'
         elif op in ['neq', '!=']:
             subsql = f' != {value}'
+        else:
+            raise BadArgument(f'Unsupported op `{op}`')
 
-    return f'{field} {subsql} '
+    return f'{field_sql} {subsql} '
 
 
 def build_and_cases_subsql(cases, column_types):

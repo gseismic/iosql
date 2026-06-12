@@ -1,6 +1,9 @@
+import os
+
 from .utils.schema import parse_db_schema
 from .exception import EngineNotExist
 from . import sqlite
+from .spec import TableSpec
 
 
 class Database(object):
@@ -21,6 +24,32 @@ class Database(object):
             self._tables[table_name] = table
         return self._tables[table_name]
 
+    def table(self, table_name, spec=None):
+        table = self[table_name]
+        if spec is not None:
+            table.use_spec(spec)
+        return table
+
+    def timeseries(self, table_name, time, primary_key, columns=None,
+                   partition_every='1day', timezone='UTC',
+                   schema_policy='evolve', symbol_column='symbol',
+                   target_rows_per_file=400_000,
+                   min_rows_per_file=300_000,
+                   max_rows_per_file=500_000):
+        spec = TableSpec.timeseries(
+            time=time,
+            primary_key=primary_key,
+            columns=columns,
+            partition_every=partition_every,
+            timezone=timezone,
+            schema_policy=schema_policy,
+            symbol_column=symbol_column,
+            target_rows_per_file=target_rows_per_file,
+            min_rows_per_file=min_rows_per_file,
+            max_rows_per_file=max_rows_per_file,
+        )
+        return self.table(table_name, spec=spec)
+
     def __enter__(self):
         return self
 
@@ -28,7 +57,15 @@ class Database(object):
         self.close()
 
     def table_names(self):
-        return self['__dummy_table'].table_names()
+        _, options = parse_db_schema(self._uri)
+        db_path = os.path.join(options.get('path') or '', options.get('db') or '')
+        if not os.path.isdir(db_path):
+            return []
+        return sorted([
+            item for item in os.listdir(db_path)
+            if os.path.isdir(os.path.join(db_path, item))
+            and not item.startswith('__')
+        ])
 
     def close(self):
         for _, table in self._tables.items():
