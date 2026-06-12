@@ -3,7 +3,7 @@
 from pathlib import Path
 import shutil
 
-from iosql import Database, PartitionSpec, TableSpec, TimeColumn
+from iosql import Database
 
 
 DB_PATH = Path(__file__).resolve().parent / "runtime" / "02_calendar.iosql"
@@ -18,19 +18,17 @@ def reset_database():
 def run():
     reset_database()
 
-    spec = TableSpec(
+    db = Database(DB_URI)
+    events = db.timeseries(
+        "events",
+        time="event_date",
+        time_unit="date",
+        partition_kind="calendar",
+        partition_every="1day",
+        timezone="Asia/Shanghai",
         primary_key=["event_date", "name"],
-        time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
-        partition=PartitionSpec.by_time(
-            "event_date",
-            every="1day",
-            kind="calendar",
-        ),
         columns={"event_date": "text", "name": "text", "city": "text"},
     )
-
-    db = Database(DB_URI)
-    events = db.table("events", spec=spec)
     events.write([
         {"event_date": "2026-01-05", "name": "open", "city": "Shanghai"},
         {"event_date": "2026-01-06", "name": "review", "city": "Beijing"},

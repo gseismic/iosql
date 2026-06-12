@@ -31,6 +31,7 @@
 - 金融 orderbook 示例第一次运行发现布局参数不合法：`target_rows_per_file=200_000` 小于默认 `min_rows_per_file=300_000`。已显式设置 `min_rows_per_file=100_000` 和 `max_rows_per_file=300_000`。
 - K 线示例第一次输出出现浮点显示噪音，已用 `round(..., 2)` 固定展示。
 - 接口 review 发现新增参数若插入 `schema_policy` 前会破坏已有位置参数兼容，已将 `time_unit` 和 `partition_kind` 移到参数列表末尾。
+- 提交后审核发现通用日历示例仍在手写 `TableSpec`，与新增的 `timeseries(time_unit="date", partition_kind="calendar")` 推荐入口不一致。已更新 `examples/02_calendar_events.py` 使用新入口。
 
 ## 验证
 
@@ -55,6 +56,7 @@ python -m pytest tests -q
 
 - 4 个金融示例均从空库成功运行，并输出扫描分区。
 - 4 个通用示例仍可运行。
+- 提交后修复验证通过：`PYTHONPATH=. python examples/02_calendar_events.py`。
 - `tests/sqlite/test_timeseries_contract.py` 通过：`10 passed`。
 - 全量测试通过：`118 passed, 14 skipped`。
 - `compileall` 和 `git diff --check` 均通过。
