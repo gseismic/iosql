@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iosql"
+dynamic = ["version"]
+description = "Partitioned SQLite storage for time-series data"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "Liu Shengli", email = "liushengli203@163.com" }
+]
+dependencies = [
+    "arrow"
+]
+
+[project.urls]
+Homepage = "http://github.com/gseismic/iosql"
+Repository = "http://github.com/gseismic/iosql"
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
+
+[tool.setuptools.dynamic]
+version = { attr = "iosql.version.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["iosql*"]

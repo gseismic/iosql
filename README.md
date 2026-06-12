@@ -1,147 +1,185 @@
 # iosql
 
-SQLite wrapper for time series data supporting datetime-based partitioning with millisecond precision.
+`iosql` 是一个面向时序数据的 SQLite 分区存储库。它把同一张逻辑表拆到多个 SQLite 分区文件中，保留 SQLite 的简单部署方式，同时提供时序表契约、分区裁剪、批量写入、布局诊断和重分区能力。
 
-## Features
+## 特性
 
-- **Partition-based storage**: Data stored in separate SQLite files per partition
-- **Partition pruning**: Queries automatically skip irrelevant partitions
-- **Auto-detection**: Partition configuration loaded from table metadata
-- **Multiple partition types**: Duration (1min, 1hour, 1day, etc.) and Calendar (YYYYMMDD, YYYYMM, etc.)
-- **High performance**: Tested with 200K+ rows
+- **时序表契约**：用 `Database.timeseries()` 或 `TableSpec` 明确主键、时间列、列类型和分区策略。
+- **分区存储**：按时间把数据写入多个 SQLite 文件，降低单文件膨胀风险。
+- **分区裁剪**：按 `start` / `end` / `date` 查询时自动跳过不相关分区。
+- **批量写入**：`write()` 和 `write_buffer()` 提供面向时序表的写入入口。
+- **布局维护**：`layout_report()` 检查分区行数，`repartition_to()` 可生成新的分区布局。
+- **日历分区**：支持带时区的日、月、年等日历分区。
 
-## Quick Start
+## 安装
+
+要求 Python 3.9 或更高版本。
+
+开发安装：
+
+```bash
+python -m pip install -e .
+```
+
+构建 wheel：
+
+```bash
+python -m pip wheel . --no-deps -w dist
+```
+
+项目使用 `pyproject.toml` 作为打包入口，版本号来自 `iosql.version.__version__`。
+
+## 快速开始
 
 ```python
 from iosql import Database
-from iosql.partition import DurationPartition
 
-db = Database('sqlite://database/kline.sqlite3')
+db = Database("sqlite://database/market.iosql")
 
-# Set partition on table (persisted to metadata)
-db['kline'].partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
+ticks = db.timeseries(
+    "ticks",
+    time="ts",
+    primary_key=["symbol", "ts"],
+    columns={"symbol": "text", "ts": "integer", "price": "float"},
+    partition_every="1day",
+)
 
-# Insert data (partition auto-used from table)
-data = [
-    {'timestamp': 1705276800000, 'symbol': 'AAPL', 'close': 185.5},
-    {'timestamp': 1705276800000 + 86400000, 'symbol': 'AAPL', 'close': 186.0},
-]
-db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
+result = ticks.write([
+    {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
+    {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
+    {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
+])
 
-# Query with partition pruning
-result = db['kline'].select(
-    '*',
-    where={'field': 'timestamp', 'op': 'between_and', 
-           'value': [1705276800000, 1705363200000]}
+rows = ticks.query(
+    symbols="AAPL",
+    start=1735689600000,
+    end=1735776000000,
+    order_by="ts",
+).to_list()
+
+plan = ticks.query(symbols="AAPL", start=1735689600000).explain()
+
+print(result.rows_seen)
+print(rows)
+print(plan.scanned_partitions)
+db.close()
+```
+
+## 常用 API
+
+### 创建或打开时序表
+
+```python
+table = db.timeseries(
+    "ticks",
+    time="ts",
+    primary_key=["symbol", "ts"],
+    columns={"symbol": "text", "ts": "integer", "price": "float"},
+    partition_every="1hour",
+    timezone="UTC",
 )
 ```
 
-## Partition Types
-
-### DurationPartition
-
-Integer-based partitions with millisecond intervals.
+### 写入
 
 ```python
-from iosql.partition import DurationPartition
+table.write({"symbol": "AAPL", "ts": 1735689600000, "price": 187.4})
 
-# Using string aliases
-partition = DurationPartition(interval_ms='1day', ts_col='timestamp')
-partition = DurationPartition(interval_ms='1hour', ts_col='timestamp')
-partition = DurationPartition(interval_ms='5min', ts_col='timestamp')
-
-# Using milliseconds directly
-partition = DurationPartition(interval_ms=3600000, ts_col='timestamp')  # 1 hour
+with table.write_buffer(max_rows=10_000) as buffer:
+    buffer.append([
+        {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
+        {"symbol": "MSFT", "ts": 1735689600000, "price": 420.3},
+    ])
 ```
 
-Supported interval aliases: `1min`, `5min`, `15min`, `30min`, `60min`, `1hour`, `4hour`, `1day`, `1week`, `1month`, `1year`
-
-### CalendarPartition
-
-Timezone-aware partitions using format strings.
+### 查询
 
 ```python
-from iosql.partition import CalendarPartition
+rows = table.query(
+    symbols=["AAPL", "MSFT"],
+    start=1735689600000,
+    end=1735776000000,
+    order_by="ts desc",
+    limit=100,
+).to_list()
 
-# Daily partitions (YYYYMMDD)
-partition = CalendarPartition(fmt='YYYYMMDD', tz='UTC', ts_col='date')
-
-# Monthly partitions (YYYYMM)
-partition = CalendarPartition(fmt='YYYYMM', tz='UTC', ts_col='date')
+plan = table.query(start=1735689600000, end=1735776000000).explain()
 ```
 
-## API
+### 日历分区
 
-### Database
+`Database.timeseries()` 默认适合毫秒时间戳。如果数据使用日期字符串，可以直接声明 `TableSpec`：
 
 ```python
-db = Database('sqlite://database/file.sqlite3')
-t = db['table_name']
+from iosql import Database, PartitionSpec, TableSpec, TimeColumn
+
+spec = TableSpec(
+    primary_key=["event_date", "name"],
+    time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
+    partition=PartitionSpec.by_time("event_date", every="1day", kind="calendar"),
+    columns={"event_date": "text", "name": "text", "city": "text"},
+)
+
+events = Database("sqlite://database/events.iosql").table("events", spec=spec)
+events.write({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
+rows = events.query(date="2026-01-06").to_list()
 ```
 
-### Table Operations
+### 布局诊断和重分区
 
 ```python
-# Insert data
-db['table'].insert_all(data, pk=['id', 'timestamp'], partition=partition)
+report = table.layout_report()
+print(report.total_rows, report.recommendation)
 
-# Upsert (insert or update based on pk)
-db['table'].upsert_all(data, pk=['id', 'timestamp'])
-
-# Query
-db['table'].select('*', where={'field': 'timestamp', 'op': '>', 'value': ts})
-
-# Delete
-db['table'].delete({'field': 'timestamp', 'op': '>', 'value': ts})
-
-# Get table info
-db['table'].table_parts()           # List partition keys
-db['table'].partition                # Get partition object
-db['table'].partition = p             # Set partition (persisted)
+new_spec = table.spec().with_partition(every="1hour")
+result = table.repartition_to("sqlite://database/market-hourly.iosql", spec=new_spec)
+print(result.rows_copied, result.partitions_created)
 ```
 
-### Where Clause
+## 示例
 
-```python
-where = {'field': 'timestamp', 'op': '>', 'value': 1705276800000}
-where = {'field': 'timestamp', 'op': '<', 'value': 1705276800000}
-where = {'field': 'timestamp', 'op': '>=', 'value': 1705276800000}
-where = {'field': 'timestamp', 'op': '<=', 'value': 1705276800000}
-where = {'field': 'timestamp', 'op': '==', 'value': 1705276800000}
-where = {'field': 'timestamp', 'op': 'between_and', 'value': [t1, t2]}
+示例位于 `examples/`，按学习顺序编号：
+
+| 文件 | 场景 |
+| --- | --- |
+| `01_quickstart_timeseries.py` | 入门时序表写入和查询。 |
+| `02_calendar_events.py` | 日期字符串和日历分区。 |
+| `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入和查询计划。 |
+| `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
+
+运行：
+
+```bash
+python examples/01_quickstart_timeseries.py
 ```
 
-## File Structure
+## 存储结构
 
-```
+示例中的 `sqlite://database/market.iosql` 会生成一个目录式数据库：
+
+```text
 database/
-└── file.sqlite3/
-    └── table_name/
+└── market.iosql/
+    └── ticks/
+        ├── meta.sqlite3
         └── data/
-            ├── meta.sqlite3        # Table metadata
-            ├── 1705276800000.sqlite3  # Partition file (DurationPartition)
-            └── 1705363200000.sqlite3
+            ├── 1735689600000.sqlite3
+            └── 1735776000000.sqlite3
 ```
 
-## Performance
+`meta.sqlite3` 保存表元数据和分区信息；每个分区文件保存该时间范围内的真实数据。
 
-- **Insert**: ~15,000 rows/second (batch insert)
-- **Query**: Partition pruning enables O(1) partition access for time-range queries
-- **200K rows** inserted in ~14 seconds across 3,334 partitions
+## 注意事项
 
-## Notes
+- `Database.timeseries()` 的时间列默认使用毫秒时间戳。
+- `Table.write()` 需要表存在 `TableSpec`，推荐优先使用 `Database.timeseries()` 创建时序表。
+- 多分区查询支持全局 `order_by` 和 `limit`，但结果会在 Python 层合并排序，扫描范围应尽量通过时间条件收窄。
+- `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
 
-- Timestamps must be in **milliseconds**
-- Partition boundaries are UTC-aligned
-- `upsert_all` uses primary key for identity (no WHERE clause)
-- `order_by` and `limit` are not supported for multi-partition queries
+## 变更记录
 
-## ChangeLog
-
-- v0.2.0 - New partition system with DurationPartition and CalendarPartition
-  - Integer-based partition keys (milliseconds)
-  - Auto-detection from metadata
-  - Partition setter on table object
-- v0.1.2 - Add create_index
-- v0.1.1 - Add partition formats
-- v0.1.0 - Initial release
+- v0.2.1 - 引入时序表契约、布局诊断、重分区规划和 pyproject 打包入口。
+- v0.2.0 - 新分区系统，支持 `DurationPartition` 和 `CalendarPartition`。
+- v0.1.2 - 添加 `create_index`。
+- v0.1.1 - 添加分区格式。
+- v0.1.0 - 初始版本。
