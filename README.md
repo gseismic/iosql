@@ -109,6 +109,12 @@ rows = table.query(
 
 plan = table.query(start=1735689600000, end=1735776000000).explain()
 segments = table.segments()
+
+snapshot = table.latest(
+    symbols=["AAPL", "MSFT"],
+    as_of=1735776000000,
+    columns=["symbol", "ts", "price"],
+).to_list()
 ```
 
 `where` 支持 dict/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
@@ -116,6 +122,8 @@ segments = table.segments()
 `segments()` 返回物理文件级 manifest，包含逻辑分区、segment id、文件 key、行数和时间范围。`query().explain()` 同时返回逻辑分区和物理 segment 的候选/扫描/跳过信息。
 
 开启物理 segment 后，`write(mode="upsert")` / `write(mode="replace")` / `write(mode="ignore")` 仍按逻辑表主键处理已有行，不会因为同一逻辑分区拆成多个文件而绕过主键语义。
+
+`latest()` / `asof()` 用于金融截面查询，返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。
 
 ### 日历分区
 

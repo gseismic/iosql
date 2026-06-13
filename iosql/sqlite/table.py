@@ -80,6 +80,31 @@ class _TableQuery:
         return self._query_spec
 
 
+class _LatestQuery:
+    def __init__(self, table, query_spec, columns):
+        self._table = table
+        self._query_spec = query_spec
+        self._columns = columns
+
+    def explain(self):
+        return self._table._build_query_plan(self._query_spec)
+
+    def to_list(self):
+        return self._table._latest_rows(self._query_spec, self._columns)
+
+    def one(self):
+        rows = self.to_list()
+        if len(rows) > 1:
+            raise BadArgument('latest().one() requires at most one row')
+        return rows[0] if rows else None
+
+    def iter_rows(self):
+        return iter(self.to_list())
+
+    def spec(self):
+        return self._query_spec
+
+
 class _BufferedWriter:
     def __init__(self, table, mode='upsert', max_rows=10_000, **write_kwargs):
         self._table = table
@@ -335,8 +360,93 @@ class Table(BaseTable):
         )
         return _TableQuery(self, spec)
 
+    def latest(self, symbols=None, as_of=None, columns='*', where=None):
+        table_spec = self.spec()
+        time_column = self._query_time_column(table_spec)
+        spec = QuerySpec(
+            table=self._table_name,
+            columns='*',
+            symbols=symbols,
+            end=as_of,
+            where=where,
+            order_by=f'{time_column.name} desc',
+        )
+        return _LatestQuery(self, spec, columns)
+
+    def asof(self, symbols=None, as_of=None, columns='*', where=None):
+        return self.latest(
+            symbols=symbols,
+            as_of=as_of,
+            columns=columns,
+            where=where,
+        )
+
     def segments(self):
         return [ref.to_dict() for ref in self._physical_part_refs()]
+
+    def _latest_rows(self, query_spec, columns):
+        table_spec = self.spec()
+        if not table_spec:
+            raise BadArgument('latest requires a TableSpec')
+        symbol_column = table_spec.symbol_column
+        rows = _TableQuery(self, query_spec).to_list()
+        if not rows:
+            return []
+
+        if symbol_column not in rows[0]:
+            if query_spec.symbols is not None:
+                raise BadArgument(
+                    f'latest requires symbol column `{symbol_column}`'
+                )
+            return self._project_rows(rows[:1], columns)
+
+        requested_symbols = self._normalize_symbols(query_spec.symbols)
+        latest_by_symbol = OrderedDict()
+        for row in rows:
+            symbol = row.get(symbol_column)
+            if symbol in latest_by_symbol:
+                continue
+            if requested_symbols is not None and symbol not in requested_symbols:
+                continue
+            latest_by_symbol[symbol] = row
+
+        if requested_symbols is None:
+            latest_rows = list(latest_by_symbol.values())
+        else:
+            latest_rows = [
+                latest_by_symbol[symbol]
+                for symbol in requested_symbols
+                if symbol in latest_by_symbol
+            ]
+        return self._project_rows(latest_rows, columns)
+
+    def _normalize_symbols(self, symbols):
+        if symbols is None:
+            return None
+        if isinstance(symbols, str) or not isinstance(symbols, (list, tuple, set)):
+            return [symbols]
+        return list(symbols)
+
+    def _project_rows(self, rows, columns):
+        fields = self._projection_fields(columns)
+        if fields is None:
+            return rows
+        return [
+            {field: row[field] for field in fields}
+            for row in rows
+        ]
+
+    def _projection_fields(self, columns):
+        if columns is None:
+            return None
+        if isinstance(columns, str):
+            text = columns.strip()
+            if text == '*':
+                return None
+            return [item.strip() for item in text.split(',') if item.strip()]
+        if isinstance(columns, (list, tuple)):
+            return list(columns)
+        raise BadArgument('columns must be a string/list/tuple')
 
     def _schema_changed(self, before_meta, after_meta):
         if before_meta is None:

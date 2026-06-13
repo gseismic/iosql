@@ -29,6 +29,33 @@ def _segmented_ticks(tmp_path):
     return db, ticks
 
 
+def _latest_ticks(tmp_path):
+    db = Database(_uri(tmp_path))
+    ticks = db.timeseries(
+        "ticks",
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={
+            "symbol": "text",
+            "ts": "integer",
+            "price": "float",
+            "venue": "text",
+        },
+        partition_every="1day",
+        target_rows_per_file=1,
+        min_rows_per_file=1,
+        max_rows_per_file=1,
+    )
+    ticks.write([
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0, "venue": "NASDAQ"},
+        {"symbol": "MSFT", "ts": 1500, "price": 2.0, "venue": "NASDAQ"},
+        {"symbol": "AAPL", "ts": 2000, "price": 3.0, "venue": "NASDAQ"},
+        {"symbol": "MSFT", "ts": 2500, "price": 4.0, "venue": "NYSE"},
+        {"symbol": "AAPL", "ts": 3000, "price": 5.0, "venue": "NYSE"},
+    ])
+    return db, ticks
+
+
 def test_timeseries_write_query_and_explain(tmp_path):
     db = Database(_uri(tmp_path))
     ticks = db.timeseries(
@@ -85,6 +112,65 @@ def test_timeseries_write_query_and_explain(tmp_path):
     assert plan.candidate_partitions == [0, 1000, 2000]
     assert plan.scanned_partitions == [1000]
     assert plan.skipped_partitions == [0, 2000]
+
+
+def test_latest_returns_single_symbol_as_of_row(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    row = ticks.latest(
+        symbols="AAPL",
+        as_of=2500,
+        columns=["symbol", "ts", "price"],
+    ).one()
+
+    assert row == {"symbol": "AAPL", "ts": 2000, "price": 3.0}
+
+
+def test_latest_returns_multi_symbol_rows_in_requested_order(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    rows = ticks.latest(
+        symbols=["MSFT", "AAPL"],
+        as_of=2500,
+        columns=["symbol", "ts", "price"],
+    ).to_list()
+
+    assert rows == [
+        {"symbol": "MSFT", "ts": 2500, "price": 4.0},
+        {"symbol": "AAPL", "ts": 2000, "price": 3.0},
+    ]
+
+
+def test_latest_combines_text_where_and_asof_alias(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    rows = ticks.asof(
+        symbols=["AAPL", "MSFT"],
+        as_of=4000,
+        where="venue = 'NASDAQ'",
+        columns=["symbol", "ts", "venue"],
+    ).to_list()
+
+    assert rows == [
+        {"symbol": "AAPL", "ts": 2000, "venue": "NASDAQ"},
+        {"symbol": "MSFT", "ts": 1500, "venue": "NASDAQ"},
+    ]
+
+
+def test_latest_explain_uses_segment_pruning(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    plan = ticks.latest(symbols="AAPL", as_of=2500).explain()
+
+    assert [item["part_key"] for item in plan.scanned_segments] == [
+        "0__000000",
+        "0__000001",
+        "0__000002",
+        "0__000003",
+    ]
+    assert "0__000004" in [
+        item["part_key"] for item in plan.skipped_segments
+    ]
 
 
 def test_table_spec_persists_for_reopen(tmp_path):

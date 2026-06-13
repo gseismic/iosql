@@ -51,6 +51,16 @@ def run():
             "close": round(187.1 + minute * 0.1, 2),
             "volume": 10_000 + minute * 100,
         })
+        rows.append({
+            "symbol": "MSFT",
+            "timeframe": "1m",
+            "ts": base_ts + minute * 60_000,
+            "open": round(420.0 + minute * 0.2, 2),
+            "high": round(420.4 + minute * 0.2, 2),
+            "low": round(419.7 + minute * 0.2, 2),
+            "close": round(420.2 + minute * 0.2, 2),
+            "volume": 8_000 + minute * 80,
+        })
 
     result = bars.write(rows)
     query = bars.query(
@@ -59,10 +69,16 @@ def run():
         end=base_ts + 4 * 60_000,
         order_by="ts",
     )
+    snapshot = bars.latest(
+        symbols=["AAPL", "MSFT"],
+        as_of=base_ts + 4 * 60_000,
+        columns=["symbol", "ts", "close"],
+    ).to_list()
 
     print("写入行数:", result.rows_seen)
     print("扫描分区:", query.explain().scanned_partitions)
     print("窗口 K 线:", query.to_list())
+    print("截面最新价:", snapshot)
     db.close()
 
 
