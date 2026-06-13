@@ -350,7 +350,7 @@ class Table(BaseTable):
     def write_buffer(self, mode='upsert', max_rows=10_000, **write_kwargs):
         return _BufferedWriter(self, mode=mode, max_rows=max_rows, **write_kwargs)
 
-    def query(self, symbols=None, start=None, end=None, date=None,
+    def query(self, symbols=None, start=None, end=None, date=None, session=None,
               columns='*', where=None, order_by=None, limit=None):
         spec = QuerySpec(
             table=self._table_name,
@@ -359,6 +359,7 @@ class Table(BaseTable):
             start=start,
             end=end,
             date=date,
+            session=session,
             where=where,
             order_by=order_by,
             limit=limit,
@@ -371,6 +372,7 @@ class Table(BaseTable):
         as_of=None,
         columns='*',
         where=None,
+        session=None,
         by=None,
         group_by=None,
     ):
@@ -382,6 +384,7 @@ class Table(BaseTable):
             columns='*',
             symbols=symbols,
             end=as_of,
+            session=session,
             where=where,
             order_by=f'{time_column.name} desc',
         )
@@ -393,6 +396,7 @@ class Table(BaseTable):
         as_of=None,
         columns='*',
         where=None,
+        session=None,
         by=None,
         group_by=None,
     ):
@@ -401,6 +405,7 @@ class Table(BaseTable):
             as_of=as_of,
             columns=columns,
             where=where,
+            session=session,
             by=by,
             group_by=group_by,
         )
@@ -571,6 +576,25 @@ class Table(BaseTable):
                     {'field': time_column.name, 'op': '<=', 'value': end},
                 ])
 
+        if query_spec.session is not None:
+            session_column = self._query_session_column(table_spec)
+            sessions = query_spec.session
+            if isinstance(sessions, str) or not isinstance(sessions, (list, tuple, set)):
+                sessions = [sessions]
+            sessions = list(sessions)
+            if len(sessions) == 1:
+                generated.append({
+                    'field': session_column,
+                    'op': '=',
+                    'value': sessions[0],
+                })
+            elif sessions:
+                generated.append({
+                    'field': session_column,
+                    'op': 'in',
+                    'value': sessions,
+                })
+
         if query_spec.start is not None or query_spec.end is not None:
             time_column = self._query_time_column(table_spec)
             if query_spec.start is not None:
@@ -592,6 +616,13 @@ class Table(BaseTable):
         if not table_spec or not table_spec.time:
             raise MissingTimeColumn('query start/end/date requires TableSpec.time')
         return table_spec.time
+
+    def _query_session_column(self, table_spec):
+        if not table_spec or not table_spec.session_column:
+            raise BadArgument(
+                'query session requires TableSpec.session_column'
+            )
+        return table_spec.session_column
 
     def _combine_query_where(self, where, generated):
         if not generated:

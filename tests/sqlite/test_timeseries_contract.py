@@ -94,6 +94,52 @@ def _latest_ticks(tmp_path):
     return db, ticks
 
 
+def _session_ticks(tmp_path):
+    db = Database(_uri(tmp_path))
+    ticks = db.timeseries(
+        "futures_ticks",
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={
+            "symbol": "text",
+            "ts": "integer",
+            "trading_date": "text",
+            "session_type": "text",
+            "price": "float",
+        },
+        session_column="trading_date",
+        partition_every="1day",
+        target_rows_per_file=10,
+        min_rows_per_file=1,
+        max_rows_per_file=20,
+    )
+    day_start = 86_400_000
+    ticks.write([
+        {
+            "symbol": "AU",
+            "ts": day_start - 2 * 3_600_000,
+            "trading_date": "1970-01-02",
+            "session_type": "night",
+            "price": 1.0,
+        },
+        {
+            "symbol": "AU",
+            "ts": day_start + 10 * 3_600_000,
+            "trading_date": "1970-01-02",
+            "session_type": "day",
+            "price": 2.0,
+        },
+        {
+            "symbol": "AG",
+            "ts": day_start + 11 * 3_600_000,
+            "trading_date": "1970-01-03",
+            "session_type": "day",
+            "price": 3.0,
+        },
+    ])
+    return db, ticks
+
+
 def test_timeseries_write_query_and_explain(tmp_path):
     db = Database(_uri(tmp_path))
     ticks = db.timeseries(
@@ -150,6 +196,97 @@ def test_timeseries_write_query_and_explain(tmp_path):
     assert plan.candidate_partitions == [0, 1000, 2000]
     assert plan.scanned_partitions == [1000]
     assert plan.skipped_partitions == [0, 2000]
+
+
+def test_query_session_uses_declared_session_column(tmp_path):
+    _, ticks = _session_ticks(tmp_path)
+
+    rows = ticks.query(
+        symbols="AU",
+        session="1970-01-02",
+        order_by="ts",
+    ).to_list()
+
+    assert [row["session_type"] for row in rows] == ["night", "day"]
+    assert [row["price"] for row in rows] == [1.0, 2.0]
+
+
+def test_query_date_remains_natural_day_not_session(tmp_path):
+    _, ticks = _session_ticks(tmp_path)
+
+    rows = ticks.query(
+        symbols="AU",
+        date="1970-01-02",
+        order_by="ts",
+    ).to_list()
+
+    assert [row["session_type"] for row in rows] == ["day"]
+
+
+def test_query_session_combines_with_text_where(tmp_path):
+    _, ticks = _session_ticks(tmp_path)
+
+    rows = ticks.query(
+        session=["1970-01-02", "1970-01-03"],
+        where="session_type = 'day'",
+        order_by="symbol",
+        columns=["symbol", "trading_date", "session_type"],
+    ).to_list()
+
+    assert rows == [
+        {
+            "symbol": "AG",
+            "trading_date": "1970-01-03",
+            "session_type": "day",
+        },
+        {
+            "symbol": "AU",
+            "trading_date": "1970-01-02",
+            "session_type": "day",
+        },
+    ]
+
+
+def test_latest_accepts_session_filter(tmp_path):
+    _, ticks = _session_ticks(tmp_path)
+
+    row = ticks.latest(
+        symbols="AU",
+        session="1970-01-02",
+        as_of=86_400_000 + 12 * 3_600_000,
+        columns=["symbol", "trading_date", "session_type", "price"],
+    ).one()
+
+    assert row == {
+        "symbol": "AU",
+        "trading_date": "1970-01-02",
+        "session_type": "day",
+        "price": 2.0,
+    }
+
+
+def test_query_session_requires_session_column(tmp_path):
+    db = Database(_uri(tmp_path))
+    ticks = db.timeseries(
+        "ticks",
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+    )
+    ticks.write({"symbol": "AAPL", "ts": 1000, "price": 1.0})
+
+    with pytest.raises(BadArgument, match="session_column"):
+        ticks.query(session="1970-01-02").to_list()
+
+
+def test_session_column_persists_for_reopen(tmp_path):
+    db, ticks = _session_ticks(tmp_path)
+    db.close()
+
+    reopened = Database(_uri(tmp_path))
+    spec = reopened.table("futures_ticks").spec()
+
+    assert spec.session_column == "trading_date"
 
 
 def test_latest_returns_single_symbol_as_of_row(tmp_path):

@@ -126,6 +126,34 @@ snapshot = table.latest(
 
 `latest()` / `asof()` 用于金融截面查询，默认返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。K 线、orderbook 等多维数据可传 `by=["symbol", "timeframe"]` 或 `by=["symbol", "venue"]`，`group_by` 是 `by` 的等价别名。
 
+### 交易日 / Session
+
+`date=` 按时间列和时区解释为自然日。期货夜盘、跨时区行情等场景应显式声明交易日/session 列：
+
+```python
+ticks = db.timeseries(
+    "futures_ticks",
+    time="ts",
+    primary_key=["symbol", "ts"],
+    columns={
+        "symbol": "text",
+        "ts": "integer",
+        "trading_date": "text",
+        "price": "float",
+    },
+    session_column="trading_date",
+)
+
+rows = ticks.query(session="2026-01-06", symbols="AU").to_list()
+snapshot = ticks.latest(
+    session="2026-01-06",
+    symbols="AU",
+    as_of=1767661200000,
+).one()
+```
+
+`session=` 会编译成对 `session_column` 的等值或 `in` 条件，可与 `symbols`、`start/end`、`date`、`where`、`latest()` 和 `asof()` 组合。
+
 ### 日历分区
 
 `Database.timeseries()` 默认适合毫秒时间戳。如果数据使用日期字符串，可以声明 `time_unit="date"` 和 `partition_kind="calendar"`：
@@ -152,6 +180,7 @@ rows = events.query(date="2026-01-06").to_list()
 | --- | --- | --- | --- |
 | K 线 | `ts` 毫秒时间戳 | `1day` duration | `symbol, timeframe, ts` |
 | orderbook | `ts` 毫秒时间戳 | `1hour` duration | `symbol, venue, ts, side, level` |
+| 期货夜盘 tick | `ts` 毫秒时间戳 + `trading_date` | `1day` duration + `session_column` | `symbol, ts` |
 | 财报 | `published_date` 日期字符串 | `1month` calendar | `symbol, fiscal_period, statement` |
 | 新闻/公告 | `event_ts` 毫秒时间戳或 `published_date` 日期 | duration 或 calendar | `symbol, event_ts, event_id` |
 

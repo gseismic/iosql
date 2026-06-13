@@ -286,6 +286,7 @@ class TableSpec:
     columns: Dict[str, Any] = field(default_factory=dict)
     schema_policy: str = "evolve"
     symbol_column: str = "symbol"
+    session_column: Optional[str] = None
     physical_layout: PhysicalLayout = field(default_factory=PhysicalLayout)
     version: int = 1
 
@@ -304,6 +305,8 @@ class TableSpec:
             self.physical_layout = PhysicalLayout.from_dict(self.physical_layout)
         self.columns = dict(self.columns or {})
         self.schema_policy = str(self.schema_policy or "evolve")
+        if self.session_column is not None:
+            self.session_column = str(self.session_column)
 
     @classmethod
     def ensure(cls, spec: Any) -> "TableSpec":
@@ -320,6 +323,7 @@ class TableSpec:
                    timezone: str = "UTC",
                    schema_policy: str = "evolve",
                    symbol_column: str = "symbol",
+                   session_column: Optional[str] = None,
                    target_rows_per_file: int = 400_000,
                    min_rows_per_file: int = 300_000,
                    max_rows_per_file: int = 500_000,
@@ -338,6 +342,7 @@ class TableSpec:
             columns=columns or {},
             schema_policy=schema_policy,
             symbol_column=symbol_column,
+            session_column=session_column,
             physical_layout=PhysicalLayout(
                 target_rows_per_file=target_rows_per_file,
                 min_rows_per_file=min_rows_per_file,
@@ -382,6 +387,7 @@ class TableSpec:
             "columns": dict(self.columns),
             "schema_policy": self.schema_policy,
             "symbol_column": self.symbol_column,
+            "session_column": self.session_column,
             "physical_layout": self.physical_layout.to_dict(),
         }
 
@@ -394,6 +400,7 @@ class TableSpec:
             columns=data.get("columns") or {},
             schema_policy=data.get("schema_policy", "evolve"),
             symbol_column=data.get("symbol_column", "symbol"),
+            session_column=data.get("session_column"),
             physical_layout=data.get("physical_layout") or {},
             version=data.get("version", 1),
         )
@@ -423,6 +430,8 @@ class TableSpec:
             partition=partition,
             columns=columns,
             schema_policy="evolve",
+            symbol_column="symbol",
+            session_column=None,
         )
 
 
@@ -454,6 +463,7 @@ class QuerySpec:
     start: Optional[Any] = None
     end: Optional[Any] = None
     date: Optional[Any] = None
+    session: Optional[Any] = None
     where: Optional[Any] = None
     order_by: Optional[Any] = None
     limit: Optional[int] = None
@@ -466,6 +476,7 @@ class QuerySpec:
             "start": self.start,
             "end": self.end,
             "date": self.date,
+            "session": self.session,
             "where": str(self.where) if self.where is not None else None,
             "order_by": self.order_by,
             "limit": self.limit,
