@@ -1,6 +1,7 @@
 from ..exception import BadArgument, IosqlBadArgument
 from .case import Case, CaseExpression
 from .case_util import flatten_expression
+from .text_where import parse_text_where
 
 
 def ensure_case(c):
@@ -43,10 +44,10 @@ class Where(object):
         AndCase: [case_or_expr..]
         OrCase: {case_or_expr..}
         '''
-        # 不支持text, 防止不同sql语法不通，不对字符串进行解析
-        # 更没有时间
         if where is None:
             self.where = None
+        elif isinstance(where, str):
+            self.where = parse_text_where(where)
         elif isinstance(where, Case):
             self.where = where
         elif isinstance(where, dict):

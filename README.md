@@ -101,12 +101,15 @@ rows = table.query(
     symbols=["AAPL", "MSFT"],
     start=1735689600000,
     end=1735776000000,
+    where="venue = 'NASDAQ'",
     order_by="ts desc",
     limit=100,
 ).to_list()
 
 plan = table.query(start=1735689600000, end=1735776000000).explain()
 ```
+
+`where` 支持 dict/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
 
 ### 日历分区
 

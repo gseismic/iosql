@@ -54,6 +54,18 @@ def test_timeseries_write_query_and_explain(tmp_path):
     ).to_list()
     assert [row["symbol"] for row in multi_symbol] == ["AAPL", "AAPL", "MSFT"]
 
+    text_where = ticks.query(
+        start=0,
+        end=2999,
+        where="price >= 2",
+        columns=["symbol", "ts", "price"],
+        order_by="ts",
+    ).to_list()
+    assert text_where == [
+        {"symbol": "AAPL", "ts": 1500, "price": 2.0},
+        {"symbol": "MSFT", "ts": 2500, "price": 3.0},
+    ]
+
     plan = ticks.query(symbols="AAPL", start=1000, end=1999).explain()
     assert plan.candidate_partitions == [0, 1000, 2000]
     assert plan.scanned_partitions == [1000]

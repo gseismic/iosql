@@ -59,7 +59,7 @@ def run():
         symbols="AAPL",
         start=base_ts,
         end=base_ts + 1000,
-        where={"field": "venue", "op": "=", "value": "NASDAQ"},
+        where="venue = 'NASDAQ'",
         order_by=["ts", "side", "level"],
         limit=8,
     )

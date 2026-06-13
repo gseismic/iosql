@@ -417,6 +417,11 @@ class Table(BaseTable):
             return where
         if where is None:
             return generated
+        if isinstance(where, str):
+            parsed = Where(where).or_and_cases or []
+            if not parsed:
+                return generated
+            return [list(cases) + generated for cases in parsed]
         if isinstance(where, dict):
             return [where] + generated
         if isinstance(where, (list, tuple)):
