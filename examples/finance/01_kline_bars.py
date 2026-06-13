@@ -72,7 +72,8 @@ def run():
     snapshot = bars.latest(
         symbols=["AAPL", "MSFT"],
         as_of=base_ts + 4 * 60_000,
-        columns=["symbol", "ts", "close"],
+        by=["symbol", "timeframe"],
+        columns=["symbol", "timeframe", "ts", "close"],
     ).to_list()
 
     print("写入行数:", result.rows_seen)

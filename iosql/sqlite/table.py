@@ -81,16 +81,21 @@ class _TableQuery:
 
 
 class _LatestQuery:
-    def __init__(self, table, query_spec, columns):
+    def __init__(self, table, query_spec, columns, by):
         self._table = table
         self._query_spec = query_spec
         self._columns = columns
+        self._by = by
 
     def explain(self):
         return self._table._build_query_plan(self._query_spec)
 
     def to_list(self):
-        return self._table._latest_rows(self._query_spec, self._columns)
+        return self._table._latest_rows(
+            self._query_spec,
+            self._columns,
+            self._by,
+        )
 
     def one(self):
         rows = self.to_list()
@@ -360,9 +365,18 @@ class Table(BaseTable):
         )
         return _TableQuery(self, spec)
 
-    def latest(self, symbols=None, as_of=None, columns='*', where=None):
+    def latest(
+        self,
+        symbols=None,
+        as_of=None,
+        columns='*',
+        where=None,
+        by=None,
+        group_by=None,
+    ):
         table_spec = self.spec()
         time_column = self._query_time_column(table_spec)
+        by = self._resolve_latest_by_arg(by, group_by)
         spec = QuerySpec(
             table=self._table_name,
             columns='*',
@@ -371,54 +385,106 @@ class Table(BaseTable):
             where=where,
             order_by=f'{time_column.name} desc',
         )
-        return _LatestQuery(self, spec, columns)
+        return _LatestQuery(self, spec, columns, by)
 
-    def asof(self, symbols=None, as_of=None, columns='*', where=None):
+    def asof(
+        self,
+        symbols=None,
+        as_of=None,
+        columns='*',
+        where=None,
+        by=None,
+        group_by=None,
+    ):
         return self.latest(
             symbols=symbols,
             as_of=as_of,
             columns=columns,
             where=where,
+            by=by,
+            group_by=group_by,
         )
 
     def segments(self):
         return [ref.to_dict() for ref in self._physical_part_refs()]
 
-    def _latest_rows(self, query_spec, columns):
+    def _latest_rows(self, query_spec, columns, by):
         table_spec = self.spec()
         if not table_spec:
             raise BadArgument('latest requires a TableSpec')
         symbol_column = table_spec.symbol_column
+        group_fields = self._normalize_latest_by(by, symbol_column)
         rows = _TableQuery(self, query_spec).to_list()
         if not rows:
             return []
 
-        if symbol_column not in rows[0]:
-            if query_spec.symbols is not None:
-                raise BadArgument(
-                    f'latest requires symbol column `{symbol_column}`'
-                )
-            return self._project_rows(rows[:1], columns)
+        self._ensure_latest_fields(rows[0], group_fields)
 
         requested_symbols = self._normalize_symbols(query_spec.symbols)
-        latest_by_symbol = OrderedDict()
+        latest_by_key = OrderedDict()
         for row in rows:
-            symbol = row.get(symbol_column)
-            if symbol in latest_by_symbol:
+            if requested_symbols is not None:
+                symbol = row.get(symbol_column)
+                if symbol not in requested_symbols:
+                    continue
+            key = tuple(row[field] for field in group_fields)
+            if key in latest_by_key:
                 continue
-            if requested_symbols is not None and symbol not in requested_symbols:
-                continue
-            latest_by_symbol[symbol] = row
+            latest_by_key[key] = row
 
         if requested_symbols is None:
-            latest_rows = list(latest_by_symbol.values())
+            latest_rows = list(latest_by_key.values())
         else:
-            latest_rows = [
-                latest_by_symbol[symbol]
-                for symbol in requested_symbols
-                if symbol in latest_by_symbol
-            ]
+            latest_rows = self._order_latest_rows_by_symbols(
+                latest_by_key,
+                requested_symbols,
+                symbol_column,
+                group_fields,
+            )
         return self._project_rows(latest_rows, columns)
+
+    def _normalize_latest_by(self, by, symbol_column):
+        if by is None:
+            return [symbol_column]
+        if isinstance(by, str):
+            fields = [item.strip() for item in by.split(',') if item.strip()]
+        elif isinstance(by, (list, tuple)):
+            fields = list(by)
+        else:
+            raise BadArgument('latest by must be a string/list/tuple')
+        if not fields:
+            raise BadArgument('latest by must not be empty')
+        return fields
+
+    def _resolve_latest_by_arg(self, by, group_by):
+        if by is not None and group_by is not None and by != group_by:
+            raise BadArgument('latest by and group_by conflict')
+        return group_by if by is None else by
+
+    def _ensure_latest_fields(self, row, fields):
+        missing = [field for field in fields if field not in row]
+        if missing:
+            raise BadArgument(
+                f'latest grouping field missing from row: {missing}'
+            )
+
+    def _order_latest_rows_by_symbols(
+        self,
+        latest_by_key,
+        requested_symbols,
+        symbol_column,
+        group_fields,
+    ):
+        if symbol_column not in group_fields:
+            return list(latest_by_key.values())
+
+        symbol_index = group_fields.index(symbol_column)
+        rows = []
+        for symbol in requested_symbols:
+            for key, row in latest_by_key.items():
+                if key[symbol_index] == symbol:
+                    rows.append(row)
+        return rows
 
     def _normalize_symbols(self, symbols):
         if symbols is None:

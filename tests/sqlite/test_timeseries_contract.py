@@ -7,7 +7,7 @@ from iosql import (
     TableSpec,
     TimeColumn,
 )
-from iosql.exception import UnsafeOperation
+from iosql.exception import BadArgument, UnsafeOperation
 
 
 def _uri(tmp_path, name="market.iosql"):
@@ -37,6 +37,7 @@ def _latest_ticks(tmp_path):
         primary_key=["symbol", "ts"],
         columns={
             "symbol": "text",
+            "timeframe": "text",
             "ts": "integer",
             "price": "float",
             "venue": "text",
@@ -47,11 +48,48 @@ def _latest_ticks(tmp_path):
         max_rows_per_file=1,
     )
     ticks.write([
-        {"symbol": "AAPL", "ts": 1000, "price": 1.0, "venue": "NASDAQ"},
-        {"symbol": "MSFT", "ts": 1500, "price": 2.0, "venue": "NASDAQ"},
-        {"symbol": "AAPL", "ts": 2000, "price": 3.0, "venue": "NASDAQ"},
-        {"symbol": "MSFT", "ts": 2500, "price": 4.0, "venue": "NYSE"},
-        {"symbol": "AAPL", "ts": 3000, "price": 5.0, "venue": "NYSE"},
+        {
+            "symbol": "AAPL",
+            "timeframe": "1m",
+            "ts": 1000,
+            "price": 1.0,
+            "venue": "NASDAQ",
+        },
+        {
+            "symbol": "MSFT",
+            "timeframe": "1m",
+            "ts": 1500,
+            "price": 2.0,
+            "venue": "NASDAQ",
+        },
+        {
+            "symbol": "AAPL",
+            "timeframe": "1m",
+            "ts": 2000,
+            "price": 3.0,
+            "venue": "NASDAQ",
+        },
+        {
+            "symbol": "MSFT",
+            "timeframe": "1m",
+            "ts": 2500,
+            "price": 4.0,
+            "venue": "NYSE",
+        },
+        {
+            "symbol": "AAPL",
+            "timeframe": "5m",
+            "ts": 2800,
+            "price": 4.5,
+            "venue": "NASDAQ",
+        },
+        {
+            "symbol": "AAPL",
+            "timeframe": "1m",
+            "ts": 3000,
+            "price": 5.0,
+            "venue": "NYSE",
+        },
     ])
     return db, ticks
 
@@ -147,7 +185,7 @@ def test_latest_combines_text_where_and_asof_alias(tmp_path):
     rows = ticks.asof(
         symbols=["AAPL", "MSFT"],
         as_of=4000,
-        where="venue = 'NASDAQ'",
+        where="venue = 'NASDAQ' and timeframe = '1m'",
         columns=["symbol", "ts", "venue"],
     ).to_list()
 
@@ -155,6 +193,78 @@ def test_latest_combines_text_where_and_asof_alias(tmp_path):
         {"symbol": "AAPL", "ts": 2000, "venue": "NASDAQ"},
         {"symbol": "MSFT", "ts": 1500, "venue": "NASDAQ"},
     ]
+
+
+def test_latest_groups_by_symbol_and_timeframe(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    rows = ticks.latest(
+        symbols=["AAPL", "MSFT"],
+        as_of=4000,
+        by=["symbol", "timeframe"],
+        columns=["symbol", "timeframe", "ts", "price"],
+    ).to_list()
+
+    assert rows == [
+        {"symbol": "AAPL", "timeframe": "1m", "ts": 3000, "price": 5.0},
+        {"symbol": "AAPL", "timeframe": "5m", "ts": 2800, "price": 4.5},
+        {"symbol": "MSFT", "timeframe": "1m", "ts": 2500, "price": 4.0},
+    ]
+
+
+def test_asof_groups_by_symbol_and_venue(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    rows = ticks.asof(
+        symbols=["AAPL"],
+        as_of=4000,
+        by=["symbol", "venue"],
+        columns=["symbol", "venue", "ts", "price"],
+    ).to_list()
+
+    assert rows == [
+        {"symbol": "AAPL", "venue": "NYSE", "ts": 3000, "price": 5.0},
+        {"symbol": "AAPL", "venue": "NASDAQ", "ts": 2800, "price": 4.5},
+    ]
+
+
+def test_latest_group_by_alias(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    rows = ticks.latest(
+        symbols="AAPL",
+        as_of=4000,
+        group_by=["symbol", "timeframe"],
+        columns=["symbol", "timeframe", "ts"],
+    ).to_list()
+
+    assert rows == [
+        {"symbol": "AAPL", "timeframe": "1m", "ts": 3000},
+        {"symbol": "AAPL", "timeframe": "5m", "ts": 2800},
+    ]
+
+
+def test_latest_rejects_conflicting_by_arguments(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    with pytest.raises(BadArgument, match="by and group_by conflict"):
+        ticks.latest(
+            symbols="AAPL",
+            as_of=4000,
+            by=["symbol"],
+            group_by=["symbol", "timeframe"],
+        ).to_list()
+
+
+def test_latest_rejects_missing_group_field(tmp_path):
+    _, ticks = _latest_ticks(tmp_path)
+
+    with pytest.raises(BadArgument, match="latest grouping field missing"):
+        ticks.latest(
+            symbols="AAPL",
+            as_of=4000,
+            by=["symbol", "session"],
+        ).to_list()
 
 
 def test_latest_explain_uses_segment_pruning(tmp_path):

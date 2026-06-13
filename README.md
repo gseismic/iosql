@@ -113,7 +113,8 @@ segments = table.segments()
 snapshot = table.latest(
     symbols=["AAPL", "MSFT"],
     as_of=1735776000000,
-    columns=["symbol", "ts", "price"],
+    by=["symbol", "timeframe"],
+    columns=["symbol", "timeframe", "ts", "price"],
 ).to_list()
 ```
 
@@ -123,7 +124,7 @@ snapshot = table.latest(
 
 开启物理 segment 后，`write(mode="upsert")` / `write(mode="replace")` / `write(mode="ignore")` 仍按逻辑表主键处理已有行，不会因为同一逻辑分区拆成多个文件而绕过主键语义。
 
-`latest()` / `asof()` 用于金融截面查询，返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。
+`latest()` / `asof()` 用于金融截面查询，默认返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。K 线、orderbook 等多维数据可传 `by=["symbol", "timeframe"]` 或 `by=["symbol", "venue"]`，`group_by` 是 `by` 的等价别名。
 
 ### 日历分区
 
