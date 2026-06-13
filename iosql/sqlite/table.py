@@ -28,6 +28,7 @@ from ..spec import (
     QueryPlan,
     QuerySpec,
     RepartitionResult,
+    SegmentInfo,
     TableSpec,
     WriteResult,
 )
@@ -48,6 +49,7 @@ from .const import (
     _TABLE_META_TABLE_NAME,
     _TABLE_PART_COLUMN_RANGE_TABLE_NAME,
     _TABLE_PART_TABLE_NAME,
+    _TABLE_SEGMENT_TABLE_NAME,
     _TABLE_PARTS_SUBDIR,
 )
 from .query_util import build_delete_sql, build_select_cases_sql
@@ -333,6 +335,9 @@ class Table(BaseTable):
         )
         return _TableQuery(self, spec)
 
+    def segments(self):
+        return [ref.to_dict() for ref in self._physical_part_refs()]
+
     def _schema_changed(self, before_meta, after_meta):
         if before_meta is None:
             return after_meta is not None
@@ -343,11 +348,11 @@ class Table(BaseTable):
     def _layout_warnings_for_parts(self, spec, parts):
         warnings_ = []
         max_rows = spec.physical_layout.max_rows_per_file
-        for part in parts:
-            row_count = self._partition_row_count(part)
+        for info in self._physical_part_refs(parts):
+            row_count = info.row_count
             if row_count > max_rows:
                 warnings_.append(
-                    f'partition {part} has {row_count} rows; '
+                    f'segment {info.part_key} has {row_count} rows; '
                     f'max_rows_per_file={max_rows}'
                 )
         return warnings_
@@ -444,6 +449,7 @@ class Table(BaseTable):
     def _build_query_plan(self, query_spec):
         compiled_where = self._compile_query_where(query_spec)
         all_parts = list(self.table_parts())
+        all_refs = self._physical_part_refs(all_parts)
         if not all_parts:
             return QueryPlan(
                 table=self._table_name,
@@ -455,17 +461,49 @@ class Table(BaseTable):
 
         w = Where(compiled_where)
         scanned = set()
+        scanned_ref_keys = set()
+        candidate_partition_keys = set()
         if not w.or_and_cases:
             scanned.update(all_parts)
+            candidate_partition_keys.update(all_parts)
+            scanned_ref_keys.update(
+                self._segment_lookup_key(ref) for ref in all_refs
+            )
         else:
             for cases in w.or_and_cases:
-                scanned.update(self._get_select_parts(cases))
+                candidate_parts = self._get_select_parts(cases)
+                candidate_partition_keys.update(candidate_parts)
+                candidate_refs = self._physical_part_refs(candidate_parts)
+                excluded = self._excluded_segments_by_cases(candidate_refs, cases)
+                part_refs = [
+                    ref for ref in candidate_refs
+                    if self._segment_lookup_key(ref) not in excluded
+                ]
+                scanned.update(ref.logical_part for ref in part_refs)
+                scanned_ref_keys.update(
+                    self._segment_lookup_key(ref) for ref in part_refs
+                )
 
         scanned_partitions = [part for part in all_parts if part in scanned]
         skipped_partitions = [part for part in all_parts if part not in scanned]
-        skip_reasons = {
-            part: 'pruned_by_partition_range'
-            for part in skipped_partitions
+        skip_reasons = {}
+        for part in skipped_partitions:
+            if part in candidate_partition_keys:
+                skip_reasons[part] = 'pruned_by_segment_time_range'
+            else:
+                skip_reasons[part] = 'pruned_by_partition_range'
+        scanned_segments = [
+            ref for ref in all_refs
+            if self._segment_lookup_key(ref) in scanned_ref_keys
+        ]
+        skipped_segments = [
+            ref for ref in all_refs
+            if self._segment_lookup_key(ref) not in scanned_ref_keys
+        ]
+        segment_skip_reasons = {
+            ref.part_key: 'pruned_by_segment_time_range'
+            for ref in skipped_segments
+            if ref.logical_part in candidate_partition_keys
         }
         return QueryPlan(
             table=self._table_name,
@@ -477,8 +515,18 @@ class Table(BaseTable):
             scanned_partitions=scanned_partitions,
             skipped_partitions=skipped_partitions,
             skip_reasons=skip_reasons,
-            requires_global_sort=bool(query_spec.order_by and len(scanned_partitions) > 1),
-            requires_python_limit=bool(query_spec.limit is not None and len(scanned_partitions) > 1),
+            candidate_segments=[
+                self._segment_to_plan_item(ref) for ref in all_refs
+            ],
+            scanned_segments=[
+                self._segment_to_plan_item(ref) for ref in scanned_segments
+            ],
+            skipped_segments=[
+                self._segment_to_plan_item(ref) for ref in skipped_segments
+            ],
+            segment_skip_reasons=segment_skip_reasons,
+            requires_global_sort=bool(query_spec.order_by and len(scanned_segments) > 1),
+            requires_python_limit=bool(query_spec.limit is not None and len(scanned_segments) > 1),
         )
 
     def _get_part_dbfile(self, part_key):
@@ -491,6 +539,267 @@ class Table(BaseTable):
             Full path to the partition file
         """
         return os.path.join(self.table_part_path, f"{part_key}.sqlite3")
+
+    def _quote_identifier(self, value):
+        return '"' + str(value).replace('"', '""') + '"'
+
+    def _part_token(self, part):
+        return str(part)
+
+    def _bool_value(self, value):
+        if isinstance(value, str):
+            return value.strip().lower() not in ['', '0', 'false', 'none']
+        return bool(value)
+
+    def _segment_part_key(self, logical_part, segment_id):
+        return f'{logical_part}__{int(segment_id):06d}'
+
+    def _segment_from_row(self, row):
+        return SegmentInfo(
+            logical_part=row['logical_part'],
+            segment_id=int(row['segment_id']),
+            part_key=row['part_key'],
+            path=self._get_part_dbfile(row['part_key']),
+            row_count=int(row.get('row_count') or 0),
+            time_min=row.get('time_min'),
+            time_max=row.get('time_max'),
+            sealed=self._bool_value(row.get('sealed')),
+            generation=int(row.get('generation') or 0),
+        )
+
+    def _segment_infos(self, logical_parts=None):
+        try:
+            rows = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].select(
+                '*',
+                where=f'table_name="{self._table_name}"',
+                to_dict=True,
+            )
+        except NoSuchTable:
+            return []
+
+        if logical_parts is not None:
+            wanted = {self._part_token(part) for part in logical_parts}
+            rows = [
+                row for row in rows
+                if self._part_token(row['logical_part']) in wanted
+            ]
+
+        infos = [self._segment_from_row(row) for row in rows]
+        return sorted(
+            infos,
+            key=lambda item: (self._part_token(item.logical_part), item.segment_id),
+        )
+
+    def _segment_lookup_key(self, info):
+        return self._part_token(info.part_key)
+
+    def _segment_to_plan_item(self, info):
+        return info.to_dict()
+
+    def _segment_created_at(self, logical_part, segment_id):
+        for info in self._segment_infos([logical_part]):
+            if info.segment_id == segment_id:
+                try:
+                    row = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].select_one(
+                        'created_at',
+                        where=(
+                            f'table_name="{self._table_name}" '
+                            f'and logical_part="{logical_part}" '
+                            f'and segment_id="{segment_id}"'
+                        ),
+                    )
+                except NoSuchTable:
+                    return None
+                return row.get('created_at') if row else None
+        return None
+
+    def _upsert_segment_info(self, info):
+        now = arrow.now().format("YYYY-MM-DD HH:mm:ss")
+        row = {
+            'table_name': self._table_name,
+            'logical_part': info.logical_part,
+            'segment_id': info.segment_id,
+            'part_key': info.part_key,
+            'path': info.path,
+            'row_count': info.row_count,
+            'time_min': info.time_min,
+            'time_max': info.time_max,
+            'created_at': self._segment_created_at(
+                info.logical_part,
+                info.segment_id,
+            ) or now,
+            'updated_at': now,
+            'sealed': int(bool(info.sealed)),
+            'generation': info.generation,
+        }
+        self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].insert(
+            row,
+            pk=['table_name', 'logical_part', 'segment_id'],
+            replace=True,
+            ensure_table=True,
+            commit=True,
+        )
+
+    def _data_file_row_count(self, part_key):
+        part_dbfile = self._get_part_dbfile(part_key)
+        if not os.path.isfile(part_dbfile):
+            return 0
+        db = self.get_part_db(part_dbfile, auto_commit=False)
+        try:
+            rows = db[_PART_DATA_TABLE_NAME].query(
+                f'select COUNT(*) from {_PART_DATA_TABLE_NAME};'
+            )
+        except NoSuchTable:
+            return 0
+        if not rows:
+            return 0
+        return dict(rows[0]).get('COUNT(*)', 0)
+
+    def _data_file_time_range(self, part_key):
+        spec = self.spec()
+        if not spec or not spec.time:
+            return None, None
+
+        part_dbfile = self._get_part_dbfile(part_key)
+        if not os.path.isfile(part_dbfile):
+            return None, None
+
+        db = self.get_part_db(part_dbfile, auto_commit=False)
+        field = self._quote_identifier(spec.time.name)
+        try:
+            rows = db[_PART_DATA_TABLE_NAME].query(
+                (
+                    f'select MIN({field}) as time_min, '
+                    f'MAX({field}) as time_max from {_PART_DATA_TABLE_NAME};'
+                ),
+                to_dict=True,
+            )
+        except NoSuchTable:
+            return None, None
+        if not rows:
+            return None, None
+        row = rows[0]
+        return row.get('time_min'), row.get('time_max')
+
+    def _refresh_segment_info(self, logical_part, segment_id, part_key, layout):
+        row_count = self._data_file_row_count(part_key)
+        time_min, time_max = self._data_file_time_range(part_key)
+        info = SegmentInfo(
+            logical_part=logical_part,
+            segment_id=segment_id,
+            part_key=part_key,
+            path=self._get_part_dbfile(part_key),
+            row_count=row_count,
+            time_min=time_min,
+            time_max=time_max,
+            sealed=row_count >= layout.max_rows_per_file,
+        )
+        self._upsert_segment_info(info)
+        return info
+
+    def _active_segment_for(self, logical_part, layout):
+        segments = self._segment_infos([logical_part])
+        for info in reversed(segments):
+            if not info.sealed and info.row_count < layout.max_rows_per_file:
+                return info
+
+        next_segment_id = 0
+        if segments:
+            next_segment_id = max(item.segment_id for item in segments) + 1
+        part_key = self._segment_part_key(logical_part, next_segment_id)
+        return SegmentInfo(
+            logical_part=logical_part,
+            segment_id=next_segment_id,
+            part_key=part_key,
+            path=self._get_part_dbfile(part_key),
+            row_count=0,
+        )
+
+    def _legacy_segment_info(self, logical_part):
+        path = self._get_part_dbfile(logical_part)
+        if not os.path.isfile(path):
+            return None
+        time_min, time_max = self._data_file_time_range(logical_part)
+        return SegmentInfo(
+            logical_part=logical_part,
+            segment_id=-1,
+            part_key=logical_part,
+            path=path,
+            row_count=self._data_file_row_count(logical_part),
+            time_min=time_min,
+            time_max=time_max,
+            sealed=True,
+        )
+
+    def _physical_part_refs(self, logical_parts=None):
+        parts = self.table_parts() if logical_parts is None else list(logical_parts)
+        refs = []
+        for part in parts:
+            legacy = self._legacy_segment_info(part)
+            if legacy is not None:
+                refs.append(legacy)
+        refs.extend(self._segment_infos(parts))
+
+        order = {self._part_token(part): index for index, part in enumerate(parts)}
+        return sorted(
+            refs,
+            key=lambda item: (
+                order.get(self._part_token(item.logical_part), len(order)),
+                item.segment_id,
+            ),
+        )
+
+    def _excluded_segments_by_case(self, refs, case):
+        table_spec = self.spec()
+        if not table_spec or not table_spec.time:
+            return set()
+        if case.field != table_spec.time.name:
+            return set()
+
+        op, case_min, case_max = self._case_partition_range(case)
+        excluded = set()
+        for info in refs:
+            time_min = info.time_min
+            time_max = info.time_max
+            if not self._is_numeric_range(case_min, case_max, time_min, time_max):
+                continue
+            if (
+                case_max is not None
+                and time_min is not None
+                and (
+                    case_max < time_min
+                    or (op in ['lt', '<'] and case_max <= time_min)
+                )
+            ):
+                excluded.add(self._segment_lookup_key(info))
+            if (
+                case_min is not None
+                and time_max is not None
+                and (
+                    case_min > time_max
+                    or (op in ['gt', '>'] and case_min >= time_max)
+                )
+            ):
+                excluded.add(self._segment_lookup_key(info))
+        return excluded
+
+    def _excluded_segments_by_cases(self, refs, cases):
+        excluded = set()
+        for case in cases or []:
+            excluded.update(self._excluded_segments_by_case(refs, case))
+        return excluded
+
+    def _get_select_part_refs(self, cases):
+        need_parts = self._get_select_parts(cases)
+        refs = self._physical_part_refs(need_parts)
+        if not cases:
+            return refs
+
+        excluded = self._excluded_segments_by_cases(refs, cases)
+        return [
+            ref for ref in refs
+            if self._segment_lookup_key(ref) not in excluded
+        ]
 
     def select_all(self, fields, where, limit=None, to_dict=False, **kwargs):
         return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
@@ -732,14 +1041,14 @@ class Table(BaseTable):
         """
         # table field必须的，涉及到查询是否需要加 "
         # 分成独立文件是为了同步数据方便，也导致数据容易被盗
-        need_parts = self._get_select_parts(cases)
+        need_refs = self._get_select_part_refs(cases)
         data = []
-        for part in need_parts:
+        for ref in need_refs:
             part_table_name = _PART_DATA_TABLE_NAME
             sql = build_select_cases_sql(part_table_name, fields, cases, column_types)
-            part_dbfile = self._get_part_dbfile(part)
+            part_dbfile = self._get_part_dbfile(ref.part_key)
 
-            logger.debug(f"{part_dbfile}: {part}: SQL: {sql}")
+            logger.debug(f"{part_dbfile}: {ref.part_key}: SQL: {sql}")
             part_table_name = _PART_DATA_TABLE_NAME
             db = self.get_part_db(part_dbfile, auto_commit=False)
             # part_data = db[part_table_name].query(sql, to_dict=True)
@@ -750,9 +1059,8 @@ class Table(BaseTable):
         return data
 
     def create_index(self, column, order="asc", exist_ok=True):
-        table_parts = self.table_parts()
-        for table_part in table_parts:
-            part_dbfile = self._get_part_dbfile(table_part)
+        for ref in self._physical_part_refs():
+            part_dbfile = self._get_part_dbfile(ref.part_key)
             part_db = self.get_part_db(part_dbfile, auto_commit=True)
             part_db[_PART_DATA_TABLE_NAME].create_index(
                 column, order, exist_ok=exist_ok
@@ -870,11 +1178,13 @@ class Table(BaseTable):
 
     def _delete_and_cases(self, cases, column_types):
         """Delete rows matching And[Case..] from all relevant partitions."""
-        need_parts = self._get_select_parts(cases)
+        need_refs = self._get_select_part_refs(cases)
         total_deleted = 0
+        spec = self.spec()
+        layout = spec.physical_layout if spec else PhysicalLayout()
 
-        for part in need_parts:
-            part_dbfile = self._get_part_dbfile(part)
+        for ref in need_refs:
+            part_dbfile = self._get_part_dbfile(ref.part_key)
             db = self.get_part_db(part_dbfile, auto_commit=True)
             part_table = db[_PART_DATA_TABLE_NAME]
 
@@ -891,6 +1201,13 @@ class Table(BaseTable):
                 logger.debug(f"{part_dbfile}: DELETE: {delete_sql}")
                 db.execute(delete_sql)
                 total_deleted += count
+                if ref.segment_id >= 0:
+                    self._refresh_segment_info(
+                        ref.logical_part,
+                        ref.segment_id,
+                        ref.part_key,
+                        layout,
+                    )
 
         return total_deleted
 
@@ -932,21 +1249,87 @@ class Table(BaseTable):
 
         # Get ts_col for range calculation (needed for metadata)
         ts_col = part_obj.TS_COL if part_obj else None
+        table_spec = kwargs.get("table_spec")
+        segment_spec = None
+        if table_spec is not None and part_obj is not None:
+            segment_spec = TableSpec.ensure(table_spec)
+        segment_kwargs = dict(kwargs)
+        segment_kwargs.pop("table_spec", None)
 
         for part_key, part_data in partitioned_data.items():
+            if segment_spec is not None:
+                self._do_insert_segmented(
+                    part_key,
+                    ts_col,
+                    part_data,
+                    pk,
+                    partition=part_obj,
+                    replace=replace,
+                    ignore=ignore,
+                    commit=commit,
+                    table_spec=segment_spec,
+                    **segment_kwargs,
+                )
+            else:
+                self._do_insert_part(
+                    part_key,
+                    ts_col,
+                    part_data,
+                    pk,
+                    partition=part_obj,
+                    replace=replace,
+                    ignore=ignore,
+                    commit=commit,
+                    **kwargs,
+                )
+        _t2 = time.time()
+        logger.debug(f"Insert Time: {_t2 - _t1}")
+
+    def _do_insert_segmented(
+        self,
+        logical_part,
+        part_column,
+        part_data,
+        pk,
+        partition=None,
+        replace=False,
+        ignore=False,
+        commit=True,
+        table_spec=None,
+        **kwargs,
+    ):
+        layout = table_spec.physical_layout
+        rows = list(part_data)
+        part_kwargs = dict(kwargs)
+        part_kwargs["table_spec"] = table_spec.to_dict()
+        while rows:
+            active = self._active_segment_for(logical_part, layout)
+            capacity = layout.max_rows_per_file - active.row_count
+            if capacity <= 0:
+                active.sealed = True
+                self._upsert_segment_info(active)
+                continue
+
+            batch = rows[:capacity]
             self._do_insert_part(
-                part_key,
-                ts_col,
-                part_data,
+                active.part_key,
+                part_column,
+                batch,
                 pk,
-                partition=part_obj,
+                partition=partition,
                 replace=replace,
                 ignore=ignore,
                 commit=commit,
-                **kwargs,
+                logical_part=logical_part,
+                **part_kwargs,
             )
-        _t2 = time.time()
-        logger.debug(f"Insert Time: {_t2 - _t1}")
+            self._refresh_segment_info(
+                logical_part,
+                active.segment_id,
+                active.part_key,
+                layout,
+            )
+            rows = rows[len(batch):]
 
     def _do_insert_part(
         self,
@@ -958,6 +1341,7 @@ class Table(BaseTable):
         replace=False,
         ignore=False,
         commit=True,
+        logical_part=None,
         **kwargs,
     ):
         # 一个table 一个文件夹
@@ -1022,7 +1406,8 @@ class Table(BaseTable):
             self.do_create_table(part_dbfile, part_table_name, createtable_meta, alter)
 
             # update meta
-            self._update_meta(part, part_column, partition, createtable_meta)
+            meta_part = part if logical_part is None else logical_part
+            self._update_meta(meta_part, part_column, partition, createtable_meta)
 
             # write data
             # db = MyDatabase(part_dbfile, auto_commit=True, pragma_dict=self._pragma_dict)
@@ -1061,7 +1446,8 @@ class Table(BaseTable):
                 createtable_meta["column_info"] = new_column_info
 
             # update meta
-            self._update_meta(part, part_column, partition, createtable_meta)
+            meta_part = part if logical_part is None else logical_part
+            self._update_meta(meta_part, part_column, partition, createtable_meta)
 
             # write data
             # db = MyDatabase(part_dbfile, auto_commit=True, pragma_dict=self._pragma_dict)
@@ -1225,22 +1611,13 @@ class Table(BaseTable):
             db.close()
 
     def _part_rows(self, part):
-        return self._rows_from_part_dbfile(self._get_part_dbfile(part))
+        rows = []
+        for ref in self._physical_part_refs([part]):
+            rows.extend(self._rows_from_part_dbfile(self._get_part_dbfile(ref.part_key)))
+        return rows
 
     def _partition_row_count(self, part):
-        part_dbfile = self._get_part_dbfile(part)
-        if not os.path.isfile(part_dbfile):
-            return 0
-        db = self.get_part_db(part_dbfile, auto_commit=False)
-        try:
-            rows = db[_PART_DATA_TABLE_NAME].query(
-                f'select COUNT(*) from {_PART_DATA_TABLE_NAME};'
-            )
-        except NoSuchTable:
-            return 0
-        if not rows:
-            return 0
-        return dict(rows[0]).get('COUNT(*)', 0)
+        return sum(ref.row_count for ref in self._physical_part_refs([part]))
 
     def _partition_time_range(self, part, rows=None):
         spec = self.spec()
@@ -1260,21 +1637,20 @@ class Table(BaseTable):
         spec = self.spec()
         layout = spec.physical_layout if spec else PhysicalLayout()
         stats = []
-        for part in self.table_parts():
-            rows = self._part_rows(part)
-            row_count = len(rows)
-            time_min, time_max = self._partition_time_range(part, rows=rows)
+        refs = self._physical_part_refs()
+        for ref in refs:
+            row_count = ref.row_count
             stats.append(PartitionStats(
-                partition_id=part,
-                path=self._get_part_dbfile(part),
+                partition_id=ref.part_key,
+                path=self._get_part_dbfile(ref.part_key),
                 row_count=row_count,
-                time_min=time_min,
-                time_max=time_max,
+                time_min=ref.time_min,
+                time_max=ref.time_max,
                 oversized=row_count > layout.max_rows_per_file,
                 undersized=(
                     row_count < layout.min_rows_per_file
                     and row_count > 0
-                    and len(self.table_parts()) > 1
+                    and len(refs) > 1
                 ),
             ))
 
@@ -1338,10 +1714,9 @@ class Table(BaseTable):
         #                                          partition=partition, **kwargs)
 
         # 每个part都手动增加字段
-        parts = self.table_parts()
-        for part in parts:
-            logger.info(f"Altering Table Schema: {part} ..")
-            part_dbfile = self._get_part_dbfile(part)
+        for ref in self._physical_part_refs():
+            logger.info(f"Altering Table Schema: {ref.part_key} ..")
+            part_dbfile = self._get_part_dbfile(ref.part_key)
             part_db = self.get_part_db(part_dbfile, auto_commit=True)
             for column, type_ in data_suggested_types.items():
                 try:

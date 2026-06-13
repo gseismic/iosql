@@ -6,6 +6,7 @@
 
 - **时序表契约**：用 `Database.timeseries()` 或 `TableSpec` 明确主键、时间列、列类型和分区策略。
 - **分区存储**：按时间把数据写入多个 SQLite 文件，降低单文件膨胀风险。
+- **物理 segment**：同一逻辑时间分区可按行数自动拆成多个 SQLite 文件，适合高频金融数据。
 - **分区裁剪**：按 `start` / `end` / `date` 查询时自动跳过不相关分区。
 - **批量写入**：`write()` 和 `write_buffer()` 提供面向时序表的写入入口。
 - **布局维护**：`layout_report()` 检查分区行数，`repartition_to()` 可生成新的分区布局。
@@ -107,9 +108,12 @@ rows = table.query(
 ).to_list()
 
 plan = table.query(start=1735689600000, end=1735776000000).explain()
+segments = table.segments()
 ```
 
 `where` 支持 dict/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
+
+`segments()` 返回物理文件级 manifest，包含逻辑分区、segment id、文件 key、行数和时间范围。`query().explain()` 同时返回逻辑分区和物理 segment 的候选/扫描/跳过信息。
 
 ### 日历分区
 
@@ -199,6 +203,7 @@ database/
 - `Database.timeseries()` 的时间列默认使用毫秒时间戳。
 - `Table.write()` 需要表存在 `TableSpec`，推荐优先使用 `Database.timeseries()` 创建时序表。
 - 多分区查询支持全局 `order_by` 和 `limit`，但结果会在 Python 层合并排序，扫描范围应尽量通过时间条件收窄。
+- 新建时序表会按 `max_rows_per_file` 自动拆分物理 segment；旧的单分区文件仍可读取，不会被原地迁移。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
 
 ## 变更记录

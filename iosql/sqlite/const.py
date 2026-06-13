@@ -10,5 +10,6 @@ _DEFAULT_N_SUGGEST_CHECK = None # 检查所有字段
 _TABLE_META_TABLE_NAME = 'meta'
 _TABLE_PART_TABLE_NAME = 'table_part'
 _TABLE_PART_COLUMN_RANGE_TABLE_NAME = 'table_part_column_range'
+_TABLE_SEGMENT_TABLE_NAME = '_iosql_segments'
 
 # _DEFAULT_PART_NAME = '__main__' 直接用str(None)

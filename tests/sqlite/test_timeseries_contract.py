@@ -211,7 +211,7 @@ def test_calendar_date_range_query_scans_only_overlapping_partitions(tmp_path):
     assert plan.skipped_partitions == ["20260201"]
 
 
-def test_layout_report_flags_oversized_partition(tmp_path):
+def test_segment_layout_splits_oversized_logical_partition(tmp_path):
     db = Database(_uri(tmp_path))
     ticks = db.timeseries(
         "ticks",
@@ -230,11 +230,40 @@ def test_layout_report_flags_oversized_partition(tmp_path):
         {"symbol": "NVDA", "ts": 3000, "price": 3.0},
     ])
 
-    assert result.layout_warnings
+    assert result.layout_warnings == []
+    assert result.partitions_touched == [0]
+
     report = ticks.layout_report()
     assert report.total_rows == 3
-    assert report.oversized_partitions == [0]
-    assert report.recommendation.startswith("repartition_to")
+    assert report.total_partitions == 2
+    assert report.oversized_partitions == []
+    assert [item.row_count for item in report.partitions] == [2, 1]
+    assert [item.partition_id for item in report.partitions] == [
+        "0__000000",
+        "0__000001",
+    ]
+    assert [item["part_key"] for item in ticks.segments()] == [
+        "0__000000",
+        "0__000001",
+    ]
+
+    rows = ticks.query(
+        start=2500,
+        end=3500,
+        order_by="ts",
+    ).to_list()
+    assert rows == [{"symbol": "NVDA", "ts": 3000, "price": 3.0}]
+
+    plan = ticks.query(start=2500, end=3500).explain()
+    assert [item["part_key"] for item in plan.candidate_segments] == [
+        "0__000000",
+        "0__000001",
+    ]
+    assert [item["part_key"] for item in plan.scanned_segments] == ["0__000001"]
+    assert [item["part_key"] for item in plan.skipped_segments] == ["0__000000"]
+    assert plan.segment_skip_reasons == {
+        "0__000000": "pruned_by_segment_time_range"
+    }
 
 
 def test_repartition_to_writes_new_database_without_touching_source(tmp_path):

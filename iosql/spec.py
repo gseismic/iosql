@@ -483,6 +483,10 @@ class QueryPlan:
     scanned_partitions: List[Any] = field(default_factory=list)
     skipped_partitions: List[Any] = field(default_factory=list)
     skip_reasons: Dict[Any, str] = field(default_factory=dict)
+    candidate_segments: List[Any] = field(default_factory=list)
+    scanned_segments: List[Any] = field(default_factory=list)
+    skipped_segments: List[Any] = field(default_factory=list)
+    segment_skip_reasons: Dict[Any, str] = field(default_factory=dict)
     requires_global_sort: bool = False
     requires_python_limit: bool = False
 
@@ -497,8 +501,38 @@ class QueryPlan:
             "scanned_partitions": list(self.scanned_partitions),
             "skipped_partitions": list(self.skipped_partitions),
             "skip_reasons": dict(self.skip_reasons),
+            "candidate_segments": list(self.candidate_segments),
+            "scanned_segments": list(self.scanned_segments),
+            "skipped_segments": list(self.skipped_segments),
+            "segment_skip_reasons": dict(self.segment_skip_reasons),
             "requires_global_sort": self.requires_global_sort,
             "requires_python_limit": self.requires_python_limit,
+        }
+
+
+@dataclass
+class SegmentInfo:
+    logical_part: Any
+    segment_id: int
+    part_key: str
+    path: str
+    row_count: int = 0
+    time_min: Optional[Any] = None
+    time_max: Optional[Any] = None
+    sealed: bool = False
+    generation: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "logical_part": self.logical_part,
+            "segment_id": self.segment_id,
+            "part_key": self.part_key,
+            "path": self.path,
+            "row_count": self.row_count,
+            "time_min": self.time_min,
+            "time_max": self.time_max,
+            "sealed": self.sealed,
+            "generation": self.generation,
         }
 
 
