@@ -670,6 +670,7 @@ class Table(BaseTable):
         scanned = set()
         scanned_ref_keys = set()
         candidate_partition_keys = set()
+        exclusion_reasons = {}
         if not w.or_and_cases:
             scanned.update(all_parts)
             candidate_partition_keys.update(all_parts)
@@ -681,7 +682,8 @@ class Table(BaseTable):
                 candidate_parts = self._get_select_parts(cases)
                 candidate_partition_keys.update(candidate_parts)
                 candidate_refs = self._physical_part_refs(candidate_parts)
-                excluded = self._excluded_segments_by_cases(candidate_refs, cases)
+                excluded = self._segment_exclusion_reasons(candidate_refs, cases)
+                exclusion_reasons.update(excluded)
                 part_refs = [
                     ref for ref in candidate_refs
                     if self._segment_lookup_key(ref) not in excluded
@@ -693,12 +695,6 @@ class Table(BaseTable):
 
         scanned_partitions = [part for part in all_parts if part in scanned]
         skipped_partitions = [part for part in all_parts if part not in scanned]
-        skip_reasons = {}
-        for part in skipped_partitions:
-            if part in candidate_partition_keys:
-                skip_reasons[part] = 'pruned_by_segment_time_range'
-            else:
-                skip_reasons[part] = 'pruned_by_partition_range'
         scanned_segments = [
             ref for ref in all_refs
             if self._segment_lookup_key(ref) in scanned_ref_keys
@@ -707,8 +703,21 @@ class Table(BaseTable):
             ref for ref in all_refs
             if self._segment_lookup_key(ref) not in scanned_ref_keys
         ]
+        skip_reasons = {}
+        for part in skipped_partitions:
+            if part in candidate_partition_keys:
+                skip_reasons[part] = self._partition_segment_skip_reason(
+                    part,
+                    skipped_segments,
+                    exclusion_reasons,
+                )
+            else:
+                skip_reasons[part] = 'pruned_by_partition_range'
         segment_skip_reasons = {
-            ref.part_key: 'pruned_by_segment_time_range'
+            ref.part_key: exclusion_reasons.get(
+                self._segment_lookup_key(ref),
+                'pruned_by_segment_time_range',
+            )
             for ref in skipped_segments
             if ref.logical_part in candidate_partition_keys
         }
@@ -770,6 +779,8 @@ class Table(BaseTable):
             row_count=int(row.get('row_count') or 0),
             time_min=row.get('time_min'),
             time_max=row.get('time_max'),
+            session_min=row.get('session_min'),
+            session_max=row.get('session_max'),
             sealed=self._bool_value(row.get('sealed')),
             generation=int(row.get('generation') or 0),
         )
@@ -831,6 +842,8 @@ class Table(BaseTable):
             'row_count': info.row_count,
             'time_min': info.time_min,
             'time_max': info.time_max,
+            'session_min': info.session_min,
+            'session_max': info.session_max,
             'created_at': self._segment_created_at(
                 info.logical_part,
                 info.segment_id,
@@ -844,6 +857,7 @@ class Table(BaseTable):
             pk=['table_name', 'logical_part', 'segment_id'],
             replace=True,
             ensure_table=True,
+            ensure_column=True,
             commit=True,
         )
 
@@ -888,9 +902,36 @@ class Table(BaseTable):
         row = rows[0]
         return row.get('time_min'), row.get('time_max')
 
+    def _data_file_session_range(self, part_key):
+        spec = self.spec()
+        if not spec or not spec.session_column:
+            return None, None
+
+        part_dbfile = self._get_part_dbfile(part_key)
+        if not os.path.isfile(part_dbfile):
+            return None, None
+
+        db = self.get_part_db(part_dbfile, auto_commit=False)
+        field = self._quote_identifier(spec.session_column)
+        try:
+            rows = db[_PART_DATA_TABLE_NAME].query(
+                (
+                    f'select MIN({field}) as session_min, '
+                    f'MAX({field}) as session_max from {_PART_DATA_TABLE_NAME};'
+                ),
+                to_dict=True,
+            )
+        except NoSuchTable:
+            return None, None
+        if not rows:
+            return None, None
+        row = rows[0]
+        return row.get('session_min'), row.get('session_max')
+
     def _refresh_segment_info(self, logical_part, segment_id, part_key, layout):
         row_count = self._data_file_row_count(part_key)
         time_min, time_max = self._data_file_time_range(part_key)
+        session_min, session_max = self._data_file_session_range(part_key)
         info = SegmentInfo(
             logical_part=logical_part,
             segment_id=segment_id,
@@ -899,6 +940,8 @@ class Table(BaseTable):
             row_count=row_count,
             time_min=time_min,
             time_max=time_max,
+            session_min=session_min,
+            session_max=session_max,
             sealed=row_count >= layout.max_rows_per_file,
         )
         self._upsert_segment_info(info)
@@ -1033,6 +1076,7 @@ class Table(BaseTable):
         if not os.path.isfile(path):
             return None
         time_min, time_max = self._data_file_time_range(logical_part)
+        session_min, session_max = self._data_file_session_range(logical_part)
         return SegmentInfo(
             logical_part=logical_part,
             segment_id=-1,
@@ -1041,6 +1085,8 @@ class Table(BaseTable):
             row_count=self._data_file_row_count(logical_part),
             time_min=time_min,
             time_max=time_max,
+            session_min=session_min,
+            session_max=session_max,
             sealed=True,
         )
 
@@ -1096,11 +1142,57 @@ class Table(BaseTable):
                 excluded.add(self._segment_lookup_key(info))
         return excluded
 
-    def _excluded_segments_by_cases(self, refs, cases):
+    def _excluded_segments_by_session_case(self, refs, case):
+        table_spec = self.spec()
+        if not table_spec or not table_spec.session_column:
+            return set()
+        if case.field != table_spec.session_column:
+            return set()
+        if case.op in ['eq', '==', '=']:
+            values = [case.value['value']]
+        elif case.op == 'in':
+            values = list(case.value['value'])
+        else:
+            return set()
+
         excluded = set()
-        for case in cases or []:
-            excluded.update(self._excluded_segments_by_case(refs, case))
+        for info in refs:
+            if self._session_values_outside_segment(values, info):
+                excluded.add(self._segment_lookup_key(info))
         return excluded
+
+    def _session_values_outside_segment(self, values, info):
+        if info.session_min is None or info.session_max is None:
+            return False
+        try:
+            for value in values:
+                if info.session_min <= value <= info.session_max:
+                    return False
+        except TypeError:
+            return False
+        return True
+
+    def _segment_exclusion_reasons(self, refs, cases):
+        reasons = {}
+        for case in cases or []:
+            for key in self._excluded_segments_by_case(refs, case):
+                reasons.setdefault(key, 'pruned_by_segment_time_range')
+            for key in self._excluded_segments_by_session_case(refs, case):
+                reasons[key] = 'pruned_by_segment_session_range'
+        return reasons
+
+    def _excluded_segments_by_cases(self, refs, cases):
+        return set(self._segment_exclusion_reasons(refs, cases))
+
+    def _partition_segment_skip_reason(self, part, skipped_segments, reasons):
+        part_reasons = [
+            reasons.get(self._segment_lookup_key(ref))
+            for ref in skipped_segments
+            if ref.logical_part == part
+        ]
+        if 'pruned_by_segment_session_range' in part_reasons:
+            return 'pruned_by_segment_session_range'
+        return 'pruned_by_segment_time_range'
 
     def _get_select_part_refs(self, cases):
         need_parts = self._get_select_parts(cases)

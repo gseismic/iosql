@@ -120,7 +120,7 @@ snapshot = table.latest(
 
 `where` 支持 dict/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
 
-`segments()` 返回物理文件级 manifest，包含逻辑分区、segment id、文件 key、行数和时间范围。`query().explain()` 同时返回逻辑分区和物理 segment 的候选/扫描/跳过信息。
+`segments()` 返回物理文件级 manifest，包含逻辑分区、segment id、文件 key、行数、时间范围和 session 范围。`query().explain()` 同时返回逻辑分区和物理 segment 的候选/扫描/跳过信息。
 
 开启物理 segment 后，`write(mode="upsert")` / `write(mode="replace")` / `write(mode="ignore")` 仍按逻辑表主键处理已有行，不会因为同一逻辑分区拆成多个文件而绕过主键语义。
 
@@ -152,7 +152,7 @@ snapshot = ticks.latest(
 ).one()
 ```
 
-`session=` 会编译成对 `session_column` 的等值或 `in` 条件，可与 `symbols`、`start/end`、`date`、`where`、`latest()` 和 `asof()` 组合。
+`session=` 会编译成对 `session_column` 的等值或 `in` 条件，可与 `symbols`、`start/end`、`date`、`where`、`latest()` 和 `asof()` 组合。新写入的 segment 会记录 `session_min/session_max`，`explain()` 可显示 `pruned_by_segment_session_range`。
 
 ### 日历分区
 

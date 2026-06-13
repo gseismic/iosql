@@ -109,9 +109,9 @@ def _session_ticks(tmp_path):
         },
         session_column="trading_date",
         partition_every="1day",
-        target_rows_per_file=10,
+        target_rows_per_file=1,
         min_rows_per_file=1,
-        max_rows_per_file=20,
+        max_rows_per_file=1,
     )
     day_start = 86_400_000
     ticks.write([
@@ -209,6 +209,31 @@ def test_query_session_uses_declared_session_column(tmp_path):
 
     assert [row["session_type"] for row in rows] == ["night", "day"]
     assert [row["price"] for row in rows] == [1.0, 2.0]
+    assert [
+        (item["part_key"], item["session_min"], item["session_max"])
+        for item in ticks.segments()
+    ] == [
+        ("0__000000", "1970-01-02", "1970-01-02"),
+        ("86400000__000000", "1970-01-02", "1970-01-02"),
+        ("86400000__000001", "1970-01-03", "1970-01-03"),
+    ]
+
+
+def test_query_session_prunes_segments_by_session_range(tmp_path):
+    _, ticks = _session_ticks(tmp_path)
+
+    plan = ticks.query(session="1970-01-02").explain()
+
+    assert [item["part_key"] for item in plan.scanned_segments] == [
+        "0__000000",
+        "86400000__000000",
+    ]
+    assert [item["part_key"] for item in plan.skipped_segments] == [
+        "86400000__000001",
+    ]
+    assert plan.segment_skip_reasons == {
+        "86400000__000001": "pruned_by_segment_session_range"
+    }
 
 
 def test_query_date_remains_natural_day_not_session(tmp_path):

@@ -530,6 +530,8 @@ class SegmentInfo:
     row_count: int = 0
     time_min: Optional[Any] = None
     time_max: Optional[Any] = None
+    session_min: Optional[Any] = None
+    session_max: Optional[Any] = None
     sealed: bool = False
     generation: int = 0
 
@@ -542,6 +544,8 @@ class SegmentInfo:
             "row_count": self.row_count,
             "time_min": self.time_min,
             "time_max": self.time_max,
+            "session_min": self.session_min,
+            "session_max": self.session_max,
             "sealed": self.sealed,
             "generation": self.generation,
         }
