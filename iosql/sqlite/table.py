@@ -20,7 +20,7 @@ from ..exception import (
 )
 from ..logger import default_logger as logger
 from ..partition import CalendarPartition, DurationPartition, Partition
-from ..query import CaseExpression, Where, get_case_range
+from ..query import Case, CaseExpression, Where, get_case_range
 from ..spec import (
     LayoutReport,
     PartitionStats,
@@ -697,6 +697,112 @@ class Table(BaseTable):
         self._upsert_segment_info(info)
         return info
 
+    def _pk_cases(self, row, pk):
+        return [Case(field, '=', row[field]) for field in pk]
+
+    def _column_types_for_pk_lookup(self, table_spec):
+        meta = self.get_table_meta()
+        if meta:
+            return {
+                key: item["type"]
+                for key, item in meta["column_info"].items()
+            }
+        return dict(table_spec.columns or {})
+
+    def _find_existing_pk_segment(self, logical_part, row, pk, table_spec):
+        if not pk:
+            return None
+
+        column_types = self._column_types_for_pk_lookup(table_spec)
+        cases = self._pk_cases(row, pk)
+        sql = build_select_cases_sql(
+            _PART_DATA_TABLE_NAME,
+            '1',
+            cases,
+            column_types,
+        )
+        for ref in self._physical_part_refs([logical_part]):
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            db = self.get_part_db(part_dbfile, auto_commit=False)
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].query(sql)
+            except NoSuchTable:
+                continue
+            if rows:
+                return ref
+        return None
+
+    def _write_segment_rows(
+        self,
+        segment,
+        logical_part,
+        part_column,
+        rows,
+        pk,
+        partition,
+        replace,
+        ignore,
+        commit,
+        layout,
+        part_kwargs,
+    ):
+        self._do_insert_part(
+            segment.part_key,
+            part_column,
+            rows,
+            pk,
+            partition=partition,
+            replace=replace,
+            ignore=ignore,
+            commit=commit,
+            logical_part=logical_part,
+            **part_kwargs,
+        )
+        return self._refresh_segment_info(
+            logical_part,
+            segment.segment_id,
+            segment.part_key,
+            layout,
+        )
+
+    def _append_segment_rows(
+        self,
+        logical_part,
+        part_column,
+        rows,
+        pk,
+        partition,
+        replace,
+        ignore,
+        commit,
+        layout,
+        part_kwargs,
+    ):
+        pending = list(rows)
+        while pending:
+            active = self._active_segment_for(logical_part, layout)
+            capacity = layout.max_rows_per_file - active.row_count
+            if capacity <= 0:
+                active.sealed = True
+                self._upsert_segment_info(active)
+                continue
+
+            batch = pending[:capacity]
+            self._write_segment_rows(
+                active,
+                logical_part,
+                part_column,
+                batch,
+                pk,
+                partition,
+                replace,
+                ignore,
+                commit,
+                layout,
+                part_kwargs,
+            )
+            pending = pending[len(batch):]
+
     def _active_segment_for(self, logical_part, layout):
         segments = self._segment_infos([logical_part])
         for info in reversed(segments):
@@ -1302,34 +1408,58 @@ class Table(BaseTable):
         rows = list(part_data)
         part_kwargs = dict(kwargs)
         part_kwargs["table_spec"] = table_spec.to_dict()
-        while rows:
-            active = self._active_segment_for(logical_part, layout)
-            capacity = layout.max_rows_per_file - active.row_count
-            if capacity <= 0:
-                active.sealed = True
-                self._upsert_segment_info(active)
-                continue
 
-            batch = rows[:capacity]
-            self._do_insert_part(
-                active.part_key,
-                part_column,
-                batch,
-                pk,
-                partition=partition,
-                replace=replace,
-                ignore=ignore,
-                commit=commit,
-                logical_part=logical_part,
-                **part_kwargs,
-            )
-            self._refresh_segment_info(
+        if not pk:
+            self._append_segment_rows(
                 logical_part,
-                active.segment_id,
-                active.part_key,
+                part_column,
+                rows,
+                pk,
+                partition,
+                replace,
+                ignore,
+                commit,
                 layout,
+                part_kwargs,
             )
-            rows = rows[len(batch):]
+            return
+
+        for row in rows:
+            existing = self._find_existing_pk_segment(
+                logical_part,
+                row,
+                pk,
+                table_spec,
+            )
+            if existing is not None:
+                if ignore:
+                    continue
+                self._write_segment_rows(
+                    existing,
+                    logical_part,
+                    part_column,
+                    [row],
+                    pk,
+                    partition,
+                    replace,
+                    ignore,
+                    commit,
+                    layout,
+                    part_kwargs,
+                )
+            else:
+                self._append_segment_rows(
+                    logical_part,
+                    part_column,
+                    [row],
+                    pk,
+                    partition,
+                    replace,
+                    ignore,
+                    commit,
+                    layout,
+                    part_kwargs,
+                )
 
     def _do_insert_part(
         self,

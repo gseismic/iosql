@@ -14,6 +14,21 @@ def _uri(tmp_path, name="market.iosql"):
     return f"sqlite://{tmp_path}/{name}"
 
 
+def _segmented_ticks(tmp_path):
+    db = Database(_uri(tmp_path))
+    ticks = db.timeseries(
+        "ticks",
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+        partition_every="1day",
+        target_rows_per_file=1,
+        min_rows_per_file=1,
+        max_rows_per_file=1,
+    )
+    return db, ticks
+
+
 def test_timeseries_write_query_and_explain(tmp_path):
     db = Database(_uri(tmp_path))
     ticks = db.timeseries(
@@ -264,6 +279,69 @@ def test_segment_layout_splits_oversized_logical_partition(tmp_path):
     assert plan.segment_skip_reasons == {
         "0__000000": "pruned_by_segment_time_range"
     }
+
+
+def test_segment_upsert_rewrites_existing_primary_key(tmp_path):
+    _, ticks = _segmented_ticks(tmp_path)
+    ticks.write([
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ])
+
+    ticks.write({"symbol": "AAPL", "ts": 1000, "price": 9.0})
+
+    assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ]
+    assert [item["row_count"] for item in ticks.segments()] == [1, 1]
+
+
+def test_segment_ignore_skips_existing_primary_key(tmp_path):
+    _, ticks = _segmented_ticks(tmp_path)
+    ticks.write([
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ])
+
+    ticks.write({"symbol": "AAPL", "ts": 1000, "price": 9.0}, mode="ignore")
+
+    assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ]
+    assert [item["part_key"] for item in ticks.segments()] == [
+        "0__000000",
+        "0__000001",
+    ]
+
+
+def test_segment_upsert_same_batch_duplicate_primary_key_last_wins(tmp_path):
+    _, ticks = _segmented_ticks(tmp_path)
+
+    ticks.write([
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
+        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+    ])
+
+    assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+    ]
+    assert [item["row_count"] for item in ticks.segments()] == [1]
+
+
+def test_segment_append_duplicate_primary_key_raises(tmp_path):
+    _, ticks = _segmented_ticks(tmp_path)
+    ticks.write({"symbol": "AAPL", "ts": 1000, "price": 1.0}, mode="append")
+    ticks.write({"symbol": "MSFT", "ts": 2000, "price": 2.0}, mode="append")
+
+    with pytest.raises(Exception, match="UNIQUE constraint failed"):
+        ticks.write({"symbol": "AAPL", "ts": 1000, "price": 9.0}, mode="append")
+
+    assert [item["part_key"] for item in ticks.segments()] == [
+        "0__000000",
+        "0__000001",
+    ]
 
 
 def test_repartition_to_writes_new_database_without_touching_source(tmp_path):

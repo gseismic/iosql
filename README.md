@@ -115,6 +115,8 @@ segments = table.segments()
 
 `segments()` 返回物理文件级 manifest，包含逻辑分区、segment id、文件 key、行数和时间范围。`query().explain()` 同时返回逻辑分区和物理 segment 的候选/扫描/跳过信息。
 
+开启物理 segment 后，`write(mode="upsert")` / `write(mode="replace")` / `write(mode="ignore")` 仍按逻辑表主键处理已有行，不会因为同一逻辑分区拆成多个文件而绕过主键语义。
+
 ### 日历分区
 
 `Database.timeseries()` 默认适合毫秒时间戳。如果数据使用日期字符串，可以声明 `time_unit="date"` 和 `partition_kind="calendar"`：
