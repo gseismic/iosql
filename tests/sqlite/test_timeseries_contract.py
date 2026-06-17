@@ -7,7 +7,12 @@ from iosql import (
     TableSpec,
     TimeColumn,
 )
-from iosql.exception import BadArgument, UnsafeOperation
+from iosql.exception import (
+    BadArgument,
+    SchemaConflict,
+    TableSpecConflict,
+    UnsafeOperation,
+)
 
 
 def _uri(tmp_path, name="market.iosql"):
@@ -196,6 +201,70 @@ def test_timeseries_write_query_and_explain(tmp_path):
     assert plan.candidate_partitions == [0, 1000, 2000]
     assert plan.scanned_partitions == [1000]
     assert plan.skipped_partitions == [0, 2000]
+
+
+def test_database_table_entrypoint_reopens_after_close(tmp_path):
+    db = Database(_uri(tmp_path))
+    spec = TableSpec.timeseries(
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+        partition_every="1day",
+        target_rows_per_file=2,
+        min_rows_per_file=1,
+        max_rows_per_file=3,
+    )
+    table = db.table("ticks", spec=spec)
+    table.write({"symbol": "AAPL", "ts": 1000, "price": 1.0})
+
+    assert db.table_names() == ["ticks"]
+    assert db.table("ticks") is table
+
+    db.close()
+    reopened = db.table("ticks")
+
+    assert reopened is not table
+    assert reopened.spec().primary_key == ["symbol", "ts"]
+    assert reopened.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0}
+    ]
+
+
+def test_database_table_rejects_incompatible_specs(tmp_path):
+    db = Database(_uri(tmp_path))
+    spec = TableSpec.timeseries(
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+    )
+    db.table("ticks", spec=spec).write(
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0}
+    )
+
+    with pytest.raises(TableSpecConflict):
+        db.table(
+            "ticks",
+            spec=TableSpec.timeseries(
+                time="ts",
+                primary_key=["symbol", "venue", "ts"],
+                columns={
+                    "symbol": "text",
+                    "venue": "text",
+                    "ts": "integer",
+                    "price": "float",
+                },
+            ),
+        )
+
+    with pytest.raises(SchemaConflict):
+        db.table(
+            "ticks",
+            spec=TableSpec.timeseries(
+                time="ts",
+                primary_key=["symbol", "ts"],
+                columns={"symbol": "text", "ts": "integer", "price": "text"},
+            ),
+        )
 
 
 def test_query_session_uses_declared_session_column(tmp_path):
@@ -655,6 +724,27 @@ def test_segment_upsert_rewrites_existing_primary_key(tmp_path):
     assert [item["row_count"] for item in ticks.segments()] == [1, 1]
 
 
+def test_segment_replace_rewrites_existing_primary_key(tmp_path):
+    _, ticks = _segmented_ticks(tmp_path)
+    ticks.write([
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ])
+
+    result = ticks.write(
+        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+        mode="replace",
+    )
+
+    assert result.rows_seen == 1
+    assert result.rows_written == 1
+    assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ]
+    assert [item["row_count"] for item in ticks.segments()] == [1, 1]
+
+
 def test_segment_ignore_skips_existing_primary_key(tmp_path):
     _, ticks = _segmented_ticks(tmp_path)
     ticks.write([
@@ -672,6 +762,27 @@ def test_segment_ignore_skips_existing_primary_key(tmp_path):
         "0__000000",
         "0__000001",
     ]
+
+
+def test_segment_delete_refreshes_segment_metadata(tmp_path):
+    _, ticks = _segmented_ticks(tmp_path)
+    ticks.write([
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0},
+    ])
+
+    deleted = ticks.delete({"field": "symbol", "op": "=", "value": "AAPL"})
+
+    assert deleted == 1
+    assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "MSFT", "ts": 2000, "price": 2.0}
+    ]
+    segments = ticks.segments()
+    assert [item["row_count"] for item in segments] == [0, 1]
+    assert segments[0]["time_min"] is None
+    assert segments[0]["time_max"] is None
+    assert segments[1]["time_min"] == 2000
+    assert segments[1]["time_max"] == 2000
 
 
 def test_segment_upsert_same_batch_duplicate_primary_key_last_wins(tmp_path):

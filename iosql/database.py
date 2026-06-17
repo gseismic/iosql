@@ -73,8 +73,9 @@ class Database(object):
         ])
 
     def close(self):
-        for _, table in self._tables.items():
+        for _, table in list(self._tables.items()):
             table.close()
+        self._tables.clear()
 
     @classmethod
     def get_engine(cls, uri):
