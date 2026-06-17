@@ -1,6 +1,6 @@
 ---
 name: iosql-usage
-description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, timeseries, TableSpec, write, query, latest, asof, partitions, segments, layout_report, repartition_to, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, or tests for this repository.
+description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec, timeseries, write, query, latest, asof, partitions, segments, layout_report, repartition_to, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, or tests for this repository.
 ---
 
 # iosql Usage
@@ -22,8 +22,8 @@ from iosql.utils.mysqlite import Database
 ## 工作流
 
 1. 明确数据模型：时间列、主键、列类型、自然日还是交易日/session、预期单日或单分区数据量。
-2. 优先用 `Database.timeseries()` 声明表契约；需要复用或传递配置时，用 `TableSpec` 并传给 `Database.table(name, spec=spec)`。
-3. 对毫秒时间戳使用默认 duration 分区；对 `YYYY-MM-DD` 日期字符串使用 `time_unit="date"` 和 `partition_kind="calendar"`。
+2. 声明表契约有两个等价入口：显式版用 `TableSpec` 并传给 `Database.table(name, spec=spec)`；快捷版用 `Database.timeseries()` 自动生成同等 `TableSpec`。
+3. 对毫秒时间戳使用 duration 分区；对 `YYYY-MM-DD` 日期字符串使用 `TimeColumn(unit="date")` + calendar 分区，或在 `timeseries()` 中传 `time_unit="date"` 和 `partition_kind="calendar"`。
 4. 写入使用 `table.write()` 或 `table.write_buffer()`。按主键覆盖用默认 `mode="upsert"`，严格追加用 `mode="append"`，忽略重复用 `mode="ignore"`。
 5. 查询使用 `table.query(...).to_list()`；需要确认分区裁剪时调用 `.explain()`。
 6. 金融截面查询使用 `latest()` 或 `asof()`，多维截面传 `by=["symbol", "timeframe"]` 等。
@@ -37,7 +37,9 @@ from iosql.utils.mysqlite import Database
 仓库内也可参考：
 
 - `README.md`
+- `examples/01_quickstart_table.py`
 - `examples/01_quickstart_timeseries.py`
+- `examples/02_calendar_events_table.py`
 - `examples/05_partition_segments_smoke.py`
 - `examples/finance/`
 - `tests/sqlite/test_timeseries_contract.py`

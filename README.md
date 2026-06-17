@@ -4,7 +4,7 @@
 
 ## 特性
 
-- **时序表契约**：用 `Database.timeseries()` 或 `TableSpec` 明确主键、时间列、列类型和分区策略。
+- **双入口表契约**：可用 `Database.table(..., spec=TableSpec(...))` 显式声明主键、时间列、列类型和分区策略，也可用 `Database.timeseries()` 快速创建同等契约。
 - **分区存储**：按时间把数据写入多个 SQLite 文件，降低单文件膨胀风险。
 - **物理 segment**：同一逻辑时间分区可按行数自动拆成多个 SQLite 文件，适合高频金融数据。
 - **分区裁剪**：按 `start` / `end` / `date` 查询时自动跳过不相关分区。
@@ -32,18 +32,20 @@ python -m pip wheel . --no-deps -w dist
 
 ## 快速开始
 
+下面是原始 `Table` + `TableSpec` 显式版本，对应快捷版见 `examples/01_quickstart_timeseries.py`。
+
 ```python
-from iosql import Database
+from iosql import Database, PartitionSpec, TableSpec, TimeColumn
 
 db = Database("sqlite://database/market.iosql")
 
-ticks = db.timeseries(
-    "ticks",
-    time="ts",
+spec = TableSpec(
     primary_key=["symbol", "ts"],
+    time=TimeColumn("ts", unit="ms", timezone="UTC"),
+    partition=PartitionSpec.by_time("ts", every="1day"),
     columns={"symbol": "text", "ts": "integer", "price": "float"},
-    partition_every="1day",
 )
+ticks = db.table("ticks", spec=spec)
 
 result = ticks.write([
     {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
@@ -68,7 +70,23 @@ db.close()
 
 ## 常用 API
 
-### 创建或打开时序表
+### 创建或打开表
+
+```python
+from iosql import PartitionSpec, TableSpec, TimeColumn
+
+spec = TableSpec(
+    primary_key=["symbol", "ts"],
+    time=TimeColumn("ts", unit="ms", timezone="UTC"),
+    partition=PartitionSpec.by_time("ts", every="1hour"),
+    columns={"symbol": "text", "ts": "integer", "price": "float"},
+)
+table = db.table("ticks", spec=spec)
+```
+
+`time` 描述业务时间列，用于 `start/end/date/latest/asof` 的时间解释；`partition` 描述物理分区布局，用于写入落盘和查询裁剪。两者通常指向同一列，但职责不同。
+
+如果偏好更短的写法，可以使用 `timeseries()`。它内部会创建同等的 `TableSpec`：
 
 ```python
 table = db.timeseries(
@@ -77,9 +95,6 @@ table = db.timeseries(
     primary_key=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
     partition_every="1hour",
-    time_unit="ms",
-    partition_kind="duration",
-    timezone="UTC",
 )
 ```
 
@@ -156,19 +171,19 @@ snapshot = ticks.latest(
 
 ### 日历分区
 
-`Database.timeseries()` 默认适合毫秒时间戳。如果数据使用日期字符串，可以声明 `time_unit="date"` 和 `partition_kind="calendar"`：
+如果数据使用日期字符串，可以在原始 `TableSpec` 中声明 `TimeColumn(unit="date")` 和 calendar 分区；对应 `timeseries()` 快捷版本见 `examples/02_calendar_events.py`：
 
 ```python
-events = db.timeseries(
-    "events",
-    time="event_date",
-    time_unit="date",
-    partition_kind="calendar",
-    partition_every="1day",
-    timezone="Asia/Shanghai",
+events = db.table("events", spec=TableSpec(
     primary_key=["event_date", "name"],
+    time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
+    partition=PartitionSpec.by_time(
+        "event_date",
+        every="1day",
+        kind="calendar",
+    ),
     columns={"event_date": "text", "name": "text", "city": "text"},
-)
+))
 
 events.write({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
 rows = events.query(date="2026-01-06").to_list()
@@ -201,8 +216,10 @@ print(result.rows_copied, result.partitions_created)
 
 | 文件 | 场景 |
 | --- | --- |
-| `01_quickstart_timeseries.py` | 入门时序表写入和查询。 |
-| `02_calendar_events.py` | 日期字符串和日历分区。 |
+| `01_quickstart_table.py` | 原始 `Table` + `TableSpec` 写入、查询和 duration 分区。 |
+| `01_quickstart_timeseries.py` | `Database.timeseries()` 快捷版写入和查询。 |
+| `02_calendar_events_table.py` | 原始 `Table` + `TableSpec` 处理日期字符串和 calendar 分区。 |
+| `02_calendar_events.py` | `Database.timeseries()` 快捷版处理日期字符串和 calendar 分区。 |
 | `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入和查询计划。 |
 | `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
 | `05_partition_segments_smoke.py` | 多分区写入、物理 segment 拆分和查询计划。 |
@@ -219,7 +236,10 @@ print(result.rows_copied, result.partitions_created)
 运行：
 
 ```bash
+python examples/01_quickstart_table.py
 python examples/01_quickstart_timeseries.py
+python examples/02_calendar_events_table.py
+python examples/02_calendar_events.py
 python examples/05_partition_segments_smoke.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
@@ -244,8 +264,8 @@ database/
 
 ## 注意事项
 
-- `Database.timeseries()` 的时间列默认使用毫秒时间戳。
-- `Table.write()` 需要表存在 `TableSpec`，推荐优先使用 `Database.timeseries()` 创建时序表。
+- `TableSpec` 中的 `TimeColumn(unit="ms")` 适合毫秒时间戳，也是 `Database.timeseries()` 的默认行为。
+- `Table.write()` 需要表存在 `TableSpec`；可以显式传给 `Database.table(..., spec=...)`，也可以通过 `Database.timeseries()` 自动生成。
 - 多分区查询支持全局 `order_by` 和 `limit`，但结果会在 Python 层合并排序，扫描范围应尽量通过时间条件收窄。
 - 新建时序表会按 `max_rows_per_file` 自动拆分物理 segment；旧的单分区文件仍可读取，不会被原地迁移。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。

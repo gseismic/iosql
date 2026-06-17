@@ -2,7 +2,7 @@
 
 `iosql.utils.mysqlite` 是 iosql 仍在使用的低层 SQLite 工具层。它直接面向单个 SQLite 文件，提供基于字典的建表、写入、查询和连接池能力。
 
-面向时序数据的新代码应优先使用 `Database.timeseries()`。只有在需要直接操作单文件 SQLite、快速 schema-on-write 或复用低层连接池时，才使用本模块。
+面向时序数据的新代码应优先使用主 API：`Database.table(..., spec=TableSpec(...))` 或 `Database.timeseries()`。只有在需要直接操作单文件 SQLite、快速 schema-on-write 或复用低层连接池时，才使用本模块。
 
 ## 基本入口
 

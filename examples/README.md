@@ -1,13 +1,15 @@
 # iosql 示例
 
-本目录只保留主 API 的少量代表性示例。编号越小越适合入门，后面的示例覆盖批量写入、查询计划和布局维护。
+本目录只保留主 API 的少量代表性示例。编号越小越适合入门，后面的示例覆盖批量写入、查询计划和布局维护。入门示例同时提供原始 `Table` + `TableSpec` 显式版和 `timeseries()` 快捷版。
 
 ## 示例索引
 
 | 文件 | 难度 | 场景 |
 | --- | --- | --- |
-| `01_quickstart_timeseries.py` | 入门 | 创建毫秒时间戳时序表，写入数据，按 symbol 和时间窗口查询。 |
-| `02_calendar_events.py` | 入门 | 使用日期字符串、时区和日历分区保存事件表。 |
+| `01_quickstart_table.py` | 入门 | 直接用原始 `Table` + `TableSpec` 写入毫秒时间戳数据，按 symbol 和时间窗口查询，并查看分区裁剪。 |
+| `01_quickstart_timeseries.py` | 入门 | 用 `Database.timeseries()` 快捷创建同等时序表，写入并按时间窗口查询。 |
+| `02_calendar_events_table.py` | 入门 | 直接用原始 `Table` + `TableSpec` 保存日期字符串事件表，使用时区和日历分区。 |
+| `02_calendar_events.py` | 入门 | 用 `Database.timeseries()` 快捷创建日期字符串和日历分区事件表。 |
 | `03_buffered_ingest_and_query_plan.py` | 进阶 | 使用 `write_buffer()` 批量写入，并通过 `query().explain()` 查看分区裁剪。 |
 | `04_layout_report_and_repartition.py` | 高级 | 使用 `layout_report()` 诊断分区行数，并用 `repartition_to()` 生成新布局。 |
 | `05_partition_segments_smoke.py` | 高级 | 小规模验证多分区写入、物理 segment 拆分和查询计划。 |
@@ -34,7 +36,9 @@ python -m pip install -e .
 再运行任意示例：
 
 ```bash
+python examples/01_quickstart_table.py
 python examples/01_quickstart_timeseries.py
+python examples/02_calendar_events_table.py
 python examples/02_calendar_events.py
 python examples/03_buffered_ingest_and_query_plan.py
 python examples/04_layout_report_and_repartition.py

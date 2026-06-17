@@ -1,6 +1,38 @@
 # iosql 使用模式
 
-## 毫秒时序表
+## 毫秒时序表：原始 Table 版
+
+```python
+from iosql import Database, PartitionSpec, TableSpec, TimeColumn
+
+db = Database(f"sqlite://{db_path}")
+spec = TableSpec(
+    primary_key=["symbol", "ts"],
+    time=TimeColumn("ts", unit="ms", timezone="UTC"),
+    partition=PartitionSpec.by_time("ts", every="1day"),
+    columns={"symbol": "text", "ts": "integer", "price": "float"},
+)
+ticks = db.table("ticks", spec=spec)
+
+ticks.write([
+    {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
+    {"symbol": "MSFT", "ts": 1735689600000, "price": 420.3},
+])
+
+rows = ticks.query(
+    symbols=["AAPL", "MSFT"],
+    start=1735689600000,
+    end=1735776000000,
+    order_by="ts",
+).to_list()
+
+plan = ticks.query(start=1735689600000, end=1735776000000).explain()
+db.close()
+```
+
+`time` 是业务时间语义，供 `query(start/end/date)`、`latest()` 和 `asof()` 解释输入；`partition` 是物理布局，供写入落盘和查询裁剪使用。
+
+## 毫秒时序表：timeseries 快捷版
 
 ```python
 from iosql import Database
@@ -30,23 +62,25 @@ plan = ticks.query(start=1735689600000, end=1735776000000).explain()
 db.close()
 ```
 
-## 日期字符串和日历分区
+## 日期字符串和日历分区：原始 Table 版
 
 ```python
-events = db.timeseries(
-    "events",
-    time="event_date",
-    time_unit="date",
-    partition_kind="calendar",
-    partition_every="1day",
-    timezone="Asia/Shanghai",
+events = db.table("events", spec=TableSpec(
     primary_key=["event_date", "name"],
+    time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
+    partition=PartitionSpec.by_time(
+        "event_date",
+        every="1day",
+        kind="calendar",
+    ),
     columns={"event_date": "text", "name": "text", "city": "text"},
-)
+))
 
 events.write({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
 rows = events.query(date="2026-01-06").to_list()
 ```
+
+`timeseries()` 快捷版可用 `time_unit="date"` 和 `partition_kind="calendar"` 表达同等契约。
 
 ## 交易日/session
 

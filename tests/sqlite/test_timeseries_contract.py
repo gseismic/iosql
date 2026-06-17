@@ -4,6 +4,7 @@ from iosql import (
     CalendarPartition,
     Database,
     PartitionSpec,
+    PhysicalLayout,
     TableSpec,
     TimeColumn,
 )
@@ -228,6 +229,59 @@ def test_database_table_entrypoint_reopens_after_close(tmp_path):
     assert reopened.query(order_by="ts").to_list() == [
         {"symbol": "AAPL", "ts": 1000, "price": 1.0}
     ]
+
+
+def test_raw_table_spec_writes_queries_and_partitions_timeseries(tmp_path):
+    db = Database(_uri(tmp_path))
+    spec = TableSpec(
+        primary_key=["symbol", "ts"],
+        time=TimeColumn("ts", unit="ms", timezone="UTC"),
+        partition=PartitionSpec.by_time("ts", every="1s"),
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+        physical_layout=PhysicalLayout(
+            target_rows_per_file=2,
+            min_rows_per_file=1,
+            max_rows_per_file=3,
+        ),
+    )
+    ticks = db.table("ticks", spec=spec)
+
+    result = ticks.write([
+        {"symbol": "AAPL", "ts": 500, "price": 1.0},
+        {"symbol": "AAPL", "ts": 1500, "price": 2.0},
+        {"symbol": "MSFT", "ts": 2500, "price": 3.0},
+    ])
+
+    assert result.rows_seen == 3
+    assert result.partitions_touched == [0, 1000, 2000]
+    assert ticks.table_parts() == [0, 1000, 2000]
+
+    rows = ticks.query(
+        symbols="AAPL",
+        start=1000,
+        end=1999,
+        columns=["symbol", "ts", "price"],
+    ).to_list()
+    assert rows == [{"symbol": "AAPL", "ts": 1500, "price": 2.0}]
+
+    plan = ticks.query(symbols="AAPL", start=1000, end=1999).explain()
+    assert plan.candidate_partitions == [0, 1000, 2000]
+    assert plan.scanned_partitions == [1000]
+    assert plan.skipped_partitions == [0, 2000]
+
+    db.close()
+    reopened_ticks = Database(_uri(tmp_path)).table("ticks")
+    reopened_spec = reopened_ticks.spec()
+
+    assert reopened_spec.primary_key == ["symbol", "ts"]
+    assert reopened_spec.time.name == "ts"
+    assert reopened_spec.partition.column == "ts"
+    assert reopened_ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 500, "price": 1.0},
+        {"symbol": "AAPL", "ts": 1500, "price": 2.0},
+        {"symbol": "MSFT", "ts": 2500, "price": 3.0},
+    ]
+    reopened_ticks.close()
 
 
 def test_database_table_rejects_incompatible_specs(tmp_path):
