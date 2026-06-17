@@ -1,7 +1,7 @@
 interface:
   display_name: "iosql 使用指南"
-  short_description: "指导 iosql 时序表建模、分区写入和查询方案"
-  default_prompt: "Use $iosql-usage to design an iosql-backed time-series storage workflow."
+  short_description: "指导 iosql 分区表建模、写入、查询、布局诊断和错误排查"
+  default_prompt: "Use $iosql-usage to design, implement, or debug an iosql-backed partition table workflow."
 
 policy:
   allow_implicit_invocation: true
