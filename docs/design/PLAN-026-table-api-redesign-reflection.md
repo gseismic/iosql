@@ -1,5 +1,7 @@
 # PLAN-026-table-api-redesign-reflection
 
+> 后续修正：`PLAN-027-partitioned-sqlite-core-api.md` 进一步收敛了本设计的结论。核心 API 不再建议出现必填 `time` 参数，而应以 `partition` / `partition_by` 表达“原生 SQLite 表 + 自动分区”。`time` 只保留在 `timeseries()` helper 和时序便利查询中。
+
 ## 背景
 
 用户给出的旧示例使用以下风格：
