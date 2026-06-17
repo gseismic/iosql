@@ -66,6 +66,7 @@ segment=Segment.rows(max_rows=500_000)
 
 - `Partition` 负责按字段值确定逻辑分区。
 - `Segment` 负责控制物理文件大小和滚动策略。
+- 一个逻辑分区可以包含多个物理 segment；逻辑分区不是文件。
 - 行数驱动属于 `Segment`，不是传统 `Partition`。
 - 查询裁剪依赖 segment manifest 的统计信息，而不是直接由 where 计算 partition key。
 
@@ -243,6 +244,28 @@ column_stats: {"seq": {"min": ..., "max": ...}, "tenant_id": {"values": ...}}
 4. 文件名可以是 {logical_part}__{segment_id}.sqlite3。
 ```
 
+### 晚到数据
+
+如果写入基本有序，segment 的 min/max 范围会比较窄，查询裁剪效果好。
+
+如果后期回补中间数据，不应把数据强行插回旧 sealed segment。推荐写入 delta/active segment：
+
+```text
+logical_part = 2026-01-01
+  segment 000000: key 00:00-08:00
+  segment 000001: key 08:00-16:00
+  segment 000002: key 16:00-24:00
+  delta   000003: late rows for 09:00-10:00
+```
+
+正确性由 manifest 保证：查询 `09:00-10:00` 时必须扫描 `000001` 和 `000003`。
+
+代价是布局局部性下降：
+
+- delta segment 可能让多个查询多扫一个文件。
+- 如果 delta segment 覆盖的 key range 很宽，裁剪效果会明显变差。
+- 后台 compaction 负责把 base + delta 重新整理为有序、范围更窄的新 segments。
+
 ## 查询裁剪
 
 按行数滚动的 segment 不能仅由 where 直接算出候选文件。需要两层裁剪。
@@ -285,6 +308,62 @@ where={"field": "seq", "op": "between_and", "value": [1_100_000, 1_200_000]}
 - 如果有 bloom filter 或 small value set，再进一步裁剪。
 
 如果没有对应 stats，则保守扫描。
+
+### 查询模型和代价
+
+最终查询计划必须承认：
+
+```text
+一个 logical partition 可以包含多个 physical segments。
+```
+
+查询流程：
+
+```text
+1. 根据 where 和 PartitionPolicy 找 candidate logical partitions。
+2. 展开每个 logical partition 下的 candidate segments。
+3. 根据 segment stats 跳过不重叠的 segments。
+4. 扫描剩余 segments。
+5. 如果跨多个 segment 且需要 order_by/limit/dedup，则执行全局合并。
+```
+
+这会带来明确影响：
+
+- 查询一个时间段可能扫描同一逻辑分区下多个 segment。
+- `order_by` 不能假设自然有序；只要 segment 范围重叠，就需要全局排序或 merge sort。
+- `limit` 不能随意下推；如果多个 segment 的 key range 重叠，必须先合并排序再截断。
+- 晚到数据进入 delta segment 后，短期内会增加扫描文件数。
+- compaction 是恢复查询效率的维护路径，不是可选优化。
+
+因此 `explain` 必须暴露逻辑分区和物理 segment 两层：
+
+```python
+plan = table.explain_select(where=...)
+
+plan.candidate_partitions
+plan.scanned_partitions
+plan.candidate_segments
+plan.scanned_segments
+plan.skipped_segments
+plan.requires_global_sort
+plan.requires_python_limit
+```
+
+如果用户只想要最少文件扫描，应优先选择：
+
+```python
+partition=Partition.duration("timestamp", every="1day")
+segment=Segment.rows(max_rows=500_000)
+order_key="timestamp"
+```
+
+而不是纯：
+
+```python
+segment=Segment.rows(max_rows=500_000)
+```
+
+前者可以先按逻辑时间分区缩小目录，再在一天内部扫描少量 segment；后者只能依赖全局 segment stats。
 
 ## API 设计
 
@@ -561,6 +640,8 @@ QueryPlan(
         "000001": "pruned_by_segment_stats",
         "000002": "pruned_by_partition_key",
     },
+    requires_global_sort=True,
+    requires_python_limit=True,
 )
 ```
 
@@ -577,6 +658,15 @@ time_min/time_max
 pruned_by_segment_key_range
 key_min/key_max
 stats_min/stats_max
+```
+
+还应区分：
+
+```text
+logical partition pruning
+segment stats pruning
+delta segment scanned
+global merge required
 ```
 
 ## 实施建议
