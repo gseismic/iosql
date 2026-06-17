@@ -93,8 +93,8 @@ for part_key, part_data in partitioned_data.items():
 | **入口** | `Database(uri)` | 创建/打开数据库，`sqlite://` 或 `postgresql://` URI |
 | | `Database.table(name, **opts)` | 创建/获取表（核心入口） |
 | | `Database.timeseries(name, time=..., primary_key=..., **opts)` | 时序 helper 快捷版 |
-| **写入** | `table.write(rows, mode='upsert')` | 写入行，支持 upsert/append/replace/ignore |
-| | `table.write_buffer(mode, max_rows)` | 缓冲批量写入（上下文管理器） |
+| **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
+| | `table.write_buffer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
 | | `table.insert_all(rows, ...)` | 低层写入（需明确传 pk/partition） |
 | | `table.upsert_all(kv_list, pk)` | 按主键合并写入（merge 字段） |
 | | `table.delete(where)` | 条件删除（传 None 已废弃，改用 truncate） |
@@ -173,10 +173,10 @@ with table.write_buffer(max_rows=10_000) as buf:
 # 退出上下文时自动 flush
 
 # 写入模式
-# mode="upsert"（默认）：按主键覆盖
-# mode="append"：严格追加，重复主键报错
+# mode=None：使用表契约 conflict，新表默认 append
+# mode="append"：严格追加，重复主键通常由 SQLite 约束处理
 # mode="ignore"：重复主键跳过
-# mode="replace"：显式覆盖
+# mode="upsert"/"replace"：覆盖写；当前不支持 Segment.rows 表
 ```
 
 ### 5. 查询

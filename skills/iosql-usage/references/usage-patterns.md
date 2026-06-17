@@ -287,13 +287,14 @@ latest = bars.latest(
 
 ## 写入模式
 
-- `mode="upsert"`：默认模式，同主键覆盖旧行。
-- `mode="replace"`：显式 replace，同主键覆盖旧行。
-- `mode="ignore"`：同主键已有行时跳过。
+- `mode=None`：使用表契约 `conflict`，新表默认 `append`。
 - `mode="append"`：严格追加，重复主键应抛出数据库约束错误。
+- `mode="ignore"`：同主键已有行时跳过。
+- `mode="upsert"`：同主键覆盖旧行，当前不支持 `Segment.rows` 表。
+- `mode="replace"`：显式 replace，同主键覆盖旧行，当前不支持 `Segment.rows` 表。
 
 ```python
-result = table.write(data, mode="upsert")
+result = table.write(data)
 print(f"seen={result.rows_seen}, written={result.rows_written}")
 ```
 

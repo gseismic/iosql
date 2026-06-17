@@ -2,6 +2,8 @@
 
 本目录只保留主 API 的少量代表性示例。编号越小越适合入门，后面的示例覆盖批量写入、查询计划和布局维护。主线示例使用普通 `Table` + `Partition` + `Segment`；`timeseries()` 文件保留为 helper 版本。
 
+当前 `Segment.rows(...)` 示例均按 append-first 语义写入；在全局 pk index/tombstone 实现前，不演示跨 segment 的 `upsert`/`replace` 覆盖写。
+
 ## 示例索引
 
 | 文件 | 难度 | 场景 |

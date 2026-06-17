@@ -510,8 +510,8 @@ class TestSegmentOnly:
         with pytest.raises(BadArgument):
             Segment.rows(max_rows=100, min_rows=200)      # min > target
 
-    def test_upsert_with_segment_cross_file(self, tmp_path):
-        """跨 segment 的 upsert 应找到已有主键并覆盖。"""
+    def test_upsert_and_replace_with_segment_rejected_until_pk_index(self, tmp_path):
+        """未实现 pk index/tombstone 前，segment 不允许覆盖写。"""
         db = Database(_uri(tmp_path))
         table = db.table(
             "data",
@@ -528,16 +528,19 @@ class TestSegmentOnly:
             {"id": 3, "val": 30},
             {"id": 4, "val": 40},
         ])
-        # 更新 id=1（在 segment 0，已是 sealed）
-        table.write({"id": 1, "val": 99}, mode="upsert")
-        # 更新 id=3（在 segment 1）
-        table.write({"id": 3, "val": 77}, mode="upsert")
+        with pytest.raises(BadArgument, match="Segment.rows"):
+            table.write({"id": 1, "val": 99}, mode="upsert")
+        with pytest.raises(BadArgument, match="Segment.rows"):
+            table.write({"id": 3, "val": 77}, mode="replace")
 
         rows = table.select("*", where=None, order_by="id", to_dict=True)
-        assert rows[0] == {"id": 1, "val": 99}
-        assert rows[2] == {"id": 3, "val": 77}
+        assert rows == [
+            {"id": 1, "val": 10},
+            {"id": 2, "val": 20},
+            {"id": 3, "val": 30},
+            {"id": 4, "val": 40},
+        ]
 
-        # 注意：segment 可能变为 3 个（upsert 晚到数据创建新 segment）
         assert len(table.table_parts()) == 1  # __all__ 不变
         db.close()
 

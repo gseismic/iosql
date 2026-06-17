@@ -71,8 +71,8 @@ with Database("sqlite://db/test.iosql") as db:
 
 | 方法 | 签名 |
 |------|------|
-| `write` | `(rows, mode='upsert', commit=True, **kwargs) -> WriteResult` |
-| `write_buffer` | `(mode='upsert', max_rows=10_000, **write_kwargs) -> BufferedWriter` |
+| `write` | `(rows, mode=None, commit=True, **kwargs) -> WriteResult` |
+| `write_buffer` | `(mode=None, max_rows=10_000, **write_kwargs) -> BufferedWriter` |
 | `insert_all` | `(data, pk=None, extra_data=None, partition=None, replace=False, ignore=False, commit=True, **kwargs) -> WriteResult` |
 | `upsert_all` | `(kv_list, pk, partition=None, commit=True, **kwargs)` |
 | `delete` | `(where) -> int` |
@@ -82,10 +82,11 @@ with Database("sqlite://db/test.iosql") as db:
 
 | 模式 | 说明 |
 |------|------|
-| `"upsert"` | 按主键覆盖旧行（默认） |
-| `"append"` | 严格追加，重复主键报错 |
+| `None` | 使用表契约 `conflict`，新表默认 `"append"` |
+| `"append"` | 严格追加，重复主键通常由 SQLite 约束处理 |
 | `"replace"` | 显式覆盖 |
 | `"ignore"` | 重复主键跳过 |
+| `"upsert"` | 按主键覆盖旧行；当前不支持 `Segment.rows` 表 |
 
 #### 查询
 
@@ -106,7 +107,7 @@ with Database("sqlite://db/test.iosql") as db:
 | `table_parts` | `() -> list` | 逻辑分区列表 |
 | `segments` | `() -> list[dict]` | 物理 segment 清单 |
 | `layout_report` | `() -> LayoutReport` | 分区诊断报告 |
-| `repartition_to` | `(target_uri, table_name=None, spec=None, mode='upsert', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
+| `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |
 
 ---

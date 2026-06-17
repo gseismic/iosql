@@ -1,4 +1,7 @@
+import pytest
+
 from iosql import Database, Partition, Segment
+from iosql.exception import BadArgument
 
 
 def _uri(tmp_path, name="partitioned.iosql"):
@@ -32,12 +35,80 @@ def test_range_partition_contract_has_no_time_key_and_prunes(tmp_path):
     )
     assert rows == [{"seq": 1010, "symbol": "A", "value": 2.0}]
 
+    projected = table.select(
+        ["symbol", "value"],
+        where=None,
+        order_by="seq desc",
+        to_dict=True,
+    )
+    assert projected == [
+        {"symbol": "A", "value": 3.0},
+        {"symbol": "A", "value": 2.0},
+        {"symbol": "A", "value": 1.0},
+    ]
+    assert "seq" not in projected[0]
+
     plan = table.explain_select(
         where={"field": "seq", "op": "between_and", "value": [1000, 1999]},
     ).to_dict()
     assert plan["candidate_partitions"] == [1000]
     assert plan["scanned_partitions"] == [1000]
     assert plan["skipped_partitions"] == [0, 2000]
+    assert [item["logical_part"] for item in plan["candidate_segments"]] == [1000]
+
+    db.close()
+
+
+def test_row_segment_delete_does_not_reopen_sealed_segment(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=2),
+        order_key="seq",
+    )
+
+    table.write([
+        {"event_id": 1, "seq": 1, "kind": "base"},
+        {"event_id": 2, "seq": 2, "kind": "base"},
+    ])
+    assert table.segments()[0]["sealed"] is True
+
+    deleted = table.delete({"field": "event_id", "op": "==", "value": 1})
+    assert deleted == 1
+    assert table.segments()[0]["row_count"] == 1
+    assert table.segments()[0]["sealed"] is True
+
+    table.write({"event_id": 99, "seq": 0, "kind": "late"})
+    segments = table.segments()
+    assert [item["row_count"] for item in segments] == [1, 1]
+    assert [item["sealed"] for item in segments] == [True, False]
+
+    db.close()
+
+
+def test_row_segment_rejects_upsert_and_replace_until_pk_index(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        segment=Segment.rows(max_rows=2),
+        order_key="seq",
+    )
+
+    table.write({"event_id": 1, "seq": 1})
+    with pytest.raises(BadArgument, match="Segment.rows"):
+        table.write({"event_id": 1, "seq": 2}, mode="upsert")
+    with pytest.raises(BadArgument, match="Segment.rows"):
+        table.write({"event_id": 1, "seq": 3}, mode="replace")
+    with pytest.raises(BadArgument, match="Segment.rows"):
+        table.insert_all({"event_id": 1, "seq": 4}, replace=True)
+
+    assert table.select("*", where=None, to_dict=True) == [
+        {"event_id": 1, "seq": 1},
+    ]
 
     db.close()
 
@@ -150,4 +221,3 @@ def test_row_segment_late_data_scans_overlapping_segments_and_skips_others(tmp_p
     assert plan["requires_global_sort"] is True
 
     db.close()
-

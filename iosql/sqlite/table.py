@@ -113,7 +113,7 @@ class _LatestQuery:
 
 
 class _BufferedWriter:
-    def __init__(self, table, mode='upsert', max_rows=10_000, **write_kwargs):
+    def __init__(self, table, mode=None, max_rows=10_000, **write_kwargs):
         self._table = table
         self._mode = mode
         self._max_rows = int(max_rows)
@@ -323,9 +323,15 @@ class Table(BaseTable):
             kwargs['table_contract'] = contract.to_dict()
             if not replace and not ignore:
                 if contract.conflict in ['upsert', 'replace']:
+                    self._ensure_segment_conflict_supported(
+                        contract,
+                        contract.conflict,
+                    )
                     replace = True
                 elif contract.conflict == 'ignore':
                     ignore = True
+            if replace:
+                self._ensure_segment_conflict_supported(contract, 'replace')
 
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
@@ -365,7 +371,7 @@ class Table(BaseTable):
             return [None]
         return sorted({partition.get_key(row) for row in rows})
 
-    def write(self, rows, mode='upsert', commit=True, **kwargs):
+    def write(self, rows, mode=None, commit=True, **kwargs):
         if isinstance(rows, dict):
             rows = [rows]
         elif not isinstance(rows, (list, tuple, set)):
@@ -380,9 +386,12 @@ class Table(BaseTable):
         if not spec.primary_key:
             raise MissingPrimaryKey('write requires TableContract.primary_key')
 
+        if mode is None:
+            mode = spec.conflict
         mode = str(mode).lower()
         if mode not in ['append', 'upsert', 'replace', 'ignore']:
             raise BadArgument(f'Unsupported write mode `{mode}`')
+        self._ensure_segment_conflict_supported(spec, mode)
 
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
@@ -421,8 +430,19 @@ class Table(BaseTable):
             layout_warnings=layout_warnings,
         )
 
-    def write_buffer(self, mode='upsert', max_rows=10_000, **write_kwargs):
+    def write_buffer(self, mode=None, max_rows=10_000, **write_kwargs):
         return _BufferedWriter(self, mode=mode, max_rows=max_rows, **write_kwargs)
+
+    def _ensure_segment_conflict_supported(self, spec, mode):
+        if not spec or not spec.segment:
+            return
+        mode = str(mode).lower()
+        if mode in ['upsert', 'replace']:
+            raise BadArgument(
+                'Segment.rows does not support upsert/replace before '
+                'global pk index and tombstone are implemented; use '
+                'append/ignore or disable segment'
+            )
 
     def query(self, symbols=None, start=None, end=None, date=None, session=None,
               columns='*', where=None, order_by=None, limit=None):
@@ -753,11 +773,15 @@ class Table(BaseTable):
         w = Where(compiled_where)
         scanned = set()
         scanned_ref_keys = set()
+        candidate_ref_keys = set()
         candidate_partition_keys = set()
         exclusion_reasons = {}
         if not w.or_and_cases:
             scanned.update(all_parts)
             candidate_partition_keys.update(all_parts)
+            candidate_ref_keys.update(
+                self._segment_lookup_key(ref) for ref in all_refs
+            )
             scanned_ref_keys.update(
                 self._segment_lookup_key(ref) for ref in all_refs
             )
@@ -766,6 +790,9 @@ class Table(BaseTable):
                 candidate_parts = self._get_select_parts(cases)
                 candidate_partition_keys.update(candidate_parts)
                 candidate_refs = self._physical_part_refs(candidate_parts)
+                candidate_ref_keys.update(
+                    self._segment_lookup_key(ref) for ref in candidate_refs
+                )
                 excluded = self._segment_exclusion_reasons(candidate_refs, cases)
                 exclusion_reasons.update(excluded)
                 part_refs = [
@@ -779,12 +806,16 @@ class Table(BaseTable):
 
         scanned_partitions = [part for part in all_parts if part in scanned]
         skipped_partitions = [part for part in all_parts if part not in scanned]
-        scanned_segments = [
+        candidate_segments = [
             ref for ref in all_refs
+            if self._segment_lookup_key(ref) in candidate_ref_keys
+        ]
+        scanned_segments = [
+            ref for ref in candidate_segments
             if self._segment_lookup_key(ref) in scanned_ref_keys
         ]
         skipped_segments = [
-            ref for ref in all_refs
+            ref for ref in candidate_segments
             if self._segment_lookup_key(ref) not in scanned_ref_keys
         ]
         skip_reasons = {}
@@ -819,7 +850,7 @@ class Table(BaseTable):
             skipped_partitions=skipped_partitions,
             skip_reasons=skip_reasons,
             candidate_segments=[
-                self._segment_to_plan_item(ref) for ref in all_refs
+                self._segment_to_plan_item(ref) for ref in candidate_segments
             ],
             scanned_segments=[
                 self._segment_to_plan_item(ref) for ref in scanned_segments
@@ -916,22 +947,27 @@ class Table(BaseTable):
     def _segment_to_plan_item(self, info):
         return info.to_dict()
 
-    def _segment_created_at(self, logical_part, segment_id):
+    def _segment_info(self, logical_part, segment_id):
         for info in self._segment_infos([logical_part]):
             if info.segment_id == segment_id:
-                try:
-                    row = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].select_one(
-                        'created_at',
-                        where=(
-                            f'table_name="{self._table_name}" '
-                            f'and logical_part="{logical_part}" '
-                            f'and segment_id="{segment_id}"'
-                        ),
-                    )
-                except NoSuchTable:
-                    return None
-                return row.get('created_at') if row else None
+                return info
         return None
+
+    def _segment_created_at(self, logical_part, segment_id):
+        if self._segment_info(logical_part, segment_id) is None:
+            return None
+        try:
+            row = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].select_one(
+                'created_at',
+                where=(
+                    f'table_name="{self._table_name}" '
+                    f'and logical_part="{logical_part}" '
+                    f'and segment_id="{segment_id}"'
+                ),
+            )
+        except NoSuchTable:
+            return None
+        return row.get('created_at') if row else None
 
     def _upsert_segment_info(self, info):
         now = arrow.now().format("YYYY-MM-DD HH:mm:ss")
@@ -1073,6 +1109,7 @@ class Table(BaseTable):
         time_min, time_max = self._data_file_time_range(part_key)
         session_min, session_max = self._data_file_session_range(part_key)
         stats = self._data_file_column_stats(part_key)
+        existing = self._segment_info(logical_part, segment_id)
         info = SegmentInfo(
             logical_part=logical_part,
             segment_id=segment_id,
@@ -1084,7 +1121,10 @@ class Table(BaseTable):
             session_min=session_min,
             session_max=session_max,
             stats=stats,
-            sealed=row_count >= layout.max_rows_per_file,
+            sealed=(
+                bool(existing and existing.sealed)
+                or row_count >= layout.max_rows_per_file
+            ),
         )
         self._upsert_segment_info(info)
         return info
@@ -1389,18 +1429,23 @@ class Table(BaseTable):
 
         w = Where(where)
         limit = self._normalize_limit(limit)
+        fetch_fields, project_fields = self._select_fields_with_order(
+            fields,
+            order_by,
+            column_types,
+        )
 
         full_data = []
         if not w.or_and_cases:
             # select all
-            data = self._select_and_cases(fields, None, column_types)
+            data = self._select_and_cases(fetch_fields, None, column_types)
             # full_data.append(data)
             if data:
                 full_data.extend(data)
         else:
             for cases in w.or_and_cases:
                 # 一个基本查询单元
-                data = self._select_and_cases(fields, cases, column_types)
+                data = self._select_and_cases(fetch_fields, cases, column_types)
                 # full_data.append((cases, data))
                 # full_data.append(data)
                 if data:
@@ -1409,6 +1454,8 @@ class Table(BaseTable):
         full_data = self._apply_order_by(full_data, order_by)
         if limit is not None:
             full_data = full_data[:limit]
+        if project_fields is not None:
+            full_data = self._project_rows(full_data, project_fields)
         if to_dict:
             full_data = [dict(item) for item in full_data]
         return full_data
@@ -1420,6 +1467,51 @@ class Table(BaseTable):
         if limit < 0:
             raise BadArgument('limit must be non-negative')
         return limit
+
+    def _select_fields_with_order(self, fields, order_by, column_types):
+        project_fields = self._plain_select_fields(fields)
+        if project_fields is None:
+            return fields, None
+
+        fetch_fields = list(project_fields)
+        for field, _ in self._parse_order_by(order_by):
+            if field not in fetch_fields and field in column_types:
+                fetch_fields.append(field)
+
+        if fetch_fields == project_fields:
+            return fields, None
+        return fetch_fields, project_fields
+
+    def _plain_select_fields(self, fields):
+        if isinstance(fields, (tuple, list)):
+            values = list(fields)
+        elif isinstance(fields, str):
+            text = fields.strip()
+            if text == '*' or '*' in text:
+                return None
+            values = [item.strip() for item in text.split(',') if item.strip()]
+        else:
+            return None
+
+        plain_fields = []
+        for item in values:
+            if not isinstance(item, str):
+                return None
+            field = item.strip().strip('"').strip("'")
+            if (
+                not field
+                or field == '*'
+                or any(char in field for char in ' ()+-*/')
+            ):
+                return None
+            plain_fields.append(field)
+        return plain_fields
+
+    def _project_rows(self, rows, fields):
+        return [
+            {field: row[field] for field in fields}
+            for row in rows
+        ]
 
     def _parse_order_by(self, order_by):
         if not order_by:
@@ -1830,6 +1922,8 @@ class Table(BaseTable):
         table_spec = kwargs.get("table_contract") or kwargs.get("table_spec")
         segment_spec = TableContract.ensure(table_spec) if table_spec is not None else None
         use_segment = bool(segment_spec and segment_spec.segment)
+        if use_segment and replace:
+            self._ensure_segment_conflict_supported(segment_spec, 'replace')
 
         if part_obj is None:
             # No partitioning - put all data in a single partition
@@ -2293,7 +2387,7 @@ class Table(BaseTable):
         )
 
     def repartition_to(self, target_uri, table_name=None, spec=None,
-                       mode='upsert', batch_size=10_000):
+                       mode='append', batch_size=10_000):
         table_name = table_name or self._table_name
         if target_uri == self._uri and table_name == self._table_name:
             raise BadArgument('repartition_to requires a different target uri or table')

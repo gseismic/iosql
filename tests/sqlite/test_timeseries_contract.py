@@ -761,7 +761,7 @@ def test_segment_layout_splits_oversized_logical_partition(tmp_path):
     }
 
 
-def test_segment_upsert_rewrites_existing_primary_key(tmp_path):
+def test_segment_default_write_appends_duplicate_primary_key(tmp_path):
     _, ticks = _segmented_ticks(tmp_path)
     ticks.write([
         {"symbol": "AAPL", "ts": 1000, "price": 1.0},
@@ -771,28 +771,31 @@ def test_segment_upsert_rewrites_existing_primary_key(tmp_path):
     ticks.write({"symbol": "AAPL", "ts": 1000, "price": 9.0})
 
     assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
         {"symbol": "AAPL", "ts": 1000, "price": 9.0},
         {"symbol": "MSFT", "ts": 2000, "price": 2.0},
     ]
-    assert [item["row_count"] for item in ticks.segments()] == [1, 1]
+    assert [item["row_count"] for item in ticks.segments()] == [1, 1, 1]
+
+    with pytest.raises(BadArgument, match="Segment.rows"):
+        ticks.write({"symbol": "AAPL", "ts": 1000, "price": 10.0}, mode="upsert")
 
 
-def test_segment_replace_rewrites_existing_primary_key(tmp_path):
+def test_segment_replace_rejected_until_pk_index(tmp_path):
     _, ticks = _segmented_ticks(tmp_path)
     ticks.write([
         {"symbol": "AAPL", "ts": 1000, "price": 1.0},
         {"symbol": "MSFT", "ts": 2000, "price": 2.0},
     ])
 
-    result = ticks.write(
-        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
-        mode="replace",
-    )
+    with pytest.raises(BadArgument, match="Segment.rows"):
+        ticks.write(
+            {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+            mode="replace",
+        )
 
-    assert result.rows_seen == 1
-    assert result.rows_written == 1
     assert ticks.query(order_by="ts").to_list() == [
-        {"symbol": "AAPL", "ts": 1000, "price": 9.0},
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
         {"symbol": "MSFT", "ts": 2000, "price": 2.0},
     ]
     assert [item["row_count"] for item in ticks.segments()] == [1, 1]
@@ -838,7 +841,7 @@ def test_segment_delete_refreshes_segment_metadata(tmp_path):
     assert segments[1]["time_max"] == 2000
 
 
-def test_segment_upsert_same_batch_duplicate_primary_key_last_wins(tmp_path):
+def test_segment_default_same_batch_duplicate_primary_key_appends(tmp_path):
     _, ticks = _segmented_ticks(tmp_path)
 
     ticks.write([
@@ -847,9 +850,10 @@ def test_segment_upsert_same_batch_duplicate_primary_key_last_wins(tmp_path):
     ])
 
     assert ticks.query(order_by="ts").to_list() == [
+        {"symbol": "AAPL", "ts": 1000, "price": 1.0},
         {"symbol": "AAPL", "ts": 1000, "price": 9.0},
     ]
-    assert [item["row_count"] for item in ticks.segments()] == [1]
+    assert [item["row_count"] for item in ticks.segments()] == [1, 1]
 
 
 def test_segment_append_allows_duplicate_primary_key_across_sealed_segments(tmp_path):

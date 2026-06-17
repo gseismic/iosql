@@ -171,7 +171,8 @@ print("跳过 segment:", plan.segment_skip_reasons)
 **排查**：
 
 1. 检查 `WriteResult.rows_seen` vs `WriteResult.rows_written`。
-2. 如果预期覆盖，使用默认 `mode="upsert"`。
+2. 如果预期覆盖，非 segment 表可显式使用 `mode="upsert"`。
+3. 如果是 `Segment.rows` 表，当前不要依赖覆盖写；改用 append/ignore 或等待 pk index/tombstone 设计。
 
 ```python
 result = table.write(data)
@@ -187,7 +188,7 @@ print(f"seen={result.rows_seen}, written={result.rows_written}")
 
 1. 确认查询的 `start`/`end` 范围覆盖了数据的时间戳。
 2. 确认没有将毫秒时间戳当作秒级时间戳使用。
-3. 检查 `mode="upsert"` 是否意外覆盖了数据（如主键相同但时间戳不同）。
+3. 检查是否显式使用了 `mode="upsert"` 或表契约 `conflict="upsert"`，导致同主键数据被覆盖。
 4. 使用 `table.segments()` 确认数据已写入正确的分区文件。
 5. 使用 `table.table_parts()` 确认分区是否已创建。
 
@@ -195,13 +196,14 @@ print(f"seen={result.rows_seen}, written={result.rows_written}")
 
 **症状**：开启 segment 后，跨 segment 的 upsert 未生效。
 
-**原因**：append-only 模式下，不主动跨 sealed segments 查重。
+**原因**：当前 `Segment.rows` 是 append-first 实现，未实现全局 pk index/tombstone，因此不允许 `upsert/replace` 覆盖写。
 
 **排查**：
 
 1. 使用 `table.segments()` 检查哪些 segment 是 sealed 状态。
-2. 晚到数据会进入新的 active/delta segment，可能需要后续引入全局主键索引和 tombstone。
-3. 纯新增数据场景使用 `mode="append"` 性能最优。
+2. 晚到数据会进入新的 active segment，查询时可能扫描多个重叠 segment。
+3. 纯新增数据场景使用默认 append 性能最优。
+4. 需要覆盖写时，暂时关闭 segment 或先离线重分区。
 
 ### WriteResult 返回 layout_warnings
 
