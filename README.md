@@ -205,6 +205,7 @@ print(result.rows_copied, result.partitions_created)
 | `02_calendar_events.py` | 日期字符串和日历分区。 |
 | `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入和查询计划。 |
 | `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
+| `05_partition_segments_smoke.py` | 多分区写入、物理 segment 拆分和查询计划。 |
 
 金融场景示例位于 `examples/finance/`：
 
@@ -219,8 +220,11 @@ print(result.rows_copied, result.partitions_created)
 
 ```bash
 python examples/01_quickstart_timeseries.py
+python examples/05_partition_segments_smoke.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
+
+低层 SQLite 工具示例位于 `examples/mysqlite/`，用于 `iosql.utils.mysqlite` 的 schema-on-write、批量写入、冲突处理和连接池清理。它们不是新的主 API 入口。
 
 ## 存储结构
 

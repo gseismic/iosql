@@ -10,6 +10,7 @@
 | `02_calendar_events.py` | 入门 | 使用日期字符串、时区和日历分区保存事件表。 |
 | `03_buffered_ingest_and_query_plan.py` | 进阶 | 使用 `write_buffer()` 批量写入，并通过 `query().explain()` 查看分区裁剪。 |
 | `04_layout_report_and_repartition.py` | 高级 | 使用 `layout_report()` 诊断分区行数，并用 `repartition_to()` 生成新布局。 |
+| `05_partition_segments_smoke.py` | 高级 | 小规模验证多分区写入、物理 segment 拆分和查询计划。 |
 
 ## 金融示例
 
@@ -37,9 +38,14 @@ python examples/01_quickstart_timeseries.py
 python examples/02_calendar_events.py
 python examples/03_buffered_ingest_and_query_plan.py
 python examples/04_layout_report_and_repartition.py
+python examples/05_partition_segments_smoke.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
 ## 运行时数据
 
 示例会写入 `examples/runtime/`，该目录不需要提交。每个脚本启动时会清理自己的示例库，便于重复运行。
+
+## 低层 mysqlite 示例
+
+`examples/mysqlite/` 保留少量 `iosql.utils.mysqlite` 示例，用于直接操作单个 SQLite 文件、schema-on-write、批量写入和连接池清理。新项目优先使用本目录上方的主时序 API 示例。

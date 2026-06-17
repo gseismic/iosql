@@ -1,0 +1,23 @@
+# mysqlite 低层示例
+
+本目录保留 `iosql.utils.mysqlite` 的少量可运行示例。它是 iosql 内部使用的低层 SQLite 工具层，适合需要直接操作单个 SQLite 文件、schema-on-write、批量写入或连接池控制的场景。
+
+新项目优先使用仓库根目录的主时序 API 示例；只有明确需要低层 SQLite 工具时再使用本目录。
+
+## 示例索引
+
+| 文件 | 场景 |
+| --- | --- |
+| `01_schemaless_crud.py` | 自动建表、动态加列、基础 CRUD。 |
+| `02_bulk_query_and_conflict.py` | 批量写入、聚合查询、复合主键、replace/ignore。 |
+| `03_connection_pool_cleanup.py` | 线程绑定连接、强制释放和重新打开数据库。 |
+
+## 运行
+
+```bash
+python examples/mysqlite/01_schemaless_crud.py
+python examples/mysqlite/02_bulk_query_and_conflict.py
+python examples/mysqlite/03_connection_pool_cleanup.py
+```
+
+运行时数据写入 `examples/runtime/mysqlite/`，脚本会在开始和结束时清理自己的目录。
