@@ -39,6 +39,53 @@ from iosql.utils.mysqlite import Database
        适合：独立 SQLite 工具、schema-on-write 快速原型
 ```
 
+## Partition 与 Segment 的关系
+
+`partition`（逻辑分区）和 `segment`（物理分段）是独立的两级机制，组合使用形成不同存储模式：
+
+```
+Partition（逻辑分区）           Segment（物理分段）
+按业务键路由到不同目录         在同一逻辑分区内按行数拆分 .sqlite3 文件
+e.g. ts=1735689600000          e.g. max_rows=500_000
+```
+
+### 四种组合及行为
+
+| Partition | Segment | 行为 | 目录结构 |
+|:---------:|:-------:|------|---------|
+| ✅ | ✅ | 按分区键路由，每个分区内按行数自动滚动文件 | `partition_key.sqlite3` / `partition_key-1.sqlite3` |
+| ✅ | ❌ | 按分区键路由，每个分区仅一个文件（无限增长） | `partition_key.sqlite3` |
+| ❌ | ✅ | 全部数据写入 `__all__`，仅按行数滚动文件 | `__all__-0.sqlite3` / `__all__-1.sqlite3` |
+| ❌ | ❌ | 退化为单文件 SQLite | `table_name.sqlite3` |
+
+### 查询裁剪
+
+有 `segment` 时执行**二级裁剪**：
+
+1. **一级**：按 `partition` 键跳过不相关的逻辑分区
+2. **二级**：通过 segment `stats`（每列 min/max）和 `session_min/session_max` 跳过不相关的物理文件
+
+`explain_select()` 返回的 `QueryPlan` 同时展示 `scanned_partitions` / `scanned_segments` 和对应的 `skip_reasons`。
+
+### 核心代码逻辑
+
+```python
+# do_insert_all 中的关键决策
+part_obj    = partition or self._partition      # 有逻辑分区？
+use_segment = bool(spec and spec.segment)       # 有物理分段？
+
+if part_obj is None:
+    logical_part = DEFAULT_LOGICAL_PART if use_segment else None  # "__all__" or None
+else:
+    partitioned_data = {part_obj.get_key(row): [rows...]}         # 按分区键拆散
+
+for part_key, part_data in partitioned_data.items():
+    if use_segment:
+        _do_insert_segmented(...)   # segment 感知：检查行数、seal、滚动
+    else:
+        _do_insert_part(...)        # 直接写入对应 SQLite 文件
+```
+
 ## API 速查表
 
 | 类别 | API | 说明 |

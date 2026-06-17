@@ -1,5 +1,43 @@
 # iosql 使用模式
 
+## Partition 与 Segment：四种组合
+
+`partition`（逻辑分区）和 `segment`（物理分段）是 iosql 核心的二级文件管理：
+
+| 组合 | 数据路由 | 文件管理 | 典型场景 |
+|------|---------|---------|---------|
+| partition + segment | 按分区键 | 分区内按行数滚动 | 高频 tick/K 线 |
+| 仅 partition | 按分区键 | 每分区单文件 | 日线、财报 |
+| 仅 segment | 全部到 `__all__` | 按行数滚动 | 日志、事件流 |
+| 两者皆无 | 无路由 | 单文件 | KV 表、元数据 |
+
+目录结构：
+
+```text
+# partition + segment（完整模式）
+ticks/data/
+├── 1735689600000.sqlite3          # partition=A, segment=0
+├── 1735689600000-1.sqlite3        # partition=A, segment=1  行数满了
+└── 1735776000000.sqlite3          # partition=B, segment=0
+
+# 仅 segment（无 partition）
+events/data/
+├── __all__-0.sqlite3              # segment=0
+├── __all__-1.sqlite3              # segment=1
+└── __all__-2.sqlite3              # segment=2
+
+# 仅 partition（无 segment）  
+daily_bars/data/
+├── 1735689600000.sqlite3          # 单文件，无限增长
+└── 1735776000000.sqlite3
+
+# 两者皆无  
+simple/data/
+└── simple.sqlite3                 # 单文件
+```
+
+以下按组合方式提供完整代码示例。
+
 ## 毫秒时序表：原始 Table 版
 
 ```python

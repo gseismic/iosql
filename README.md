@@ -12,6 +12,62 @@
 - **布局维护**：`layout_report()` 检查分区行数，`repartition_to()` 可生成新的分区布局。
 - **时序 helper**：`Database.timeseries()` 保留为快捷封装，适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 
+## Partition 与 Segment 的关系
+
+`partition`（逻辑分区）和 `segment`（物理分段）是 iosql 核心的二级文件管理机制，两者独立配置、组合使用。
+
+```
+Partition（逻辑分区）          Segment（物理分段）
+按业务键做第一级路由         按行数做第二级文件滚动
+e.g. ts=1735689600000         每个逻辑分区下可拆分多个 .sqlite3 文件
+```
+
+### 四种组合
+
+| Partition | Segment | 数据路由 | 文件滚动 | 适用场景 |
+|:---------:|:-------:|---------|---------|---------|
+| ✅ | ✅ | 按分区键路由 | 按行数自动创建新文件 | 高频时序数据（tick/K线），单分区数据量大 |
+| ✅ | ❌ | 按分区键路由 | 不滚动，单文件 | 低频数据（日线/财报），单分区数据量可控 |
+| ❌ | ✅ | 全部到 `__all__` | 按行数自动创建新文件 | 日志/事件流，只需控制文件大小 |
+| ❌ | ❌ | 无路由 | 不滚动 | 简单 KV 表、元数据、配置表 |
+
+### 目录结构
+
+**完整模式（partition + segment）**：
+```text
+ticks/
+└── data/
+    ├── 1735689600000.sqlite3        # partition=0000, segment=0
+    ├── 1735689600000-1.sqlite3      # 同一逻辑分区, segment=1（行数满了）
+    └── 1735776000000.sqlite3        # partition=0000, segment=0
+```
+
+**纯 segment（无 partition）**：
+```text
+events/
+└── data/
+    ├── __all__-0.sqlite3            # segment=0
+    ├── __all__-1.sqlite3            # segment=1
+    └── __all__-2.sqlite3            # segment=2
+```
+
+**纯 partition（无 segment）**：
+```text
+daily_bars/
+└── data/
+    ├── 1735689600000.sqlite3        # 单文件（会无限增长）
+    └── 1735776000000.sqlite3
+```
+
+### 查询裁剪
+
+配置 `segment` 后，查询时执行**二级裁剪**：
+
+1. **一级（logical partition）**：按分区键跳过不相关的时间段/数值范围
+2. **二级（physical segment）**：通过 segment `stats`（每列 min/max）和 `session_min/session_max` 跳过无关文件
+
+`explain_select()` 返回的 `QueryPlan` 同时展示两级裁剪结果。
+
 ## 安装
 
 要求 Python 3.9 或更高版本。
@@ -266,19 +322,20 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 
 ## 存储结构
 
-示例中的 `sqlite://database/market.iosql` 会生成一个目录式数据库：
+示例中的 `sqlite://database/market.iosql` 会生成一个目录式数据库。开启 segment 后，同一逻辑分区可以拆分多个物理文件：
 
 ```text
 database/
 └── market.iosql/
     └── ticks/
-        ├── meta.sqlite3
+        ├── meta.sqlite3            # 表元数据、分区信息、segment 清单
         └── data/
-            ├── 1735689600000.sqlite3
-            └── 1735776000000.sqlite3
+            ├── 1735689600000.sqlite3     # partition=1735689600000, segment=0
+            ├── 1735689600000-1.sqlite3   # 同一分区, segment=1（行数>max_rows 时创建）
+            └── 1735776000000.sqlite3     # partition=1735776000000, segment=0
 ```
 
-`meta.sqlite3` 保存表元数据和分区信息；每个分区文件保存该时间范围内的真实数据。
+不配置 `partition` 时，所有数据使用 `__all__` 作为逻辑分区名。不配置 `segment` 时，每个逻辑分区仅一个文件。
 
 ## 注意事项
 
