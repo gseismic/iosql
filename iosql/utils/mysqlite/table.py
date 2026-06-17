@@ -26,7 +26,7 @@ from .sql import (
     getsql_add_column,
     suggest_value_type,
     suggest_data_columns,
-    getsql_query_table, quoted_sql_text,
+    getsql_query_table, quoted_sql_text, sql_literal,
     getarg_diclist_insertmany,
     suggest_columns
 )
@@ -95,24 +95,25 @@ class Table:
             finally:
                 cursor.close()
     
-    def _execute_with_fallback(self, sql: str, commit: Optional[bool], data: Dict[str, Any], 
-                              ensure_table: bool, ensure_column: bool, **kwargs) -> None:
+    def _execute_with_fallback(self, sql: str, commit: Optional[bool], data: Dict[str, Any],
+                              ensure_table: bool, ensure_column: bool,
+                              params: Optional[List[Any]] = None, **kwargs) -> None:
         """Execute SQL with fallback handling for missing table/column"""
         try:
-            self.execute(sql, commit=commit)
+            self.execute_params(sql, params, commit=commit)
         except NoSuchTable as e:
             if ensure_table:
                 if self.verbose >= 1:
                     logger.info(f'Table {self._table_name} Not Exist, try-to-create by Data')
                 self.create_table_like(data, **kwargs)
                 # 创建了table，就不会报错 NoSuchColumn
-                self.execute(sql, commit=commit)
+                self.execute_params(sql, params, commit=commit)
             else:
                 raise e
         except NoSuchColumn as e:
             if ensure_column:
                 self.ensure_columns_like(data)
-                self.execute(sql, commit=commit)
+                self.execute_params(sql, params, commit=commit)
             else:
                 raise e
 
@@ -198,10 +199,10 @@ class Table:
         )
         self.execute(_sql, commit=True)
 
-        __sql, _ = getsqlarg_dict_insert(
+        __sql, __values = getsqlarg_dict_insert(
             meta_table_name, {
                 'table_name': self._table_name,
-                'columns': json.dumps(columns).replace('"', '""'),
+                'columns': json.dumps(columns),
                 'pk': ','.join(pk) if isinstance(pk, (list,tuple)) else pk,
                 'table_comment': table_comment,
                 'author': kwargs.get('author'),
@@ -211,7 +212,7 @@ class Table:
             },
             replace=True
         )
-        self.execute(__sql, commit=True)
+        self.execute_params(__sql, __values, commit=True)
         logger.debug(f'Table {self._table_name} meta info Created.')
         self._invalidate_cache()
 
@@ -224,10 +225,7 @@ class Table:
                       default: Optional[Any] = None) -> bool:
         definition = column_type
         if default is not None:
-            if isinstance(default, str):
-                definition += f" DEFAULT '{default}'"
-            else:
-                definition += f" DEFAULT {default}"
+            definition += f" DEFAULT {sql_literal(default)}"
         try:
             self.add_column(column_name, definition)
             return True
@@ -237,7 +235,7 @@ class Table:
 
     def ensure_columns(self, columns: Dict[str, str]) -> None:
         for column_name, type_ in columns.items():
-            is_added = self.ensure_column(column_name, column_type=type_)
+            is_added = self.ensure_column(column_name, column_type=type_ or 'text')
             if is_added and self.verbose >= 1:
                 logger.info(f'{self._table_name}: Added column {column_name} {type_}')
 
@@ -314,6 +312,19 @@ class Table:
         except sqlite3.OperationalError as e:
             self._handle_error_on_connection(e, conn)
 
+    def _execute_params_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
+                                      sql: str, params: Optional[List[Any]] = None,
+                                      commit: Optional[bool] = None) -> None:
+        """在指定连接上执行带参数的SQL语句"""
+        if self.verbose >= 2:
+            logger.info(f'SQL: {sql}; params={params}')
+
+        try:
+            cursor.execute(sql, params or [])
+            self._try_commit_on_connection(conn, commit)
+        except sqlite3.OperationalError as e:
+            self._handle_error_on_connection(e, conn)
+
     def _executemany_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
                                   sql: str, list_values: List[Tuple], 
                                   commit: Optional[bool] = None) -> None:
@@ -340,6 +351,11 @@ class Table:
                 self._try_commit_on_connection(conn, commit)
             except sqlite3.OperationalError as e:
                 self._handle_error_on_connection(e, conn)
+
+    def execute_params(self, sql: str, params: Optional[List[Any]] = None,
+                       commit: Optional[bool] = None) -> None:
+        with self._get_cursor() as (cursor, conn):
+            self._execute_params_on_connection(cursor, conn, sql, params, commit)
 
     def executemany(self, sql: str, list_values: List[Tuple], commit: Optional[bool] = None) -> None:
         '''SQL简单封装
@@ -385,6 +401,8 @@ class Table:
             conn: 数据库连接对象
             commit: 是否提交事务，None表示根据auto_commit决定
         """
+        if self.database.in_transaction():
+            return
         if commit is None:
             if self.auto_commit:
                 conn.commit()
@@ -392,12 +410,11 @@ class Table:
             conn.commit()
 
     def _update(self, kv: Dict[str, Any], where: Optional[str], commit: Optional[bool] = None) -> None:
-        # Use f-strings for better performance
-        kv_string = ','.join([f'{k}="{v}"' for k, v in kv.items()])
-        sql = f'UPDATE {self._table_name} SET {kv_string}'
+        kv_string = ','.join([f'{quoted_sql_text(k)}=?' for k in kv.keys()])
+        sql = f'UPDATE {quoted_sql_text(self._table_name)} SET {kv_string}'
         if where:
             sql += f' WHERE {where}'
-        self.execute(sql, commit=commit)
+        self.execute_params(sql, list(kv.values()), commit=commit)
 
     def select_one(self, fields: Optional[Union[str, List[str]]], where: Optional[str] = None, 
                    order_by: Optional[str] = None, option: Optional[str] = None) -> Optional[Dict]:
@@ -426,13 +443,13 @@ class Table:
         if fields is None:
             field_string = '*'
         elif isinstance(fields, (tuple, list)):
-            field_string = ','.join(fields)
+            field_string = ','.join(quoted_sql_text(field) for field in fields)
         elif isinstance(fields, str):
             field_string = fields
         else:
             raise Exception('BadFields')
 
-        sql = f'SELECT {field_string} FROM {self._table_name}'
+        sql = f'SELECT {field_string} FROM {quoted_sql_text(self._table_name)}'
         if where:
             sql += f' WHERE {where}'
         if order_by:
@@ -454,8 +471,13 @@ class Table:
                ensure_column: bool = False, **kwargs) -> None:
         if not kv:
             return
-        sql, _ = getsqlarg_dict_insert(self._table_name, kv, replace=replace, ignore=ignore)
-        self._execute_with_fallback(sql, commit, kv, ensure_table, ensure_column, **kwargs)
+        sql, values = getsqlarg_dict_insert(
+            self._table_name, kv, replace=replace, ignore=ignore
+        )
+        self._execute_with_fallback(
+            sql, commit, kv, ensure_table, ensure_column,
+            params=values, **kwargs
+        )
 
     def _insert_one_batch(self, batch_data: List[Dict[str, Any]], 
                           replace: bool = False, ignore: bool = False,
@@ -513,13 +535,13 @@ class Table:
                 # Note 这里忽略了not_null等参数, 用了默认数值
                 # 用户能传的只有 columns(包含了not_null等信息), pk
                 columns = suggest_columns(od_fields)
-                self.create_table(columns, **kwargs)
+                self._create_table_on_connection(cursor, conn, columns, **kwargs)
                 self._executemany_on_connection(cursor, conn, sql, list_values)
             else:
                 raise e
         except NoSuchColumn as e:
             if ensure_column:
-                self.ensure_columns(od_fields)
+                self._ensure_columns_on_connection(cursor, conn, od_fields)
                 # self.ensure_columns_like(batch_data[0])
                 self._executemany_on_connection(cursor, conn, sql, list_values)
             else:
@@ -569,10 +591,10 @@ class Table:
         )
         cursor.execute(_sql)
 
-        __sql, _ = getsqlarg_dict_insert(
+        __sql, __values = getsqlarg_dict_insert(
             meta_table_name, {
                 'table_name': self._table_name,
-                'columns': json.dumps(columns).replace('"', '""'),
+                'columns': json.dumps(columns),
                 'pk': ','.join(pk) if isinstance(pk, (list,tuple)) else pk,
                 'table_comment': table_comment,
                 'author': kwargs.get('author'),
@@ -582,15 +604,16 @@ class Table:
             },
             replace=True
         )
-        cursor.execute(__sql)
+        cursor.execute(__sql, __values)
         logger.debug(f'Table {self._table_name} meta info Created.')
+        self._invalidate_cache()
 
     def _ensure_columns_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection, 
                                      od_fields: Dict[str, Any]) -> None:
         """在指定连接上确保列存在"""
         for column_name, value in od_fields.items():
             try:
-                type_ = suggest_value_type(value)
+                type_ = suggest_value_type(value) or 'text'
                 sql = getsql_add_column(self._table_name, column_name, type_)
                 cursor.execute(sql)
                 self._invalidate_cache()
@@ -612,9 +635,11 @@ class Table:
         
         # 使用单个连接进行整个批量操作
         with self._get_cursor() as (cursor, conn):
+            own_transaction = not self.database.in_transaction()
             try:
                 # 开始事务
-                conn.execute('BEGIN IMMEDIATE;')
+                if own_transaction:
+                    conn.execute('BEGIN IMMEDIATE;')
                 
                 for i in range(n_batch):
                     start_idx = i * batch_size
@@ -633,11 +658,12 @@ class Table:
                     )
                 
                 # 提交整个事务
-                if commit:
+                if commit and own_transaction:
                     conn.commit()
                     
             except Exception as e:
-                conn.rollback()
+                if own_transaction:
+                    conn.rollback()
                 raise e
 
 
@@ -656,13 +682,13 @@ class Table:
         self.executemany(sql, list_values, batch_size=batch_size, commit=commit)
 
     def delete(self, where: str) -> None:
-        sql = f'DELETE FROM {self._table_name} WHERE {where}'
+        sql = f'DELETE FROM {quoted_sql_text(self._table_name)} WHERE {where}'
         self.execute(sql, commit=True)
 
     def update(self, kv: Dict[str, Any], where: str) -> None:
-        kv_string = ','.join([f'{k}=?' for k in kv.keys()])
+        kv_string = ','.join([f'{quoted_sql_text(k)}=?' for k in kv.keys()])
         values = list(kv.values())
-        sql = f'UPDATE {self._table_name} SET {kv_string} WHERE {where}'
+        sql = f'UPDATE {quoted_sql_text(self._table_name)} SET {kv_string} WHERE {where}'
         with self._get_cursor() as (cursor, conn):
             try:
                 cursor.execute(sql, values)
@@ -671,7 +697,7 @@ class Table:
                 self._handle_error_on_connection(e, conn)
 
     def count(self, where: Optional[str] = None) -> int:
-        sql = f'SELECT COUNT(*) FROM {self._table_name}'
+        sql = f'SELECT COUNT(*) FROM {quoted_sql_text(self._table_name)}'
         if where:
             sql += f' WHERE {where}'
         result = self.fetchone(sql)
@@ -679,11 +705,14 @@ class Table:
 
     def delete_all(self) -> None:
         # commit 字段无效
-        sql = f'DELETE FROM {self._table_name}'
+        sql = f'DELETE FROM {quoted_sql_text(self._table_name)}'
         self.execute(sql, commit=True)
 
     def get_all_index(self, full_info: bool = False) -> Union[List[str], List[Dict]]:
-        sql = f"SELECT * FROM sqlite_master WHERE type == 'index' AND tbl_name == \"{self._table_name}\""
+        sql = (
+            "SELECT * FROM sqlite_master WHERE type == 'index' "
+            f"AND tbl_name == {sql_literal(self._table_name)}"
+        )
         data = self.fetchall(sql)
         if full_info:
             return [dict(item) for item in data]
@@ -699,7 +728,7 @@ class Table:
             self.drop_index(index)
 
     def drop_index(self, index_name: str) -> None:
-        sql = f'DROP INDEX {index_name}'
+        sql = f'DROP INDEX {quoted_sql_text(index_name)}'
         self.execute(sql, commit=True)
 
     def drop_column_index(self, column: str) -> int:
@@ -709,7 +738,7 @@ class Table:
         for item in items:
             match = _INDEX_COLUMN_PATTERN.search(item['sql'])
             if match:
-                _column = match.group(1).split(' ')[0]
+                _column = match.group(1).split(' ')[0].strip('"')
                 if _column == column:
                     to_del.add(item['name'])
 
@@ -721,7 +750,7 @@ class Table:
         return len(to_del)
 
     def drop_table(self) -> None:
-        sql = f'DROP TABLE IF EXISTS {self._table_name}'
+        sql = f'DROP TABLE IF EXISTS {quoted_sql_text(self._table_name)}'
         self.execute(sql, commit=True)
 
     def commit(self, rollback_if_err: bool = True) -> None:
@@ -783,7 +812,10 @@ class Table:
         '''
         if self._default_values_cache is None:
             infos = self._table_info()
-            self._default_values_cache = {item['name']: item['dflt_value'] for item in infos}
+            self._default_values_cache = {
+                item['name']: self._normalize_default_value(item['dflt_value'])
+                for item in infos
+            }
         return self._default_values_cache
         # [{'cid': 0, 'name': 'art_code', 'type': 'TEXT', 'notnull': 0, 'dflt_value': None, 'pk': 1}, 
 
@@ -801,10 +833,20 @@ class Table:
         info_dict['column_type'] = OrderedDict([(i['name'], i['type']) for i in infos])
         # info_dict['not_null'] = OrderedDict([(i['name'], bool(i['notnull'])) for i in infos])
         info_dict['not_null'] = [item['name'] for item in infos if item['notnull'] != 0]
-        info_dict['default'] = {item['name']: item['dflt_value'] for item in infos if item['dflt_value'] is not None}
+        info_dict['default'] = {
+            item['name']: self._normalize_default_value(item['dflt_value'])
+            for item in infos
+            if item['dflt_value'] is not None
+        }
         return info_dict
         # print(table_info)
         # table_info['column_type'] = OrderedDict([tuple(item['name'], item['type'] for item in infos]
         # https://stackoverflow.com/questions/54412977/sqlite3-python-get-list-of-primary-and-foreign-keys
         # 在连接池模式下，需要使用 with self._get_cursor() as (cursor, conn): 来获取连接
         # rows = cursor.execute("PRAGMA foreign_key_list({})".format(quoted_sql_text(table)))
+
+    def _normalize_default_value(self, value):
+        if isinstance(value, str) and len(value) >= 2:
+            if value[0] == "'" and value[-1] == "'":
+                return value[1:-1].replace("''", "'")
+        return value

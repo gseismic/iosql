@@ -13,7 +13,7 @@ db = Database("examples/runtime/mysqlite/demo.sqlite3", auto_commit=True)
 table = db["events"]
 ```
 
-`Database` 会按需创建目录和 SQLite 文件。使用完成后调用 `db.close()`，长时间运行或异常退出场景可调用 `db.force_close_all_connections()`。
+`Database` 会按需创建目录和 SQLite 文件。使用完成后调用 `db.close()`；关闭后的实例不可继续使用，需要重新创建 `Database`。
 
 ## 自动建表和动态加列
 
@@ -84,7 +84,19 @@ with db.get_connection() as conn:
 db.force_close_all_connections()
 ```
 
-连接池用于减少重复打开 SQLite 文件的成本，并避免长时间运行时泄露文件句柄。更多说明见 `CONNECTION_POOL_CLEANUP.md`。
+连接池用于减少重复打开 SQLite 文件的成本，并避免长时间运行时泄露文件句柄。`max_connections` 是单个 `Database` 实例的连接总数上限。
+
+可通过 `db.get_connection_pool_status()` 和 `db.is_connection_pool_healthy()` 查看连接池状态。`force_close_all_connections()` 会关闭连接池并使当前 `Database` 实例不可复用。更多说明见 `CONNECTION_POOL_CLEANUP.md`。
+
+## 事务
+
+```python
+with db.transaction():
+    table.insert({"id": 1, "name": "Alice"}, pk="id", ensure_table=True)
+    table.insert({"id": 2, "name": "Bob"})
+```
+
+`transaction()` 正常退出时提交，异常退出时回滚。`commit()` 和 `rollback()` 只在活跃事务上下文中可用。
 
 ## 示例
 

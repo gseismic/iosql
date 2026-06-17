@@ -4,7 +4,6 @@ import logging
 import copy
 import threading
 import contextlib
-import signal
 import atexit
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
@@ -14,6 +13,7 @@ from .connection_pool import DatabaseConnectionPool
 from . import table
 from .logger import logger
 from .const import _DEFAULT_PRAGMA 
+from .sql import quoted_sql_text
 
 
 class DatabaseError(Exception):
@@ -49,14 +49,6 @@ def _register_cleanup():
     global _cleanup_registered
     if not _cleanup_registered:
         atexit.register(_cleanup_all_databases)
-        # 注册信号处理器
-        def signal_handler(signum, frame):
-            logger.info(f'收到信号 {signum}，开始清理数据库连接')
-            _cleanup_all_databases()
-            exit(0)
-        
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
         _cleanup_registered = True
 
 
@@ -96,7 +88,12 @@ class Database(object):
         
         # 简化锁的使用
         self._lock = threading.Lock()  # 只用于关键配置操作
-        self._pragma_dict = pragma_dict or copy.deepcopy(_DEFAULT_PRAGMA)
+        self._pragma_dict = (
+            copy.deepcopy(pragma_dict)
+            if pragma_dict is not None
+            else copy.deepcopy(_DEFAULT_PRAGMA)
+        )
+        self._local = threading.local()
         
         # 添加连接池
         self._pool = DatabaseConnectionPool(
@@ -166,6 +163,7 @@ class Database(object):
 
     def __getitem__(self, table_name: str) -> 'table.Table':
         """通过名称获取表，如果不存在则创建"""
+        self._ensure_open()
         if table_name not in self._tables:
             if self.verbose >= 2:
                 logger.debug(f'创建表 {self.db_file}: {table_name}')
@@ -180,26 +178,42 @@ class Database(object):
     @contextmanager
     def get_connection(self):
         """获取数据库连接的上下文管理器"""
-        # 确保目录存在
+        self._ensure_open()
+        transaction_conn = getattr(self._local, 'transaction_conn', None)
+        if transaction_conn is not None:
+            yield transaction_conn
+            return
+
+        self._ensure_db_dir()
+
+        with self._pool.get_connection() as conn:
+            yield conn
+
+    def _ensure_open(self) -> None:
+        if getattr(self, '_closed', False):
+            raise DatabaseConnectionError(f'Database is closed: {self.db_file}')
+
+    def _ensure_db_dir(self) -> None:
         db_dirname = self.db_file.parent
         if not db_dirname.exists():
             if self.verbose >= 1:
                 logger.debug(f'创建数据库目录: {db_dirname} ...')
             db_dirname.mkdir(parents=True, exist_ok=True)
-            
-        with self._pool.get_connection() as conn:
-            yield conn
+
+    def in_transaction(self) -> bool:
+        return getattr(self._local, 'transaction_conn', None) is not None
     
 
     def execute(self, sql: str) -> None:
         """执行SQL语句，包含适当的错误处理"""
+        self._ensure_open()
         if self.verbose >= 2:
             logger.debug(f'{self.db_file}: 执行: {sql}')
 
         with self.get_connection() as conn:
             try:
                 conn.execute(sql)
-                if self.auto_commit:
+                if self.auto_commit and not self.in_transaction():
                     conn.commit()
             except sqlite3.Error as e:
                 logger.error(f"SQL execution failed: {sql}")
@@ -207,14 +221,39 @@ class Database(object):
                 raise DatabaseError(f"SQL execution failed: {e}") from e
 
     def commit(self) -> None:
-        """提交当前事务 - 注意：在连接池模式下，每个操作都是自动提交的"""
-        if self.verbose >= 2:
-            logger.debug(f'连接池模式下事务自动提交 {self.db_file}')
+        """提交当前 transaction() 上下文中的事务"""
+        conn = getattr(self._local, 'transaction_conn', None)
+        if conn is None:
+            raise DatabaseError('commit requires an active transaction() context')
+        conn.commit()
 
     def rollback(self) -> None:
-        """回滚当前事务 - 注意：在连接池模式下，每个操作都是自动提交的"""
-        if self.verbose >= 2:
-            logger.debug(f'连接池模式下无法回滚已提交的事务 {self.db_file}')
+        """回滚当前 transaction() 上下文中的事务"""
+        conn = getattr(self._local, 'transaction_conn', None)
+        if conn is None:
+            raise DatabaseError('rollback requires an active transaction() context')
+        conn.rollback()
+
+    @contextmanager
+    def transaction(self, immediate: bool = True):
+        """在同一个连接上执行一组操作，退出时自动提交或回滚"""
+        self._ensure_open()
+        if getattr(self._local, 'transaction_conn', None) is not None:
+            yield self._local.transaction_conn
+            return
+
+        self._ensure_db_dir()
+        with self._pool.get_connection() as conn:
+            self._local.transaction_conn = conn
+            try:
+                conn.execute('BEGIN IMMEDIATE;' if immediate else 'BEGIN;')
+                yield conn
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                self._local.transaction_conn = None
 
     def close(self) -> None:
         """关闭数据库连接池并标记实例为已关闭"""
@@ -276,6 +315,25 @@ class Database(object):
         """检查连接是否已关闭 - 连接池模式下返回真实关闭状态"""
         return getattr(self, '_closed', False)
 
+    def get_connection_pool_status(self) -> Dict[str, Any]:
+        """返回连接池状态，便于长时间运行进程监控文件句柄使用量"""
+        if not hasattr(self, '_pool') or self._pool is None:
+            return {
+                'max_connections': 0,
+                'created_connections': 0,
+                'available_connections': 0,
+                'checked_out_connections': 0,
+                'closed': True,
+                'db_file': str(self.db_file),
+            }
+        return self._pool.get_pool_status()
+
+    def is_connection_pool_healthy(self) -> bool:
+        """检查连接池是否没有超过配置的连接数上限"""
+        if not hasattr(self, '_pool') or self._pool is None:
+            return False
+        return self._pool.is_pool_healthy()
+
 
     def get_conn(self) -> sqlite3.Connection:
         """获取数据库连接 - 不推荐在连接池模式下直接使用"""
@@ -301,6 +359,7 @@ class Database(object):
 
     def get_all_tables(self) -> List[str]:
         """获取数据库中所有表名"""
+        self._ensure_open()
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
@@ -313,6 +372,7 @@ class Database(object):
 
     def get_table_indices(self, table_name: str, exclude_autoindex: bool = True) -> List[str]:
         """获取指定表的所有索引"""
+        self._ensure_open()
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
@@ -334,6 +394,7 @@ class Database(object):
 
     def get_all_indices(self, exclude_autoindex: bool = True) -> List[str]:
         """获取数据库中所有索引"""
+        self._ensure_open()
         try:
             with self.get_connection() as conn:
                 cursor = conn.cursor()
@@ -349,6 +410,7 @@ class Database(object):
 
     def drop_table(self, table_name: Union[str, List[str], tuple]) -> None:
         """删除一个或多个表"""
+        self._ensure_open()
         if isinstance(table_name, str):
             table_names = [table_name]
         elif isinstance(table_name, (list, tuple)):
@@ -358,7 +420,7 @@ class Database(object):
 
         for tbl in table_names:
             try:
-                sql = f'DROP TABLE IF EXISTS {tbl}'
+                sql = f'DROP TABLE IF EXISTS {quoted_sql_text(tbl)}'
                 if self.verbose >= 1:
                     logger.info(f'删除表: {sql}')
                 self.execute(sql)
@@ -367,6 +429,7 @@ class Database(object):
 
     def drop_index(self, index_or_indices: Union[str, List[str], tuple]) -> None:
         """删除一个或多个索引"""
+        self._ensure_open()
         if isinstance(index_or_indices, (list, tuple)):
             indices = list(index_or_indices)
         elif isinstance(index_or_indices, str):
@@ -376,7 +439,7 @@ class Database(object):
 
         for index in indices:
             try:
-                sql = f'DROP INDEX IF EXISTS {index}'
+                sql = f'DROP INDEX IF EXISTS {quoted_sql_text(index)}'
                 if self.verbose >= 1:
                     logger.info(f'删除索引: {sql}')
                 self.execute(sql)
@@ -385,6 +448,7 @@ class Database(object):
 
     def drop_all_indices(self, exclude_autoindex: bool = True) -> None:
         """删除数据库中所有索引"""
+        self._ensure_open()
         if self.verbose >= 1:
             logger.info('删除所有索引...')
         
@@ -397,13 +461,17 @@ class Database(object):
     def create_index(self, table_name: str, field: str, 
                      option: str = 'ASC', ignore_if_exists: bool = True) -> None:
         """在表字段上创建索引"""
+        self._ensure_open()
         if ignore_if_exists:
             base_sql = 'CREATE INDEX IF NOT EXISTS'
         else:
             base_sql = 'CREATE INDEX'
 
         index_name = f'{table_name}_{field}_index'
-        sql = f'{base_sql} {index_name} ON {table_name} ({field} {option})'
+        sql = (
+            f'{base_sql} {quoted_sql_text(index_name)} '
+            f'ON {quoted_sql_text(table_name)} ({quoted_sql_text(field)} {option})'
+        )
         
         if self.verbose >= 1:
             logger.info(f'创建索引: {sql}')

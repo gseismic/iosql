@@ -702,6 +702,35 @@ def test_segment_append_duplicate_primary_key_raises(tmp_path):
     ]
 
 
+def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
+    db = Database(_uri(tmp_path))
+    ticks = db.timeseries(
+        "ticks",
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+        partition_every="1day",
+        target_rows_per_file=100,
+        min_rows_per_file=1,
+        max_rows_per_file=100,
+    )
+    ticks._num_opened_max_allowed = 3
+    ticks.write([
+        {
+            "symbol": "AAPL",
+            "ts": day * 86_400_000,
+            "price": float(day),
+        }
+        for day in range(10)
+    ])
+
+    rows = ticks.query(order_by="ts").to_list()
+
+    assert len(rows) == 10
+    assert ticks._open_part_db_count() <= 3
+    assert len(ticks._db_parts) <= 3
+
+
 def test_repartition_to_writes_new_database_without_touching_source(tmp_path):
     source_uri = _uri(tmp_path, "source.iosql")
     target_uri = _uri(tmp_path, "target.iosql")

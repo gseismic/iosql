@@ -79,9 +79,63 @@ class TestConnectionPool:
 
     def test_force_close_all_connections(self, pool):
         with pool.get_connection() as conn:
-            conn_id = id(conn)
+            conn.execute("SELECT 1")
 
         pool.force_close_all_connections()
 
-        with pool.get_connection() as conn:
-            assert id(conn) != conn_id
+        with pytest.raises(RuntimeError):
+            with pool.get_connection():
+                pass
+
+    def test_max_connections_bounds_total_open_connections(self):
+        pool = DatabaseConnectionPool(TEST_DB, max_connections=2)
+        barrier = threading.Barrier(8)
+        connection_ids = []
+        errors = []
+
+        def worker():
+            try:
+                barrier.wait()
+                with pool.get_connection() as conn:
+                    connection_ids.append(id(conn))
+                    cursor = conn.execute("SELECT value FROM test_table WHERE id = 1")
+                    assert cursor.fetchone()[0] == "test_value"
+                    time.sleep(0.02)
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(connection_ids) == 8
+        assert len(set(connection_ids)) <= 2
+        assert pool.get_pool_status()["created_connections"] <= 2
+
+    def test_waiting_checkout_exits_when_pool_is_closed(self):
+        pool = DatabaseConnectionPool(TEST_DB, max_connections=1)
+        errors = []
+
+        with pool.get_connection():
+            thread = threading.Thread(
+                target=lambda: self._try_pool_checkout(pool, errors)
+            )
+            thread.start()
+            time.sleep(0.05)
+            pool.force_close_all_connections()
+            thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+
+    @staticmethod
+    def _try_pool_checkout(pool, errors):
+        try:
+            with pool.get_connection():
+                pass
+        except Exception as e:
+            errors.append(e)

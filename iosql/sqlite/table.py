@@ -5,7 +5,7 @@ import time
 import warnings
 
 # from itertools import chain
-from collections import Counter, OrderedDict
+from collections import OrderedDict
 
 import arrow
 
@@ -200,9 +200,11 @@ class Table(BaseTable):
             self._table_meta_db.close()
         if self._meta_db and not self._meta_db.is_closed():
             self._meta_db.close()
-        for _, db in self._db_parts.items():
+        for _, db in list(self._db_parts.items()):
             if db and not db.is_closed():
                 db.close()
+        self._db_parts.clear()
+        self._db_parts_status.clear()
 
     def _load_partition(self) -> Partition | None:
         """Load partition from table metadata.
@@ -761,6 +763,12 @@ class Table(BaseTable):
 
     def _part_token(self, part):
         return str(part)
+
+    def _part_meta_value(self, part):
+        return 'None' if part is None else part
+
+    def _meta_key_value(self, value):
+        return 'None' if value is None else value
 
     def _bool_value(self, value):
         if isinstance(value, str):
@@ -1946,7 +1954,7 @@ class Table(BaseTable):
 
         # OrderDict
         createtable_meta["column_info"] = list(createtable_meta["column_info"].items())
-        meta = json.dumps(createtable_meta).replace('"', '""')
+        meta = json.dumps(createtable_meta)
 
         updated_at = arrow.now().format("YYYY-MM-DD HH:mm:ss")
         info = {
@@ -1971,7 +1979,7 @@ class Table(BaseTable):
         # 某个表格的各分区最大最小数值
         info = {
             "table_name": self._table_name,
-            "part": part,
+            "part": self._part_meta_value(part),
             "updated_at": updated_at,
         }
         # table_meta_db = MyDatabase(self.table_meta_path)
@@ -2003,8 +2011,8 @@ class Table(BaseTable):
         # column_max, column_min: None 表示没有最大/小
         info = {
             "table_name": self._table_name,
-            "part": part,
-            "column": column,
+            "part": self._part_meta_value(part),
+            "column": self._meta_key_value(column),
             "column_min": column_min,
             "column_max": column_max,
         }
@@ -2246,19 +2254,8 @@ class Table(BaseTable):
         return self._meta_db
 
     def get_part_db(self, part_dbfile, auto_commit=True):
-        # 只有查询时，auto_commit 才为False
-        c = Counter(self._db_parts_status.values())
-
-        if c.get(True, 0) >= self._num_opened_max_allowed:
-            # Close all True connections to free up resources
-            for key in list(self._db_parts.keys()):
-                if self._db_parts_status.get(key, False):
-                    logger.debug(f"Clean up, closing {key} ..")
-                    self._db_parts[key].force_close_all_connections()
-                    del self._db_parts[key]
-                    del self._db_parts_status[key]
-
         if part_dbfile not in self._db_parts or self._db_parts[part_dbfile].is_closed():
+            self._prune_part_db_cache(exclude={part_dbfile})
             db = MyDatabase(
                 part_dbfile, pragma_dict=self._pragma_dict, auto_commit=auto_commit
             )
@@ -2266,8 +2263,35 @@ class Table(BaseTable):
             self._db_parts_status[part_dbfile] = True
         else:
             self._db_parts[part_dbfile].auto_commit = auto_commit
+            self._db_parts.move_to_end(part_dbfile)
+            self._db_parts_status[part_dbfile] = True
 
         return self._db_parts[part_dbfile]
+
+    def _prune_part_db_cache(self, exclude=None):
+        exclude = set(exclude or [])
+        while self._open_part_db_count(exclude=exclude) >= self._num_opened_max_allowed:
+            key_to_close = None
+            for key, db in self._db_parts.items():
+                if key in exclude:
+                    continue
+                if db and not db.is_closed():
+                    key_to_close = key
+                    break
+            if key_to_close is None:
+                return
+            logger.debug(f"Clean up, closing {key_to_close} ..")
+            self._db_parts[key_to_close].close()
+            del self._db_parts[key_to_close]
+            self._db_parts_status.pop(key_to_close, None)
+
+    def _open_part_db_count(self, exclude=None):
+        exclude = set(exclude or [])
+        return sum(
+            1
+            for key, db in self._db_parts.items()
+            if key not in exclude and db and not db.is_closed()
+        )
 
     def pragma(self, key, value=None):
         self._pragma_dict[key] = value

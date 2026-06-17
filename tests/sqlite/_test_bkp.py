@@ -37,7 +37,7 @@ def test_multi_part():
     # 过于复杂不采用
     return
     db['ij'].insert_all([
-        {'i': i, 'j', j, 'name': f'name_{i}_{j}'}
+        {'i': i, 'j': j, 'name': f'name_{i}_{j}'}
         for i,j in product(range(20), range(10))
     ], pk=['i','j'], partition={
         'columns': ['i', 'j'], 

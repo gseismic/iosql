@@ -1,6 +1,8 @@
 import os
+import threading
 import pytest
 from iosql.utils.mysqlite import Database
+from iosql.utils.mysqlite.database import DatabaseConnectionError, DatabaseError
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
 
 
@@ -26,6 +28,71 @@ class TestBasic:
         with Database(TEST_DB, auto_commit=True, verbose=0) as db:
             db['data'].insert({'id': 5, 'test': 5, 'name': 'lsl'}, pk=['id'],
                               ensure_table=True, ensure_column=True)
+
+    def test_database_can_be_created_in_worker_thread(self):
+        errors = []
+
+        def worker():
+            try:
+                Database(TEST_DB, auto_commit=True, verbose=0).close()
+            except Exception as e:
+                errors.append(e)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        assert errors == []
+
+    def test_database_close_blocks_later_use(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['data'].insert({'id': 1}, ensure_table=True)
+        db.close()
+
+        assert db.is_closed() is True
+        with pytest.raises(DatabaseConnectionError):
+            db['data'].insert({'id': 2})
+
+    def test_database_exposes_pool_status(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0, max_connections=2)
+        db['data'].insert({'id': 1}, ensure_table=True)
+
+        status = db.get_connection_pool_status()
+
+        assert status['max_connections'] == 2
+        assert status['created_connections'] <= 2
+        assert db.is_connection_pool_healthy() is True
+
+    def test_transaction_commit_and_rollback(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        with db.transaction():
+            db['items'].insert({'id': 1, 'name': 'commit'}, pk='id', ensure_table=True)
+
+        assert db['items'].count() == 1
+
+        with pytest.raises(RuntimeError):
+            with db.transaction():
+                db['items'].insert({'id': 2, 'name': 'rollback'})
+                raise RuntimeError('rollback')
+
+        assert db['items'].select_all('*', order_by='id') == [
+            {'id': 1, 'name': 'commit'}
+        ]
+
+    def test_commit_requires_transaction_context(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        with pytest.raises(DatabaseError):
+            db.commit()
+
+    def test_transaction_creates_parent_directory(self, tmp_path):
+        db_file = tmp_path / 'nested' / 'tx.sqlite3'
+        db = Database(str(db_file), auto_commit=True, verbose=0)
+
+        with db.transaction():
+            db['items'].insert({'id': 1}, pk='id', ensure_table=True)
+
+        assert db_file.exists()
+        assert db['items'].count() == 1
 
 
 class TestDefault:
@@ -109,6 +176,18 @@ class TestTable:
         assert db['demo'].table_exists() is True
         assert db['not_exist'].table_exists() is False
 
+    def test_reserved_identifiers_and_quoted_values(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['select'].insert(
+            {'from': 1, 'value': 'a"b'},
+            pk='from',
+            ensure_table=True,
+        )
+
+        assert db['select'].select_all(['from', 'value']) == [
+            {'from': 1, 'value': 'a"b'}
+        ]
+
 
 class TestInsert:
     def test_insert_all(self):
@@ -138,6 +217,24 @@ class TestInsert:
         data = [{'id': i, 'name': str(i*i)} for i in range(10)]
         db['data3'].insert_all(data, ensure_table=True)
         assert db['data3'].table_exists()
+
+    def test_insert_all_does_not_mutate_input_rows(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        data = [{'id': 1}, {'id': 2, 'name': 'Bob'}]
+        original = [row.copy() for row in data]
+
+        db['data4'].insert_all(data, ensure_table=True)
+
+        assert data == original
+
+    def test_insert_all_type_promotion_uses_float_for_mixed_numbers(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['data5'].insert_all([
+            {'id': 1, 'value': 1},
+            {'id': 2, 'value': 1.5},
+        ], ensure_table=True)
+
+        assert db['data5'].column_info()['column_type']['value'] == 'float'
 
 
 class TestDelete:
