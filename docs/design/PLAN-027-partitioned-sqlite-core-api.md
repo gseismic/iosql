@@ -4,6 +4,8 @@
 
 上一版设计 `PLAN-026-table-api-redesign-reflection` 已经提出：主入口应从 `timeseries()` 转向原始 `Table`，`TableSpec` 退到高级/内部层。
 
+后续补充：当单位时间或单位分区的数据密度不可预测时，不应只依赖字段值分区；按行数滚动的物理 segment 和 WAL-like ingest/checkpoint 设计见 `PLAN-028-row-count-segments-and-wal.md`。
+
 用户进一步指出：不希望核心 API 必须出现 `time` 这个 key。分区字段可以是时间，也可以是序号、offset、block height、版本号或其他可排序字段。目标更接近：
 
 ```text
