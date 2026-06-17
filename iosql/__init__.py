@@ -1,8 +1,14 @@
 from .database import Database
 from .query import Case, CaseExpression, Where
 from .version import __version__
-from .partition import Partition, DurationPartition, CalendarPartition
+from .partition import (
+    Partition,
+    DurationPartition,
+    CalendarPartition,
+    RangePartition,
+)
 from .spec import (
+    DEFAULT_LOGICAL_PART,
     LayoutReport,
     PartitionSpec,
     PartitionStats,
@@ -10,7 +16,9 @@ from .spec import (
     QueryPlan,
     QuerySpec,
     RepartitionResult,
+    Segment,
     TableSpec,
+    TableContract,
     TimeColumn,
     WriteResult,
 )
@@ -22,6 +30,7 @@ __all__ = [
     'CaseExpression',
     'Database',
     'DurationPartition',
+    'DEFAULT_LOGICAL_PART',
     'LayoutReport',
     'Partition',
     'PartitionSpec',
@@ -29,7 +38,10 @@ __all__ = [
     'PhysicalLayout',
     'QueryPlan',
     'QuerySpec',
+    'RangePartition',
     'RepartitionResult',
+    'Segment',
+    'TableContract',
     'TableSpec',
     'TimeColumn',
     'Where',

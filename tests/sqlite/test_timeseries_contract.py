@@ -199,7 +199,7 @@ def test_timeseries_write_query_and_explain(tmp_path):
     ]
 
     plan = ticks.query(symbols="AAPL", start=1000, end=1999).explain()
-    assert plan.candidate_partitions == [0, 1000, 2000]
+    assert plan.candidate_partitions == [1000]
     assert plan.scanned_partitions == [1000]
     assert plan.skipped_partitions == [0, 2000]
 
@@ -265,7 +265,7 @@ def test_raw_table_spec_writes_queries_and_partitions_timeseries(tmp_path):
     assert rows == [{"symbol": "AAPL", "ts": 1500, "price": 2.0}]
 
     plan = ticks.query(symbols="AAPL", start=1000, end=1999).explain()
-    assert plan.candidate_partitions == [0, 1000, 2000]
+    assert plan.candidate_partitions == [1000]
     assert plan.scanned_partitions == [1000]
     assert plan.skipped_partitions == [0, 2000]
 
@@ -559,13 +559,12 @@ def test_latest_explain_uses_segment_pruning(tmp_path):
 
     assert [item["part_key"] for item in plan.scanned_segments] == [
         "0__000000",
-        "0__000001",
         "0__000002",
-        "0__000003",
     ]
-    assert "0__000004" in [
-        item["part_key"] for item in plan.skipped_segments
-    ]
+    skipped = [item["part_key"] for item in plan.skipped_segments]
+    assert "0__000001" in skipped
+    assert "0__000003" in skipped
+    assert "0__000004" in skipped
 
 
 def test_table_spec_persists_for_reopen(tmp_path):
@@ -643,7 +642,7 @@ def test_timeseries_supports_calendar_date_unit_and_prunes(tmp_path):
     ])
 
     plan = reports.query(date="2026-01-06").explain()
-    assert plan.candidate_partitions == ["20260105", "20260106", "20260107"]
+    assert plan.candidate_partitions == ["20260106"]
     assert plan.scanned_partitions == ["20260106"]
     assert plan.skipped_partitions == ["20260105", "20260107"]
 
@@ -758,7 +757,7 @@ def test_segment_layout_splits_oversized_logical_partition(tmp_path):
     assert [item["part_key"] for item in plan.scanned_segments] == ["0__000001"]
     assert [item["part_key"] for item in plan.skipped_segments] == ["0__000000"]
     assert plan.segment_skip_reasons == {
-        "0__000000": "pruned_by_segment_time_range"
+        "0__000000": "pruned_by_segment_stats"
     }
 
 
@@ -853,18 +852,19 @@ def test_segment_upsert_same_batch_duplicate_primary_key_last_wins(tmp_path):
     assert [item["row_count"] for item in ticks.segments()] == [1]
 
 
-def test_segment_append_duplicate_primary_key_raises(tmp_path):
+def test_segment_append_allows_duplicate_primary_key_across_sealed_segments(tmp_path):
     _, ticks = _segmented_ticks(tmp_path)
     ticks.write({"symbol": "AAPL", "ts": 1000, "price": 1.0}, mode="append")
     ticks.write({"symbol": "MSFT", "ts": 2000, "price": 2.0}, mode="append")
 
-    with pytest.raises(Exception, match="UNIQUE constraint failed"):
-        ticks.write({"symbol": "AAPL", "ts": 1000, "price": 9.0}, mode="append")
+    ticks.write({"symbol": "AAPL", "ts": 1000, "price": 9.0}, mode="append")
 
     assert [item["part_key"] for item in ticks.segments()] == [
         "0__000000",
         "0__000001",
+        "0__000002",
     ]
+    assert sorted(row["price"] for row in ticks.query().to_list()) == [1.0, 2.0, 9.0]
 
 
 def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):

@@ -1,9 +1,9 @@
-"""高级：用当前时序 API 验证多分区和物理 segment 布局。"""
+"""高级：验证逻辑分区 + 物理 row segment 布局。"""
 
 from pathlib import Path
 import shutil
 
-from iosql import Database
+from iosql import Database, Partition, Segment
 
 
 DB_PATH = Path(__file__).resolve().parent / "runtime" / "05_partition_segments.iosql"
@@ -38,35 +38,37 @@ def run():
     reset_database()
 
     db = Database(DB_URI)
-    ticks = db.timeseries(
+    ticks = db.table(
         "ticks",
-        time="ts",
-        primary_key=["symbol", "ts"],
+        pk=["symbol", "ts"],
         columns={
             "symbol": "text",
             "ts": "integer",
             "price": "float",
             "volume": "integer",
         },
-        partition_every="1day",
-        target_rows_per_file=24,
-        min_rows_per_file=12,
-        max_rows_per_file=32,
+        partition=Partition.duration("ts", every="1day"),
+        segment=Segment.rows(max_rows=32, target_rows=24, min_rows=12),
+        order_key="ts",
     )
 
     rows = build_rows()
-    result = ticks.write(rows)
+    result = ticks.insert_all(rows)
     report = ticks.layout_report()
     segments = ticks.segments()
     first_segment = {
         key: segments[0][key]
-        for key in ["logical_part", "segment_id", "part_key", "row_count", "time_min", "time_max"]
+        for key in ["logical_part", "segment_id", "part_key", "row_count", "stats"]
     }
 
     start = rows[ROWS_PER_DAY * 2]["ts"]
     end = rows[ROWS_PER_DAY * 3 - 1]["ts"]
-    query = ticks.query(symbols="AAPL", start=start, end=end, order_by="ts")
-    plan = query.explain()
+    where = [
+        {"field": "symbol", "op": "==", "value": "AAPL"},
+        {"field": "ts", "op": "between_and", "value": [start, end]},
+    ]
+    query_rows = ticks.select("*", where=where, order_by="ts", to_dict=True)
+    plan = ticks.explain_select(where=where, order_by="ts")
 
     print("写入行数:", result.rows_seen)
     print("逻辑分区:", ticks.table_parts())
@@ -75,7 +77,7 @@ def run():
     print("布局建议:", report.recommendation)
     print("实际扫描分区:", plan.scanned_partitions)
     print("扫描 segment:", [item["part_key"] for item in plan.scanned_segments])
-    print("AAPL 第 3 天窗口行数:", len(query.to_list()))
+    print("AAPL 第 3 天窗口行数:", len(query_rows))
     db.close()
 
 

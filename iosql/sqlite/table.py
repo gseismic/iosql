@@ -22,12 +22,14 @@ from ..logger import default_logger as logger
 from ..partition import CalendarPartition, DurationPartition, Partition
 from ..query import Case, CaseExpression, Where, get_case_range
 from ..spec import (
+    DEFAULT_LOGICAL_PART,
     LayoutReport,
     PartitionStats,
     PhysicalLayout,
     QueryPlan,
     QuerySpec,
     RepartitionResult,
+    TableContract,
     SegmentInfo,
     TableSpec,
     WriteResult,
@@ -243,17 +245,20 @@ class Table(BaseTable):
         meta["partition"] = value.to_meta() if value else None
         self._overwrite_table_meta(meta)
 
-    def use_spec(self, spec):
-        spec = TableSpec.ensure(spec)
-        current_spec = self.spec()
-        if current_spec:
-            self._ensure_spec_compatible(current_spec, spec)
-        self._declared_spec = spec
-        self._partition = spec.to_partition()
+    def use_contract(self, contract):
+        contract = TableContract.ensure(contract)
+        current_contract = self.spec()
+        if current_contract:
+            self._ensure_spec_compatible(current_contract, contract)
+        self._declared_spec = contract
+        self._partition = contract.to_partition()
         return self
 
+    def use_spec(self, spec):
+        return self.use_contract(spec)
+
     def spec(self):
-        stored_spec = TableSpec.from_table_meta(self.get_table_meta())
+        stored_spec = TableContract.from_table_meta(self.get_table_meta())
         if stored_spec:
             return stored_spec
         return self._declared_spec
@@ -272,6 +277,12 @@ class Table(BaseTable):
         if current_meta != new_meta:
             raise TableSpecConflict(
                 f'Partition conflict: current={current_meta} new={new_meta}'
+            )
+        current_segment = current_spec.segment.to_dict() if current_spec.segment else None
+        new_segment = new_spec.segment.to_dict() if new_spec.segment else None
+        if current_segment != new_segment:
+            raise TableSpecConflict(
+                f'Segment conflict: current={current_segment} new={new_segment}'
             )
         self._ensure_spec_columns_compatible(current_spec, new_spec)
 
@@ -293,6 +304,67 @@ class Table(BaseTable):
                     f'current={current_columns[column]} new={type_}'
                 )
 
+    def insert_all(self, data, pk=None, extra_data=None, partition=None,
+                   replace=False, ignore=False, commit=True, **kwargs):
+        if not data:
+            return WriteResult()
+        if isinstance(data, dict):
+            data = [data]
+        data = list(data)
+
+        contract = self.spec()
+        if contract:
+            pk = pk if pk is not None else contract.primary_key
+            partition = partition if partition is not None else contract.to_partition()
+            column_type = dict(contract.columns or {})
+            column_type.update(kwargs.pop('column_type', {}) or {})
+            kwargs['column_type'] = column_type
+            kwargs.setdefault('alter', contract.schema_policy == 'evolve')
+            kwargs['table_contract'] = contract.to_dict()
+            if not replace and not ignore:
+                if contract.conflict in ['upsert', 'replace']:
+                    replace = True
+                elif contract.conflict == 'ignore':
+                    ignore = True
+
+        before_parts = set(self.table_parts())
+        before_meta = self.get_table_meta()
+        rows = self._add_extra_data(data, extra_data)
+        partitions_touched = (
+            contract.parts_for(rows) if contract else self._parts_for_runtime_partition(rows, partition)
+        )
+
+        self.do_insert_all(
+            rows,
+            pk=pk,
+            partition=partition,
+            replace=replace,
+            ignore=ignore,
+            commit=commit,
+            **kwargs,
+        )
+
+        after_parts = set(self.table_parts())
+        after_meta = self.get_table_meta()
+        return WriteResult(
+            rows_seen=len(rows),
+            rows_written=None if ignore else len(rows),
+            partitions_touched=partitions_touched,
+            partitions_created=sorted(after_parts - before_parts),
+            schema_changed=self._schema_changed(before_meta, after_meta),
+            layout_warnings=(
+                self._layout_warnings_for_parts(contract, partitions_touched)
+                if contract else []
+            ),
+        )
+
+    def _parts_for_runtime_partition(self, rows, partition):
+        if not rows:
+            return []
+        if partition is None:
+            return [None]
+        return sorted({partition.get_key(row) for row in rows})
+
     def write(self, rows, mode='upsert', commit=True, **kwargs):
         if isinstance(rows, dict):
             rows = [rows]
@@ -304,9 +376,9 @@ class Table(BaseTable):
 
         spec = self.spec()
         if not spec:
-            raise BadArgument('write requires a TableSpec')
+            raise BadArgument('write requires a TableContract')
         if not spec.primary_key:
-            raise MissingPrimaryKey('write requires TableSpec.primary_key')
+            raise MissingPrimaryKey('write requires TableContract.primary_key')
 
         mode = str(mode).lower()
         if mode not in ['append', 'upsert', 'replace', 'ignore']:
@@ -333,7 +405,7 @@ class Table(BaseTable):
             commit=commit,
             alter=alter,
             column_type=column_type,
-            table_spec=spec.to_dict(),
+            table_contract=spec.to_dict(),
             **kwargs,
         )
 
@@ -367,6 +439,16 @@ class Table(BaseTable):
             limit=limit,
         )
         return _TableQuery(self, spec)
+
+    def explain_select(self, fields='*', where=None, order_by=None, limit=None):
+        spec = QuerySpec(
+            table=self._table_name,
+            columns=fields,
+            where=where,
+            order_by=order_by,
+            limit=limit,
+        )
+        return self._build_query_plan(spec)
 
     def latest(
         self,
@@ -718,7 +800,7 @@ class Table(BaseTable):
         segment_skip_reasons = {
             ref.part_key: exclusion_reasons.get(
                 self._segment_lookup_key(ref),
-                'pruned_by_segment_time_range',
+                'pruned_by_segment_stats',
             )
             for ref in skipped_segments
             if ref.logical_part in candidate_partition_keys
@@ -729,7 +811,10 @@ class Table(BaseTable):
             where=compiled_where,
             order_by=query_spec.order_by,
             limit=query_spec.limit,
-            candidate_partitions=all_parts,
+            candidate_partitions=[
+                part for part in all_parts
+                if part in candidate_partition_keys
+            ],
             scanned_partitions=scanned_partitions,
             skipped_partitions=skipped_partitions,
             skip_reasons=skip_reasons,
@@ -779,6 +864,14 @@ class Table(BaseTable):
         return f'{logical_part}__{int(segment_id):06d}'
 
     def _segment_from_row(self, row):
+        stats = row.get('stats_json')
+        if isinstance(stats, str) and stats:
+            try:
+                stats = json.loads(stats)
+            except json.JSONDecodeError:
+                stats = {}
+        if not isinstance(stats, dict):
+            stats = {}
         return SegmentInfo(
             logical_part=row['logical_part'],
             segment_id=int(row['segment_id']),
@@ -789,6 +882,7 @@ class Table(BaseTable):
             time_max=row.get('time_max'),
             session_min=row.get('session_min'),
             session_max=row.get('session_max'),
+            stats=stats,
             sealed=self._bool_value(row.get('sealed')),
             generation=int(row.get('generation') or 0),
         )
@@ -852,6 +946,7 @@ class Table(BaseTable):
             'time_max': info.time_max,
             'session_min': info.session_min,
             'session_max': info.session_max,
+            'stats_json': json.dumps(info.stats or {}),
             'created_at': self._segment_created_at(
                 info.logical_part,
                 info.segment_id,
@@ -936,10 +1031,48 @@ class Table(BaseTable):
         row = rows[0]
         return row.get('session_min'), row.get('session_max')
 
+    def _data_file_column_stats(self, part_key):
+        meta = self.get_table_meta()
+        columns = list((meta or {}).get('column_info') or {})
+        if not columns:
+            return {}
+
+        part_dbfile = self._get_part_dbfile(part_key)
+        if not os.path.isfile(part_dbfile):
+            return {}
+
+        db = self.get_part_db(part_dbfile, auto_commit=False)
+        projections = []
+        for column in columns:
+            field = self._quote_identifier(column)
+            alias_min = self._quote_identifier(f'{column}__min')
+            alias_max = self._quote_identifier(f'{column}__max')
+            projections.append(f'MIN({field}) as {alias_min}')
+            projections.append(f'MAX({field}) as {alias_max}')
+        try:
+            rows = db[_PART_DATA_TABLE_NAME].query(
+                f"select {', '.join(projections)} from {_PART_DATA_TABLE_NAME};",
+                to_dict=True,
+            )
+        except NoSuchTable:
+            return {}
+        if not rows:
+            return {}
+
+        row = rows[0]
+        stats = {}
+        for column in columns:
+            stats[column] = {
+                'min': row.get(f'{column}__min'),
+                'max': row.get(f'{column}__max'),
+            }
+        return stats
+
     def _refresh_segment_info(self, logical_part, segment_id, part_key, layout):
         row_count = self._data_file_row_count(part_key)
         time_min, time_max = self._data_file_time_range(part_key)
         session_min, session_max = self._data_file_session_range(part_key)
+        stats = self._data_file_column_stats(part_key)
         info = SegmentInfo(
             logical_part=logical_part,
             segment_id=segment_id,
@@ -950,6 +1083,7 @@ class Table(BaseTable):
             time_max=time_max,
             session_min=session_min,
             session_max=session_max,
+            stats=stats,
             sealed=row_count >= layout.max_rows_per_file,
         )
         self._upsert_segment_info(info)
@@ -1085,6 +1219,7 @@ class Table(BaseTable):
             return None
         time_min, time_max = self._data_file_time_range(logical_part)
         session_min, session_max = self._data_file_session_range(logical_part)
+        stats = self._data_file_column_stats(logical_part)
         return SegmentInfo(
             logical_part=logical_part,
             segment_id=-1,
@@ -1095,6 +1230,7 @@ class Table(BaseTable):
             time_max=time_max,
             session_min=session_min,
             session_max=session_max,
+            stats=stats,
             sealed=True,
         )
 
@@ -1117,38 +1253,45 @@ class Table(BaseTable):
         )
 
     def _excluded_segments_by_case(self, refs, case):
-        table_spec = self.spec()
-        if not table_spec or not table_spec.time:
-            return set()
-        if case.field != table_spec.time.name:
-            return set()
-
-        op, case_min, case_max = self._case_partition_range(case)
         excluded = set()
         for info in refs:
-            time_min = info.time_min
-            time_max = info.time_max
-            if not self._is_numeric_range(case_min, case_max, time_min, time_max):
-                continue
-            if (
-                case_max is not None
-                and time_min is not None
-                and (
-                    case_max < time_min
-                    or (op in ['lt', '<'] and case_max <= time_min)
-                )
-            ):
-                excluded.add(self._segment_lookup_key(info))
-            if (
-                case_min is not None
-                and time_max is not None
-                and (
-                    case_min > time_max
-                    or (op in ['gt', '>'] and case_min >= time_max)
-                )
-            ):
+            stats = (info.stats or {}).get(case.field)
+            if stats and self._stats_excludes_case(stats, case):
                 excluded.add(self._segment_lookup_key(info))
         return excluded
+
+    def _stats_excludes_case(self, stats, case):
+        stat_min = stats.get('min')
+        stat_max = stats.get('max')
+        if stat_min is None or stat_max is None:
+            return False
+
+        op = case.op
+        value = case.value['value']
+        try:
+            if op == 'in':
+                return all(
+                    self._value_outside_range(item, stat_min, stat_max)
+                    for item in value
+                )
+
+            op, case_min, case_max = self._case_partition_range(case)
+            if case_max is not None:
+                if case_max < stat_min:
+                    return True
+                if op in ['lt', '<'] and case_max <= stat_min:
+                    return True
+            if case_min is not None:
+                if case_min > stat_max:
+                    return True
+                if op in ['gt', '>'] and case_min >= stat_max:
+                    return True
+        except TypeError:
+            return False
+        return False
+
+    def _value_outside_range(self, value, stat_min, stat_max):
+        return value < stat_min or value > stat_max
 
     def _excluded_segments_by_session_case(self, refs, case):
         table_spec = self.spec()
@@ -1184,7 +1327,7 @@ class Table(BaseTable):
         reasons = {}
         for case in cases or []:
             for key in self._excluded_segments_by_case(refs, case):
-                reasons.setdefault(key, 'pruned_by_segment_time_range')
+                reasons.setdefault(key, 'pruned_by_segment_stats')
             for key in self._excluded_segments_by_session_case(refs, case):
                 reasons[key] = 'pruned_by_segment_session_range'
         return reasons
@@ -1200,7 +1343,7 @@ class Table(BaseTable):
         ]
         if 'pruned_by_segment_session_range' in part_reasons:
             return 'pruned_by_segment_session_range'
-        return 'pruned_by_segment_time_range'
+        return 'pruned_by_segment_stats'
 
     def _get_select_part_refs(self, cases):
         need_parts = self._get_select_parts(cases)
@@ -1437,15 +1580,54 @@ class Table(BaseTable):
             excluded_parts = excluded_parts.union(excluded)
         return excluded_parts
 
+    def _candidate_part_tokens_by_partition_cases(self, cases):
+        partition = self._partition
+        if partition is None:
+            spec = self.spec()
+            partition = spec.to_partition() if spec else None
+        if partition is None or not cases:
+            return None
+
+        candidates = None
+        for case in cases:
+            if case.field != partition.TS_COL:
+                continue
+            case_tokens = self._candidate_part_tokens_for_case(partition, case)
+            if case_tokens is None:
+                continue
+            candidates = case_tokens if candidates is None else candidates & case_tokens
+        return candidates
+
+    def _candidate_part_tokens_for_case(self, partition, case):
+        op = case.op
+        value = case.value['value']
+        try:
+            if op in ['eq', '==', '=']:
+                return {self._part_token(partition.get_key({partition.TS_COL: value}))}
+            if op == 'in':
+                return {
+                    self._part_token(partition.get_key({partition.TS_COL: item}))
+                    for item in value
+                }
+        except Exception:
+            return None
+        return None
+
     def _get_select_parts(self, cases):
         """case And[Case..]"""
         infos = self.get_part_column_ranges()
+        candidate_tokens = self._candidate_part_tokens_by_partition_cases(cases)
         if cases:
             excluded_parts = self._excluded_parts_by_cases(infos, cases)
         else:
             excluded_parts = set()
         all_parts = self.table_parts()
         need_parts = sorted(set(all_parts) - set(excluded_parts))
+        if candidate_tokens is not None:
+            need_parts = [
+                part for part in need_parts
+                if self._part_token(part) in candidate_tokens
+            ]
         return need_parts
 
     def _select_and_cases(self, fields, cases, column_types):
@@ -1645,9 +1827,14 @@ class Table(BaseTable):
         if part_obj is None:
             part_obj = self._partition
 
+        table_spec = kwargs.get("table_contract") or kwargs.get("table_spec")
+        segment_spec = TableContract.ensure(table_spec) if table_spec is not None else None
+        use_segment = bool(segment_spec and segment_spec.segment)
+
         if part_obj is None:
             # No partitioning - put all data in a single partition
-            partitioned_data = {None: data}
+            logical_part = DEFAULT_LOGICAL_PART if use_segment else None
+            partitioned_data = {logical_part: data}
         else:
             # Partition data by key
             partitioned_data = {}
@@ -1662,15 +1849,12 @@ class Table(BaseTable):
 
         # Get ts_col for range calculation (needed for metadata)
         ts_col = part_obj.TS_COL if part_obj else None
-        table_spec = kwargs.get("table_spec")
-        segment_spec = None
-        if table_spec is not None and part_obj is not None:
-            segment_spec = TableSpec.ensure(table_spec)
         segment_kwargs = dict(kwargs)
+        segment_kwargs.pop("table_contract", None)
         segment_kwargs.pop("table_spec", None)
 
         for part_key, part_data in partitioned_data.items():
-            if segment_spec is not None:
+            if use_segment:
                 self._do_insert_segmented(
                     part_key,
                     ts_col,
@@ -1714,9 +1898,9 @@ class Table(BaseTable):
         layout = table_spec.physical_layout
         rows = list(part_data)
         part_kwargs = dict(kwargs)
-        part_kwargs["table_spec"] = table_spec.to_dict()
+        part_kwargs["table_contract"] = table_spec.to_dict()
 
-        if not pk:
+        if not pk or not (replace or ignore):
             self._append_segment_rows(
                 logical_part,
                 part_column,

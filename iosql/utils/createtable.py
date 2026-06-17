@@ -76,6 +76,8 @@ def build_createtable_meta(data_suggested_types, pk, partition, **kwargs):
     column_infos = reorder_by_column_order(column_infos, column_order)
 
     meta = {'column_info': column_infos, 'pk': pk, 'partition': partition}
-    if 'table_spec' in kwargs:
-        meta['table_spec'] = kwargs.get('table_spec')
+    if 'table_contract' in kwargs:
+        meta['table_contract'] = kwargs.get('table_contract')
+    elif 'table_spec' in kwargs:
+        meta['table_contract'] = kwargs.get('table_spec')
     return meta

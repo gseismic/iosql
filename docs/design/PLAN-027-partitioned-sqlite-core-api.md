@@ -1,5 +1,7 @@
 # PLAN-027-partitioned-sqlite-core-api
 
+> 最终设计以 `PLAN-030-partitioned-sqlite-final-design.md` 为准。本文保留为去 `time` 化核心 API 的中间草案，不再作为实现依据。
+
 ## 背景
 
 上一版设计 `PLAN-026-table-api-redesign-reflection` 已经提出：主入口应从 `timeseries()` 转向原始 `Table`，`TableSpec` 退到高级/内部层。

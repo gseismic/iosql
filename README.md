@@ -1,16 +1,16 @@
 # iosql
 
-`iosql` 是一个面向时序数据的 SQLite 分区存储库。它把同一张逻辑表拆到多个 SQLite 分区文件中，保留 SQLite 的简单部署方式，同时提供时序表契约、分区裁剪、批量写入、布局诊断和重分区能力。
+`iosql` 是一个接近原生 SQLite 的自动分区存储库。它把同一张逻辑表拆到多个 SQLite 分区文件中，保留 SQLite 的简单部署方式，同时提供逻辑分区、物理 row segment、查询裁剪、批量写入和布局诊断能力。时间序列只是普通分区表的一种 helper 用法。
 
 ## 特性
 
-- **双入口表契约**：可用 `Database.table(..., spec=TableSpec(...))` 显式声明主键、时间列、列类型和分区策略，也可用 `Database.timeseries()` 快速创建同等契约。
-- **分区存储**：按时间把数据写入多个 SQLite 文件，降低单文件膨胀风险。
-- **物理 segment**：同一逻辑时间分区可按行数自动拆成多个 SQLite 文件，适合高频金融数据。
-- **分区裁剪**：按 `start` / `end` / `date` 查询时自动跳过不相关分区。
-- **批量写入**：`write()` 和 `write_buffer()` 提供面向时序表的写入入口。
+- **普通 Table 主入口**：用 `Database.table(..., pk=..., partition=..., segment=...)` 声明主键、列类型、逻辑分区和物理分段。
+- **任意可排序字段分区**：`Partition.range(...)`、`Partition.duration(...)`、`Partition.calendar(...)` 都是普通分区策略，不要求核心 API 存在 `time` 字段。
+- **物理 row segment**：同一 logical partition 可按行数自动拆成多个 SQLite 文件，也可以不配置 logical partition，仅用 `__all__` + row segment 控制文件大小。
+- **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
+- **批量写入**：`insert_all()` 和 `write_buffer()` 可直接使用表契约写入。
 - **布局维护**：`layout_report()` 检查分区行数，`repartition_to()` 可生成新的分区布局。
-- **日历分区**：支持带时区的日、月、年等日历分区。
+- **时序 helper**：`Database.timeseries()` 保留为快捷封装，适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 
 ## 安装
 
@@ -32,35 +32,38 @@ python -m pip wheel . --no-deps -w dist
 
 ## 快速开始
 
-下面是原始 `Table` + `TableSpec` 显式版本，对应快捷版见 `examples/01_quickstart_timeseries.py`。
+下面是核心 `Table` API。除 `partition=...` 外，它尽量保持 SQLite 表的心智：声明表、写入行、用 `where` 查询。
 
 ```python
-from iosql import Database, PartitionSpec, TableSpec, TimeColumn
+from iosql import Database, Partition
 
 db = Database("sqlite://database/market.iosql")
 
-spec = TableSpec(
-    primary_key=["symbol", "ts"],
-    time=TimeColumn("ts", unit="ms", timezone="UTC"),
-    partition=PartitionSpec.by_time("ts", every="1day"),
+ticks = db.table(
+    "ticks",
+    pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
+    partition=Partition.duration("ts", every="1day"),
 )
-ticks = db.table("ticks", spec=spec)
 
-result = ticks.write([
+result = ticks.insert_all([
     {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
     {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
     {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
 ])
 
-rows = ticks.query(
-    symbols="AAPL",
-    start=1735689600000,
-    end=1735776000000,
+where = [
+    {"field": "symbol", "op": "==", "value": "AAPL"},
+    {"field": "ts", "op": "between_and", "value": [1735689600000, 1735776000000]},
+]
+rows = ticks.select(
+    "*",
+    where=where,
     order_by="ts",
-).to_list()
+    to_dict=True,
+)
 
-plan = ticks.query(symbols="AAPL", start=1735689600000).explain()
+plan = ticks.explain_select(where=where, order_by="ts")
 
 print(result.rows_seen)
 print(rows)
@@ -73,20 +76,21 @@ db.close()
 ### 创建或打开表
 
 ```python
-from iosql import PartitionSpec, TableSpec, TimeColumn
+from iosql import Partition, Segment
 
-spec = TableSpec(
-    primary_key=["symbol", "ts"],
-    time=TimeColumn("ts", unit="ms", timezone="UTC"),
-    partition=PartitionSpec.by_time("ts", every="1hour"),
+table = db.table(
+    "ticks",
+    pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
+    partition=Partition.duration("ts", every="1hour"),
+    segment=Segment.rows(max_rows=500_000),
+    order_key="ts",
 )
-table = db.table("ticks", spec=spec)
 ```
 
-`time` 描述业务时间列，用于 `start/end/date/latest/asof` 的时间解释；`partition` 描述物理分区布局，用于写入落盘和查询裁剪。两者通常指向同一列，但职责不同。
+`partition` 描述按哪个字段做逻辑路由；`segment` 描述单个 logical partition 下物理 SQLite 文件如何按行数滚动。字段可以是时间戳、序号、offset、版本号等任意可排序字段。
 
-如果偏好更短的写法，可以使用 `timeseries()`。它内部会创建同等的 `TableSpec`：
+如果偏好时序业务 helper，可以使用 `timeseries()`。它内部等价于 `Database.table(..., partition=Partition.duration(...), order_key=time)`：
 
 ```python
 table = db.timeseries(
@@ -101,7 +105,7 @@ table = db.timeseries(
 ### 写入
 
 ```python
-table.write({"symbol": "AAPL", "ts": 1735689600000, "price": 187.4})
+table.insert_all({"symbol": "AAPL", "ts": 1735689600000, "price": 187.4})
 
 with table.write_buffer(max_rows=10_000) as buffer:
     buffer.append([
@@ -113,17 +117,31 @@ with table.write_buffer(max_rows=10_000) as buffer:
 ### 查询
 
 ```python
-rows = table.query(
-    symbols=["AAPL", "MSFT"],
-    start=1735689600000,
-    end=1735776000000,
-    where="venue = 'NASDAQ'",
+where = [
+    {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
+    {"field": "ts", "op": "between_and", "value": [1735689600000, 1735776000000]},
+    {"field": "venue", "op": "==", "value": "NASDAQ"},
+]
+rows = table.select(
+    "*",
+    where=where,
     order_by="ts desc",
     limit=100,
-).to_list()
+    to_dict=True,
+)
 
-plan = table.query(start=1735689600000, end=1735776000000).explain()
+plan = table.explain_select(where=where, order_by="ts desc", limit=100)
 segments = table.segments()
+```
+
+`where` 支持 dict/list/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
+
+`segments()` 返回物理文件级 manifest，包含 logical partition、segment id、文件 key、行数和列级 `stats`。`explain_select()` 同时返回 logical partitions 和 physical segments 的候选/扫描/跳过信息。
+
+`timeseries()` helper 额外提供业务查询：
+
+```python
+rows = ticks.query(start=1735689600000, end=1735776000000).to_list()
 
 snapshot = table.latest(
     symbols=["AAPL", "MSFT"],
@@ -133,11 +151,7 @@ snapshot = table.latest(
 ).to_list()
 ```
 
-`where` 支持 dict/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
-
-`segments()` 返回物理文件级 manifest，包含逻辑分区、segment id、文件 key、行数、时间范围和 session 范围。`query().explain()` 同时返回逻辑分区和物理 segment 的候选/扫描/跳过信息。
-
-开启物理 segment 后，`write(mode="upsert")` / `write(mode="replace")` / `write(mode="ignore")` 仍按逻辑表主键处理已有行，不会因为同一逻辑分区拆成多个文件而绕过主键语义。
+开启物理 segment 后，append-only 表不主动跨 sealed segments 查重。需要跨 segment upsert 时，后续应引入全局主键索引和 tombstone。
 
 `latest()` / `asof()` 用于金融截面查询，默认返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。K 线、orderbook 等多维数据可传 `by=["symbol", "timeframe"]` 或 `by=["symbol", "venue"]`，`group_by` 是 `by` 的等价别名。
 
@@ -171,22 +185,22 @@ snapshot = ticks.latest(
 
 ### 日历分区
 
-如果数据使用日期字符串，可以在原始 `TableSpec` 中声明 `TimeColumn(unit="date")` 和 calendar 分区；对应 `timeseries()` 快捷版本见 `examples/02_calendar_events.py`：
+如果数据使用日期字符串，可以直接使用 `Partition.calendar(...)`；对应 `timeseries()` 快捷版本见 `examples/02_calendar_events.py`：
 
 ```python
-events = db.table("events", spec=TableSpec(
-    primary_key=["event_date", "name"],
-    time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
-    partition=PartitionSpec.by_time(
-        "event_date",
-        every="1day",
-        kind="calendar",
-    ),
+events = db.table(
+    "events",
+    pk=["event_date", "name"],
     columns={"event_date": "text", "name": "text", "city": "text"},
-))
+    partition=Partition.calendar("event_date", every="1day", timezone="Asia/Shanghai"),
+)
 
-events.write({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
-rows = events.query(date="2026-01-06").to_list()
+events.insert_all({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
+rows = events.select(
+    "*",
+    where={"field": "event_date", "op": "==", "value": "2026-01-06"},
+    to_dict=True,
+)
 ```
 
 ### 金融数据建议
@@ -216,13 +230,14 @@ print(result.rows_copied, result.partitions_created)
 
 | 文件 | 场景 |
 | --- | --- |
-| `01_quickstart_table.py` | 原始 `Table` + `TableSpec` 写入、查询和 duration 分区。 |
-| `01_quickstart_timeseries.py` | `Database.timeseries()` 快捷版写入和查询。 |
-| `02_calendar_events_table.py` | 原始 `Table` + `TableSpec` 处理日期字符串和 calendar 分区。 |
+| `01_quickstart_table.py` | 普通 `Table` + `Partition.duration(...)` 写入、查询和 explain。 |
+| `01_quickstart_timeseries.py` | `Database.timeseries()` helper 版写入和查询。 |
+| `02_calendar_events_table.py` | 普通 `Table` + `Partition.calendar(...)` 处理日期字符串分区。 |
 | `02_calendar_events.py` | `Database.timeseries()` 快捷版处理日期字符串和 calendar 分区。 |
-| `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入和查询计划。 |
+| `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入、row segment 和查询计划。 |
 | `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
-| `05_partition_segments_smoke.py` | 多分区写入、物理 segment 拆分和查询计划。 |
+| `05_partition_segments_smoke.py` | 逻辑分区 + 物理 segment 拆分和二级查询计划。 |
+| `06_row_segment_late_data.py` | 纯 row segment、晚到数据和 stats pruning。 |
 
 金融场景示例位于 `examples/finance/`：
 
@@ -240,7 +255,10 @@ python examples/01_quickstart_table.py
 python examples/01_quickstart_timeseries.py
 python examples/02_calendar_events_table.py
 python examples/02_calendar_events.py
+python examples/03_buffered_ingest_and_query_plan.py
+python examples/04_layout_report_and_repartition.py
 python examples/05_partition_segments_smoke.py
+python examples/06_row_segment_late_data.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
@@ -264,10 +282,10 @@ database/
 
 ## 注意事项
 
-- `TableSpec` 中的 `TimeColumn(unit="ms")` 适合毫秒时间戳，也是 `Database.timeseries()` 的默认行为。
-- `Table.write()` 需要表存在 `TableSpec`；可以显式传给 `Database.table(..., spec=...)`，也可以通过 `Database.timeseries()` 自动生成。
+- 核心 `Database.table(...)` 不需要 `time` 字段；分区字段由 `Partition.*(...)` 指定。
+- `timeseries()` 仍保留为 helper，适合需要 `query(start/end/date)`、`latest()`、`asof()` 的业务场景。
 - 多分区查询支持全局 `order_by` 和 `limit`，但结果会在 Python 层合并排序，扫描范围应尽量通过时间条件收窄。
-- 新建时序表会按 `max_rows_per_file` 自动拆分物理 segment；旧的单分区文件仍可读取，不会被原地迁移。
+- 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
 
 ## 变更记录

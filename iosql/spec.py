@@ -4,7 +4,15 @@ from typing import Any, Dict, Iterable, List, Optional
 import arrow
 
 from .exception import BadArgument, PartitionSpecError
-from .partition import CalendarPartition, DurationPartition, Partition as RuntimePartition
+from .partition import (
+    CalendarPartition,
+    DurationPartition,
+    RangePartition,
+    Partition as RuntimePartition,
+)
+
+
+DEFAULT_LOGICAL_PART = "__all__"
 
 
 _TIME_UNIT_ALIASES = {
@@ -180,6 +188,68 @@ class PhysicalLayout:
 
 
 @dataclass
+class Segment:
+    kind: str = "rows"
+    max_rows: int = 500_000
+    target_rows: Optional[int] = None
+    min_rows: Optional[int] = None
+
+    def __post_init__(self):
+        self.kind = str(self.kind or "rows").lower()
+        if self.kind != "rows":
+            raise BadArgument(f"Unsupported segment kind `{self.kind}`")
+        self.max_rows = int(self.max_rows)
+        self.target_rows = int(self.target_rows or self.max_rows)
+        self.min_rows = int(self.min_rows or min(self.target_rows, self.max_rows))
+        if self.max_rows <= 0:
+            raise BadArgument("segment max_rows must be positive")
+        if self.target_rows <= 0:
+            raise BadArgument("segment target_rows must be positive")
+        if self.min_rows <= 0:
+            raise BadArgument("segment min_rows must be positive")
+        if self.target_rows > self.max_rows:
+            raise BadArgument("segment target_rows must be <= max_rows")
+        if self.min_rows > self.target_rows:
+            raise BadArgument("segment min_rows must be <= target_rows")
+
+    @classmethod
+    def rows(cls, max_rows: int = 500_000, target_rows: Optional[int] = None,
+             min_rows: Optional[int] = None) -> "Segment":
+        return cls(
+            kind="rows",
+            max_rows=max_rows,
+            target_rows=target_rows,
+            min_rows=min_rows,
+        )
+
+    def to_physical_layout(self) -> PhysicalLayout:
+        return PhysicalLayout(
+            target_rows_per_file=self.target_rows,
+            min_rows_per_file=self.min_rows,
+            max_rows_per_file=self.max_rows,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "max_rows": self.max_rows,
+            "target_rows": self.target_rows,
+            "min_rows": self.min_rows,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> Optional["Segment"]:
+        if not data:
+            return None
+        return cls(
+            kind=data.get("kind", "rows"),
+            max_rows=data.get("max_rows", data.get("max_rows_per_file", 500_000)),
+            target_rows=data.get("target_rows", data.get("target_rows_per_file")),
+            min_rows=data.get("min_rows", data.get("min_rows_per_file")),
+        )
+
+
+@dataclass
 class PartitionSpec:
     column: str
     every: Any = "1day"
@@ -209,6 +279,8 @@ class PartitionSpec:
     def to_partition(self, time: Optional[TimeColumn] = None) -> RuntimePartition:
         spec = self.with_time(time)
         unit = spec.time_unit
+        if spec.kind == "range":
+            return RangePartition(width=spec.every, column=spec.column)
         if spec.kind == "calendar" or unit == "date":
             fmt = spec.fmt or _calendar_fmt(spec.every)
             return CalendarPartition(
@@ -244,6 +316,10 @@ class PartitionSpec:
         return cls(column=column, every=every, timezone=timezone, kind=kind)
 
     @classmethod
+    def range(cls, column: str, every: Any) -> "PartitionSpec":
+        return cls(column=column, every=every, kind="range")
+
+    @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PartitionSpec":
         return cls(
             column=data["column"],
@@ -266,6 +342,12 @@ class PartitionSpec:
                 kind="duration",
                 time_unit="ms",
             )
+        if partition_type == "range":
+            return cls(
+                column=meta["ts_col"],
+                every=meta["width"],
+                kind="range",
+            )
         if partition_type == "calendar":
             return cls(
                 column=meta["ts_col"],
@@ -279,12 +361,16 @@ class PartitionSpec:
 
 
 @dataclass
-class TableSpec:
+class TableContract:
     primary_key: List[str] = field(default_factory=list)
+    # time/symbol/session 仅为旧 timeseries helper 过渡字段，不属于核心契约。
     time: Optional[TimeColumn] = None
     partition: Optional[PartitionSpec] = None
+    segment: Optional[Segment] = None
     columns: Dict[str, Any] = field(default_factory=dict)
     schema_policy: str = "evolve"
+    order_key: Optional[str] = None
+    conflict: str = "append"
     symbol_column: str = "symbol"
     session_column: Optional[str] = None
     physical_layout: PhysicalLayout = field(default_factory=PhysicalLayout)
@@ -297,19 +383,34 @@ class TableSpec:
             self.primary_key = list(self.primary_key or [])
         if isinstance(self.time, dict):
             self.time = TimeColumn.from_dict(self.time)
+        if isinstance(self.partition, RuntimePartition):
+            self.partition = PartitionSpec.from_partition_meta(self.partition.to_meta())
         if isinstance(self.partition, dict):
             self.partition = PartitionSpec.from_dict(self.partition)
         if self.partition and self.time:
             self.partition = self.partition.with_time(self.time)
+        if isinstance(self.segment, dict):
+            self.segment = Segment.from_dict(self.segment)
         if isinstance(self.physical_layout, dict):
             self.physical_layout = PhysicalLayout.from_dict(self.physical_layout)
+        if self.segment is not None:
+            self.physical_layout = self.segment.to_physical_layout()
         self.columns = dict(self.columns or {})
         self.schema_policy = str(self.schema_policy or "evolve")
+        if self.order_key is not None:
+            self.order_key = str(self.order_key)
+        self.conflict = str(self.conflict or "append").lower()
+        if self.conflict not in ["append", "upsert", "replace", "ignore"]:
+            raise BadArgument(f"Unsupported conflict policy `{self.conflict}`")
         if self.session_column is not None:
             self.session_column = str(self.session_column)
 
+    @property
+    def pk(self) -> List[str]:
+        return self.primary_key
+
     @classmethod
-    def ensure(cls, spec: Any) -> "TableSpec":
+    def ensure(cls, spec: Any) -> "TableContract":
         if isinstance(spec, cls):
             return spec
         if isinstance(spec, dict):
@@ -328,8 +429,13 @@ class TableSpec:
                    min_rows_per_file: int = 300_000,
                    max_rows_per_file: int = 500_000,
                    time_unit: str = "ms",
-                   partition_kind: str = "duration") -> "TableSpec":
+                   partition_kind: str = "duration") -> "TableContract":
         time_column = TimeColumn(time, unit=time_unit, timezone=timezone)
+        segment = Segment.rows(
+            max_rows=max_rows_per_file,
+            target_rows=target_rows_per_file,
+            min_rows=min_rows_per_file,
+        )
         return cls(
             primary_key=primary_key,
             time=time_column,
@@ -341,6 +447,8 @@ class TableSpec:
             ),
             columns=columns or {},
             schema_policy=schema_policy,
+            order_key=time,
+            segment=segment,
             symbol_column=symbol_column,
             session_column=session_column,
             physical_layout=PhysicalLayout(
@@ -375,21 +483,28 @@ class TableSpec:
             return []
         partition = self.to_partition()
         if partition is None:
-            return [None]
+            return [DEFAULT_LOGICAL_PART if self.segment else None]
         return sorted({partition.get_key(row) for row in rows})
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        data = {
             "version": self.version,
             "primary_key": list(self.primary_key),
-            "time": self.time.to_dict() if self.time else None,
             "partition": self.partition.to_dict() if self.partition else None,
+            "segment": self.segment.to_dict() if self.segment else None,
             "columns": dict(self.columns),
             "schema_policy": self.schema_policy,
-            "symbol_column": self.symbol_column,
-            "session_column": self.session_column,
+            "order_key": self.order_key,
+            "conflict": self.conflict,
             "physical_layout": self.physical_layout.to_dict(),
         }
+        if self.time is not None:
+            data["time"] = self.time.to_dict()
+        if self.symbol_column != "symbol":
+            data["symbol_column"] = self.symbol_column
+        if self.session_column is not None:
+            data["session_column"] = self.session_column
+        return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TableSpec":
@@ -397,8 +512,11 @@ class TableSpec:
             primary_key=data.get("primary_key") or data.get("pk") or [],
             time=data.get("time"),
             partition=data.get("partition"),
+            segment=data.get("segment"),
             columns=data.get("columns") or {},
             schema_policy=data.get("schema_policy", "evolve"),
+            order_key=data.get("order_key"),
+            conflict=data.get("conflict", "append"),
             symbol_column=data.get("symbol_column", "symbol"),
             session_column=data.get("session_column"),
             physical_layout=data.get("physical_layout") or {},
@@ -406,9 +524,11 @@ class TableSpec:
         )
 
     @classmethod
-    def from_table_meta(cls, meta: Optional[Dict[str, Any]]) -> Optional["TableSpec"]:
+    def from_table_meta(cls, meta: Optional[Dict[str, Any]]) -> Optional["TableContract"]:
         if not meta:
             return None
+        if meta.get("table_contract"):
+            return cls.from_dict(meta["table_contract"])
         if meta.get("table_spec"):
             return cls.from_dict(meta["table_spec"])
 
@@ -428,11 +548,16 @@ class TableSpec:
             primary_key=meta.get("pk") or [],
             time=time,
             partition=partition,
+            segment=Segment.from_dict(meta.get("segment")),
             columns=columns,
             schema_policy="evolve",
             symbol_column="symbol",
             session_column=None,
         )
+
+
+# 旧名称保留为过渡别名；新核心代码应使用 TableContract。
+TableSpec = TableContract
 
 
 @dataclass
@@ -532,6 +657,7 @@ class SegmentInfo:
     time_max: Optional[Any] = None
     session_min: Optional[Any] = None
     session_max: Optional[Any] = None
+    stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     sealed: bool = False
     generation: int = 0
 
@@ -546,6 +672,7 @@ class SegmentInfo:
             "time_max": self.time_max,
             "session_min": self.session_min,
             "session_max": self.session_max,
+            "stats": dict(self.stats or {}),
             "sealed": self.sealed,
             "generation": self.generation,
         }

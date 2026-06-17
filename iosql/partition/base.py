@@ -3,14 +3,47 @@ from typing import Any, Dict, Union
 
 
 class Partition(ABC):
-    """Abstract base class for partition strategies.
-    
-    A Partition determines how data is divided into separate storage units
-    (files, tables, etc.) based on a timestamp column.
-    """
+    """Abstract base class for logical partition strategies."""
     
     TS_COL: str
     PARTITION_TYPE: str
+
+    @classmethod
+    def range(cls, column: str, every: int) -> 'Partition':
+        from .range import RangePartition
+
+        return RangePartition(width=every, column=column)
+
+    @classmethod
+    def duration(cls, column: str, every: Any = '1day') -> 'Partition':
+        from .duration import DurationPartition
+
+        return DurationPartition(interval_ms=every, ts_col=column)
+
+    @classmethod
+    def calendar(
+        cls,
+        column: str,
+        every: Any = '1day',
+        timezone: str = 'UTC',
+    ) -> 'Partition':
+        from .calendar import CalendarPartition
+
+        fmt = cls._calendar_format(every)
+        return CalendarPartition(fmt=fmt, tz=timezone, ts_col=column)
+
+    @staticmethod
+    def _calendar_format(every: Any) -> str:
+        text = str(every).strip().lower()
+        if text in ['1y', '1year', '1years', 'year', 'years']:
+            return 'YYYY'
+        if text in ['1mo', '1mon', '1month', '1months', 'month', 'months']:
+            return 'YYYYMM'
+        if text in ['1d', '1day', '1days', 'day', 'days']:
+            return 'YYYYMMDD'
+        if text in ['1h', '1hour', '1hours', 'hour', 'hours']:
+            return 'YYYYMMDDHH'
+        raise ValueError(f"Unsupported calendar partition interval: {every}")
     
     @abstractmethod
     def get_key(self, row: Dict[str, Any]) -> Union[int, str]:
@@ -71,10 +104,13 @@ class Partition(ABC):
         """
         from .duration import DurationPartition
         from .calendar import CalendarPartition
+        from .range import RangePartition
         
         partition_type = meta.get('type')
         if partition_type == 'duration':
             return DurationPartition.from_meta(meta)
+        elif partition_type == 'range':
+            return RangePartition.from_meta(meta)
         elif partition_type == 'calendar':
             return CalendarPartition.from_meta(meta)
         else:

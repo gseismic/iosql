@@ -3,7 +3,7 @@
 from pathlib import Path
 import shutil
 
-from iosql import Database
+from iosql import Database, Partition, Segment
 
 
 DB_PATH = Path(__file__).resolve().parent / "runtime" / "03_buffered.iosql"
@@ -19,15 +19,13 @@ def run():
     reset_database()
 
     db = Database(DB_URI)
-    ticks = db.timeseries(
+    ticks = db.table(
         "ticks",
-        time="ts",
-        primary_key=["symbol", "ts"],
+        pk=["symbol", "ts"],
         columns={"symbol": "text", "ts": "integer", "price": "float"},
-        partition_every="1hour",
-        target_rows_per_file=1000,
-        min_rows_per_file=100,
-        max_rows_per_file=2000,
+        partition=Partition.duration("ts", every="1hour"),
+        segment=Segment.rows(max_rows=2000, target_rows=1000, min_rows=100),
+        order_key="ts",
     )
 
     base_ts = 1735689600000
@@ -40,18 +38,26 @@ def run():
                     "price": 100 + hour * 2 + (0.5 if symbol == "MSFT" else 0),
                 })
 
-    query = ticks.query(
-        symbols=["AAPL", "MSFT"],
-        start=base_ts + 3_600_000,
-        end=base_ts + 2 * 3_600_000,
+    where = [
+        {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
+        {
+            "field": "ts",
+            "op": "between_and",
+            "value": [base_ts + 3_600_000, base_ts + 2 * 3_600_000],
+        },
+    ]
+    rows = ticks.select(
+        "*",
+        where=where,
         order_by="ts desc",
         limit=3,
+        to_dict=True,
     )
-    plan = query.explain()
+    plan = ticks.explain_select(where=where, order_by="ts desc", limit=3)
 
     print("候选分区:", plan.candidate_partitions)
     print("实际扫描分区:", plan.scanned_partitions)
-    print("查询结果:", query.to_list())
+    print("查询结果:", rows)
     db.close()
 
 

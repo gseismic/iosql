@@ -1,9 +1,17 @@
 import os
 
 from .utils.schema import parse_db_schema
-from .exception import EngineNotExist
+from .exception import BadArgument, EngineNotExist
 from . import sqlite
-from .spec import TableSpec
+from .spec import TableContract, TableSpec
+
+
+def _normalize_pk(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [value]
+    return list(value)
 
 
 class Database(object):
@@ -24,10 +32,51 @@ class Database(object):
             self._tables[table_name] = table
         return self._tables[table_name]
 
-    def table(self, table_name, spec=None):
+    def table(
+        self,
+        table_name,
+        spec=None,
+        pk=None,
+        primary_key=None,
+        columns=None,
+        partition=None,
+        segment=None,
+        order_key=None,
+        conflict='append',
+        schema_policy='evolve',
+    ):
         table = self[table_name]
+        shortcut_values = [
+            pk,
+            primary_key,
+            columns,
+            partition,
+            segment,
+            order_key,
+        ]
+        if spec is not None and any(value is not None for value in shortcut_values):
+            raise BadArgument('Database.table: spec conflicts with shortcut arguments')
+
         if spec is not None:
-            table.use_spec(spec)
+            table.use_contract(TableContract.ensure(spec))
+        elif any(value is not None for value in shortcut_values):
+            normalized_pk = _normalize_pk(pk)
+            normalized_primary_key = _normalize_pk(primary_key)
+            if (
+                normalized_pk is not None
+                and normalized_primary_key is not None
+                and normalized_pk != normalized_primary_key
+            ):
+                raise BadArgument('Database.table: pk and primary_key conflict')
+            table.use_contract(TableContract(
+                primary_key=normalized_pk if normalized_pk is not None else normalized_primary_key,
+                columns=columns or {},
+                partition=partition,
+                segment=segment,
+                order_key=order_key,
+                conflict=conflict,
+                schema_policy=schema_policy,
+            ))
         return table
 
     def timeseries(self, table_name, time, primary_key, columns=None,

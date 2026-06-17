@@ -1,9 +1,9 @@
-"""入门：直接用原始 Table + TableSpec 写入时间序列数据。"""
+"""入门：用普通 Table + 自动分区写入可排序字段数据。"""
 
 from pathlib import Path
 import shutil
 
-from iosql import Database, PartitionSpec, TableSpec, TimeColumn
+from iosql import Database, Partition
 
 
 DB_PATH = Path(__file__).resolve().parent / "runtime" / "01_quickstart_table.iosql"
@@ -19,29 +19,30 @@ def run():
     reset_database()
 
     db = Database(DB_URI)
-    spec = TableSpec(
-        primary_key=["symbol", "ts"],
-        # time 是查询语义，partition 是物理布局；二者通常使用同一时间列。
-        time=TimeColumn("ts", unit="ms", timezone="UTC"),
-        partition=PartitionSpec.by_time("ts", every="1day"),
+    ticks = db.table(
+        "ticks",
+        pk=["symbol", "ts"],
+        partition=Partition.duration("ts", every="1day"),
         columns={"symbol": "text", "ts": "integer", "price": "float"},
     )
-    ticks = db.table("ticks", spec=spec)
 
-    result = ticks.write([
+    result = ticks.insert_all([
         {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
         {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
         {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
     ])
 
-    query = ticks.query(
-        symbols="AAPL",
-        start=1735689600000,
-        end=1735776000000,
+    where = [
+        {"field": "symbol", "op": "==", "value": "AAPL"},
+        {"field": "ts", "op": "between_and", "value": [1735689600000, 1735776000000]},
+    ]
+    rows = ticks.select(
+        "*",
+        where=where,
         order_by="ts",
+        to_dict=True,
     )
-    rows = query.to_list()
-    plan = query.explain()
+    plan = ticks.explain_select(where=where, order_by="ts")
 
     print("写入行数:", result.rows_seen)
     print("分区:", ticks.table_parts())

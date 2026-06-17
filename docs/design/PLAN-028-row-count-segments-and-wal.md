@@ -1,5 +1,7 @@
 # PLAN-028-row-count-segments-and-wal
 
+> 最终设计以 `PLAN-030-partitioned-sqlite-final-design.md` 为准。本文保留为 row segment / WAL-like 设计的中间草案，不再作为实现依据。
+
 ## 背景
 
 `PLAN-027-partitioned-sqlite-core-api` 已经把核心 API 从 `time + query(start/end)` 调整为更接近 SQLite 的：
