@@ -347,6 +347,7 @@ database/
 
 ## 变更记录
 
+- v0.2.4 - 修复查询语义，重组 core/query 与 engines 包结构，删除旧 query/sqlite/postgresql 兼容入口。
 - v0.2.1 - 引入时序表契约、布局诊断、重分区规划和 pyproject 打包入口。
 - v0.2.0 - 新分区系统，支持 `DurationPartition` 和 `CalendarPartition`。
 - v0.1.2 - 添加 `create_index`。

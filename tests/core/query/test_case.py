@@ -3,9 +3,9 @@ import arrow
 import logging
 import pytest
 from iosql import Database
-from iosql.query.where import Where
-from iosql.query.case import Case
-from iosql.query.case_util import flatten_expression, unique_or_and_cases
+from iosql.core.query.where import Where
+from iosql.core.query.case import Case
+from iosql.core.query.case_util import flatten_expression, unique_or_and_cases
 
 
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s: %(message)s')

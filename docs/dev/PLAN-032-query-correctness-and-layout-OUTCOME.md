@@ -49,13 +49,15 @@ iosql.engines.postgresql
 
 `Database.get_engine()` 已改为从 `iosql.engines` 加载引擎。
 
-旧入口保留为薄转发：
+旧入口在 `PLAN-032` 中曾短暂保留为薄转发：
 
 ```text
 iosql.query       -> iosql.core.query
 iosql.sqlite      -> iosql.engines.sqlite
 iosql.postgresql  -> iosql.engines.postgresql
 ```
+
+后续 `PLAN-033` 已按重构思路删除这些旧入口。
 
 删除了未引用的历史备份源文件：
 
@@ -70,9 +72,9 @@ iosql/sqlite/backup/*.py
 
 ```bash
 python -m compileall iosql -q
-python -m pytest tests/sqlite/test_query_correctness.py -q
-python -m pytest tests/query tests/sqlite -q
-python -m pytest tests/query tests/sqlite tests/test_postgresql.py -q
+python -m pytest tests/engines/sqlite/test_query_correctness.py -q
+python -m pytest tests/core/query tests/engines/sqlite -q
+python -m pytest tests/core/query tests/engines/sqlite tests/engines/postgresql -q
 python -m pytest tests/utils/mysqlite -q
 python examples/01_quickstart_table.py
 python examples/03_buffered_ingest_and_query_plan.py
@@ -96,7 +98,7 @@ tests/test_partition_integration.py::TestLargeData::test_upsert_large_data
 
 ## 新增测试
 
-新增 `tests/sqlite/test_query_correctness.py` 覆盖：
+新增 `tests/engines/sqlite/test_query_correctness.py` 覆盖：
 
 - 字符串值等于列名时不能被当作标识符。
 - 数值列字符串输入不能注入 SQL。

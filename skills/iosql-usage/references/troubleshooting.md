@@ -358,15 +358,15 @@ def test_my_case():
 
 ```bash
 # 仅跑 sqlite 相关测试
-pytest tests/sqlite/ -v
+pytest tests/engines/sqlite/ -v
 
 # 跑特定测试文件
-pytest tests/sqlite/test_timeseries_contract.py -v
+pytest tests/engines/sqlite/test_timeseries_contract.py -v
 
 # 跑分区测试
 pytest tests/test_partition.py -v
 pytest tests/test_partition_integration.py -v
 
 # 含输出
-pytest tests/sqlite/ -v -s --tb=short
+pytest tests/engines/sqlite/ -v -s --tb=short
 ```

@@ -22,8 +22,6 @@ from .spec import (
     TimeColumn,
     WriteResult,
 )
-# from .query import Case, CaseExpression, Where
-
 __all__ = [
     'CalendarPartition',
     'Case',

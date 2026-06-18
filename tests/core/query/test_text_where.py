@@ -1,7 +1,7 @@
 import pytest
 
 from iosql.exception import BadArgument
-from iosql.query.where import Where
+from iosql.core.query.where import Where
 
 
 def _case_tuple(case):

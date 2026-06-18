@@ -4,7 +4,7 @@ import psycopg2
 from psycopg2 import sql
 
 from iosql.partition import DurationPartition
-from iosql.postgresql import Table
+from iosql.engines.postgresql import Table
 
 POSTGRES_URI = os.environ.get('POSTGRES_DSN') or 'postgresql://postgres:@localhost:5432/test_db'
 _POSTGRES_ERROR = None

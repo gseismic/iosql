@@ -275,12 +275,12 @@ iosql.engines.sqlite   SQLite 引擎实现
 iosql.engines.postgresql PostgreSQL 引擎实现
 ```
 
-旧入口只作为兼容转发层：
+旧入口不保留：
 
 ```text
-iosql.query       -> iosql.core.query
-iosql.sqlite      -> iosql.engines.sqlite
-iosql.postgresql  -> iosql.engines.postgresql
+iosql.query       删除，改用 iosql.core.query
+iosql.sqlite      删除，改用 iosql.engines.sqlite
+iosql.postgresql  删除，改用 iosql.engines.postgresql
 ```
 
 后续新增通用查询能力时应进入 `iosql.core.query`，不要放入某个具体引擎目录；新增具体 SQL 编译或执行细节时应进入对应 `iosql.engines.*`。

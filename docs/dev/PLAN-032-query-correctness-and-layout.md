@@ -22,7 +22,7 @@
 5. 重组代码目录：
    - 新增 `iosql/core/query` 存放通用 query AST、where parser 和 case 工具。
    - 新增 `iosql/engines/sqlite`、`iosql/engines/postgresql` 存放具体引擎实现。
-   - 原 `iosql.query`、`iosql.sqlite`、`iosql.postgresql` 暂作为薄转发层，避免一次性改动所有 public import。
+   - 原 `iosql.query`、`iosql.sqlite`、`iosql.postgresql` 后续按重构要求删除。
 
 ## 非目标
 
@@ -43,6 +43,6 @@
 
 ```bash
 python -m compileall iosql -q
-python -m pytest tests/query tests/sqlite tests/test_postgresql.py -q
+python -m pytest tests/core/query tests/engines/sqlite tests/engines/postgresql -q
 python -m pytest tests/utils/mysqlite -q
 ```

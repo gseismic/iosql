@@ -257,7 +257,7 @@ with Database("sqlite://db/test.iosql") as db:
 - 让 `TableSpec/TableContract` 成为表契约来源，避免隐式依赖第一次写入推断出的结构。
 - 查询 API 优先表达业务条件：`symbols/start/end/date/session/where/order_by/limit`。
 - 复杂 where 优先使用受支持的 dict/list/`Case` 或文本 where，不要拼接原始 SQL。
-- 代码结构按层理解：`iosql.core.query` 是通用查询 AST/where 解析；`iosql.engines.sqlite` / `iosql.engines.postgresql` 是引擎实现；`iosql.query` / `iosql.sqlite` / `iosql.postgresql` 只是兼容转发层。
+- 代码结构按层理解：`iosql.core.query` 是通用查询 AST/where 解析；`iosql.engines.sqlite` / `iosql.engines.postgresql` 是引擎实现；旧 `iosql.query` / `iosql.sqlite` / `iosql.postgresql` 包已删除。
 - `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数，合理配置以控制文件大小。
 - `repartition_to()` 写入新库，不要假设它会原地修改源库。
 - 测试必须覆盖写入结果、查询结果和必要的 `explain()` 裁剪信息。
@@ -295,4 +295,4 @@ with Database("sqlite://db/test.iosql") as db:
 - `examples/05_partition_segments_smoke.py`
 - `examples/06_row_segment_late_data.py`
 - `examples/finance/`
-- `tests/sqlite/test_timeseries_contract.py`
+- `tests/engines/sqlite/test_timeseries_contract.py`

@@ -6,8 +6,8 @@ import arrow
 import logging
 import sqlite3
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
-from iosql.query.where import Where
-from iosql.query.case import Case
+from iosql.core.query.where import Where
+from iosql.core.query.case import Case
 from iosql import Database
 
 logging.basicConfig(
