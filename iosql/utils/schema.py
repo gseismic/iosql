@@ -87,15 +87,19 @@ def parse_db_schema(uri: str) -> Tuple[str, Dict[str, Union[str, int, bool, None
     schema, detail = parts
 
     # Parse based on schema type
-    if schema == 'mysql':
-        _raise_if_not('@' in detail, schema, uri)
-        auth_part, host_part = detail.split('@', 1)
-        options['user'], options['password'] = _parse_user_pass(auth_part)
-        
+    if schema in ('mysql', 'postgresql'):
+        if '@' in detail:
+            auth_part, host_part = detail.split('@', 1)
+            options['user'], options['password'] = _parse_user_pass(auth_part)
+        else:
+            host_part = detail
+            options['user'] = None
+            options['password'] = None
+
         host, port, db = _parse_host_port_db(host_part)
         _raise_if_not(host is not None and port is not None and db is not None, schema, uri)
         options.update({'host': host, 'port': port, 'db': db})
-        
+
     elif schema == 'redis':
         # Handle both with and without authentication
         if '@' in detail:
