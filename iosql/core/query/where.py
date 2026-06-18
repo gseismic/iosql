@@ -1,4 +1,4 @@
-from ...exception import BadArgument, IosqlBadArgument
+from ...exception import BadArgument
 from .case import Case, CaseExpression
 from .case_util import flatten_expression
 from .text_where import parse_text_where
@@ -11,7 +11,7 @@ def ensure_case(c):
     elif isinstance(c, Case):
         case = c
     else:
-        raise IosqlBadArgument(f'Error Parsing Case: `{str(c)}`')
+        raise BadArgument(f'Error Parsing Case: `{str(c)}`')
     return case
 
 
