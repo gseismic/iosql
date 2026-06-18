@@ -344,9 +344,13 @@ database/
 - 多分区查询支持全局 `order_by` 和 `limit`，但结果会在 Python 层合并排序，扫描范围应尽量通过时间条件收窄。
 - 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
+- `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
+- PostgreSQL URI 格式为 `postgresql://user:pass@host:port/dbname`，与 SQLite 引擎共享同一套分区和查询 API。
+- `Segment.rows` 表当前不支持 `upsert`/`replace` 覆盖写；需要覆盖写时请关闭 segment 或使用 `append`/`ignore`。
 
 ## 变更记录
 
+- v0.2.5 - 修复列类型推断 Bug（用户声明的 `columns` 类型此前被静默忽略）；修复 PostgreSQL URI 解析（此前不可达）；修复元数据查询 SQL 注入（5 处 f-string 改为参数化）；修复 `Partition | None` 在 Python 3.9 上的兼容性；修复 `create_table` 静默空操作；清理重复异常定义和死代码文件。
 - v0.2.4 - 修复查询语义，重组 core/query 与 engines 包结构，删除旧 query/sqlite/postgresql 兼容入口。
 - v0.2.1 - 引入时序表契约、布局诊断、重分区规划和 pyproject 打包入口。
 - v0.2.0 - 新分区系统，支持 `DurationPartition` 和 `CalendarPartition`。
