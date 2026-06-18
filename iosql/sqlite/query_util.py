@@ -25,12 +25,23 @@ def _column_type(column_types, field):
     return type_
 
 
+_NUMERIC_TYPE_NAMES = {
+    'integer', 'int', 'real', 'float', 'double', 'numeric', 'decimal', 'bool', 'boolean',
+}
+
+
 def _case_value_needs_quote(case, column_types):
+    """判断 Case 的值在生成 SQL 时是否需要加引号。
+
+    变量类型（[[field]]）不加引号；数值类型不加引号；其余（text 等）加引号。
+    """
     if case.value['type'] == 'variable':
         return False
 
     type_ = _column_type(column_types, case.field)
-    return type_ not in [int, float, bool, 'integer', 'float', 'bool']
+    if isinstance(type_, type):
+        return type_ not in (int, float, bool)
+    return str(type_).lower() not in _NUMERIC_TYPE_NAMES
 
 
 def _format_case_value(value, to_quoted_str):
@@ -54,10 +65,10 @@ def build_case_subsql(case, column_types):
         assert isinstance(value, (list, tuple))
         _value = [_format_case_value(v, to_quoted_str) for v in value]
         if op == 'between_and':
-            subsql = f' between {_value[0]} and {_value[1]}'
+            subsql = f'between {_value[0]} and {_value[1]}'
         elif op == 'in':
             value_sql = ','.join(str(v) for v in _value)
-            subsql = f' in ({value_sql})'
+            subsql = f'in ({value_sql})'
     else:
         if case.value['type'] == 'variable':
             assert isinstance(value, str)
@@ -65,21 +76,21 @@ def build_case_subsql(case, column_types):
         else:
             value = _format_case_value(value, to_quoted_str)
         if op in ['gt', '>']:
-            subsql = f' > {value}'
+            subsql = f'> {value}'
         elif op in ['ge', '>=']:
-            subsql = f' >= {value}'
+            subsql = f'>= {value}'
         elif op in ['lt', '<']:
-            subsql = f' < {value}'
+            subsql = f'< {value}'
         elif op in ['le', '<=']:
-            subsql = f' <= {value}'
+            subsql = f'<= {value}'
         elif op in ['eq', '==', '=']:
-            subsql = f' == {value}'
+            subsql = f'= {value}'
         elif op in ['neq', '!=']:
-            subsql = f' != {value}'
+            subsql = f'!= {value}'
         else:
             raise BadArgument(f'Unsupported op `{op}`')
 
-    return f'{field_sql} {subsql} '
+    return f'{field_sql} {subsql}'
 
 
 def build_and_cases_subsql(cases, column_types):
