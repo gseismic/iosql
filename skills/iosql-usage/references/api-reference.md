@@ -19,9 +19,13 @@
 
 数据库入口。支持 `sqlite://` 和 `postgresql://` URI。
 
+**SQLite URI 格式**：`sqlite://path/database_name.iosql`
+
+**PostgreSQL URI 格式**：`postgresql://user:pass@host:port/dbname`
+
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` |
+| `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` 或 `"postgresql://user:pass@localhost:5432/mydb"` |
 | `verbose` | `int` | 日志详细度，`0`=静默 |
 
 **上下文管理器**：
@@ -352,7 +356,6 @@ Segment.rows(max_rows=500_000, target_rows=400_000, min_rows=300_000)
 | `ChunkVerificationError` | 数据块校验错误 |
 | `EngineNotExist` | 不支持的存储引擎 |
 | `InvalidUriSchema` | URI schema 无效 |
-| `IosqlBadArgument` | 参数错误（旧版别名） |
 
 ---
 

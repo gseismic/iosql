@@ -36,6 +36,18 @@ db.table("t", pk=["id"], columns={"id": "integer", "val": "float"})
 # Error: Column `val` type conflict: current=text new=float
 ```
 
+### 主键或分区变更报 TableSpecConflict
+
+**症状**：写入时报 `TableSpecConflict: PrimaryKeyCanNotChange` 或 `PartitionCanNotChange`。
+
+**原因**：表已存在且元数据中记录的主键或分区策略与当前写入传入的不一致。
+
+**排查**：
+
+1. 使用 `table.spec()` 查看当前表契约。
+2. 如需更改主键或分区策略，使用新表名或删除旧数据库目录后重建。
+3. 使用 `repartition_to()` 按新策略写入新库。
+
 ### MissingPrimaryKey / MissingTimeColumn
 
 **症状**：调用 `db.timeseries()` 时报 `MissingPrimaryKey` 或 `MissingTimeColumn`。
@@ -225,13 +237,16 @@ if result.layout_warnings:
 
 **症状**：`Database("data.sqlite3")` 报 `InvalidUriSchema`。
 
-**原因**：主 API 要求 `sqlite://` 前缀的 URI 格式。
+**原因**：主 API 要求 `sqlite://` 或 `postgresql://` 前缀的 URI 格式。
 
 **排查**：
 
 ```python
-# 正确：使用 sqlite:// 前缀
+# 正确：SQLite 使用 sqlite:// 前缀
 db = Database("sqlite://db/market.iosql")
+
+# 正确：PostgreSQL 使用 postgresql:// 前缀
+db = Database("postgresql://user:pass@localhost:5432/mydb")
 
 # 错误：直接传文件路径（低层 mysqlite 才接受）
 db = Database("db/market.iosql")  # 报 InvalidUriSchema

@@ -262,6 +262,9 @@ with Database("sqlite://db/test.iosql") as db:
 - `repartition_to()` 写入新库，不要假设它会原地修改源库。
 - 测试必须覆盖写入结果、查询结果和必要的 `explain()` 裁剪信息。
 - 修改核心行为时，至少跑相关 sqlite 契约测试、partition 测试和 mysqlite 测试。
+- `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
+- 异常体系统一使用 `IosqlError` 子类（`BadArgument`、`TableSpecConflict`、`SchemaConflict` 等）；`IosqlBadArgument` 已移除，统一用 `BadArgument`。
+- `BaseTable.create_table()` 在基类中抛 `NotImplementedError`，SQLite 引擎子类已实现实际建表逻辑。
 
 ## 反模式（避免）
 
