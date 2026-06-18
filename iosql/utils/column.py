@@ -1,6 +1,5 @@
 from collections import OrderedDict
 import datetime
-import numpy
 
 try:
     import numpy as np
@@ -64,7 +63,7 @@ def suggest_column_types(data, column_type=None, n_check=None):
     column_type = column_type or {}
     kvalue_types = sqlite_types_of_data(data, n_check)
     for column, type_by_data in kvalue_types.items():
-        if column in column_type.items():
+        if column in column_type:
             out_column_types[column] = column_type[column]
         else:
             out_column_types[column] = type_by_data
