@@ -2,7 +2,7 @@ import os
 
 from .utils.schema import parse_db_schema
 from .exception import BadArgument, EngineNotExist
-from . import sqlite
+from .engines import sqlite
 from .spec import TableContract, TableSpec
 
 
@@ -134,7 +134,7 @@ class Database(object):
         if uri_schema in ['sqlite', 'sqlite3']:
             engine = sqlite.Table
         elif uri_schema == 'postgresql':
-            from . import postgresql
+            from .engines import postgresql
             engine = postgresql.Table
 
         if not engine:

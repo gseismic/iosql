@@ -265,6 +265,26 @@ ticks = db.table(
 
 ## 公开概念
 
+## 代码分层
+
+实现层按职责分为三类包：
+
+```text
+iosql.core.query        通用查询 AST、where parser、Case/Where 表达式
+iosql.engines.sqlite   SQLite 引擎实现
+iosql.engines.postgresql PostgreSQL 引擎实现
+```
+
+旧入口只作为兼容转发层：
+
+```text
+iosql.query       -> iosql.core.query
+iosql.sqlite      -> iosql.engines.sqlite
+iosql.postgresql  -> iosql.engines.postgresql
+```
+
+后续新增通用查询能力时应进入 `iosql.core.query`，不要放入某个具体引擎目录；新增具体 SQL 编译或执行细节时应进入对应 `iosql.engines.*`。
+
 ### Database
 
 ```python
@@ -832,4 +852,3 @@ table.insert_all(rows)
 8. 多 segment 隶属同一时间段是允许的，但必须通过 stats、global sort 标记和 compaction 管理查询代价。
 9. `timeseries()` 可以保留为新核心之上的 helper，不再是核心模型。
 10. 旧的围绕 `TimeColumn/TableSpec/query(start/end)` 的代码，如果不再服务新模型，应删除或下沉。
-

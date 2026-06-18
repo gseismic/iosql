@@ -373,20 +373,20 @@ class Table:
             except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
                 self._handle_error_on_connection(e, conn)
 
-    def fetchall(self, sql: str) -> List[Tuple]:
+    def fetchall(self, sql: str, params: Optional[List[Any]] = None) -> List[Tuple]:
         """执行查询并返回所有结果"""
         with self._get_cursor() as (cursor, conn):
             try:
-                cursor.execute(sql)
+                cursor.execute(sql, params or [])
                 return cursor.fetchall()
             except sqlite3.OperationalError as e:
                 self._handle_error_on_connection(e, conn)
 
-    def fetchone(self, sql: str) -> Optional[Tuple]:
+    def fetchone(self, sql: str, params: Optional[List[Any]] = None) -> Optional[Tuple]:
         """执行查询并返回单个结果"""
         with self._get_cursor() as (cursor, conn):
             try:
-                cursor.execute(sql)
+                cursor.execute(sql, params or [])
                 return cursor.fetchone()
             except sqlite3.OperationalError as e:
                 self._handle_error_on_connection(e, conn)
@@ -429,10 +429,11 @@ class Table:
     def query_all(self, sql: str) -> List[Dict]:
         return self.query(sql, to_dict=True)
 
-    def query(self, sql: str, to_dict: bool = False) -> Union[List[Tuple], List[Dict]]:
+    def query(self, sql: str, to_dict: bool = False,
+              params: Optional[List[Any]] = None) -> Union[List[Tuple], List[Dict]]:
         #print(self.database.db_file)
         #print(sql)
-        data = self.fetchall(sql)
+        data = self.fetchall(sql, params=params)
         if to_dict and data:
             data = [dict(item) for item in data]
         return data

@@ -1,33 +1,15 @@
-# partition
+# SQLite compatibility package
 
+`iosql.sqlite` 现在只是兼容转发层。
+
+真实 SQLite 引擎实现位于：
+
+```python
+iosql.engines.sqlite
 ```
-toYYYYMM('date')
-[fn, 'date', min, max]
 
-{
-	'fn': fn, 
-	'column': ['date', 'symbol'],
-	'forward_fn': lambda x: x/100,
-   	'reverse_min_fn': {
-	   	'id': lambda part: part*100,
-   	},
-   	'reverse_max_fn': {
-	   	'id': lambda part: (part+1)*100
-   	}
-}
+通用查询 AST 和 where 解析位于：
 
-{
-	'key': ['date', 'symbol'],
-	'map': lambda x: x/100,
-   	'imap_min': {
-	   	'id': lambda part: part*100,
-   	},
-   	'imap_max': {
-	   	'id': lambda part: (part+1)*100
-   	}
-}
-{
-	'key': 'date',
-	'map': 'toYYYYMM'
-}
+```python
+iosql.core.query
 ```
