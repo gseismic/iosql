@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -924,9 +926,9 @@ class Table(BaseTable):
 
     def _segment_infos(self, logical_parts=None):
         try:
-            rows = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].select(
-                '*',
-                where=f'table_name="{self._table_name}"',
+            rows = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].query(
+                f'select * from {_TABLE_SEGMENT_TABLE_NAME} where table_name = ?',
+                params=[self._table_name],
                 to_dict=True,
             )
         except NoSuchTable:
@@ -961,17 +963,17 @@ class Table(BaseTable):
         if self._segment_info(logical_part, segment_id) is None:
             return None
         try:
-            row = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].select_one(
-                'created_at',
-                where=(
-                    f'table_name="{self._table_name}" '
-                    f'and logical_part="{logical_part}" '
-                    f'and segment_id="{segment_id}"'
+            rows = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].query(
+                (
+                    f'select created_at from {_TABLE_SEGMENT_TABLE_NAME} '
+                    'where table_name = ? and logical_part = ? and segment_id = ?'
                 ),
+                params=[self._table_name, logical_part, segment_id],
+                to_dict=True,
             )
         except NoSuchTable:
             return None
-        return row.get('created_at') if row else None
+        return rows[0].get('created_at') if rows else None
 
     def _upsert_segment_info(self, info):
         now = arrow.now().format("YYYY-MM-DD HH:mm:ss")
@@ -1717,7 +1719,7 @@ class Table(BaseTable):
                     self._part_token(partition.get_key({partition.TS_COL: item}))
                     for item in value
                 }
-        except Exception:
+        except (KeyError, TypeError, ValueError):
             return None
         return None
 
@@ -1836,7 +1838,7 @@ class Table(BaseTable):
         if isinstance(kv_list, dict):
             kv_list = [kv_list]
         elif not isinstance(kv_list, (list, tuple, set)):
-            raise Exception(f"upsert_all: `list/tuple/set/dict` required for `kv_list`")
+            raise BadArgument("upsert_all: `list/tuple/set/dict` required for `kv_list`")
 
         if not kv_list:
             return
@@ -2131,7 +2133,7 @@ class Table(BaseTable):
         column_type = kwargs.get("column_type", None)  # 用户指定的类型
         if "columns" in kwargs:
             self.logger.error("`columns` deprecated, please use `column_type` instead")
-            raise Exception("Deprecated")
+            raise BadArgument("`columns` deprecated, please use `column_type` instead")
 
         alter = kwargs.get("alter")
         batch_size = kwargs.get("batch_size", _DEFAULT_BATCH_SIZE)
@@ -2139,11 +2141,9 @@ class Table(BaseTable):
         # 当前记录的大表结构
         current_meta = self.get_table_meta()
         if current_meta and set(current_meta["pk"] or []) != set(pk or []):
-            raise Exception(
-                (
-                    f"PrimaryKeyCanNotChange: supplied pk={pk}, "
-                    f"table {current_meta['pk']}"
-                )
+            raise TableSpecConflict(
+                f"PrimaryKeyCanNotChange: supplied pk={pk}, "
+                f"table {current_meta['pk']}"
             )
         # Compare partition meta dicts - only check if table already exists
         prev_partition_meta = current_meta.get("partition") if current_meta else None
@@ -2153,7 +2153,7 @@ class Table(BaseTable):
             prev_partition_meta is not None
             and prev_partition_meta != curr_partition_meta
         ):
-            raise Exception(
+            raise TableSpecConflict(
                 f"PartitionCanNotChange: prev={prev_partition_meta} curr={curr_partition_meta}"
             )
 
@@ -2267,14 +2267,16 @@ class Table(BaseTable):
 
     def get_table_meta(self):
         try:
-            # meta = self.meta_db[_DB_META_TABLE_NAME].select_one(
-            meta = self.table_meta_db[_TABLE_META_TABLE_NAME].select_one(
-                "meta", where=f'table_name="{self._table_name}"'
+            rows = self.table_meta_db[_TABLE_META_TABLE_NAME].query(
+                f'select meta from {_TABLE_META_TABLE_NAME} where table_name = ?',
+                params=[self._table_name],
+                to_dict=True,
             )
-            if meta:
-                meta = json.loads(meta["meta"])
+            if rows:
+                meta = json.loads(rows[0]["meta"])
                 meta["column_info"] = OrderedDict(meta["column_info"])
-            return meta
+                return meta
+            return None
         except NoSuchTable:
             return None
 
@@ -2337,10 +2339,11 @@ class Table(BaseTable):
         )
 
     def table_parts(self):
-        # table_meta_db = MyDatabase(self.table_meta_path)
         try:
-            parts = self.table_meta_db[_TABLE_PART_TABLE_NAME].select(
-                "*", where=f'table_name="{self._table_name}"', to_dict=True
+            parts = self.table_meta_db[_TABLE_PART_TABLE_NAME].query(
+                f'select * from {_TABLE_PART_TABLE_NAME} where table_name = ?',
+                params=[self._table_name],
+                to_dict=True,
             )
         except NoSuchTable:
             return []
@@ -2366,13 +2369,14 @@ class Table(BaseTable):
         )
 
     def get_part_column_ranges(self, table_name=None):
-        # table_meta_db = MyDatabase(self.table_meta_path)
         _tblname = _TABLE_PART_COLUMN_RANGE_TABLE_NAME
         if table_name is None:
             table_name = self._table_name
         try:
-            infos = self.table_meta_db[_tblname].select(
-                "*", where=f'table_name="{table_name}"', to_dict=True
+            infos = self.table_meta_db[_tblname].query(
+                f'select * from {_tblname} where table_name = ?',
+                params=[table_name],
+                to_dict=True,
             )
         except NoSuchTable:
             return []
@@ -2559,10 +2563,8 @@ class Table(BaseTable):
                 save_meta=True,
                 table_comment=None,
             )
-        except OSError as e:
-            if str(e).find("Too many open files") != -1:
-                raise e
-            raise e
+        except OSError:
+            raise
         finally:
             db.close()
 
@@ -2641,4 +2643,19 @@ class Table(BaseTable):
         self._pragma_dict[key] = value
 
     def create_table(self, column_type, pk, partition=None, **kwargs):
-        pass
+        """手动创建表结构（非 insert 路径）。
+
+        通过推断列类型并调用 do_create_table 在主分区文件上建表。
+        """
+        data_suggested_types = self.suggest_column_types(
+            [], column_type=column_type, n_suggest_check=None
+        )
+        createtable_meta = build_createtable_meta(
+            column_type, pk=pk, partition=partition, **kwargs
+        )
+        part_key = DEFAULT_LOGICAL_PART if self.spec() and self.spec().segment else None
+        part_dbfile = self._get_part_dbfile(part_key)
+        self.do_create_table(
+            part_dbfile, _PART_DATA_TABLE_NAME, createtable_meta,
+            alter=kwargs.get('alter', False),
+        )
