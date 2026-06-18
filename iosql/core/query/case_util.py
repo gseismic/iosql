@@ -72,9 +72,6 @@ def unique_or_and_cases(list_cases: 'List[List[Case]]'):
     for i, cases in enumerate(out_and_cases):
         if i not in to_del_index:
             final_out.append(cases)
-        else:
-            print(f'\t**Removing {cases}')
-            pass
 
     return final_out
 
@@ -188,4 +185,3 @@ def _flatten_expression_tree(op, left, right):
         else:
             _right = right
         return _flatten_expression_tree(op, _left, _right)
-    return rv

@@ -1,6 +1,5 @@
 from abc import ABCMeta, abstractmethod
 from .utils.schema import parse_db_schema
-from .utils.createtable import build_createtable_meta
 
 
 class BaseTable(metaclass=ABCMeta):
@@ -37,12 +36,9 @@ class BaseTable(metaclass=ABCMeta):
         params:
             columns 包含创建该类型数据库所需要的type
         '''
-        # column_ = kwargs.get('columns') # 推荐的类型
-        assert 0
-        alter = kwargs.get('alter', False)
-        createtable_meta = build_createtable_meta(
-            column_type, pk, partition=partition, **kwargs)
-        self.do_create_table(createtable_meta, alter=alter)
+        raise NotImplementedError(
+            'BaseTable.create_table must be overridden by the engine subclass'
+        )
 
     def insert(self, dic, pk=None, extra_data=None, partition=None, 
                replace=False, ignore=False, commit=True, **kwargs):
