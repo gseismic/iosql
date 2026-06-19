@@ -11,8 +11,11 @@ git commit语言: 中文
 ## 如何确定下一步的工作
 如果用户没有指定，应该思考本系统的最终目标是什么，当前代码状态下的高价值、最紧急的任务是什么。
 
+## 如何做设计
+设计命名为 {topic}-{date:YYYYMMDD}-{tag}.md 如，memory-20260606-overview.md
+
 ## 如何制定计划
-计划文件命名为 PLAN-{XXX}-{tag}.md 放在对应目录，比如命名为: PLAN-001-function.md
+计划文件命名为 PLAN-{XXX:数字}-{tag}.md 放在对应目录，比如命名为: PLAN-001-function.md
 
 ## 如何实施代码
 按计划实施代码，如果计划实施前有更新，先更新计划文件再实施。实施完代码应该review一遍代码，如果有问题，应该修复，然后生成结果文件，比如PLAN-001-function-OUTCOME.md
