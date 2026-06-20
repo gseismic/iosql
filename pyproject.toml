@@ -12,7 +12,9 @@ authors = [
     { name = "Liu Shengli", email = "liushengli203@163.com" }
 ]
 dependencies = [
-    "arrow"
+    "arrow",
+    "typer>=0.9.0",
+    "loguru>=0.7.0",
 ]
 
 [project.urls]
@@ -27,4 +29,7 @@ zip-safe = false
 version = { attr = "iosql.version.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["iosql*"]
+include = ["iosql*", "cli*"]
+
+[project.scripts]
+iosql = "cli.__main__:app"
