@@ -78,18 +78,22 @@ def doctor(
         undersized = report.undersized_partitions
         if oversized:
             issues += 1
+            avg = report.total_rows // report.total_partitions if report.total_partitions else 0
+            suggestion = _suggest_period_down(avg, report.target_rows_per_file)
             logger.warning(
                 f"  ⚠ 分区过大 ({len(oversized)} 个 > {report.max_rows_per_file} 行): "
                 f"{oversized[:5]}{'...' if len(oversized) > 5 else ''}"
             )
-            logger.info(f"  修复: iosql repartition -s {source} -t {tname} -e <更小周期>")
+            logger.info(f"  修复: iosql repartition -s {source} -t {tname} -e {suggestion}")
         elif undersized:
             issues += 1
+            avg = report.total_rows // report.total_partitions if report.total_partitions else 0
+            suggestion = _suggest_period_up(avg, report.target_rows_per_file)
             logger.warning(
                 f"  ⚠ 分区过小 ({len(undersized)} 个 < {report.min_rows_per_file} 行): "
                 f"{undersized[:5]}{'...' if len(undersized) > 5 else ''}"
             )
-            logger.info(f"  修复: iosql repartition -s {source} -t {tname} -e <更大周期>")
+            logger.info(f"  修复: iosql repartition -s {source} -t {tname} -e {suggestion}")
         else:
             logger.info(f"  ✓ 分区大小正常 ({report.min_rows_per_file}~{report.max_rows_per_file})")
 
@@ -112,6 +116,30 @@ def doctor(
         logger.info("✓ 数据库健康状态正常")
     else:
         logger.warning(f"发现 {issues} 个问题" + (f"，已修复 {fixed} 个" if fix else ""))
+
+
+def _suggest_period_up(avg_rows: int, target: int) -> str:
+    """根据平均行数建议更大的分区周期。"""
+    ratio = target / max(avg_rows, 1)
+    if ratio >= 24:
+        return "biennium"
+    elif ratio >= 8:
+        return "quarter"
+    elif ratio >= 2:
+        return "month"
+    return "week"
+
+
+def _suggest_period_down(avg_rows: int, target: int) -> str:
+    """根据平均行数建议更小的分区周期。"""
+    ratio = avg_rows / max(target, 1)
+    if ratio >= 24:
+        return "week"
+    elif ratio >= 8:
+        return "biweek"
+    elif ratio >= 2:
+        return "month"
+    return "quarter"
 
 
 def _missing_indexes(source_path: Path, table_name: str, pk_columns: list) -> list:
