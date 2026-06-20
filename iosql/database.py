@@ -44,6 +44,7 @@ class Database(object):
         order_key=None,
         conflict='append',
         schema_policy='evolve',
+        force_partition=False,
     ):
         table = self[table_name]
         shortcut_values = [
@@ -58,7 +59,9 @@ class Database(object):
             raise BadArgument('Database.table: spec conflicts with shortcut arguments')
 
         if spec is not None:
-            table.use_contract(TableContract.ensure(spec))
+            contract = TableContract.ensure(spec)
+            contract.force_partition = force_partition
+            table.use_contract(contract)
         elif any(value is not None for value in shortcut_values):
             normalized_pk = _normalize_pk(pk)
             normalized_primary_key = _normalize_pk(primary_key)

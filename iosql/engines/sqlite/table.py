@@ -2148,14 +2148,23 @@ class Table(BaseTable):
         # Compare partition meta dicts - only check if table already exists
         prev_partition_meta = current_meta.get("partition") if current_meta else None
         curr_partition_meta = partition.to_meta() if partition else None
-        # Only raise if previous partition existed and is different from current
         if (
             prev_partition_meta is not None
             and prev_partition_meta != curr_partition_meta
         ):
-            raise TableSpecConflict(
-                f"PartitionCanNotChange: prev={prev_partition_meta} curr={curr_partition_meta}"
-            )
+            table_contract = kwargs.get("table_contract") or {}
+            force = table_contract.get("force_partition", False)
+            if force:
+                logger.warning(
+                    f"强制使用新分区: prev={prev_partition_meta} curr={curr_partition_meta}"
+                )
+                current_meta["partition"] = curr_partition_meta
+                self._overwrite_table_meta(current_meta)
+            else:
+                logger.warning(
+                    f"分区已存在，忽略新分区配置: "
+                    f"prev={prev_partition_meta} curr={curr_partition_meta}"
+                )
 
         part_dbfile = self._get_part_dbfile(part)
         part_db = self.get_part_db(part_dbfile, auto_commit=True)

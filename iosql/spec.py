@@ -363,7 +363,6 @@ class PartitionSpec:
 @dataclass
 class TableContract:
     primary_key: List[str] = field(default_factory=list)
-    # time/symbol/session 仅为旧 timeseries helper 过渡字段，不属于核心契约。
     time: Optional[TimeColumn] = None
     partition: Optional[PartitionSpec] = None
     segment: Optional[Segment] = None
@@ -375,6 +374,7 @@ class TableContract:
     session_column: Optional[str] = None
     physical_layout: PhysicalLayout = field(default_factory=PhysicalLayout)
     version: int = 1
+    force_partition: bool = False
 
     def __post_init__(self):
         if isinstance(self.primary_key, str):
@@ -497,6 +497,7 @@ class TableContract:
             "order_key": self.order_key,
             "conflict": self.conflict,
             "physical_layout": self.physical_layout.to_dict(),
+            "force_partition": self.force_partition,
         }
         if self.time is not None:
             data["time"] = self.time.to_dict()
@@ -521,6 +522,7 @@ class TableContract:
             session_column=data.get("session_column"),
             physical_layout=data.get("physical_layout") or {},
             version=data.get("version", 1),
+            force_partition=data.get("force_partition", False),
         )
 
     @classmethod
