@@ -1812,6 +1812,14 @@ class Table(BaseTable):
                 column, order, exist_ok=exist_ok
             )
 
+    def drop_index(self, column):
+        dropped = 0
+        for ref in self._physical_part_refs():
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            part_db = self.get_part_db(part_dbfile, auto_commit=True)
+            dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
+        return dropped
+
     def upsert_all(
         self, kv_list, pk, partition=None, commit=True, **kwargs
     ):

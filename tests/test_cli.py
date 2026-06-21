@@ -187,6 +187,32 @@ def test_cli_doctor_fix_and_index_check(tmp_path):
     assert "data_symbol_index" in payload["parts"][0]["indexes"]
 
 
+def test_cli_index_create_and_drop(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke(
+        "index", "create", "-s", str(db_path), "-t", "ticks", "-c", "symbol"
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["created"] is True
+
+    result = _invoke("index", "list", "-s", str(db_path), "-t", "ticks")
+    payload = json.loads(result.output)
+    assert "data_symbol_index" in payload["parts"][0]["indexes"]
+
+    result = _invoke(
+        "index", "drop", "-s", str(db_path), "-t", "ticks", "-c", "symbol"
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["dropped"] > 0
+
+    result = _invoke("index", "list", "-s", str(db_path), "-t", "ticks")
+    payload = json.loads(result.output)
+    assert "data_symbol_index" not in payload["parts"][0]["indexes"]
+
+
 def test_cli_backup_and_restore(tmp_path):
     db_path = _make_sample_db(tmp_path)
     backup_path = tmp_path / "backup.iosql"

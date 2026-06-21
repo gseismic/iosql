@@ -562,9 +562,10 @@ def doctor(
                         typer.echo("    fix: ok")
                 else:
                     unresolved += 1
-                    typer.echo(
-                        f"    → iosql doctor -s {source} -t {tname} --fix"
-                    )
+                    for col in missing_columns:
+                        typer.echo(
+                            f"    → iosql index create -s {source} -t {tname} -c {col}"
+                        )
             else:
                 typer.echo("  indexes: ok")
     finally:
@@ -779,6 +780,22 @@ def index_create(
     finally:
         db.close()
     _echo_json({"table": table, "column": column, "order": order_value, "created": True})
+
+
+@index_app.command("drop")
+def index_drop(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="表名"),
+    column: str = typer.Option(..., "--column", "-c", help="列名"),
+):
+    """删除表的所有物理分区文件上的列索引。"""
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        dropped = _require_table(db, table).drop_index(column)
+    finally:
+        db.close()
+    _echo_json({"table": table, "column": column, "dropped": dropped})
 
 
 if __name__ == "__main__":

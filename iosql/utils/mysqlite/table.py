@@ -737,7 +737,8 @@ class Table:
         items = self.get_all_index(full_info=True)
         to_del = set()
         for item in items:
-            match = _INDEX_COLUMN_PATTERN.search(item['sql'])
+            sql_text = item.get('sql') or ''
+            match = _INDEX_COLUMN_PATTERN.search(sql_text)
             if match:
                 _column = match.group(1).split(' ')[0].strip('"')
                 if _column == column:

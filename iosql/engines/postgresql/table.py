@@ -364,6 +364,9 @@ class Table(BaseTable):
         cursor.execute(query)
         if self.verbose >= 1:
             logger.info(f'Created index {index_name}')
+
+    def drop_index(self, column):
+        raise NotImplementedError("drop_index not implemented for postgresql engine")
     
     def suggest_column_types(self, data, column_type, n_suggest_check=None):
         """Suggest column types based on data."""

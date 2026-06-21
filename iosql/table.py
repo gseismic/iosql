@@ -98,6 +98,10 @@ class BaseTable(metaclass=ABCMeta):
         raise NotImplementedError()
 
     @abstractmethod
+    def drop_index(self, column):
+        raise NotImplementedError()
+
+    @abstractmethod
     def do_insert_all(self, data, pk, partition=None, replace=False, 
                       ignore=False, commit=True, **kwargs):
         raise NotImplementedError()
