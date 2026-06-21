@@ -26,6 +26,13 @@ def test_parse_and_format_duration_partition_expr():
     assert spec.to_partition().interval_ms == 86_400_000
 
 
+def test_format_duration_partition_prefers_readable_units():
+    # doctor 反推多日周期时，CLI 应输出 5day 而不是裸毫秒。
+    spec = parse_partition_spec("duration(ts,every=432000000ms)")
+
+    assert spec.to_string() == "duration(ts,every=5day)"
+
+
 def test_parse_and_format_calendar_partition_expr():
     # 验证 calendar 能表达日历粒度和时区，且能映射到底层格式。
     spec = parse_partition_spec("calendar(event_date,every=1month,tz=Asia/Shanghai)")
@@ -36,6 +43,17 @@ def test_parse_and_format_calendar_partition_expr():
     assert spec.timezone == "Asia/Shanghai"
     assert runtime_partition.fmt == "YYYYMM"
     assert spec.to_string() == "calendar(event_date,every=1month,tz=Asia/Shanghai)"
+
+
+def test_calendar_partition_expr_accepts_multi_day_bucket():
+    # 验证 doctor 推荐的 4day 这类时间桶可以被 CLI 字符串表达。
+    spec = parse_partition_spec("calendar(date,every=4day,tz=Asia/Shanghai)")
+    runtime_partition = spec.to_partition()
+
+    assert spec.to_string() == "calendar(date,every=4day,tz=Asia/Shanghai)"
+    assert runtime_partition.get_key({"date": "2025-01-03"}) == "20250101"
+    assert runtime_partition.get_key({"date": "2025-01-05"}) == "20250105"
+    assert runtime_partition.to_meta()["every"] == "4day"
 
 
 def test_parse_and_format_range_partition_expr():

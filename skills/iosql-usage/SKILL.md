@@ -136,7 +136,7 @@ CLI 只支持 SQLite 目录库，`--source` 可传本地路径或 `sqlite://...`
 | | `iosql query -s DB -t TABLE --where JSON --format jsonl` | 查询小规模结果 |
 | **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append` | 写入既有契约表 |
 | | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON` | 导出查询结果 |
-| **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引 |
+| **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
 | | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份 |
 | | `iosql restore --backup BACKUP --target DB` | 目录级恢复 |
@@ -180,10 +180,11 @@ ticks = db.table(
 ```python
 "duration(ts,every=1day)"
 "calendar(event_date,every=1day,tz=Asia/Shanghai)"
+"calendar(date,every=4day,tz=Asia/Shanghai)"
 "range(id,width=100000)"
 ```
 
-对象 API 仍然兼容：`Partition.duration(...)`、`Partition.calendar(...)`、`Partition.range(...)`。
+时序表优先使用 `duration(...)` 或 `calendar(...)`。`range(...)` 主要用于 id、offset、版本号等非时间数值字段；历史库里的 `range(partition_key,...)` 可以作为兼容迁移方案。对象 API 仍然兼容：`Partition.duration(...)`、`Partition.calendar(...)`、`Partition.range(...)`。
 
 **快捷版（timeseries helper）**：
 ```python
@@ -201,7 +202,7 @@ ticks = db.timeseries(
 | 分区类型 | API | 适用场景 | 分区键格式 |
 |---------|-----|---------|-----------|
 | duration | `"duration(ts,every=1hour)"` | 毫秒时间戳 | 整数（对齐边界） |
-| calendar | `"calendar(date,every=1day,tz=Asia/Shanghai)"` | 日期字符串 | `YYYYMMDD` 等 |
+| calendar | `"calendar(date,every=1day,tz=Asia/Shanghai)"`、`"calendar(date,every=4day,tz=Asia/Shanghai)"` | 日期字符串 | `YYYYMMDD` 等 |
 | range | `"range(seq,width=10000)"` | 任意可排序数值 | 整数（对齐边界） |
 
 ### 4. 写入

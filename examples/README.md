@@ -17,6 +17,7 @@
 | `05_partition_segments_smoke.py` | 高级 | 验证逻辑分区 + 物理 row segment 的二级查询计划。 |
 | `06_row_segment_late_data.py` | 高级 | 仅按行数滚动 segment，展示晚到数据、`__all__` 逻辑分区和 stats pruning。 |
 | `07_partition_string_repartition_cli.py` | 高级 | 使用字符串 partition，并通过 CLI `repartition --partition --target` 生成新布局。 |
+| `08_doctor_time_first_suggestions.py` | 高级 | 展示 `doctor` 如何对历史 `partition_key` 表优先推荐 `calendar(date,...)`。 |
 
 ## 金融示例
 
@@ -49,6 +50,7 @@ python examples/04_layout_report_and_repartition.py
 python examples/05_partition_segments_smoke.py
 python examples/06_row_segment_late_data.py
 python examples/07_partition_string_repartition_cli.py
+python examples/08_doctor_time_first_suggestions.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

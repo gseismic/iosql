@@ -4,7 +4,14 @@ import os
 from typer.testing import CliRunner
 
 from iosql.cli import app
-from iosql import Database, Partition, Segment
+from iosql import (
+    Database,
+    Partition,
+    PhysicalLayout,
+    Segment,
+    TableContract,
+    TimeColumn,
+)
 
 
 runner = CliRunner()
@@ -512,12 +519,124 @@ def test_cli_doctor_recommends_partition_expr_for_range(tmp_path):
     result = _invoke("doctor", "-s", str(db_path), "-t", "items")
     assert result.exit_code == 1, result.output
     assert "partition: range(id,width=1)" in result.output
-    assert "--partition 'range(id,width=400000)' --replace-source --yes" in result.output
+    assert "suggestions:" in result.output
+    assert "--partition 'range(id,width=500000)' --replace-source --yes" in result.output
+
+
+def test_cli_doctor_prefers_time_partition_for_range_time_table(tmp_path):
+    db_path = tmp_path / "time_range_doctor.iosql"
+    db = Database(_db_uri(db_path))
+    spec = TableContract(
+        primary_key=["symbol", "date"],
+        time=TimeColumn("date", unit="date", timezone="Asia/Shanghai"),
+        partition="range(partition_key,width=1)",
+        columns={
+            "symbol": "text",
+            "date": "text",
+            "partition_key": "integer",
+            "close": "float",
+        },
+        order_key="date",
+        physical_layout=PhysicalLayout(
+            target_rows_per_file=8,
+            min_rows_per_file=5,
+            max_rows_per_file=10,
+        ),
+    )
+    table = db.table("daily_bars", spec=spec)
+    rows = []
+    for day in range(4):
+        date = f"2025-01-{day + 1:02d}"
+        rows.extend([
+            {
+                "symbol": "AAPL",
+                "date": date,
+                "partition_key": day,
+                "close": 100.0 + day,
+            },
+            {
+                "symbol": "MSFT",
+                "date": date,
+                "partition_key": day,
+                "close": 200.0 + day,
+            },
+        ])
+    table.write(rows)
+    db.close()
+
+    result = _invoke("doctor", "-s", str(db_path), "-t", "daily_bars")
+
+    assert result.exit_code == 1, result.output
+    assert "partition: range(partition_key,width=1)" in result.output
+    assert "suggestions:" in result.output
+    assert "1. 推荐: 按时间列 date 使用 5day" in result.output
+    assert "max/avg≈5" in result.output
+    assert "--partition 'calendar(date,every=5day,tz=Asia/Shanghai)'" in result.output
+    assert "--partition 'calendar(date,every=1week,tz=Asia/Shanghai)'" in result.output
+    assert "--partition 'range(partition_key,width=5)'" in result.output
+    assert result.output.index("calendar(date,every=5day") < result.output.index(
+        "range(partition_key,width=5)"
+    )
+
+
+def test_cli_doctor_duration_time_range_table_uses_day_baseline(tmp_path):
+    db_path = tmp_path / "ts_range_doctor.iosql"
+    db = Database(_db_uri(db_path))
+    spec = TableContract(
+        primary_key=["symbol", "ts"],
+        time=TimeColumn("ts", unit="ms", timezone="UTC"),
+        partition="range(partition_key,width=1)",
+        columns={
+            "symbol": "text",
+            "ts": "integer",
+            "partition_key": "integer",
+            "price": "float",
+        },
+        order_key="ts",
+        physical_layout=PhysicalLayout(
+            target_rows_per_file=8,
+            min_rows_per_file=5,
+            max_rows_per_file=10,
+        ),
+    )
+    table = db.table("ticks", spec=spec)
+    base_ts = 1735689600000
+    rows = []
+    for day in range(4):
+        rows.extend([
+            {
+                "symbol": "AAPL",
+                "ts": base_ts + day * 86_400_000,
+                "partition_key": day,
+                "price": 100.0 + day,
+            },
+            {
+                "symbol": "MSFT",
+                "ts": base_ts + day * 86_400_000,
+                "partition_key": day,
+                "price": 200.0 + day,
+            },
+        ])
+    table.write(rows)
+    db.close()
+
+    result = _invoke("doctor", "-s", str(db_path), "-t", "ticks")
+
+    assert result.exit_code == 1, result.output
+    assert "1. 推荐: 按时间列 ts 使用 5day" in result.output
+    assert "--partition 'duration(ts,every=5day)'" in result.output
+    assert "duration(ts,every=5ms)" not in result.output
 
 
 def test_cli_doctor_range_partition_suggestion(tmp_path):
-    from iosql.cli import _suggest_range_every_up, _suggest_range_every_down
+    from iosql.cli import (
+        _recommended_calendar_every,
+        _suggest_range_every_down,
+        _suggest_range_every_up,
+    )
 
     assert _suggest_range_every_up(avg_rows=316, target=350_000, current_every=1) > 1
     assert _suggest_range_every_down(avg_rows=500_000, target=200_000, current_every=100) < 100
     assert _suggest_range_every_down(avg_rows=500_000, target=200_000, current_every=1) == 1
+    assert _recommended_calendar_every(4) == ("4day", 4)
+    assert _recommended_calendar_every(1582) == ("5year", 1260)

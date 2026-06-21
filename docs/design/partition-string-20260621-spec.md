@@ -97,7 +97,9 @@ iosql repartition -s DB -t TABLE --every 1hour --target TARGET
 
 兼容路径含义：沿用旧分区的 `kind/column/timezone/fmt`，只替换内部粒度字段。新文档和 `doctor` 建议不再推荐 `--every`。
 
-`doctor` 输出示例：
+后续 `docs/design/time-first-repartition-suggestions-20260621-overview.md` 对 `doctor` 建议策略做了进一步优化：时序表优先推荐 `calendar(...)` / `duration(...)`，`range(partition_key,...)` 只作为兼容 fallback。
+
+旧 `doctor` 输出示例：
 
 ```text
 partition: range(partition_key,width=1)

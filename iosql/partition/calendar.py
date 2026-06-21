@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict
 import arrow
 from .base import Partition
@@ -25,17 +26,139 @@ class CalendarPartition(Partition):
         'YYYYMMDDHH': {'hours': 1},
         'YYYYMMDDHHmm': {'minutes': 1},
     }
+
+    UNIT_ALIASES = {
+        'y': 'year',
+        'year': 'year',
+        'years': 'year',
+        'mo': 'month',
+        'mon': 'month',
+        'month': 'month',
+        'months': 'month',
+        'w': 'week',
+        'week': 'week',
+        'weeks': 'week',
+        'd': 'day',
+        'day': 'day',
+        'days': 'day',
+        'h': 'hour',
+        'hr': 'hour',
+        'hour': 'hour',
+        'hours': 'hour',
+        'min': 'minute',
+        'minute': 'minute',
+        'minutes': 'minute',
+    }
+
+    FMT_BY_UNIT = {
+        'year': 'YYYY',
+        'month': 'YYYYMM',
+        'week': 'YYYYMMDD',
+        'day': 'YYYYMMDD',
+        'hour': 'YYYYMMDDHH',
+        'minute': 'YYYYMMDDHHmm',
+    }
+
+    DEFAULT_EVERY_BY_FMT = {
+        'YYYY': '1year',
+        'YYYYMM': '1month',
+        'YYYYMMDD': '1day',
+        'YYYYMMDDHH': '1hour',
+        'YYYYMMDDHHmm': '1minute',
+    }
     
-    def __init__(self, fmt: str, tz: str, ts_col: str):
+    def __init__(self, fmt: str, tz: str, ts_col: str, every: Any = None):
         """
         Args:
             fmt: Date format string (e.g., 'YYYYMMDD', 'YYYYMM', 'YYYYMMDDHH')
             tz: Timezone string (e.g., 'Asia/Shanghai', 'UTC')
             ts_col: Column name containing timestamp/datetime
+            every: Calendar interval, e.g. '1day', '1week', '4day'
         """
         self.fmt = fmt
         self.tz = tz
         self.TS_COL = ts_col
+        self.every = self.normalize_every(every) if every else None
+        count, unit = self.parse_every(self.every or self.default_every_for_fmt(fmt))
+        self._every_count = count
+        self._every_unit = unit
+
+    @classmethod
+    def parse_every(cls, every: Any) -> tuple[int, str]:
+        text = str(every or '1day').strip().lower()
+        match = re.fullmatch(r'(?:(\d+)\s*)?([a-z]+)', text)
+        if not match:
+            raise ValueError(f'Unsupported calendar partition interval: {every}')
+        count = int(match.group(1) or '1')
+        if count <= 0:
+            raise ValueError('calendar partition interval must be positive')
+        unit = cls.UNIT_ALIASES.get(match.group(2))
+        if unit is None:
+            raise ValueError(f'Unsupported calendar partition interval: {every}')
+        return count, unit
+
+    @classmethod
+    def normalize_every(cls, every: Any) -> str:
+        count, unit = cls.parse_every(every)
+        return f'{count}{unit}'
+
+    @classmethod
+    def format_for_every(cls, every: Any) -> str:
+        _, unit = cls.parse_every(every)
+        return cls.FMT_BY_UNIT[unit]
+
+    @classmethod
+    def default_every_for_fmt(cls, fmt: str) -> str:
+        return cls.DEFAULT_EVERY_BY_FMT.get(fmt, '1day')
+
+    def _bucket_start(self, dt):
+        count = self._every_count
+        unit = self._every_unit
+        if unit == 'year':
+            year = max((dt.year // count) * count, 1)
+            return dt.replace(
+                year=year, month=1, day=1,
+                hour=0, minute=0, second=0, microsecond=0,
+            )
+        if unit == 'month':
+            month_index = dt.year * 12 + dt.month - 1
+            start_index = (month_index // count) * count
+            return dt.replace(
+                year=start_index // 12,
+                month=start_index % 12 + 1,
+                day=1, hour=0, minute=0, second=0, microsecond=0,
+            )
+        if unit == 'week':
+            origin = arrow.get(1970, 1, 5, tzinfo=self.tz)
+            week_start = dt.floor('week')
+            delta_days = (week_start.date() - origin.date()).days
+            weeks = delta_days // 7
+            return origin.shift(weeks=(weeks // count) * count)
+        if unit == 'day':
+            if count <= 366:
+                origin = arrow.get(dt.year, 1, 1, tzinfo=self.tz)
+            else:
+                origin = arrow.get(1970, 1, 1, tzinfo=self.tz)
+            delta_days = (dt.floor('day').date() - origin.date()).days
+            return origin.shift(days=(delta_days // count) * count)
+
+        origin = arrow.get(1970, 1, 1, tzinfo=self.tz)
+        seconds = int((dt.datetime - origin.datetime).total_seconds())
+        scale = 3600 if unit == 'hour' else 60
+        units = seconds // scale
+        shift = {'hours' if unit == 'hour' else 'minutes': (units // count) * count}
+        return origin.shift(**shift)
+
+    def _shift_kwargs(self) -> Dict[str, int]:
+        plural = {
+            'year': 'years',
+            'month': 'months',
+            'week': 'weeks',
+            'day': 'days',
+            'hour': 'hours',
+            'minute': 'minutes',
+        }[self._every_unit]
+        return {plural: self._every_count}
     
     def get_key(self, row: Dict[str, Any]) -> str:
         """Get partition key as formatted string.
@@ -47,7 +170,7 @@ class CalendarPartition(Partition):
             Formatted partition key string
         """
         dt = arrow.get(row[self.TS_COL]).to(self.tz)
-        return dt.format(self.fmt)
+        return self._bucket_start(dt).format(self.fmt)
     
     def get_range(self, key: str) -> tuple[int, int]:
         """Get [start_ms, end_ms) range for partition key.
@@ -58,11 +181,11 @@ class CalendarPartition(Partition):
         Returns:
             Tuple of (start_timestamp_ms, end_timestamp_ms)
         """
-        start_dt = arrow.get(key, self.fmt, tzinfo=self.tz).to('UTC')
-        end_dt = start_dt.shift(**self.FMT_SHIFT_MAP.get(self.fmt, {'days': 1}))
+        start_dt = arrow.get(key, self.fmt, tzinfo=self.tz)
+        end_dt = start_dt.shift(**self._shift_kwargs())
         return (
-            int(start_dt.timestamp() * 1000),
-            int(end_dt.timestamp() * 1000)
+            int(start_dt.to('UTC').timestamp() * 1000),
+            int(end_dt.to('UTC').timestamp() * 1000)
         )
     
     def get_file_suffix(self, key: str) -> str:
@@ -78,12 +201,16 @@ class CalendarPartition(Partition):
     
     def to_meta(self) -> Dict[str, Any]:
         """Serialize to metadata dict."""
-        return {
+        meta = {
             'type': self.PARTITION_TYPE,
             'ts_col': self.TS_COL,
             'fmt': self.fmt,
             'tz': self.tz,
         }
+        default_every = self.default_every_for_fmt(self.fmt)
+        if self.every and self.every != default_every:
+            meta['every'] = self.every
+        return meta
     
     @classmethod
     def from_meta(cls, meta: Dict[str, Any]) -> 'CalendarPartition':
@@ -99,4 +226,5 @@ class CalendarPartition(Partition):
             fmt=meta['fmt'],
             tz=meta['tz'],
             ts_col=meta['ts_col'],
+            every=meta.get('every'),
         )

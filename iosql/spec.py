@@ -101,16 +101,10 @@ def _to_int_every(value: Any) -> int:
 
 
 def _calendar_fmt(every: Any) -> str:
-    text = str(every).strip().lower()
-    if text in ["1y", "1year", "1years", "year", "years"]:
-        return "YYYY"
-    if text in ["1mo", "1mon", "1month", "1months", "month", "months"]:
-        return "YYYYMM"
-    if text in ["1d", "1day", "1days", "day", "days"]:
-        return "YYYYMMDD"
-    if text in ["1h", "1hour", "1hours", "hour", "hours"]:
-        return "YYYYMMDDHH"
-    raise PartitionSpecError(f"Unsupported calendar partition `{every}`")
+    try:
+        return CalendarPartition.format_for_every(every)
+    except ValueError as e:
+        raise PartitionSpecError(f"Unsupported calendar partition `{every}`") from e
 
 
 def _calendar_every_from_fmt(fmt: Optional[str]) -> Optional[str]:
@@ -122,6 +116,8 @@ def _calendar_every_from_fmt(fmt: Optional[str]) -> Optional[str]:
         return "1day"
     if fmt == "YYYYMMDDHH":
         return "1hour"
+    if fmt == "YYYYMMDDHHmm":
+        return "1minute"
     return None
 
 
@@ -267,11 +263,29 @@ def _parse_partition_expr(text: str) -> "PartitionSpec":
 
 def _format_duration_every(every: Any) -> str:
     if isinstance(every, int):
-        return _DURATION_MS_TO_ALIAS.get(every, f"{every}ms")
+        alias = _DURATION_MS_TO_ALIAS.get(every)
+        if alias:
+            return alias
+        for scale, unit in [
+            (31_536_000_000, "year"),
+            (2_592_000_000, "month"),
+            (604_800_000, "week"),
+            (86_400_000, "day"),
+            (3_600_000, "hour"),
+            (60_000, "min"),
+            (1_000, "s"),
+        ]:
+            if every % scale == 0:
+                return f"{every // scale}{unit}"
+        return f"{every}ms"
     text = str(every).strip()
     if text.isdigit():
         value = int(text)
-        return _DURATION_MS_TO_ALIAS.get(value, f"{value}ms")
+        return _format_duration_every(value)
+    try:
+        return _format_duration_every(_duration_to_ms(text))
+    except PartitionSpecError:
+        pass
     return text
 
 
@@ -307,7 +321,7 @@ def format_partition_spec(value: Any) -> str:
             f"width={_format_partition_value(_to_int_every(spec.every))})"
         )
     if spec.kind == "calendar":
-        every = _calendar_every_from_fmt(spec.fmt) or spec.every or "1day"
+        every = spec.every or _calendar_every_from_fmt(spec.fmt) or "1day"
         parts = [
             _format_partition_value(spec.column),
             f"every={_format_partition_value(every)}",
@@ -515,6 +529,7 @@ class PartitionSpec:
                 fmt=fmt,
                 tz=spec.timezone or "UTC",
                 ts_col=spec.column,
+                every=spec.every,
             )
         if unit not in [None, "ms"]:
             raise PartitionSpecError(
@@ -586,7 +601,7 @@ class PartitionSpec:
         if partition_type == "calendar":
             return cls(
                 column=meta["ts_col"],
-                every="1day",
+                every=meta.get("every") or _calendar_every_from_fmt(meta.get("fmt")) or "1day",
                 kind="calendar",
                 time_unit="date",
                 timezone=meta.get("tz", "UTC"),

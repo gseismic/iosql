@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import typer
 
-from iosql import Database, format_partition_spec
+from iosql import Database, PartitionSpec, format_partition_spec
 from iosql.exception import PartitionSpecError
 from iosql.utils.mysqlite import Database as MyDatabase
 
@@ -258,9 +258,15 @@ def _partition_desc(partition) -> str:
     return format_partition_spec(partition)
 
 
-def _repartition_hint(source: str, table: str, partition_expr: str, hint: str = "") -> str:
+def _repartition_hint(
+    source: str,
+    table: str,
+    partition_expr: str,
+    hint: str = "",
+    indent: str = "    ",
+) -> str:
     return (
-        f"    → iosql repartition --source {source} --table {table} "
+        f"{indent}→ iosql repartition --source {source} --table {table} "
         f"--partition '{partition_expr}' --replace-source --yes{hint}"
     )
 
@@ -300,6 +306,332 @@ def _suggest_period_down(avg_rows: int, target: int) -> str:
     if ratio >= 2:
         return "1day"
     return "1week"
+
+
+_DATE_COLUMN_NAMES = {
+    "date",
+    "day",
+    "trade_date",
+    "trading_date",
+    "event_date",
+    "biz_date",
+}
+_TIMESTAMP_COLUMN_NAMES = {
+    "ts",
+    "time",
+    "timestamp",
+    "datetime",
+    "event_time",
+    "created_at",
+    "updated_at",
+}
+_INTERNAL_PARTITION_COLUMNS = {"partition_key", "_partition_key", "part_key"}
+_NATURAL_CALENDAR_PERIODS = [
+    (5, "1week"),
+    (10, "2week"),
+    (21, "1month"),
+    (63, "3month"),
+    (126, "6month"),
+    (252, "1year"),
+    (504, "2year"),
+    (1260, "5year"),
+    (2520, "10year"),
+]
+
+
+def _column_names(table_spec) -> List[str]:
+    names: List[str] = []
+    for name in [
+        table_spec.order_key,
+        *(table_spec.primary_key or []),
+        *list((table_spec.columns or {}).keys()),
+    ]:
+        if name and name not in names:
+            names.append(str(name))
+    return names
+
+
+def _is_date_column(column: str) -> bool:
+    name = column.lower()
+    return (
+        name in _DATE_COLUMN_NAMES
+        or name.endswith("_date")
+        or name.endswith("_day")
+    )
+
+
+def _is_timestamp_column(column: str) -> bool:
+    name = column.lower()
+    return (
+        name in _TIMESTAMP_COLUMN_NAMES
+        or name.endswith("_ts")
+        or name.endswith("_time")
+        or name.endswith("_at")
+    )
+
+
+def _infer_time_partition_base(table_spec) -> Optional[Dict[str, str]]:
+    partition = table_spec.partition
+    timezone = (
+        table_spec.time.timezone
+        if table_spec.time and table_spec.time.timezone
+        else (partition.timezone if partition else None)
+    ) or "UTC"
+
+    if table_spec.time and table_spec.time.name:
+        unit = table_spec.time.unit or "ms"
+        kind = "calendar" if unit == "date" else "duration"
+        return {
+            "kind": kind,
+            "column": table_spec.time.name,
+            "timezone": timezone,
+        }
+
+    for column in _column_names(table_spec):
+        if column.lower() in _INTERNAL_PARTITION_COLUMNS:
+            continue
+        if _is_date_column(column):
+            return {"kind": "calendar", "column": column, "timezone": timezone}
+        if _is_timestamp_column(column):
+            return {"kind": "duration", "column": column, "timezone": timezone}
+    return None
+
+
+def _merge_factor(avg_rows: int, target_rows: int) -> int:
+    if avg_rows <= 0:
+        return 1
+    return max(int(target_rows // avg_rows), 2)
+
+
+def _natural_calendar_period(factor: int) -> Optional[tuple[str, int]]:
+    candidates = [
+        (days, period)
+        for days, period in _NATURAL_CALENDAR_PERIODS
+        if days <= factor
+    ]
+    if not candidates:
+        return None
+    days, period = candidates[-1]
+    return period, days
+
+
+def _recommended_calendar_every(factor: int) -> tuple[str, int]:
+    if factor <= 20:
+        return f"{factor}day", factor
+    natural = _natural_calendar_period(factor)
+    if natural:
+        period, period_factor = natural
+        return period, period_factor
+    return f"{factor}day", factor
+
+
+def _partition_expr(kind: str, column: str, every: Any, timezone: str = "UTC") -> str:
+    if kind == "calendar":
+        return PartitionSpec(
+            column=column,
+            every=every,
+            kind="calendar",
+            timezone=timezone,
+        ).to_string()
+    if kind == "duration":
+        return PartitionSpec(
+            column=column,
+            every=every,
+            kind="duration",
+            time_unit="ms",
+        ).to_string()
+    return PartitionSpec.range(column, every).to_string()
+
+
+def _display_partition_every(kind: str, every: Any) -> str:
+    if kind != "duration":
+        return str(every)
+    expr = PartitionSpec(
+        column="_",
+        every=every,
+        kind="duration",
+        time_unit="ms",
+    ).to_string()
+    return expr.removeprefix("duration(_,every=").removesuffix(")")
+
+
+def _add_suggestion(
+    suggestions: List[Dict[str, Any]],
+    label: str,
+    expr: str,
+    note: str,
+    estimated_rows: Optional[int] = None,
+) -> None:
+    if any(item["expr"] == expr for item in suggestions):
+        return
+    suggestions.append({
+        "label": label,
+        "expr": expr,
+        "note": note,
+        "estimated_rows": estimated_rows,
+    })
+
+
+def _compatible_undersized_suggestion(table_spec, avg: int, factor: int):
+    partition = table_spec.partition
+    if not partition:
+        return None
+    estimated = avg * factor
+    if partition.kind == "range":
+        width = _to_positive_int(partition.every, 1) * factor
+        return {
+            "label": "兼容",
+            "expr": PartitionSpec.range(partition.column, width).to_string(),
+            "note": (
+                f"保留当前数值分区键 {partition.column}，width={width} "
+                f"(扩大 {factor} 倍)"
+            ),
+            "estimated_rows": estimated,
+        }
+    if partition.kind == "calendar":
+        every, estimated_factor = _recommended_calendar_every(factor)
+        expr = _partition_expr(
+            "calendar",
+            partition.column,
+            every,
+            partition.timezone or "UTC",
+        )
+        return {
+            "label": "兼容",
+            "expr": expr,
+            "note": (
+                f"保持当前 calendar 字段 {partition.column}，"
+                f"按 {every} 合并 (max/avg≈{factor})"
+            ),
+            "estimated_rows": avg * estimated_factor,
+        }
+    if partition.kind == "duration":
+        every = _scaled_duration_every(partition.every, factor)
+        expr = _partition_expr("duration", partition.column, every)
+        return {
+            "label": "兼容",
+            "expr": expr,
+            "note": f"保持当前 duration 字段 {partition.column}，扩大 {factor} 倍",
+            "estimated_rows": estimated,
+        }
+    return None
+
+
+def _to_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _scaled_duration_every(every: Any, factor: int) -> Any:
+    try:
+        base_ms = PartitionSpec(
+            column="_",
+            every=every,
+            kind="duration",
+            time_unit="ms",
+        ).to_partition().interval_ms
+        return base_ms * factor
+    except Exception:
+        return f"{factor}day"
+
+
+def _undersized_repartition_suggestions(table_spec, report, avg: int):
+    target = report.max_rows_per_file
+    factor = _merge_factor(avg, target)
+    suggestions: List[Dict[str, Any]] = []
+
+    time_base = _infer_time_partition_base(table_spec)
+    if time_base:
+        every: Any
+        estimated_factor = factor
+        every = f"{factor}day"
+        if time_base["kind"] == "calendar":
+            every, estimated_factor = _recommended_calendar_every(factor)
+        if time_base["kind"] == "duration":
+            baseline = "1day"
+            if table_spec.partition and table_spec.partition.kind == "duration":
+                baseline = table_spec.partition.every
+            every = _scaled_duration_every(
+                baseline,
+                factor,
+            )
+        expr = _partition_expr(
+            time_base["kind"],
+            time_base["column"],
+            every,
+            time_base["timezone"],
+        )
+        every_text = _display_partition_every(time_base["kind"], every)
+        _add_suggestion(
+            suggestions,
+            "推荐",
+            expr,
+            (
+                f"按时间列 {time_base['column']} 使用 {every_text} "
+                f"(max/avg≈{factor}, 目标<={_comma(target)})"
+            ),
+            avg * estimated_factor,
+        )
+
+        if time_base["kind"] == "calendar":
+            natural = _natural_calendar_period(factor)
+            if natural:
+                period, period_factor = natural
+                expr = _partition_expr(
+                    "calendar",
+                    time_base["column"],
+                    period,
+                    time_base["timezone"],
+                )
+                _add_suggestion(
+                    suggestions,
+                    "自然周期",
+                    expr,
+                    (
+                        f"按时间列 {time_base['column']} 使用 {period} "
+                        f"(约 {period_factor} 个交易日)"
+                    ),
+                    avg * period_factor,
+                )
+
+    compatible = _compatible_undersized_suggestion(table_spec, avg, factor)
+    if compatible:
+        _add_suggestion(
+            suggestions,
+            compatible["label"],
+            compatible["expr"],
+            compatible["note"],
+            compatible["estimated_rows"],
+        )
+
+    return suggestions
+
+
+def _emit_repartition_suggestions(source: str, table: str, suggestions) -> None:
+    if not suggestions:
+        return
+    typer.echo("  suggestions:")
+    for idx, item in enumerate(suggestions, 1):
+        estimated = item.get("estimated_rows")
+        estimate_text = (
+            f", 估算~{_comma(estimated)} 行/分区"
+            if estimated is not None
+            else ""
+        )
+        typer.echo(
+            f"    {idx}. {item['label']}: {item['note']}{estimate_text}"
+        )
+        typer.echo(
+            _repartition_hint(
+                source,
+                table,
+                item["expr"],
+                indent="       ",
+            )
+        )
 
 
 def _query_rows(
@@ -582,20 +914,16 @@ def doctor(
             elif undersized:
                 issues += 1
                 unresolved += 1
-                if table_spec.partition and table_spec.partition.kind == "range":
-                    cur_every = int(table_spec.partition.every or 1)
-                    suggestion = _suggest_range_every_up(avg, report.target_rows_per_file, cur_every)
-                    estimated = avg * suggestion
-                    hint = f"  (~{_comma(estimated)} 行/分区)"
-                else:
-                    suggestion = _suggest_period_up(avg, report.target_rows_per_file)
-                    hint = ""
-                suggestion_expr = table_spec.with_partition(every=suggestion).partition.to_string()
                 typer.echo(
                     f"  undersized: {len(undersized)} 个分区行数不足 "
                     f"(min={_comma(report.min_rows_per_file)}, avg={_comma(avg)})"
                 )
-                typer.echo(_repartition_hint(source, tname, suggestion_expr, hint))
+                suggestions = _undersized_repartition_suggestions(
+                    table_spec,
+                    report,
+                    avg,
+                )
+                _emit_repartition_suggestions(source, tname, suggestions)
             else:
                 typer.echo("  layout: ok")
 

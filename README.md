@@ -151,8 +151,11 @@ table = db.table(
 ```python
 db.table("ticks", pk=["symbol", "ts"], partition="duration(ts,every=1day)")
 db.table("events", pk=["event_date", "name"], partition="calendar(event_date,every=1day,tz=Asia/Shanghai)")
+db.table("daily_bars", pk=["symbol", "date"], partition="calendar(date,every=4day,tz=Asia/Shanghai)")
 db.table("items", pk=["id"], partition="range(id,width=100000)")
 ```
+
+时序数据优先使用 `duration(...)` 或 `calendar(...)`。`range(...)` 主要用于 id、offset、版本号等非时间数值字段；历史库中基于 `partition_key` 的 `range(...)` 可以作为兼容迁移方案。
 
 等价对象 API：
 
@@ -304,6 +307,16 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
   --target sqlite://database/market-hourly.iosql
 ```
 
+`iosql doctor` 会按布局行数给出多条候选命令。对带 `time` 契约或明显时间列的表，会优先推荐时间分区，例如：
+
+```text
+suggestions:
+  1. 推荐: 按时间列 date 使用 4day (max/avg≈4, 目标<=500,000), 估算~465,136 行/分区
+     → iosql repartition --source DB --table daily_bars --partition 'calendar(date,every=4day,tz=Asia/Shanghai)' --replace-source --yes
+  2. 兼容: 保留当前数值分区键 partition_key，width=4 (扩大 4 倍), 估算~465,136 行/分区
+     → iosql repartition --source DB --table daily_bars --partition 'range(partition_key,width=4)' --replace-source --yes
+```
+
 需要直接替换源库时必须显式声明风险：
 
 ```bash
@@ -327,6 +340,7 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 | `05_partition_segments_smoke.py` | 逻辑分区 + 物理 segment 拆分和二级查询计划。 |
 | `06_row_segment_late_data.py` | 纯 row segment、晚到数据和 stats pruning。 |
 | `07_partition_string_repartition_cli.py` | 字符串 partition 和 CLI `repartition --partition`。 |
+| `08_doctor_time_first_suggestions.py` | `doctor` 对历史 `partition_key` 表优先推荐时间分区。 |
 
 金融场景示例位于 `examples/finance/`：
 
@@ -349,6 +363,7 @@ python examples/04_layout_report_and_repartition.py
 python examples/05_partition_segments_smoke.py
 python examples/06_row_segment_late_data.py
 python examples/07_partition_string_repartition_cli.py
+python examples/08_doctor_time_first_suggestions.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

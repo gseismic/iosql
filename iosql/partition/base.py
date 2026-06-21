@@ -34,16 +34,9 @@ class Partition(ABC):
 
     @staticmethod
     def _calendar_format(every: Any) -> str:
-        text = str(every).strip().lower()
-        if text in ['1y', '1year', '1years', 'year', 'years']:
-            return 'YYYY'
-        if text in ['1mo', '1mon', '1month', '1months', 'month', 'months']:
-            return 'YYYYMM'
-        if text in ['1d', '1day', '1days', 'day', 'days']:
-            return 'YYYYMMDD'
-        if text in ['1h', '1hour', '1hours', 'hour', 'hours']:
-            return 'YYYYMMDDHH'
-        raise ValueError(f"Unsupported calendar partition interval: {every}")
+        from .calendar import CalendarPartition
+
+        return CalendarPartition.format_for_every(every)
     
     @abstractmethod
     def get_key(self, row: Dict[str, Any]) -> Union[int, str]:
