@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import errno
 import io
 import json
+import os
 import shutil
 import time
 from datetime import datetime
@@ -65,6 +67,32 @@ def _require_source(source: str) -> tuple[str, Path]:
 def _backup_path(source_path: Path) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return source_path.with_name(f"{source_path.name}.backup_{ts}")
+
+
+def _rmtree_robust(path: Path) -> None:
+    """递归删除目录树，处理 FUSE 文件系统的 .fuse_hidden 残留文件。
+
+    在 FUSE 挂载的文件系统上，已删除但仍有进程持有的文件会被重命名为
+    .fuse_hidden*。这些残留文件会导致 shutil.rmtree 内部 os.rmdir 时
+    触发 ENOTEMPTY 错误。
+    """
+    path_str = str(path)
+    for attempt in range(6):
+        # 每次重试前清理 .fuse_hidden* 残留文件
+        for root_str, dirs, files in os.walk(path_str, topdown=False):
+            for name in files:
+                if name.startswith(".fuse_hidden"):
+                    try:
+                        (Path(root_str) / name).unlink()
+                    except OSError:
+                        pass
+        try:
+            shutil.rmtree(path_str)
+            return
+        except OSError as e:
+            if e.errno != errno.ENOTEMPTY or attempt == 5:
+                raise
+            time.sleep(0.5 * (attempt + 1))
 
 
 def _comma(n: int) -> str:
@@ -1082,7 +1110,7 @@ def repartition(
             if backup_path.exists():
                 _fail(f"备份目标已存在: {backup_path}")
             shutil.copytree(source_path, backup_path, dirs_exist_ok=False)
-        shutil.rmtree(source_path)
+        _rmtree_robust(source_path)
         shutil.move(str(final_target_path), str(source_path))
 
     _echo_json({
