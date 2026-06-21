@@ -137,14 +137,14 @@ CLI 只支持 SQLite 目录库，`--source` 可传本地路径或 `sqlite://...`
 | **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append` | 写入既有契约表 |
 | | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON` | 导出查询结果 |
 | **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引 |
-| | `iosql repartition -s DB -t TABLE -e 1hour --target TARGET` | 按新分区策略写入目标库 |
+| | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份 |
 | | `iosql restore --backup BACKUP --target DB` | 目录级恢复 |
 | | `iosql index list/check/create ...` | 检查或创建物理分区索引 |
 
 ### CLI 安全规则
 
-- `repartition` 默认必须提供 `--target`，不原地覆盖源库。
+- `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。
 - 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。
 - `restore` 覆盖已有目标时必须使用 `--replace --yes`。
 - `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`。
@@ -169,11 +169,21 @@ ticks = db.table(
     "ticks",
     pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
-    partition=Partition.duration("ts", every="1day"),
+    partition="duration(ts,every=1day)",
     segment=Segment.rows(max_rows=500_000),
     order_key="ts",
 )
 ```
+
+`partition` 推荐使用统一字符串表达，便于 CLI、诊断输出和 Python API 复用：
+
+```python
+"duration(ts,every=1day)"
+"calendar(event_date,every=1day,tz=Asia/Shanghai)"
+"range(id,width=100000)"
+```
+
+对象 API 仍然兼容：`Partition.duration(...)`、`Partition.calendar(...)`、`Partition.range(...)`。
 
 **快捷版（timeseries helper）**：
 ```python
@@ -190,9 +200,9 @@ ticks = db.timeseries(
 
 | 分区类型 | API | 适用场景 | 分区键格式 |
 |---------|-----|---------|-----------|
-| duration | `Partition.duration("ts", every="1hour")` | 毫秒时间戳 | 整数（对齐边界） |
-| calendar | `Partition.calendar("date", every="1day", timezone="Asia/Shanghai")` | 日期字符串 | `YYYYMMDD` 等 |
-| range | `Partition.range("seq", every=10000)` | 任意可排序数值 | 整数（对齐边界） |
+| duration | `"duration(ts,every=1hour)"` | 毫秒时间戳 | 整数（对齐边界） |
+| calendar | `"calendar(date,every=1day,tz=Asia/Shanghai)"` | 日期字符串 | `YYYYMMDD` 等 |
+| range | `"range(seq,width=10000)"` | 任意可排序数值 | 整数（对齐边界） |
 
 ### 4. 写入
 
@@ -273,7 +283,7 @@ rows = futures.query(session="2026-01-06", symbols="AU").to_list()
 report = table.layout_report()
 print(report.total_rows, report.recommendation)
 
-new_spec = table.spec().with_partition(every="1hour")
+new_spec = table.spec().with_partition(partition="duration(ts,every=1hour)")
 result = table.repartition_to("sqlite://db/hourly.iosql", spec=new_spec)
 print(result.rows_copied, result.partitions_created)
 ```

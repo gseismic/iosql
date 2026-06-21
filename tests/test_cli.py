@@ -236,37 +236,46 @@ def test_cli_repartition_default_behavior_and_flags(tmp_path):
 
     result = _invoke("repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour")
     assert result.exit_code == 1, result.output
-    assert "替换源库必须同时提供 --yes" in result.output
+    assert "请提供 --target 写入新库，或提供 --replace-source 明确替换源库" in result.output
 
     result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
         "--target", str(tmp_path / "target.iosql"), "--backup", str(tmp_path / "backup.iosql"),
     )
     assert result.exit_code == 1, result.output
-    assert "--target 与 --backup 不能同时使用" in result.output
+    assert "--backup 只能与 --replace-source 同时使用" in result.output
 
     result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
         "--target", str(tmp_path / "target.iosql"), "--no-backup",
     )
     assert result.exit_code == 1, result.output
-    assert "--target 与 --no-backup 不能同时使用" in result.output
+    assert "--no-backup 只能与 --replace-source 同时使用" in result.output
 
     result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
-        "--backup", str(tmp_path / "backup.iosql"), "--no-backup", "--yes",
+        "--backup", str(tmp_path / "backup.iosql"), "--no-backup",
+        "--replace-source", "--yes",
     )
     assert result.exit_code == 1, result.output
     assert "--backup 与 --no-backup 不能同时使用" in result.output
 
     result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks",
+        "--partition", "duration(ts,every=1hour)", "-e", "1day", "--dry-run",
+    )
+    assert result.exit_code == 1, result.output
+    assert "--partition 不能与 --every/--kind/--timezone 同时使用" in result.output
+
+    result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
-        "--dry-run",
+        "--replace-source", "--dry-run",
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["dry_run"] is True
     assert payload["plan"]["source_replaced"] is True
+    assert payload["plan"]["new_partition_expr"] == "duration(ts,every=1hour)"
 
 
 def test_cli_repartition_replace_source_with_backup(tmp_path):
@@ -274,7 +283,7 @@ def test_cli_repartition_replace_source_with_backup(tmp_path):
 
     result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
-        "--yes",
+        "--replace-source", "--yes",
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -296,7 +305,7 @@ def test_cli_repartition_replace_source_no_backup(tmp_path):
 
     result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
-        "--no-backup", "--yes",
+        "--replace-source", "--no-backup", "--yes",
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -317,7 +326,7 @@ def test_cli_repartition_replace_source_custom_backup(tmp_path):
 
     result = _invoke(
         "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
-        "--backup", str(custom_backup), "--yes",
+        "--replace-source", "--backup", str(custom_backup), "--yes",
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -365,6 +374,8 @@ def test_cli_repartition_dry_run_and_target(tmp_path):
         str(target_path),
     )
     assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["backup"] is None
     assert target_path.exists()
 
     db = Database(_db_uri(target_path))
@@ -372,6 +383,52 @@ def test_cli_repartition_dry_run_and_target(tmp_path):
         target_table = db.table("ticks")
         assert target_table.spec().partition.every == "1hour"
         assert len(target_table.select("*", where=None, to_dict=True)) == 4
+    finally:
+        db.close()
+
+
+def test_cli_repartition_partition_expr_dry_run_and_target(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+    target_path = tmp_path / "partition_expr.iosql"
+
+    result = _invoke(
+        "repartition",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "--partition",
+        "duration(ts,every=1hour)",
+        "--target",
+        str(target_path),
+        "--dry-run",
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["plan"]["old_partition_expr"] == "duration(ts,every=1day)"
+    assert payload["plan"]["new_partition_expr"] == "duration(ts,every=1hour)"
+    assert not target_path.exists()
+
+    result = _invoke(
+        "repartition",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "--partition",
+        "duration(ts,every=1hour)",
+        "--target",
+        str(target_path),
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["backup"] is None
+    assert target_path.exists()
+
+    db = Database(_db_uri(target_path))
+    try:
+        target_table = db.table("ticks")
+        assert target_table.spec().partition.to_string() == "duration(ts,every=1hour)"
     finally:
         db.close()
 
@@ -389,7 +446,8 @@ def test_cli_repartition_range_partition(tmp_path):
     db.close()
 
     result = _invoke(
-        "repartition", "-s", str(db_path), "-t", "items", "-e", "5", "--yes",
+        "repartition", "-s", str(db_path), "-t", "items", "-e", "5",
+        "--replace-source", "--yes",
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
@@ -403,6 +461,58 @@ def test_cli_repartition_range_partition(tmp_path):
         assert len(rows) == 20
     finally:
         db.close()
+
+
+def test_cli_repartition_range_partition_expr(tmp_path):
+    db_path = tmp_path / "range_expr.iosql"
+    db = Database(_db_uri(db_path))
+    table = db.table(
+        "items",
+        pk=["id"],
+        columns={"id": "integer", "val": "float"},
+        partition=Partition.range("id", every=1),
+    )
+    table.write([{"id": i, "val": i * 1.5} for i in range(20)])
+    db.close()
+
+    result = _invoke(
+        "repartition",
+        "-s",
+        str(db_path),
+        "-t",
+        "items",
+        "--partition",
+        "range(id,width=5)",
+        "--replace-source",
+        "--yes",
+    )
+    assert result.exit_code == 0, result.output
+
+    db = Database(_db_uri(db_path))
+    try:
+        t = db.table("items")
+        assert t.spec().partition.to_string() == "range(id,width=5)"
+        assert len(t.select("*", where=None, to_dict=True)) == 20
+    finally:
+        db.close()
+
+
+def test_cli_doctor_recommends_partition_expr_for_range(tmp_path):
+    db_path = tmp_path / "range_doctor.iosql"
+    db = Database(_db_uri(db_path))
+    table = db.table(
+        "items",
+        pk=["id"],
+        columns={"id": "integer", "val": "float"},
+        partition=Partition.range("id", every=1),
+    )
+    table.write([{"id": i, "val": i * 1.5} for i in range(20)])
+    db.close()
+
+    result = _invoke("doctor", "-s", str(db_path), "-t", "items")
+    assert result.exit_code == 1, result.output
+    assert "partition: range(id,width=1)" in result.output
+    assert "--partition 'range(id,width=400000)' --replace-source --yes" in result.output
 
 
 def test_cli_doctor_range_partition_suggestion(tmp_path):

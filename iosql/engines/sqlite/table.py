@@ -2169,8 +2169,8 @@ class Table(BaseTable):
                 current_meta["partition"] = curr_partition_meta
                 self._overwrite_table_meta(current_meta)
             else:
-                logger.warning(
-                    f"分区已存在，忽略新分区配置: "
+                raise TableSpecConflict(
+                    f"PartitionCanNotChange: "
                     f"prev={prev_partition_meta} curr={curr_partition_meta}"
                 )
 

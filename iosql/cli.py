@@ -13,7 +13,8 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import typer
 
-from iosql import Database
+from iosql import Database, format_partition_spec
+from iosql.exception import PartitionSpecError
 from iosql.utils.mysqlite import Database as MyDatabase
 
 
@@ -254,11 +255,14 @@ def _missing_index_columns(missing: List[Dict[str, Any]]) -> List[str]:
 
 
 def _partition_desc(partition) -> str:
-    kind = partition.kind
-    every = partition.every
-    tz = partition.timezone
-    tz_str = f", tz={tz}" if tz else ""
-    return f"{kind}({partition.column}, every={every}{tz_str})"
+    return format_partition_spec(partition)
+
+
+def _repartition_hint(source: str, table: str, partition_expr: str, hint: str = "") -> str:
+    return (
+        f"    → iosql repartition --source {source} --table {table} "
+        f"--partition '{partition_expr}' --replace-source --yes{hint}"
+    )
 
 
 def _suggest_range_every_up(avg_rows: int, target: int, current_every: int = 1) -> int:
@@ -569,13 +573,12 @@ def doctor(
                 else:
                     suggestion = _suggest_period_down(avg, report.target_rows_per_file)
                     hint = ""
+                suggestion_expr = table_spec.with_partition(every=suggestion).partition.to_string()
                 typer.echo(
                     f"  oversized: {len(oversized)} 个分区行数过多 "
                     f"(max={_comma(report.max_rows_per_file)}, avg={_comma(avg)})"
                 )
-                typer.echo(
-                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes{hint}"
-                )
+                typer.echo(_repartition_hint(source, tname, suggestion_expr, hint))
             elif undersized:
                 issues += 1
                 unresolved += 1
@@ -587,13 +590,12 @@ def doctor(
                 else:
                     suggestion = _suggest_period_up(avg, report.target_rows_per_file)
                     hint = ""
+                suggestion_expr = table_spec.with_partition(every=suggestion).partition.to_string()
                 typer.echo(
                     f"  undersized: {len(undersized)} 个分区行数不足 "
                     f"(min={_comma(report.min_rows_per_file)}, avg={_comma(avg)})"
                 )
-                typer.echo(
-                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes{hint}"
-                )
+                typer.echo(_repartition_hint(source, tname, suggestion_expr, hint))
             else:
                 typer.echo("  layout: ok")
 
@@ -628,32 +630,40 @@ def doctor(
 def repartition(
     source: str = typer.Option(..., "--source", "-s", help="源数据库 URI 或本地路径"),
     table: str = typer.Option(..., "--table", "-t", help="表名"),
-    every: str = typer.Option("", "--every", "-e", help="新分区粒度（如 1day/1hour 或整数），空值表示沿用旧值"),
-    kind: str = typer.Option("", "--kind", help="duration / calendar / range，不指定则保持原有类型"),
-    timezone: str = typer.Option("", "--timezone", help="新时区，不指定则保持原有时区"),
-    target: str = typer.Option("", "--target", help="写入目标数据库（不指定则直接替换源库）"),
+    partition: str = typer.Option("", "--partition", help="新分区表达式，如 duration(ts,every=1hour)、range(id,width=100000)"),
+    every: str = typer.Option("", "--every", "-e", help="兼容选项：只替换旧分区粒度，推荐改用 --partition"),
+    kind: str = typer.Option("", "--kind", help="兼容选项：duration / calendar / range，不指定则保持原有类型"),
+    timezone: str = typer.Option("", "--timezone", help="兼容选项：新时区，不指定则保持原有时区"),
+    target: str = typer.Option("", "--target", help="写入目标数据库，不修改源库"),
     target_table: str = typer.Option("", "--target-table", help="目标表名，默认同源表"),
     batch_size: int = typer.Option(10_000, "--batch-size", help="复制批大小"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只输出计划，不写文件"),
+    replace_source: bool = typer.Option(False, "--replace-source", help="用重分区结果替换源库；实际执行还必须 --yes"),
     backup: str = typer.Option("", "--backup", help="替换源库前备份到指定路径（默认自动生成）"),
     no_backup: bool = typer.Option(False, "--no-backup", help="替换源库时不备份"),
     yes: bool = typer.Option(False, "--yes", help="确认替换源库"),
 ):
     """按新分区策略重写表数据。
 
-    不指定 --target 时，默认替换源库（替换前自动备份到 .backup.{datetime}）。
-    指定 --target 则写入新库，不修改源库。"""
+    指定 --target 时写入新库，不修改源库。
+    指定 --replace-source 时替换源库，实际执行还必须传 --yes。"""
 
     if batch_size <= 0:
         _fail("batch-size 必须大于 0")
-    if target and backup:
-        _fail("--target 与 --backup 不能同时使用")
-    if target and no_backup:
-        _fail("--target 与 --no-backup 不能同时使用")
+    if partition and (every or kind or timezone):
+        _fail("--partition 不能与 --every/--kind/--timezone 同时使用")
+    if target and replace_source:
+        _fail("--target 与 --replace-source 不能同时使用")
+    if not target and not replace_source:
+        _fail("请提供 --target 写入新库，或提供 --replace-source 明确替换源库")
+    if not replace_source and backup:
+        _fail("--backup 只能与 --replace-source 同时使用")
+    if not replace_source and no_backup:
+        _fail("--no-backup 只能与 --replace-source 同时使用")
     if backup and no_backup:
         _fail("--backup 与 --no-backup 不能同时使用")
-    if not target and not yes and not dry_run:
-        _fail("替换源库必须同时提供 --yes")
+    if replace_source and not yes and not dry_run:
+        _fail("替换源库必须同时提供 --replace-source --yes")
 
     source_uri, source_path = _require_source(source)
     db = Database(source_uri)
@@ -662,14 +672,19 @@ def repartition(
         old_spec = t.spec()
         if not old_spec:
             _fail(f"表不存在或无契约: {table}")
-        if not old_spec.partition:
-            _fail(f"表没有逻辑分区，无法通过 --every 重分区: {table}")
-
-        new_spec = old_spec.with_partition(
-            every=every or old_spec.partition.every,
-            kind=kind or old_spec.partition.kind,
-            timezone=timezone or old_spec.partition.timezone,
-        )
+        if partition:
+            try:
+                new_spec = old_spec.with_partition(partition=partition)
+            except PartitionSpecError as exc:
+                _fail(f"分区表达式错误: {exc}")
+        else:
+            if not old_spec.partition:
+                _fail(f"表没有逻辑分区，请使用 --partition 指定新分区: {table}")
+            new_spec = old_spec.with_partition(
+                every=every or old_spec.partition.every,
+                kind=kind or old_spec.partition.kind,
+                timezone=timezone or old_spec.partition.timezone,
+            )
         new_spec.force_partition = True
         report = t.layout_report()
     finally:
@@ -685,18 +700,26 @@ def repartition(
         final_target_uri = f"sqlite://{tmp_path}"
         final_target_path = tmp_path
 
-    source_replaced = not bool(target)
+    source_replaced = bool(replace_source)
     plan = {
         "source_uri": source_uri,
         "source_path": str(source_path),
         "table": table,
         "target_uri": final_target_uri,
         "target_path": str(final_target_path),
+        "final_uri": source_uri if source_replaced else final_target_uri,
+        "final_path": str(source_path if source_replaced else final_target_path),
         "target_table": target_table or table,
         "source_replaced": source_replaced,
         "batch_size": batch_size,
         "old_partition": old_spec.partition.to_dict() if old_spec.partition else None,
         "new_partition": new_spec.partition.to_dict() if new_spec.partition else None,
+        "old_partition_expr": (
+            old_spec.partition.to_string() if old_spec.partition else None
+        ),
+        "new_partition_expr": (
+            new_spec.partition.to_string() if new_spec.partition else None
+        ),
         "source_layout": {
             "total_rows": report.total_rows,
             "total_partitions": report.total_partitions,
@@ -736,8 +759,9 @@ def repartition(
 
     _echo_json({
         "result": result.to_dict(),
+        "plan": plan,
         "elapsed_seconds": round(elapsed, 3),
-        "backup": None if no_backup else str(backup_path),
+        "backup": str(backup_path) if backup_path is not None else None,
         "source_replaced": source_replaced,
     })
 

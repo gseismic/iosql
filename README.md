@@ -138,13 +138,29 @@ table = db.table(
     "ticks",
     pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
-    partition=Partition.duration("ts", every="1hour"),
+    partition="duration(ts,every=1hour)",
     segment=Segment.rows(max_rows=500_000),
     order_key="ts",
 )
 ```
 
 `partition` 描述按哪个字段做逻辑路由；`segment` 描述单个 logical partition 下物理 SQLite 文件如何按行数滚动。字段可以是时间戳、序号、offset、版本号等任意可排序字段。
+
+`partition` 可以使用对象 API，也可以使用统一字符串表达。字符串表达更适合 CLI、文档和诊断输出：
+
+```python
+db.table("ticks", pk=["symbol", "ts"], partition="duration(ts,every=1day)")
+db.table("events", pk=["event_date", "name"], partition="calendar(event_date,every=1day,tz=Asia/Shanghai)")
+db.table("items", pk=["id"], partition="range(id,width=100000)")
+```
+
+等价对象 API：
+
+```python
+Partition.duration("ts", every="1day")
+Partition.calendar("event_date", every="1day", timezone="Asia/Shanghai")
+Partition.range("id", every=100000)
+```
 
 如果偏好时序业务 helper，可以使用 `timeseries()`。它内部等价于 `Database.table(..., partition=Partition.duration(...), order_key=time)`：
 
@@ -275,9 +291,25 @@ rows = events.select(
 report = table.layout_report()
 print(report.total_rows, report.recommendation)
 
-new_spec = table.spec().with_partition(every="1hour")
+new_spec = table.spec().with_partition(partition="duration(ts,every=1hour)")
 result = table.repartition_to("sqlite://database/market-hourly.iosql", spec=new_spec)
 print(result.rows_copied, result.partitions_created)
+```
+
+CLI 重分区推荐使用 `--partition`：
+
+```bash
+iosql repartition -s sqlite://database/market.iosql -t ticks \
+  --partition 'duration(ts,every=1hour)' \
+  --target sqlite://database/market-hourly.iosql
+```
+
+需要直接替换源库时必须显式声明风险：
+
+```bash
+iosql repartition -s sqlite://database/market.iosql -t ticks \
+  --partition 'duration(ts,every=1hour)' \
+  --replace-source --yes
 ```
 
 ## 示例
@@ -294,6 +326,7 @@ print(result.rows_copied, result.partitions_created)
 | `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
 | `05_partition_segments_smoke.py` | 逻辑分区 + 物理 segment 拆分和二级查询计划。 |
 | `06_row_segment_late_data.py` | 纯 row segment、晚到数据和 stats pruning。 |
+| `07_partition_string_repartition_cli.py` | 字符串 partition 和 CLI `repartition --partition`。 |
 
 金融场景示例位于 `examples/finance/`：
 
@@ -315,6 +348,7 @@ python examples/03_buffered_ingest_and_query_plan.py
 python examples/04_layout_report_and_repartition.py
 python examples/05_partition_segments_smoke.py
 python examples/06_row_segment_late_data.py
+python examples/07_partition_string_repartition_cli.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

@@ -15,6 +15,8 @@ from .partition import (
 DEFAULT_LOGICAL_PART = "__all__"
 
 
+_PARTITION_KINDS = {"duration", "calendar", "range"}
+
 _TIME_UNIT_ALIASES = {
     "s": "s",
     "sec": "s",
@@ -109,6 +111,218 @@ def _calendar_fmt(every: Any) -> str:
     if text in ["1h", "1hour", "1hours", "hour", "hours"]:
         return "YYYYMMDDHH"
     raise PartitionSpecError(f"Unsupported calendar partition `{every}`")
+
+
+def _calendar_every_from_fmt(fmt: Optional[str]) -> Optional[str]:
+    if fmt == "YYYY":
+        return "1year"
+    if fmt == "YYYYMM":
+        return "1month"
+    if fmt == "YYYYMMDD":
+        return "1day"
+    if fmt == "YYYYMMDDHH":
+        return "1hour"
+    return None
+
+
+_DURATION_MS_TO_ALIAS = {
+    60_000: "1min",
+    300_000: "5min",
+    900_000: "15min",
+    1_800_000: "30min",
+    3_600_000: "1hour",
+    14_400_000: "4hour",
+    86_400_000: "1day",
+    604_800_000: "1week",
+    2_592_000_000: "1month",
+    5_184_000_000: "2month",
+    7_776_000_000: "3month",
+    15_552_000_000: "6month",
+    31_536_000_000: "1year",
+    63_072_000_000: "2year",
+    157_680_000_000: "5year",
+    315_360_000_000: "10year",
+}
+
+
+def _split_partition_expr_args(body: str) -> List[str]:
+    args: List[str] = []
+    current: List[str] = []
+    quote: Optional[str] = None
+    escape = False
+
+    for char in body:
+        if escape:
+            current.append(char)
+            escape = False
+            continue
+        if quote:
+            if char == "\\":
+                escape = True
+                continue
+            if char == quote:
+                quote = None
+            current.append(char)
+            continue
+        if char in ["'", '"']:
+            quote = char
+            current.append(char)
+            continue
+        if char == ",":
+            args.append("".join(current).strip())
+            current = []
+            continue
+        current.append(char)
+
+    if quote:
+        raise PartitionSpecError("Unclosed quote in partition expression")
+
+    args.append("".join(current).strip())
+    return args
+
+
+def _unquote_partition_value(value: str) -> str:
+    text = value.strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ["'", '"']:
+        return text[1:-1]
+    return text
+
+
+def _validate_partition_token(name: str, label: str) -> str:
+    value = str(name or "").strip()
+    if not value:
+        raise PartitionSpecError(f"partition {label} must not be empty")
+    if any(char in value for char in ["(", ")", ",", "="]):
+        raise PartitionSpecError(f"Bad partition {label} `{name}`")
+    return value
+
+
+def _parse_partition_expr_options(kind: str, tokens: List[str]) -> tuple[str, Dict[str, str]]:
+    if not tokens or not tokens[0]:
+        raise PartitionSpecError("partition expression requires a column")
+    column = _validate_partition_token(_unquote_partition_value(tokens[0]), "column")
+    options: Dict[str, str] = {}
+    for token in tokens[1:]:
+        if not token:
+            continue
+        if "=" not in token:
+            raise PartitionSpecError(f"Bad partition option `{token}`")
+        key, raw_value = token.split("=", 1)
+        option_key = key.strip().lower()
+        if option_key == "tz":
+            option_key = "timezone"
+        if option_key in options:
+            raise PartitionSpecError(f"Duplicate partition option `{key.strip()}`")
+        value = _unquote_partition_value(raw_value)
+        if value == "":
+            raise PartitionSpecError(f"partition option `{key.strip()}` must not be empty")
+        options[option_key] = value
+
+    allowed = {
+        "duration": {"every"},
+        "calendar": {"every", "timezone", "fmt"},
+        "range": {"width"},
+    }[kind]
+    unknown = sorted(set(options) - allowed)
+    if unknown:
+        raise PartitionSpecError(
+            f"Unsupported option(s) for {kind} partition: {', '.join(unknown)}"
+        )
+    return column, options
+
+
+def _parse_partition_expr(text: str) -> "PartitionSpec":
+    expr = str(text or "").strip()
+    open_at = expr.find("(")
+    if open_at <= 0 or not expr.endswith(")"):
+        raise PartitionSpecError(f"Bad partition expression `{text}`")
+
+    kind = expr[:open_at].strip().lower()
+    if kind not in _PARTITION_KINDS:
+        raise PartitionSpecError(f"Unsupported partition kind `{kind}`")
+
+    body = expr[open_at + 1:-1].strip()
+    tokens = _split_partition_expr_args(body)
+    column, options = _parse_partition_expr_options(kind, tokens)
+
+    if kind == "range":
+        if "width" not in options:
+            raise PartitionSpecError("range partition requires width")
+        return PartitionSpec.range(column, _to_int_every(options["width"]))
+
+    if kind == "calendar":
+        return PartitionSpec(
+            column=column,
+            every=options.get("every", "1day"),
+            kind="calendar",
+            timezone=options.get("timezone"),
+            fmt=options.get("fmt"),
+        )
+
+    every: Any = options.get("every", "1day")
+    if isinstance(every, str) and every.isdigit():
+        every = int(every)
+    return PartitionSpec(column=column, every=every, kind="duration", time_unit="ms")
+
+
+def _format_duration_every(every: Any) -> str:
+    if isinstance(every, int):
+        return _DURATION_MS_TO_ALIAS.get(every, f"{every}ms")
+    text = str(every).strip()
+    if text.isdigit():
+        value = int(text)
+        return _DURATION_MS_TO_ALIAS.get(value, f"{value}ms")
+    return text
+
+
+def _format_partition_value(value: Any) -> str:
+    text = str(value)
+    if any(char in text for char in [",", "(", ")", "=", " "]):
+        return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+    return text
+
+
+def parse_partition_spec(value: Any) -> "PartitionSpec":
+    """把用户可见的 partition 表示规范化为 PartitionSpec。"""
+    if isinstance(value, PartitionSpec):
+        return value
+    if isinstance(value, RuntimePartition):
+        spec = PartitionSpec.from_partition_meta(value.to_meta())
+        if spec is None:
+            raise PartitionSpecError(f"Unsupported partition `{value}`")
+        return spec
+    if isinstance(value, dict):
+        return PartitionSpec.from_dict(value)
+    if isinstance(value, str):
+        return PartitionSpec.from_string(value)
+    raise PartitionSpecError(f"Bad partition spec `{value}`")
+
+
+def format_partition_spec(value: Any) -> str:
+    """输出可复制到 CLI 或 Python API 的规范 partition 字符串。"""
+    spec = parse_partition_spec(value)
+    if spec.kind == "range":
+        return (
+            f"range({_format_partition_value(spec.column)},"
+            f"width={_format_partition_value(_to_int_every(spec.every))})"
+        )
+    if spec.kind == "calendar":
+        every = _calendar_every_from_fmt(spec.fmt) or spec.every or "1day"
+        parts = [
+            _format_partition_value(spec.column),
+            f"every={_format_partition_value(every)}",
+        ]
+        if spec.timezone:
+            parts.append(f"tz={_format_partition_value(spec.timezone)}")
+        if spec.fmt and _calendar_every_from_fmt(spec.fmt) is None:
+            parts.append(f"fmt={_format_partition_value(spec.fmt)}")
+        return f"calendar({','.join(parts)})"
+    if spec.kind == "duration":
+        return (
+            f"duration({_format_partition_value(spec.column)},"
+            f"every={_format_partition_value(_format_duration_every(spec.every))})"
+        )
+    raise PartitionSpecError(f"Unsupported partition kind `{spec.kind}`")
 
 
 @dataclass
@@ -281,6 +495,8 @@ class PartitionSpec:
     def with_time(self, time: Optional[TimeColumn]) -> "PartitionSpec":
         if time is None:
             return self
+        if self.kind == "range":
+            return self
         return replace(
             self,
             time_unit=self.time_unit or time.unit,
@@ -330,6 +546,13 @@ class PartitionSpec:
     @classmethod
     def range(cls, column: str, every: Any) -> "PartitionSpec":
         return cls(column=column, every=every, kind="range")
+
+    @classmethod
+    def from_string(cls, text: str) -> "PartitionSpec":
+        return _parse_partition_expr(text)
+
+    def to_string(self) -> str:
+        return format_partition_spec(self)
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PartitionSpec":
@@ -397,6 +620,8 @@ class TableContract:
             self.time = TimeColumn.from_dict(self.time)
         if isinstance(self.partition, RuntimePartition):
             self.partition = PartitionSpec.from_partition_meta(self.partition.to_meta())
+        if isinstance(self.partition, str):
+            self.partition = PartitionSpec.from_string(self.partition)
         if isinstance(self.partition, dict):
             self.partition = PartitionSpec.from_dict(self.partition)
         if self.partition and self.time:
@@ -470,9 +695,15 @@ class TableContract:
             ),
         )
 
-    def with_partition(self, every: Any = None, kind: Optional[str] = None,
+    def with_partition(self, partition: Any = None, every: Any = None,
+                       kind: Optional[str] = None,
                        timezone: Optional[str] = None,
                        fmt: Optional[str] = None) -> "TableSpec":
+        if partition is not None:
+            return replace(
+                self,
+                partition=parse_partition_spec(partition).with_time(self.time),
+            )
         if not self.partition:
             raise PartitionSpecError("TableSpec has no partition to update")
         partition = replace(

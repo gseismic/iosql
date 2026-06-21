@@ -16,6 +16,7 @@
 | `04_layout_report_and_repartition.py` | 高级 | 使用 `layout_report()` 诊断分区行数，并用 `repartition_to()` 生成新布局。 |
 | `05_partition_segments_smoke.py` | 高级 | 验证逻辑分区 + 物理 row segment 的二级查询计划。 |
 | `06_row_segment_late_data.py` | 高级 | 仅按行数滚动 segment，展示晚到数据、`__all__` 逻辑分区和 stats pruning。 |
+| `07_partition_string_repartition_cli.py` | 高级 | 使用字符串 partition，并通过 CLI `repartition --partition --target` 生成新布局。 |
 
 ## 金融示例
 
@@ -47,6 +48,7 @@ python examples/03_buffered_ingest_and_query_plan.py
 python examples/04_layout_report_and_repartition.py
 python examples/05_partition_segments_smoke.py
 python examples/06_row_segment_late_data.py
+python examples/07_partition_string_repartition_cli.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

@@ -21,6 +21,8 @@ from .spec import (
     TableContract,
     TimeColumn,
     WriteResult,
+    format_partition_spec,
+    parse_partition_spec,
 )
 __all__ = [
     'CalendarPartition',
@@ -45,4 +47,6 @@ __all__ = [
     'Where',
     'WriteResult',
     '__version__',
+    'format_partition_spec',
+    'parse_partition_spec',
 ]
