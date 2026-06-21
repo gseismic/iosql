@@ -1,6 +1,6 @@
 ---
 name: iosql-usage
-description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, layout_report, repartition_to, spec, table_parts, delete, truncate, create_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, or tests for this repository.
+description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, layout_report, repartition_to, spec, table_parts, delete, truncate, create_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
 ---
 
 # iosql 使用指南
@@ -113,6 +113,43 @@ for part_key, part_data in partitioned_data.items():
 | **维护** | `table.create_index(column, order)` | 为所有分区创建索引 |
 | | `Database.table_names()` | 列出数据库中所有表 |
 | | `db.close()` | 关闭所有连接 |
+
+## CLI 速查表
+
+CLI 入口：
+
+```bash
+iosql --help
+python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
+```
+
+CLI 只支持 SQLite 目录库，`--source` 可传本地路径或 `sqlite://...` / `sqlite3://...`。如果输入 `postgresql://...` 等其他 URI，应直接拒绝，不要自动包装成 SQLite 路径。
+
+| 类别 | 命令 | 说明 |
+|------|------|------|
+| **发现** | `iosql tables -s DB` | 列出逻辑表 |
+| | `iosql spec -s DB -t TABLE` | 输出表契约 JSON |
+| | `iosql layout -s DB -t TABLE` | 输出 `layout_report()` |
+| | `iosql parts -s DB -t TABLE` | 输出逻辑分区 |
+| | `iosql segments -s DB -t TABLE` | 输出物理 segment |
+| **查询** | `iosql explain -s DB -t TABLE --where JSON` | 输出 `explain_select()` 查询计划 |
+| | `iosql query -s DB -t TABLE --where JSON --format jsonl` | 查询小规模结果 |
+| **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append` | 写入既有契约表 |
+| | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON` | 导出查询结果 |
+| **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引 |
+| | `iosql repartition -s DB -t TABLE -e 1hour --target TARGET` | 按新分区策略写入目标库 |
+| | `iosql backup -s DB --target BACKUP` | 目录级备份 |
+| | `iosql restore --backup BACKUP --target DB` | 目录级恢复 |
+| | `iosql index list/check/create ...` | 检查或创建物理分区索引 |
+
+### CLI 安全规则
+
+- `repartition` 默认必须提供 `--target`，不原地覆盖源库。
+- 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。
+- `restore` 覆盖已有目标时必须使用 `--replace --yes`。
+- `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`。
+- `query/export` 适合排查和小规模导出；当前不是流式大数据导出入口。
+- 复杂 where 优先传 JSON 或 `@file`，例如 `--where '{"field":"symbol","op":"==","value":"AAPL"}'`。
 
 ## 工作流
 

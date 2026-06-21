@@ -29,7 +29,7 @@ zip-safe = false
 version = { attr = "iosql.version.__version__" }
 
 [tool.setuptools.packages.find]
-include = ["iosql*", "cli*"]
+include = ["iosql*"]
 
 [project.scripts]
-iosql = "cli.__main__:app"
+iosql = "iosql.cli:app"
