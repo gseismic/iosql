@@ -261,14 +261,6 @@ def _partition_desc(partition) -> str:
     return f"{kind}({partition.column}, every={every}{tz_str})"
 
 
-def _existing_pk_indexes(source_path: Path, table_name: str, pk_columns: List[str]) -> set:
-    expected = {f"{_PART_DATA_TABLE_NAME}_{col}_index" for col in pk_columns}
-    found: set = set()
-    for item in _index_report(source_path, table_name):
-        found.update(item["indexes"])
-    return expected & found
-
-
 def _suggest_range_every_up(avg_rows: int, target: int, current_every: int = 1) -> int:
     ratio = target / max(avg_rows, 1)
     return max(int(current_every * ratio), current_every + 1)
@@ -552,9 +544,8 @@ def doctor(
                 typer.echo("  partition: none")
 
             pk = table_spec.primary_key
-            existing = _existing_pk_indexes(source_path, tname, pk)
-            existing_cols = [c for c in pk if f"{_PART_DATA_TABLE_NAME}_{c}_index" in existing]
-            missing_cols = [c for c in pk if c not in existing_cols]
+            missing_cols = _missing_index_columns(_missing_indexes(source_path, tname, pk))
+            existing_cols = [c for c in pk if c not in missing_cols]
             if existing_cols:
                 parts = [f"{c} ✓" for c in existing_cols]
                 if missing_cols:
@@ -611,7 +602,7 @@ def doctor(
                         unresolved += 1
                         typer.echo(f"    fix incomplete: {_missing_index_columns(remaining)}")
                     else:
-                        typer.echo(f"    fix: {'ok'}")
+                        typer.echo("    fix: ok")
                 else:
                     unresolved += 1
                     for col in missing_cols:

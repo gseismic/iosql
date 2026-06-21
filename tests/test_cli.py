@@ -374,3 +374,40 @@ def test_cli_repartition_dry_run_and_target(tmp_path):
         assert len(target_table.select("*", where=None, to_dict=True)) == 4
     finally:
         db.close()
+
+
+def test_cli_repartition_range_partition(tmp_path):
+    db_path = tmp_path / "range.iosql"
+    db = Database(_db_uri(db_path))
+    table = db.table(
+        "items",
+        pk=["id"],
+        columns={"id": "integer", "val": "float"},
+        partition=Partition.range("id", every=1),
+    )
+    table.write([{"id": i, "val": i * 1.5} for i in range(20)])
+    db.close()
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "items", "-e", "5", "--yes",
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["source_replaced"] is True
+
+    db = Database(_db_uri(db_path))
+    try:
+        t = db.table("items")
+        assert t.spec().partition.kind == "range"
+        rows = t.select("*", where=None, to_dict=True)
+        assert len(rows) == 20
+    finally:
+        db.close()
+
+
+def test_cli_doctor_range_partition_suggestion(tmp_path):
+    from iosql.cli import _suggest_range_every_up, _suggest_range_every_down
+
+    assert _suggest_range_every_up(avg_rows=316, target=350_000, current_every=1) > 1
+    assert _suggest_range_every_down(avg_rows=500_000, target=200_000, current_every=100) < 100
+    assert _suggest_range_every_down(avg_rows=500_000, target=200_000, current_every=1) == 1
