@@ -562,6 +562,9 @@ def doctor(
                         typer.echo("    fix: ok")
                 else:
                     unresolved += 1
+                    typer.echo(
+                        f"    → iosql doctor -s {source} -t {tname} --fix"
+                    )
             else:
                 typer.echo("  indexes: ok")
     finally:
