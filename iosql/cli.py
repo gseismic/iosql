@@ -66,6 +66,10 @@ def _backup_path(source_path: Path) -> Path:
     return source_path.with_name(f"{source_path.name}.backup_{ts}")
 
 
+def _comma(n: int) -> str:
+    return f"{n:,}"
+
+
 def _json_default(value: Any) -> Any:
     if hasattr(value, "to_dict"):
         return value.to_dict()
@@ -506,36 +510,46 @@ def doctor(
                 continue
 
             report = t.layout_report()
-            typer.echo(f"[{tname}] rows={report.total_rows} partitions={report.total_partitions}")
+            typer.echo(
+                f"\n[{tname}] rows={_comma(report.total_rows)}  "
+                f"partitions={report.total_partitions}"
+            )
 
             oversized = report.oversized_partitions
             undersized = report.undersized_partitions
+            avg = report.total_rows // report.total_partitions if report.total_partitions else 0
+
             if oversized:
                 issues += 1
                 unresolved += 1
-                avg = report.total_rows // report.total_partitions if report.total_partitions else 0
                 suggestion = _suggest_period_down(avg, report.target_rows_per_file)
                 typer.echo(
-                    f"  oversized={len(oversized)} max_rows={report.max_rows_per_file} "
-                    f"suggest='iosql repartition -s {source} -t {tname} -e {suggestion} --yes'"
+                    f"  oversized: {len(oversized)} 个分区行数过多 "
+                    f"(max={_comma(report.max_rows_per_file)}, avg={_comma(avg)})"
+                )
+                typer.echo(
+                    f"    → iosql repartition -s {source} -t {tname} -e {suggestion} --yes"
                 )
             elif undersized:
                 issues += 1
                 unresolved += 1
-                avg = report.total_rows // report.total_partitions if report.total_partitions else 0
                 suggestion = _suggest_period_up(avg, report.target_rows_per_file)
                 typer.echo(
-                    f"  undersized={len(undersized)} min_rows={report.min_rows_per_file} "
-                    f"suggest='iosql repartition -s {source} -t {tname} -e {suggestion} --yes'"
+                    f"  undersized: {len(undersized)} 个分区行数不足 "
+                    f"(min={_comma(report.min_rows_per_file)}, avg={_comma(avg)})"
+                )
+                typer.echo(
+                    f"    → iosql repartition -s {source} -t {tname} -e {suggestion} --yes"
                 )
             else:
-                typer.echo("  layout=ok")
+                typer.echo("  layout: ok")
 
             missing = _missing_indexes(source_path, tname, table_spec.primary_key)
             if missing:
                 issues += 1
                 missing_columns = _missing_index_columns(missing)
-                typer.echo(f"  missing_pk_indexes={missing_columns}")
+                columns_str = ", ".join(missing_columns)
+                typer.echo(f"  missing indexes: {columns_str}")
                 if fix:
                     for column in missing_columns:
                         t.create_index(column)
@@ -543,20 +557,20 @@ def doctor(
                     missing = _missing_indexes(source_path, tname, table_spec.primary_key)
                     if missing:
                         unresolved += 1
-                        typer.echo(f"  index_fix_incomplete={missing}")
+                        typer.echo(f"    fix incomplete: {_missing_index_columns(missing)}")
                     else:
-                        typer.echo("  index_fix=ok")
+                        typer.echo("    fix: ok")
                 else:
                     unresolved += 1
             else:
-                typer.echo("  pk_indexes=ok")
+                typer.echo("  indexes: ok")
     finally:
         db.close()
 
     if issues:
-        typer.echo(f"发现 {issues} 个问题" + (f"，已修复 {fixed} 个索引" if fix else ""))
+        typer.echo(f"\n发现 {issues} 个问题" + (f"，已修复 {fixed} 个索引" if fix else ""))
         raise typer.Exit(1 if unresolved else 0)
-    typer.echo("数据库健康状态正常")
+    typer.echo("\n数据库健康状态正常")
 
 
 @app.command()

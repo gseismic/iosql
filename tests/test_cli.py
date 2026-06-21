@@ -173,7 +173,7 @@ def test_cli_doctor_fix_and_index_check(tmp_path):
 
     result = _invoke("doctor", "-s", str(db_path), "-t", "ticks", "--fix")
     assert result.exit_code == 0, result.output
-    assert "index_fix=ok" in result.output
+    assert "fix: ok" in result.output
 
     result = _invoke("index", "check", "-s", str(db_path), "-t", "ticks")
     assert result.exit_code == 0, result.output
