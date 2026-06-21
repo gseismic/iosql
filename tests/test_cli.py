@@ -1,4 +1,5 @@
 import json
+import os
 
 from typer.testing import CliRunner
 
@@ -204,27 +205,105 @@ def test_cli_backup_and_restore(tmp_path):
     assert "ticks" in result.output
 
 
-def test_cli_repartition_requires_explicit_target_or_replace(tmp_path):
+def test_cli_repartition_default_behavior_and_flags(tmp_path):
     db_path = _make_sample_db(tmp_path)
 
     result = _invoke("repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour")
     assert result.exit_code == 1, result.output
-    assert "必须提供 --target" in result.output
+    assert "替换源库必须同时提供 --yes" in result.output
 
     result = _invoke(
-        "repartition",
-        "-s",
-        str(db_path),
-        "-t",
-        "ticks",
-        "-e",
-        "1hour",
-        "--replace-source",
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
+        "--target", str(tmp_path / "target.iosql"), "--backup", str(tmp_path / "backup.iosql"),
+    )
+    assert result.exit_code == 1, result.output
+    assert "--target 与 --backup 不能同时使用" in result.output
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
+        "--target", str(tmp_path / "target.iosql"), "--no-backup",
+    )
+    assert result.exit_code == 1, result.output
+    assert "--target 与 --no-backup 不能同时使用" in result.output
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
+        "--backup", str(tmp_path / "backup.iosql"), "--no-backup", "--yes",
+    )
+    assert result.exit_code == 1, result.output
+    assert "--backup 与 --no-backup 不能同时使用" in result.output
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
         "--dry-run",
     )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload["dry_run"] is True
+    assert payload["plan"]["source_replaced"] is True
+
+
+def test_cli_repartition_replace_source_with_backup(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
+        "--yes",
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["source_replaced"] is True
+    assert payload["backup"] is not None
+    assert os.path.isdir(payload["backup"])
+
+    db = Database(_db_uri(db_path))
+    try:
+        target_table = db.table("ticks")
+        assert target_table.spec().partition.every == "1hour"
+        assert len(target_table.select("*", where=None, to_dict=True)) == 4
+    finally:
+        db.close()
+
+
+def test_cli_repartition_replace_source_no_backup(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
+        "--no-backup", "--yes",
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["source_replaced"] is True
+    assert payload["backup"] is None
+
+    db = Database(_db_uri(db_path))
+    try:
+        target_table = db.table("ticks")
+        assert target_table.spec().partition.every == "1hour"
+    finally:
+        db.close()
+
+
+def test_cli_repartition_replace_source_custom_backup(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+    custom_backup = tmp_path / "my_backup.iosql"
+
+    result = _invoke(
+        "repartition", "-s", str(db_path), "-t", "ticks", "-e", "1hour",
+        "--backup", str(custom_backup), "--yes",
+    )
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["source_replaced"] is True
+    assert str(custom_backup) in payload["backup"]
+    assert custom_backup.exists()
+    backup_db = Database(_db_uri(custom_backup))
+    try:
+        t = backup_db.table("ticks")
+        assert t.spec().partition.every == 86400000
+    finally:
+        backup_db.close()
 
 
 def test_cli_repartition_dry_run_and_target(tmp_path):

@@ -517,7 +517,7 @@ def doctor(
                 suggestion = _suggest_period_down(avg, report.target_rows_per_file)
                 typer.echo(
                     f"  oversized={len(oversized)} max_rows={report.max_rows_per_file} "
-                    f"suggest='iosql repartition -s {source} -t {tname} -e {suggestion} --target TARGET'"
+                    f"suggest='iosql repartition -s {source} -t {tname} -e {suggestion} --yes'"
                 )
             elif undersized:
                 issues += 1
@@ -526,7 +526,7 @@ def doctor(
                 suggestion = _suggest_period_up(avg, report.target_rows_per_file)
                 typer.echo(
                     f"  undersized={len(undersized)} min_rows={report.min_rows_per_file} "
-                    f"suggest='iosql repartition -s {source} -t {tname} -e {suggestion} --target TARGET'"
+                    f"suggest='iosql repartition -s {source} -t {tname} -e {suggestion} --yes'"
                 )
             else:
                 typer.echo("  layout=ok")
@@ -566,22 +566,24 @@ def repartition(
     every: str = typer.Option("", "--every", "-e", help="新分区周期，空值表示沿用旧周期"),
     kind: str = typer.Option("", "--kind", help="duration/calendar/range，空值表示沿用旧类型"),
     timezone: str = typer.Option("", "--timezone", help="新时区，空值表示沿用旧时区"),
-    target: str = typer.Option("", "--target", help="目标数据库 URI 或本地路径"),
+    target: str = typer.Option("", "--target", help="目标数据库 URI 或本地路径（不提供则默认替换源库）"),
     target_table: str = typer.Option("", "--target-table", help="目标表名，默认同源表"),
     batch_size: int = typer.Option(10_000, "--batch-size", help="复制批大小"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只输出计划，不写文件"),
-    replace_source: bool = typer.Option(False, "--replace-source", help="用新库替换源库"),
-    yes: bool = typer.Option(False, "--yes", help="确认破坏性操作"),
-    rm_backup: bool = typer.Option(False, "--rm-backup", help="替换源库后删除备份"),
+    backup: str = typer.Option("", "--backup", help="备份路径，替换源库前备份（默认自动生成 .backup.{datetime}）"),
+    no_backup: bool = typer.Option(False, "--no-backup", help="替换源库时不备份（危险）"),
+    yes: bool = typer.Option(False, "--yes", help="确认替换源库（未指定 --target 时必须提供）"),
 ):
     """按新分区策略重写表数据。"""
     if batch_size <= 0:
         _fail("batch-size 必须大于 0")
-    if target and replace_source:
-        _fail("--target 与 --replace-source 不能同时使用")
-    if not target and not replace_source:
-        _fail("必须提供 --target，或显式提供 --replace-source --yes 替换源库")
-    if replace_source and not yes and not dry_run:
+    if target and backup:
+        _fail("--target 与 --backup 不能同时使用")
+    if target and no_backup:
+        _fail("--target 与 --no-backup 不能同时使用")
+    if backup and no_backup:
+        _fail("--backup 与 --no-backup 不能同时使用")
+    if not target and not yes and not dry_run:
         _fail("替换源库必须同时提供 --yes")
 
     source_uri, source_path = _require_source(source)
@@ -614,6 +616,7 @@ def repartition(
         final_target_uri = f"sqlite://{tmp_path}"
         final_target_path = tmp_path
 
+    source_replaced = not bool(target)
     plan = {
         "source_uri": source_uri,
         "source_path": str(source_path),
@@ -621,7 +624,7 @@ def repartition(
         "target_uri": final_target_uri,
         "target_path": str(final_target_path),
         "target_table": target_table or table,
-        "replace_source": replace_source,
+        "source_replaced": source_replaced,
         "batch_size": batch_size,
         "old_partition": old_spec.partition.to_dict() if old_spec.partition else None,
         "new_partition": new_spec.partition.to_dict() if new_spec.partition else None,
@@ -652,20 +655,21 @@ def repartition(
     finally:
         db2.close()
 
-    backup = None
-    if replace_source:
-        backup = _backup_path(source_path)
-        shutil.copytree(source_path, backup, dirs_exist_ok=False)
+    backup_path = None
+    if source_replaced:
+        if not no_backup:
+            backup_path = Path(backup) if backup else _backup_path(source_path)
+            if backup_path.exists():
+                _fail(f"备份目标已存在: {backup_path}")
+            shutil.copytree(source_path, backup_path, dirs_exist_ok=False)
         shutil.rmtree(source_path)
         shutil.move(str(final_target_path), str(source_path))
-        if rm_backup:
-            shutil.rmtree(backup)
 
     _echo_json({
         "result": result.to_dict(),
         "elapsed_seconds": round(elapsed, 3),
-        "backup": None if backup is None or rm_backup else str(backup),
-        "source_replaced": replace_source,
+        "backup": None if no_backup else str(backup_path),
+        "source_replaced": source_replaced,
     })
 
 
