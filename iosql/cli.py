@@ -253,6 +253,22 @@ def _missing_index_columns(missing: List[Dict[str, Any]]) -> List[str]:
     return sorted(columns)
 
 
+def _partition_desc(partition) -> str:
+    kind = partition.kind
+    every = partition.every
+    tz = partition.timezone
+    tz_str = f", tz={tz}" if tz else ""
+    return f"{kind}({partition.column}, every={every}{tz_str})"
+
+
+def _existing_pk_indexes(source_path: Path, table_name: str, pk_columns: List[str]) -> set:
+    expected = {f"{_PART_DATA_TABLE_NAME}_{col}_index" for col in pk_columns}
+    found: set = set()
+    for item in _index_report(source_path, table_name):
+        found.update(item["indexes"])
+    return expected & found
+
+
 def _suggest_period_up(avg_rows: int, target: int) -> str:
     ratio = target / max(avg_rows, 1)
     if ratio >= 24:
@@ -515,6 +531,23 @@ def doctor(
                 f"partitions={report.total_partitions}"
             )
 
+            if table_spec.partition:
+                typer.echo(f"  partition: {_partition_desc(table_spec.partition)}")
+            else:
+                typer.echo("  partition: none")
+
+            pk = table_spec.primary_key
+            existing = _existing_pk_indexes(source_path, tname, pk)
+            existing_cols = [c for c in pk if f"{_PART_DATA_TABLE_NAME}_{c}_index" in existing]
+            missing_cols = [c for c in pk if c not in existing_cols]
+            if existing_cols:
+                parts = [f"{c} ✓" for c in existing_cols]
+                if missing_cols:
+                    parts += [f"{c} ✗" for c in missing_cols]
+                typer.echo(f"  pk indexes: {', '.join(parts)}")
+            else:
+                typer.echo(f"  pk indexes: {', '.join(f'{c} ✗' for c in pk)}")
+
             oversized = report.oversized_partitions
             undersized = report.undersized_partitions
             avg = report.total_rows // report.total_partitions if report.total_partitions else 0
@@ -544,30 +577,24 @@ def doctor(
             else:
                 typer.echo("  layout: ok")
 
-            missing = _missing_indexes(source_path, tname, table_spec.primary_key)
-            if missing:
+            if missing_cols:
                 issues += 1
-                missing_columns = _missing_index_columns(missing)
-                columns_str = ", ".join(missing_columns)
-                typer.echo(f"  missing indexes: {columns_str}")
                 if fix:
-                    for column in missing_columns:
+                    for column in missing_cols:
                         t.create_index(column)
                         fixed += 1
-                    missing = _missing_indexes(source_path, tname, table_spec.primary_key)
-                    if missing:
+                    remaining = _missing_indexes(source_path, tname, pk)
+                    if remaining:
                         unresolved += 1
-                        typer.echo(f"    fix incomplete: {_missing_index_columns(missing)}")
+                        typer.echo(f"    fix incomplete: {_missing_index_columns(remaining)}")
                     else:
-                        typer.echo("    fix: ok")
+                        typer.echo(f"    fix: {'ok'}")
                 else:
                     unresolved += 1
-                    for col in missing_columns:
+                    for col in missing_cols:
                         typer.echo(
                             f"    → iosql index create -s {source} -t {tname} -c {col}"
                         )
-            else:
-                typer.echo("  indexes: ok")
     finally:
         db.close()
 
