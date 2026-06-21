@@ -269,6 +269,11 @@ def _existing_pk_indexes(source_path: Path, table_name: str, pk_columns: List[st
     return expected & found
 
 
+def _suggest_range_every(avg_rows: int, target: int, current_every: int = 1) -> int:
+    ratio = target / max(avg_rows, 1)
+    return max(int(current_every * ratio), current_every + 1)
+
+
 def _suggest_period_up(avg_rows: int, target: int) -> str:
     ratio = target / max(avg_rows, 1)
     if ratio >= 24:
@@ -555,7 +560,11 @@ def doctor(
             if oversized:
                 issues += 1
                 unresolved += 1
-                suggestion = _suggest_period_down(avg, report.target_rows_per_file)
+                if table_spec.partition and table_spec.partition.kind == "range":
+                    cur_every = int(table_spec.partition.every or 1)
+                    suggestion = _suggest_range_every(avg, report.target_rows_per_file, cur_every)
+                else:
+                    suggestion = _suggest_period_down(avg, report.target_rows_per_file)
                 typer.echo(
                     f"  oversized: {len(oversized)} 个分区行数过多 "
                     f"(max={_comma(report.max_rows_per_file)}, avg={_comma(avg)})"
@@ -566,7 +575,11 @@ def doctor(
             elif undersized:
                 issues += 1
                 unresolved += 1
-                suggestion = _suggest_period_up(avg, report.target_rows_per_file)
+                if table_spec.partition and table_spec.partition.kind == "range":
+                    cur_every = int(table_spec.partition.every or 1)
+                    suggestion = _suggest_range_every(avg, report.target_rows_per_file, cur_every)
+                else:
+                    suggestion = _suggest_period_up(avg, report.target_rows_per_file)
                 typer.echo(
                     f"  undersized: {len(undersized)} 个分区行数不足 "
                     f"(min={_comma(report.min_rows_per_file)}, avg={_comma(avg)})"

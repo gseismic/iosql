@@ -87,6 +87,17 @@ def _duration_to_ms(value: Any) -> int:
     raise PartitionSpecError(f"Unsupported partition duration `{value}`")
 
 
+def _to_int_every(value: Any) -> int:
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError) as e:
+        raise PartitionSpecError(
+            f"range partition every must be an integer, got `{value}`"
+        ) from e
+
+
 def _calendar_fmt(every: Any) -> str:
     text = str(every).strip().lower()
     if text in ["1y", "1year", "1years", "year", "years"]:
@@ -280,7 +291,8 @@ class PartitionSpec:
         spec = self.with_time(time)
         unit = spec.time_unit
         if spec.kind == "range":
-            return RangePartition(width=spec.every, column=spec.column)
+            width = _to_int_every(spec.every)
+            return RangePartition(width=width, column=spec.column)
         if spec.kind == "calendar" or unit == "date":
             fmt = spec.fmt or _calendar_fmt(spec.every)
             return CalendarPartition(
