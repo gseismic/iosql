@@ -564,14 +564,17 @@ def doctor(
                 if table_spec.partition and table_spec.partition.kind == "range":
                     cur_every = int(table_spec.partition.every or 1)
                     suggestion = _suggest_range_every_down(avg, report.target_rows_per_file, cur_every)
+                    estimated = avg * suggestion
+                    hint = f"  (~{_comma(estimated)} 行/分区)"
                 else:
                     suggestion = _suggest_period_down(avg, report.target_rows_per_file)
+                    hint = ""
                 typer.echo(
                     f"  oversized: {len(oversized)} 个分区行数过多 "
                     f"(max={_comma(report.max_rows_per_file)}, avg={_comma(avg)})"
                 )
                 typer.echo(
-                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes"
+                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes{hint}"
                 )
             elif undersized:
                 issues += 1
@@ -579,14 +582,17 @@ def doctor(
                 if table_spec.partition and table_spec.partition.kind == "range":
                     cur_every = int(table_spec.partition.every or 1)
                     suggestion = _suggest_range_every_up(avg, report.target_rows_per_file, cur_every)
+                    estimated = avg * suggestion
+                    hint = f"  (~{_comma(estimated)} 行/分区)"
                 else:
                     suggestion = _suggest_period_up(avg, report.target_rows_per_file)
+                    hint = ""
                 typer.echo(
                     f"  undersized: {len(undersized)} 个分区行数不足 "
                     f"(min={_comma(report.min_rows_per_file)}, avg={_comma(avg)})"
                 )
                 typer.echo(
-                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes"
+                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes{hint}"
                 )
             else:
                 typer.echo("  layout: ok")
