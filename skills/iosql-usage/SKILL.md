@@ -327,22 +327,17 @@ with Database("sqlite://db/test.iosql") as db:
 
 ## 引用资料
 
-需要代码模板时，读取 [usage-patterns.md](references/usage-patterns.md)。
+所有资料均包含在 skills 目录内，同步分发：
 
-遇到错误时，读取 [troubleshooting.md](references/troubleshooting.md)。
-
-需要完整 API 签名时，读取 [api-reference.md](references/api-reference.md)。
-
-仓库内也可参考：
-
-- `README.md`
-- `examples/01_quickstart_table.py`
-- `examples/01_quickstart_timeseries.py`
-- `examples/02_calendar_events_table.py`
-- `examples/02_calendar_events.py`
-- `examples/03_buffered_ingest_and_query_plan.py`
-- `examples/04_layout_report_and_repartition.py`
-- `examples/05_partition_segments_smoke.py`
-- `examples/06_row_segment_late_data.py`
-- `examples/finance/`
-- `tests/engines/sqlite/test_timeseries_contract.py`
+- **代码模板**：[usage-patterns.md](references/usage-patterns.md) —— 涵盖全部 Partition × Segment 组合、duration/calendar/range 分区、timeseries helper、缓冲写入、查询计划、布局诊断、重分区、晚到数据、金融场景（K线/orderbook/财报/新闻）、CLI 模式
+- **可运行示例**：[examples/](examples/) —— 可直接运行的 Python 脚本，按学习顺序编号：
+  - `01_quickstart_table.py`、`01_quickstart_timeseries.py` —— 入门：普通 Table vs timeseries helper
+  - `02_calendar_events_table.py`、`02_calendar_events.py` —— 日历分区处理日期字符串
+  - `03_buffered_ingest_and_query_plan.py` —— 批量缓冲写入 + 查询计划
+  - `04_layout_report_and_repartition.py` —— 布局诊断 + 重分区
+  - `05_partition_segments_smoke.py` —— 逻辑分区 + 物理 segment
+  - `06_row_segment_late_data.py` —— 纯 row segment + 晚到数据
+  - `07_partition_string_repartition_cli.py` —— 字符串 partition + CLI 重分区
+  - `finance/` —— 金融场景：K线、orderbook、财报、新闻
+- **错误排查**：[troubleshooting.md](references/troubleshooting.md)
+- **API 签名**：[api-reference.md](references/api-reference.md)
