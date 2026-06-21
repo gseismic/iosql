@@ -571,7 +571,7 @@ def doctor(
                     f"(max={_comma(report.max_rows_per_file)}, avg={_comma(avg)})"
                 )
                 typer.echo(
-                    f"    → iosql repartition -s {source} -t {tname} -e {suggestion} --yes"
+                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes"
                 )
             elif undersized:
                 issues += 1
@@ -586,7 +586,7 @@ def doctor(
                     f"(min={_comma(report.min_rows_per_file)}, avg={_comma(avg)})"
                 )
                 typer.echo(
-                    f"    → iosql repartition -s {source} -t {tname} -e {suggestion} --yes"
+                    f"    → iosql repartition --source {source} --table {tname} --every {suggestion} --yes"
                 )
             else:
                 typer.echo("  layout: ok")
@@ -607,7 +607,7 @@ def doctor(
                     unresolved += 1
                     for col in missing_cols:
                         typer.echo(
-                            f"    → iosql index create -s {source} -t {tname} -c {col}"
+                            f"    → iosql index create --source {source} --table {tname} --column {col}"
                         )
     finally:
         db.close()
@@ -622,18 +622,22 @@ def doctor(
 def repartition(
     source: str = typer.Option(..., "--source", "-s", help="源数据库 URI 或本地路径"),
     table: str = typer.Option(..., "--table", "-t", help="表名"),
-    every: str = typer.Option("", "--every", "-e", help="新分区周期，空值表示沿用旧周期"),
-    kind: str = typer.Option("", "--kind", help="duration/calendar/range，空值表示沿用旧类型"),
-    timezone: str = typer.Option("", "--timezone", help="新时区，空值表示沿用旧时区"),
-    target: str = typer.Option("", "--target", help="目标数据库 URI 或本地路径（不提供则默认替换源库）"),
+    every: str = typer.Option("", "--every", "-e", help="新分区粒度（如 1day/1hour 或整数），空值表示沿用旧值"),
+    kind: str = typer.Option("", "--kind", help="duration / calendar / range，不指定则保持原有类型"),
+    timezone: str = typer.Option("", "--timezone", help="新时区，不指定则保持原有时区"),
+    target: str = typer.Option("", "--target", help="写入目标数据库（不指定则直接替换源库）"),
     target_table: str = typer.Option("", "--target-table", help="目标表名，默认同源表"),
     batch_size: int = typer.Option(10_000, "--batch-size", help="复制批大小"),
     dry_run: bool = typer.Option(False, "--dry-run", help="只输出计划，不写文件"),
-    backup: str = typer.Option("", "--backup", help="备份路径，替换源库前备份（默认自动生成 .backup.{datetime}）"),
-    no_backup: bool = typer.Option(False, "--no-backup", help="替换源库时不备份（危险）"),
-    yes: bool = typer.Option(False, "--yes", help="确认替换源库（未指定 --target 时必须提供）"),
+    backup: str = typer.Option("", "--backup", help="替换源库前备份到指定路径（默认自动生成）"),
+    no_backup: bool = typer.Option(False, "--no-backup", help="替换源库时不备份"),
+    yes: bool = typer.Option(False, "--yes", help="确认替换源库"),
 ):
-    """按新分区策略重写表数据。"""
+    """按新分区策略重写表数据。
+
+    不指定 --target 时，默认替换源库（替换前自动备份到 .backup.{datetime}）。
+    指定 --target 则写入新库，不修改源库。"""
+
     if batch_size <= 0:
         _fail("batch-size 必须大于 0")
     if target and backup:
