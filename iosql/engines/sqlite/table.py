@@ -170,6 +170,16 @@ class Table(BaseTable):
 
     def __init__(self, *args, **kwargs):
         pragma_dict = kwargs.pop("pragma_dict", None)
+        max_open_partitions = kwargs.pop("max_open_partitions", 5)
+        max_connections_per_file = kwargs.pop("max_connections_per_file", 1)
+        self._num_opened_max_allowed = self._positive_int_option(
+            "max_open_partitions",
+            max_open_partitions,
+        )
+        self._max_connections_per_file = self._positive_int_option(
+            "max_connections_per_file",
+            max_connections_per_file,
+        )
         self._pragma_dict = copy.deepcopy(_MYSQLITE_DEFAULT_PRAGMA)
         self._pragma_dict.update(pragma_dict or {})
         self._meta_db = None
@@ -177,14 +187,26 @@ class Table(BaseTable):
         self._db_parts = OrderedDict()
         self._db_parts_status = OrderedDict()
         self._declared_spec = None
-        # 一般情况下，这个part写完，一般就意味这写完了，可以关闭了
-        self._num_opened_max_allowed = 5
         # New partition system
         self._partition = None
         super().__init__(*args, **kwargs)
         # Load partition from metadata after initialization
         self._partition = self._load_partition()
         self.logger = logger
+
+    @staticmethod
+    def _positive_int_option(name, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise BadArgument(f"{name} must be a positive integer")
+        return value
+
+    @property
+    def max_open_partitions(self):
+        return self._num_opened_max_allowed
+
+    @property
+    def max_connections_per_file(self):
+        return self._max_connections_per_file
 
     def connect(self):
         """连接
@@ -2521,15 +2543,12 @@ class Table(BaseTable):
     def _rows_from_part_dbfile(self, part_dbfile):
         if not os.path.isfile(part_dbfile):
             return []
-        db = MyDatabase(part_dbfile, auto_commit=False)
+        db = self.get_part_db(part_dbfile, auto_commit=False)
         try:
-            try:
-                rows = db[_PART_DATA_TABLE_NAME].select('*', where=None, to_dict=True)
-            except NoSuchTable:
-                return []
-            return [dict(row) for row in rows]
-        finally:
-            db.close()
+            rows = db[_PART_DATA_TABLE_NAME].select('*', where=None, to_dict=True)
+        except NoSuchTable:
+            return []
+        return [dict(row) for row in rows]
 
     def _part_rows(self, part):
         rows = []
@@ -2690,19 +2709,14 @@ class Table(BaseTable):
             }
             mysqlite_columns.append(dic)
 
-        db = MyDatabase(part_dbfile, verbose=self.verbose)
-        try:
-            # sqlite3.OperationalError: unable to open database file
-            db[part_table_name].create_table(
-                mysqlite_columns,
-                pk=createtable_meta["pk"],
-                save_meta=True,
-                table_comment=None,
-            )
-        except OSError:
-            raise
-        finally:
-            db.close()
+        db = self.get_part_db(part_dbfile, auto_commit=True)
+        # sqlite3.OperationalError: unable to open database file
+        db[part_table_name].create_table(
+            mysqlite_columns,
+            pk=createtable_meta["pk"],
+            save_meta=True,
+            table_comment=None,
+        )
 
     @property
     def table_meta_db(self):
@@ -2716,6 +2730,7 @@ class Table(BaseTable):
                 auto_commit=auto_commit,
                 verbose=self.verbose,
                 pragma_dict=self._pragma_dict,
+                max_connections=self._max_connections_per_file,
             )
         else:
             pass
@@ -2732,6 +2747,7 @@ class Table(BaseTable):
                 auto_commit=auto_commit,
                 verbose=self.verbose,
                 pragma_dict=self._pragma_dict,
+                max_connections=self._max_connections_per_file,
             )
         return self._meta_db
 
@@ -2739,7 +2755,10 @@ class Table(BaseTable):
         if part_dbfile not in self._db_parts or self._db_parts[part_dbfile].is_closed():
             self._prune_part_db_cache(exclude={part_dbfile})
             db = MyDatabase(
-                part_dbfile, pragma_dict=self._pragma_dict, auto_commit=auto_commit
+                part_dbfile,
+                pragma_dict=self._pragma_dict,
+                auto_commit=auto_commit,
+                max_connections=self._max_connections_per_file,
             )
             self._db_parts[part_dbfile] = db
             self._db_parts_status[part_dbfile] = True

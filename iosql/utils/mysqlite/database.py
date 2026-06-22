@@ -5,6 +5,7 @@ import copy
 import threading
 import contextlib
 import atexit
+import weakref
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 import sqlite3
@@ -26,8 +27,8 @@ class DatabaseConnectionError(DatabaseError):
     pass
 
 
-# 全局数据库实例注册表，用于程序退出时的自动清理
-_active_databases = set()
+# 弱引用注册表用于退出清理，但不能延长业务对象生命周期。
+_active_databases = weakref.WeakSet()
 _cleanup_registered = False
 
 

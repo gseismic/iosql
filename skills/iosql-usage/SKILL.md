@@ -233,8 +233,11 @@ with table.write_buffer(max_rows=10_000) as buf:
 - orderbook/tick 使用 append-only，建议每批 `50_000` 至 `100_000` 行，并配置 `Segment.rows(max_rows=...)`。
 - 高频宽表可用 `Segment.rows(..., stats_columns=["ts", "sequence"])` 限制 min/max 统计开销；partition/time/order/session 字段会自动保留。
 - iosql 默认 SQLite 写入配置是 `WAL + synchronous=NORMAL`；更强断电保障可传 `Database(..., pragma_dict={"journal_mode": "wal", "synchronous": "full"})`。
+- 主 API 默认 `max_open_partitions=5`、`max_connections_per_file=1`，在进程内限制分区数据库和单文件连接数；不要依赖提高 `ulimit -n`，也不要直接修改私有字段。
+- 长期进程必须使用上下文管理器或显式 `db.close()`；弱引用清理只负责避免遗弃对象被注册表永久保活。
 - 目标盘必须运行仓库 `benchmarks/benchmark_write.py`，不要用系统盘测试结果推断 ext4 HDD。
 - 批次和磁盘比较使用 `benchmarks/sweep_write.py`，可同时传多个 `--root` 并生成 JSON/Markdown 排名。
+- 多分区 FD 压力测试使用 `benchmarks/stress_open_files.py`，报告系统 FD 限制、进程 FD 峰值和分区连接峰值。
 - 详细选择和命令见 [write-performance.md](references/write-performance.md)。
 
 ### 5. 查询

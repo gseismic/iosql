@@ -6,6 +6,10 @@ from .engines import sqlite
 from .spec import TableContract, TableSpec
 
 
+_DEFAULT_MAX_OPEN_PARTITIONS = 5
+_DEFAULT_MAX_CONNECTIONS_PER_FILE = 1
+
+
 def _normalize_pk(value):
     if value is None:
         return None
@@ -19,15 +23,45 @@ class Database(object):
     table是BigTable
     '''
 
-    def __init__(self, uri, verbose=0, pragma_dict=None):
+    def __init__(
+        self,
+        uri,
+        verbose=0,
+        pragma_dict=None,
+        max_open_partitions=_DEFAULT_MAX_OPEN_PARTITIONS,
+        max_connections_per_file=_DEFAULT_MAX_CONNECTIONS_PER_FILE,
+    ):
         self._uri = uri
         self._table_cls = Database.get_engine(uri)
         self._tables = {}
         self.verbose = verbose
         uri_schema, _ = parse_db_schema(uri)
-        if pragma_dict is not None and uri_schema not in ["sqlite", "sqlite3"]:
+        self._uri_schema = uri_schema
+        sqlite_engine = uri_schema in ["sqlite", "sqlite3"]
+        if pragma_dict is not None and not sqlite_engine:
             raise BadArgument("pragma_dict is only supported by the SQLite engine")
+        if not sqlite_engine and (
+            max_open_partitions != _DEFAULT_MAX_OPEN_PARTITIONS
+            or max_connections_per_file != _DEFAULT_MAX_CONNECTIONS_PER_FILE
+        ):
+            raise BadArgument(
+                "SQLite file limits are only supported by the SQLite engine"
+            )
+        self._max_open_partitions = self._positive_int(
+            "max_open_partitions",
+            max_open_partitions,
+        )
+        self._max_connections_per_file = self._positive_int(
+            "max_connections_per_file",
+            max_connections_per_file,
+        )
         self._pragma_dict = pragma_dict
+
+    @staticmethod
+    def _positive_int(name, value):
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise BadArgument(f"{name} must be a positive integer")
+        return value
 
     def __getitem__(self, table_name):
         if table_name not in self._tables:
@@ -35,8 +69,13 @@ class Database(object):
                 "table_name": table_name,
                 "verbose": self.verbose,
             }
-            if self._pragma_dict is not None:
-                table_options["pragma_dict"] = self._pragma_dict
+            if self._uri_schema in ["sqlite", "sqlite3"]:
+                table_options.update({
+                    "max_open_partitions": self._max_open_partitions,
+                    "max_connections_per_file": self._max_connections_per_file,
+                })
+                if self._pragma_dict is not None:
+                    table_options["pragma_dict"] = self._pragma_dict
             table = self._table_cls(self._uri, **table_options)
             self._tables[table_name] = table
         return self._tables[table_name]

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from benchmarks.benchmark_write import daily_batches, run_benchmark
+from benchmarks.stress_open_files import run_stress
 from benchmarks.sweep_write import (
     _markdown_report,
     _positive_int_list,
@@ -77,4 +78,24 @@ def test_run_benchmark_reports_environment_and_cleans_up(tmp_path):
     assert report["run_retained"] is False
     assert report["environment"]["python_version"]
     assert report["environment"]["sqlite_version"]
+    assert not tmp_path.joinpath(report["run_dir"]).exists()
+
+
+def test_open_file_stress_keeps_partition_cache_and_fds_bounded(tmp_path):
+    report = run_stress(
+        SimpleNamespace(
+            root=tmp_path,
+            partitions=10,
+            abandoned_instances=10,
+            max_open_partitions=2,
+            max_connections_per_file=1,
+            gc_every=2,
+            cleanup=True,
+        ),
+        emit=False,
+    )
+
+    assert report["peak_open_partitions"] <= 2
+    assert report["peak_connections"] <= 4
+    assert report["fd_final"] <= report["fd_baseline"] + 3
     assert not tmp_path.joinpath(report["run_dir"]).exists()

@@ -1,9 +1,15 @@
+import gc
 import os
 import sqlite3
 import threading
+import weakref
 import pytest
 from iosql.utils.mysqlite import Database
-from iosql.utils.mysqlite.database import DatabaseConnectionError, DatabaseError
+from iosql.utils.mysqlite.database import (
+    DatabaseConnectionError,
+    DatabaseError,
+    _active_databases,
+)
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
 
 
@@ -63,6 +69,32 @@ class TestBasic:
         assert status['max_connections'] == 2
         assert status['created_connections'] <= 2
         assert db.is_connection_pool_healthy() is True
+
+    def test_single_connection_pool_supports_batch_insert(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0, max_connections=1)
+
+        db['data'].insert_all(
+            [{'id': i, 'value': str(i)} for i in range(20)],
+            pk=['id'],
+            ensure_table=True,
+            batch_size=5,
+        )
+
+        assert db['data'].count() == 20
+        assert db.get_connection_pool_status()['created_connections'] == 1
+        db.close()
+
+    def test_abandoned_database_is_not_kept_alive_by_cleanup_registry(self, tmp_path):
+        db_file = tmp_path / 'abandoned.sqlite3'
+        db = Database(str(db_file), auto_commit=True, verbose=0, max_connections=1)
+        db['data'].insert({'id': 1}, pk=['id'], ensure_table=True)
+        db_ref = weakref.ref(db)
+
+        del db
+        gc.collect()
+
+        assert db_ref() is None
+        assert all(item.db_file != db_file for item in _active_databases)
 
     def test_transaction_commit_and_rollback(self):
         db = Database(TEST_DB, auto_commit=True, verbose=0)

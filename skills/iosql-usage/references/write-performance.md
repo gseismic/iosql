@@ -174,6 +174,37 @@ pragma_dict={"journal_mode": "wal", "synchronous": "off"}
 
 `synchronous=OFF` 在掉电、内核崩溃或存储故障时可能损坏最近事务，不应作为默认生产配置。
 
+## 文件描述符预算
+
+主 API 默认使用：
+
+```python
+db = Database(
+    "sqlite:///media/lsl/G1/market.iosql",
+    max_open_partitions=5,
+    max_connections_per_file=1,
+)
+```
+
+- `max_open_partitions` 限制每张表同时缓存的分区数据库数量，并以 LRU 淘汰。
+- `max_connections_per_file` 限制每个 SQLite 文件的连接数。
+- WAL 模式下每条连接可能同时打开数据库、`-wal`、`-shm`，单表可按
+  `(max_open_partitions + 2) * max_connections_per_file * 3` 粗估 FD 上限。
+- 多线程读取确实需要同文件并发时，可将 `max_connections_per_file` 调到 `2`，
+  但应先在默认系统 FD 限制下运行压力测试。
+- 不要以提高 `ulimit -n` 掩盖连接泄漏；长期进程仍需显式 `close()`。
+
+目标盘验证命令：
+
+```bash
+python benchmarks/stress_open_files.py \
+  --root /media/lsl/G1/iosql-fd-stress \
+  --partitions 500 \
+  --abandoned-instances 150 \
+  --max-open-partitions 5 \
+  --max-connections-per-file 1
+```
+
 ## ext4 HDD 与 NTFS
 
 - Linux 本地 ext4 通常更适合 SQLite 的 WAL、锁和 fsync 语义。

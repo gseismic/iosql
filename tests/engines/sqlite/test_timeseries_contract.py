@@ -872,7 +872,11 @@ def test_segment_append_allows_duplicate_primary_key_across_sealed_segments(tmp_
 
 
 def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
-    db = Database(_uri(tmp_path))
+    db = Database(
+        _uri(tmp_path),
+        max_open_partitions=3,
+        max_connections_per_file=1,
+    )
     ticks = db.timeseries(
         "ticks",
         time="ts",
@@ -883,7 +887,6 @@ def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
         min_rows_per_file=1,
         max_rows_per_file=100,
     )
-    ticks._num_opened_max_allowed = 3
     ticks.write([
         {
             "symbol": "AAPL",
@@ -896,8 +899,32 @@ def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
     rows = ticks.query(order_by="ts").to_list()
 
     assert len(rows) == 10
+    assert ticks.max_open_partitions == 3
+    assert ticks.max_connections_per_file == 1
     assert ticks._open_part_db_count() <= 3
     assert len(ticks._db_parts) <= 3
+    assert all(
+        part_db.get_connection_pool_status()["created_connections"] <= 1
+        for part_db in ticks._db_parts.values()
+    )
+    assert ticks.table_meta_db.get_connection_pool_status()["created_connections"] <= 1
+    assert ticks.meta_db.get_connection_pool_status()["created_connections"] <= 1
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("max_open_partitions", 0),
+        ("max_open_partitions", True),
+        ("max_open_partitions", 1.5),
+        ("max_connections_per_file", 0),
+        ("max_connections_per_file", False),
+        ("max_connections_per_file", "2"),
+    ],
+)
+def test_sqlite_file_limits_require_positive_integers(tmp_path, option, value):
+    with pytest.raises(BadArgument, match=f"{option} must be a positive integer"):
+        Database(_uri(tmp_path), **{option: value})
 
 
 def test_repartition_to_writes_new_database_without_touching_source(tmp_path):

@@ -530,7 +530,7 @@ class Table:
         if not batch_data:
             return
 
-        default_values = self.default_values()
+        default_values = self.default_values(cursor=cursor)
         prepared = getarg_diclist_insertmany_known_fields(
             batch_data,
             default_values,
@@ -828,22 +828,30 @@ class Table:
     def table_name(self) -> str:
         return self._table_name
 
-    def _table_info(self) -> List[Dict]:
+    def _table_info(self, cursor: Optional[sqlite3.Cursor] = None) -> List[Dict]:
         # [{'cid': 0, 'name': 'art_code', 'type': 'TEXT', 'notnull': 0, 'dflt_value': None, 'pk': 1}, 
         if self._table_info_cache is None:
             table = self.table_name
             sql = f"PRAGMA table_info({quoted_sql_text(table)})"
-            with self._get_cursor() as (cursor, conn):
+            if cursor is None:
+                with self._get_cursor() as (owned_cursor, conn):
+                    owned_cursor.execute(sql)
+                    rows = owned_cursor.fetchall()
+            else:
                 cursor.execute(sql)
-                self._table_info_cache = [dict(item) for item in cursor.fetchall()]
+                rows = cursor.fetchall()
+            self._table_info_cache = [dict(item) for item in rows]
         return self._table_info_cache
 
-    def default_values(self) -> Dict[str, Any]:
+    def default_values(
+        self,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> Dict[str, Any]:
         '''
         return default or None
         '''
         if self._default_values_cache is None:
-            infos = self._table_info()
+            infos = self._table_info(cursor=cursor)
             self._default_values_cache = {
                 item['name']: self._normalize_default_value(item['dflt_value'])
                 for item in infos
