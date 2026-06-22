@@ -205,6 +205,21 @@ python benchmarks/stress_open_files.py \
   --max-connections-per-file 1
 ```
 
+G1 权威验证（2026-06-22，提交 `6326a4d`）：
+
+| 项目 | 结果 |
+|------|------|
+| 设备 | `/dev/sdb1`，ext4，USB HDD `Elements 25A1` |
+| Linux / SQLite | `6.8.0-52-generic` / `3.46.0` |
+| FD 软限制 | `1024`，测试未提高 |
+| 分区 / 遗弃实例 | `5000` / `500` |
+| 进程 FD | baseline `4`，peak `41`，final `4` |
+| 分区 / 连接峰值 | `5` / `6` |
+| 压测耗时 | `95.720033s` |
+| Linux 全量测试 | `263 passed, 14 skipped` |
+
+该结果验证的是文件描述符预算和回收，不代表日线或 orderbook 的 rows/s。
+
 ## ext4 HDD 与 NTFS
 
 - Linux 本地 ext4 通常更适合 SQLite 的 WAL、锁和 fsync 语义。

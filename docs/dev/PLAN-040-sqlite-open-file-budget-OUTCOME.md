@@ -111,12 +111,13 @@ elapsed_seconds=1.945297
 ```text
 针对性测试：14 passed
 ulimit -n 256：262 passed, 14 skipped, 1 deselected
+Linux ulimit -n 1024：263 passed, 14 skipped
 ```
 
 被排除的遗留用例 `test_upsert_large_data` 会创建 1 万个日分区，并进行全扫描和
 全量重写。本机运行时 FD 稳定在约 28 至 30，但 WAL LRU 关闭会执行 checkpoint
-和 fsync，导致该反模式布局耗时超过 7 分钟。该用例将在提交后于 Linux 环境继续
-验证；它的耗时不属于 FD 泄漏。
+和 fsync，导致该反模式布局耗时超过 7 分钟。Linux 系统盘全量测试已包含并通过
+该用例，完整套件耗时 93.53 秒；它的本机耗时不属于 FD 泄漏。
 
 ## 文档
 
@@ -126,17 +127,52 @@ ulimit -n 256：262 passed, 14 skipped, 1 deselected
 - troubleshooting 删除修改私有字段和依赖 `ulimit` 的建议。
 - write performance 增加文件描述符预算章节。
 
-## 后续验证
+## G1 验证
 
-提交后在 `/media/lsl/G1`、默认 `ulimit -n=1024` 下执行：
+设备环境：
 
-```bash
-python benchmarks/stress_open_files.py \
-  --root /media/lsl/G1/iosql-fd-stress \
-  --partitions 500 \
-  --abandoned-instances 150 \
-  --max-open-partitions 5 \
-  --max-connections-per-file 1
+```text
+mount=/dev/sdb1
+filesystem=ext4
+options=rw,relatime
+device=Elements 25A1
+transport=usb
+rotational=1
+fd_soft_limit=1024
 ```
 
-并在相同默认限制下运行 Linux 全量测试，结果将在 G1 验证提交中补充。
+第一档：
+
+```text
+partitions=500
+abandoned_instances=150
+fd_baseline=4
+fd_peak=37
+fd_final=4
+peak_open_partitions=5
+peak_connections=6
+elapsed_seconds=14.342122
+```
+
+第二档：
+
+```text
+partitions=5000
+abandoned_instances=500
+fd_baseline=4
+fd_peak=41
+fd_final=4
+peak_open_partitions=5
+peak_connections=6
+elapsed_seconds=95.720033
+```
+
+5000 分区运行期间 `/dev/sdb` 一度达到约 92% util，但 FD 仍保持低位，说明此时
+瓶颈是机械盘 WAL 切换、checkpoint 和 fsync，而不是打开文件数量。两档测试结束
+后 FD 都回落到基线 4，未出现 `EMFILE`。
+
+报告保留在：
+
+```text
+/media/lsl/G1/iosql-benchmark/20260622-6326a4d/fd-stress/
+```

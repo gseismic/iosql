@@ -303,6 +303,11 @@ python benchmarks/stress_open_files.py \
   --max-connections-per-file 1
 ```
 
+2026-06-22 在 G1（`/dev/sdb1`、ext4、USB HDD `Elements 25A1`）验证提交
+`6326a4d`：默认 `ulimit -n=1024` 下，5000 分区写入/全扫描并连续遗弃 500 个
+数据库实例，`fd_peak=41`、`fd_final=4`、`peak_open_partitions=5`，未出现
+`Too many open files`。同环境 Linux 全量测试为 `263 passed, 14 skipped`。
+
 先用较小样本自动比较 G1/ext4 与 Z1/NTFS，并扫描批次和 durability：
 
 ```bash
