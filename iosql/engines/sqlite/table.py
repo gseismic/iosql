@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -40,6 +41,7 @@ from ...table import BaseTable
 from ...utils.column import suggest_sqlite_column_types
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite import Database as MyDatabase
+from ...utils.mysqlite.const import _DEFAULT_PRAGMA as _MYSQLITE_DEFAULT_PRAGMA
 
 # from mysqlite import Database as MyDatabase
 from ...utils.mysqlite.exception import DuplicateColumn, NoSuchColumn, NoSuchTable
@@ -167,7 +169,9 @@ class Table(BaseTable):
     """
 
     def __init__(self, *args, **kwargs):
-        self._pragma_dict = {}  # for all database
+        pragma_dict = kwargs.pop("pragma_dict", None)
+        self._pragma_dict = copy.deepcopy(_MYSQLITE_DEFAULT_PRAGMA)
+        self._pragma_dict.update(pragma_dict or {})
         self._meta_db = None
         self._table_meta_db = None
         self._db_parts = OrderedDict()
@@ -399,11 +403,8 @@ class Table(BaseTable):
             raise BadArgument(f'Unsupported write mode `{mode}`')
         self._ensure_segment_conflict_supported(spec, mode)
 
-        before_parts = set(self.table_parts())
-        before_meta = self.get_table_meta()
         partition = spec.to_partition()
         self._partition = partition
-        partitions_touched = spec.parts_for(rows)
 
         column_type = dict(spec.columns)
         column_type.update(kwargs.pop('column_type', {}) or {})
@@ -411,7 +412,7 @@ class Table(BaseTable):
         replace = mode in ['upsert', 'replace']
         ignore = mode == 'ignore'
 
-        self.insert_all(
+        return self.insert_all(
             rows,
             pk=spec.primary_key,
             partition=partition,
@@ -422,18 +423,6 @@ class Table(BaseTable):
             column_type=column_type,
             table_contract=spec.to_dict(),
             **kwargs,
-        )
-
-        after_parts = set(self.table_parts())
-        after_meta = self.get_table_meta()
-        layout_warnings = self._layout_warnings_for_parts(spec, partitions_touched)
-        return WriteResult(
-            rows_seen=len(rows),
-            rows_written=None if mode == 'ignore' else len(rows),
-            partitions_touched=partitions_touched,
-            partitions_created=sorted(after_parts - before_parts),
-            schema_changed=self._schema_changed(before_meta, after_meta),
-            layout_warnings=layout_warnings,
         )
 
     def write_buffer(self, mode=None, max_rows=10_000, **write_kwargs):
@@ -637,9 +626,11 @@ class Table(BaseTable):
         return before_columns != after_columns
 
     def _layout_warnings_for_parts(self, spec, parts):
+        if not spec.segment:
+            return []
         warnings_ = []
         max_rows = spec.physical_layout.max_rows_per_file
-        for info in self._physical_part_refs(parts):
+        for info in self._segment_infos(parts):
             row_count = info.row_count
             if row_count > max_rows:
                 warnings_.append(
@@ -922,6 +913,7 @@ class Table(BaseTable):
             stats=stats,
             sealed=self._bool_value(row.get('sealed')),
             generation=int(row.get('generation') or 0),
+            created_at=row.get('created_at'),
         )
 
     def _segment_infos(self, logical_parts=None):
@@ -989,10 +981,7 @@ class Table(BaseTable):
             'session_min': info.session_min,
             'session_max': info.session_max,
             'stats_json': json.dumps(info.stats or {}),
-            'created_at': self._segment_created_at(
-                info.logical_part,
-                info.segment_id,
-            ) or now,
+            'created_at': info.created_at or now,
             'updated_at': now,
             'sealed': int(bool(info.sealed)),
             'generation': info.generation,
@@ -1131,6 +1120,113 @@ class Table(BaseTable):
                 bool(existing and existing.sealed)
                 or row_count >= layout.max_rows_per_file
             ),
+            created_at=existing.created_at if existing else None,
+        )
+        self._upsert_segment_info(info)
+        return info
+
+    def _batch_column_stats(self, rows, table_spec):
+        columns = list(table_spec.columns or {})
+        seen = set(columns)
+        for row in rows:
+            for column in row:
+                if column not in seen:
+                    columns.append(column)
+                    seen.add(column)
+
+        stats = {}
+        for column in columns:
+            values = [
+                row[column]
+                for row in rows
+                if column in row and row[column] is not None
+            ]
+            if not values:
+                stats[column] = {'min': None, 'max': None}
+                continue
+            try:
+                stats[column] = {'min': min(values), 'max': max(values)}
+            except TypeError:
+                # 混合不可比较类型时保守禁用该列裁剪，避免错误跳过 segment。
+                stats[column] = {
+                    'min': None,
+                    'max': None,
+                    'complete': False,
+                }
+        return stats
+
+    def _merge_column_stats(self, current, incoming):
+        merged = dict(current or {})
+        for column, bounds in incoming.items():
+            old_bounds = merged.get(column) or {}
+            if (
+                old_bounds.get('complete') is False
+                or bounds.get('complete') is False
+            ):
+                merged[column] = {
+                    'min': None,
+                    'max': None,
+                    'complete': False,
+                }
+                continue
+            old_min = old_bounds.get('min')
+            old_max = old_bounds.get('max')
+            new_min = bounds.get('min')
+            new_max = bounds.get('max')
+            if new_min is None or new_max is None:
+                merged.setdefault(column, {'min': old_min, 'max': old_max})
+                continue
+            if old_min is None or old_max is None:
+                merged[column] = {'min': new_min, 'max': new_max}
+                continue
+            try:
+                merged[column] = {
+                    'min': min(old_min, new_min),
+                    'max': max(old_max, new_max),
+                }
+            except TypeError:
+                merged[column] = {
+                    'min': None,
+                    'max': None,
+                    'complete': False,
+                }
+        return merged
+
+    def _increment_segment_info(self, segment, rows, layout, table_spec):
+        stats = self._merge_column_stats(
+            segment.stats,
+            self._batch_column_stats(rows, table_spec),
+        )
+
+        time_min = segment.time_min
+        time_max = segment.time_max
+        if table_spec.time:
+            time_stats = stats.get(table_spec.time.name) or {}
+            time_min = time_stats.get('min')
+            time_max = time_stats.get('max')
+
+        session_min = segment.session_min
+        session_max = segment.session_max
+        if table_spec.session_column:
+            session_stats = stats.get(table_spec.session_column) or {}
+            session_min = session_stats.get('min')
+            session_max = session_stats.get('max')
+
+        row_count = segment.row_count + len(rows)
+        info = SegmentInfo(
+            logical_part=segment.logical_part,
+            segment_id=segment.segment_id,
+            part_key=segment.part_key,
+            path=segment.path,
+            row_count=row_count,
+            time_min=time_min,
+            time_max=time_max,
+            session_min=session_min,
+            session_max=session_max,
+            stats=stats,
+            sealed=segment.sealed or row_count >= layout.max_rows_per_file,
+            generation=segment.generation,
+            created_at=segment.created_at,
         )
         self._upsert_segment_info(info)
         return info
@@ -1199,6 +1295,14 @@ class Table(BaseTable):
             logical_part=logical_part,
             **part_kwargs,
         )
+        if not replace and not ignore:
+            table_spec = TableContract.ensure(part_kwargs['table_contract'])
+            return self._increment_segment_info(
+                segment,
+                rows,
+                layout,
+                table_spec,
+            )
         return self._refresh_segment_info(
             logical_part,
             segment.segment_id,
@@ -2202,6 +2306,8 @@ class Table(BaseTable):
             )
             # 确保表格建好后，才写meta，确保不删列(不支持)情况下，meta中有的信息, 表中都有
             self.do_create_table(part_dbfile, part_table_name, createtable_meta, alter)
+            # 首次探测不存在的表时 mysqlite 会缓存空 table_info。
+            part_db[part_table_name]._invalidate_cache()
 
             # update meta
             meta_part = part if logical_part is None else logical_part

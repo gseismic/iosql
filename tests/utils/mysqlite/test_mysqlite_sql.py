@@ -2,6 +2,7 @@ import pytest
 from iosql.utils.mysqlite.sql import (
     getsql_create_table,
     getarg_diclist_insertmany,
+    getarg_diclist_insertmany_known_fields,
     _union_fields_of_dictlist
 )
 
@@ -45,3 +46,29 @@ class TestSqlModule:
         assert list_data[0] == [2, 3, None, None]
         assert list_data[1] == [None, 3, 1, None]
         assert list_data[2] == [None, None, 1, 3]
+
+    def test_getarg_diclist_insertmany_known_fields(self):
+        prepared = getarg_diclist_insertmany_known_fields(
+            [
+                {"id": 1, "name": "A"},
+                {"id": 2},
+            ],
+            {"id": None, "name": "unknown"},
+        )
+
+        fields, list_data = prepared
+        assert list(fields) == ["id", "name"]
+        assert list_data == [[1, "A"], [2, "unknown"]]
+        full_fields, full_data = getarg_diclist_insertmany_known_fields(
+            [
+                {"id": 1, "name": "A"},
+                {"name": "B", "id": 2},
+            ],
+            {"id": None, "name": None},
+        )
+        assert list(full_fields) == ["id", "name"]
+        assert full_data == [(1, "A"), (2, "B")]
+        assert getarg_diclist_insertmany_known_fields(
+            [{"id": 1, "extra": "new"}],
+            {"id": None},
+        ) is None

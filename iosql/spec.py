@@ -920,6 +920,7 @@ class SegmentInfo:
     stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     sealed: bool = False
     generation: int = 0
+    created_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {

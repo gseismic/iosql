@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from operator import itemgetter
 from typing import Dict, List, Tuple, Union, Optional, Any
 
 """
@@ -79,6 +80,44 @@ def getarg_diclist_insertmany(data: List[Dict[str, Any]], defaults: Dict[str, An
                 if f not in row:
                     row[f] = defaults.get(f)
         list_values.append([row.get(k) for k in field_keys])
+    return fields, list_values
+
+
+def getarg_diclist_insertmany_known_fields(
+    data: List[Dict[str, Any]],
+    defaults: Dict[str, Any],
+) -> Optional[Tuple[OrderedDict[str, Optional[str]], List[List[Any]]]]:
+    """固定表结构的批量参数快速路径。
+
+    如果批次出现未知字段则返回 None，让调用方回退到字段 union 和 schema evolve 路径。
+    """
+    if not defaults:
+        return None
+
+    fields = OrderedDict((field, None) for field in defaults)
+    default_keys = defaults.keys()
+    if all(
+        len(item) == len(defaults) and item.keys() == default_keys
+        for item in data
+    ):
+        if len(fields) == 1:
+            field = next(iter(fields))
+            return fields, [(item[field],) for item in data]
+        getter = itemgetter(*fields)
+        return fields, list(map(getter, data))
+
+    for item in data:
+        if any(field not in defaults for field in item):
+            return None
+
+    field_names = list(fields)
+    list_values = [
+        [
+            item[field] if field in item else defaults[field]
+            for field in field_names
+        ]
+        for item in data
+    ]
     return fields, list_values
 
 

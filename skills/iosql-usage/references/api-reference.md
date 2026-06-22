@@ -15,7 +15,7 @@
 
 ## 核心入口
 
-### `Database(uri, verbose=0)`
+### `Database(uri, verbose=0, pragma_dict=None)`
 
 数据库入口。支持 `sqlite://` 和 `postgresql://` URI。
 
@@ -27,6 +27,7 @@
 |------|------|------|
 | `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` 或 `"postgresql://user:pass@localhost:5432/mydb"` |
 | `verbose` | `int` | 日志详细度，`0`=静默 |
+| `pragma_dict` | `dict`/`None` | 仅 SQLite；覆盖默认 balanced PRAGMA，例如 `{"synchronous": "full"}` |
 
 **上下文管理器**：
 

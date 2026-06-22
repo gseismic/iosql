@@ -189,6 +189,113 @@ with table.write_buffer(max_rows=10_000) as buffer:
     ])
 ```
 
+### 大批量写入性能
+
+历史回灌和高频流不要逐行调用 `write()`。日线数据建议从每批 `50_000` 行开始测；orderbook/tick 建议从每批 `50_000` 至 `100_000` 行开始测。
+
+20 年、每天约 5000 支股票的日线约为 2500 万行。此类数据通常按年分区比按日分区更合理：
+
+```python
+daily = db.table(
+    "daily",
+    pk=["symbol", "date"],
+    columns={
+        "symbol": "text",
+        "date": "text",
+        "open": "real",
+        "high": "real",
+        "low": "real",
+        "close": "real",
+        "volume": "integer",
+        "amount": "real",
+    },
+    partition="calendar(date,every=1year,tz=Asia/Shanghai)",
+    order_key="date",
+    conflict="append",
+)
+
+for rows in source_batches:
+    daily.write(rows)
+```
+
+orderbook/tick 优先使用 append-only + 日逻辑分区 + row segment：
+
+```python
+from iosql import Segment
+
+book = db.table(
+    "orderbook",
+    pk=["event_id"],
+    columns={
+        "event_id": "integer",
+        "symbol": "text",
+        "ts": "integer",
+        "sequence": "integer",
+        "side": "text",
+        "price": "real",
+        "size": "integer",
+    },
+    partition="duration(ts,every=1day)",
+    segment=Segment.rows(max_rows=1_000_000),
+    order_key="ts",
+    conflict="append",
+)
+
+with book.write_buffer(max_rows=100_000) as buffer:
+    for rows in stream_batches:
+        buffer.append(rows)
+```
+
+默认 SQLite 配置是适合持续导入的 balanced 模式：`journal_mode=WAL`、`synchronous=NORMAL`、64 MiB page cache。需要更强断电保障时显式改为 `FULL`：
+
+```python
+db = Database(
+    "sqlite:///media/lsl/G1/market.iosql",
+    pragma_dict={
+        "journal_mode": "wal",
+        "synchronous": "full",
+        "cache_size": "-64000",
+        "temp_store": "memory",
+        "busy_timeout": "30000",
+    },
+)
+```
+
+只有原始抓取数据可确定重放时才考虑 `synchronous=OFF`；掉电或系统崩溃时它可能损坏最近事务。
+
+在 Linux ext4 HDD 上直接运行目标盘 benchmark：
+
+```bash
+python benchmarks/benchmark_write.py daily \
+  --root /media/lsl/G1/iosql-bench \
+  --rows 25000000 \
+  --batch-size 50000 \
+  --profile balanced
+
+python benchmarks/benchmark_write.py orderbook \
+  --root /media/lsl/G1/iosql-bench \
+  --rows 100000000 \
+  --batch-size 100000 \
+  --segment-rows 1000000 \
+  --profile balanced
+```
+
+先用较小样本自动比较 G1/ext4 与 Z1/NTFS，并扫描批次和 durability：
+
+```bash
+python benchmarks/sweep_write.py daily \
+  --root /media/lsl/G1/iosql-bench \
+  --root /media/lsl/Z1/iosql-bench \
+  --rows 2000000 \
+  --batch-sizes 20000,50000,100000 \
+  --profiles balanced,durable \
+  --output /tmp/iosql-daily-disk-compare.json
+```
+
+扫描默认删除每个组合的临时数据库，只保留汇总 JSON 和同名 Markdown；确认最佳参数后，再在 G1 上运行 2500 万行完整测试。
+
+比较 ext4 与 NTFS 时必须保持 workload、行数、batch size 和 profile 相同。Linux 本地 ext4 通常更适合 SQLite WAL，但最终以目标机器实测为准。HDD 单盘建议每张逻辑表保持单 writer，避免多个导入任务并行制造随机寻道。
+
 ### 查询
 
 ```python

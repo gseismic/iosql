@@ -4,11 +4,12 @@ from .utils.schema import parse_db_schema
 
 class BaseTable(metaclass=ABCMeta):
 
-    def __init__(self, uri, table_name, verbose=0):
+    def __init__(self, uri, table_name, verbose=0, **engine_options):
         self._uri = uri
         self._table_name = table_name
         self._uri_schema, self._uri_options = parse_db_schema(uri)
         self.verbose = verbose
+        self._engine_options = dict(engine_options)
         self.connect()
 
     def __enter__(self):

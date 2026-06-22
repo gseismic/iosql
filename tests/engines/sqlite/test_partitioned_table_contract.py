@@ -221,3 +221,120 @@ def test_row_segment_late_data_scans_overlapping_segments_and_skips_others(tmp_p
     assert plan["requires_global_sort"] is True
 
     db.close()
+
+
+def test_write_hot_path_does_not_scan_legacy_file_stats(tmp_path, monkeypatch):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "daily",
+        pk=["symbol", "date"],
+        columns={
+            "symbol": "text",
+            "date": "text",
+            "close": "real",
+        },
+        partition=Partition.calendar("date", every="1year", timezone="UTC"),
+    )
+    table.write({"symbol": "A", "date": "2026-01-01", "close": 1.0})
+
+    def fail_if_scanned(*args, **kwargs):
+        raise AssertionError("写入热路径不应扫描整个数据文件")
+
+    monkeypatch.setattr(table, "_data_file_column_stats", fail_if_scanned)
+    result = table.write(
+        {"symbol": "B", "date": "2026-01-01", "close": 2.0}
+    )
+
+    assert result.rows_seen == 1
+    assert result.layout_warnings == []
+    part_table = next(iter(table._db_parts.values()))["data"]
+    assert list(part_table.default_values()) == ["symbol", "date", "close"]
+    db.close()
+
+
+def test_segment_append_uses_incremental_manifest_stats(tmp_path, monkeypatch):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "orderbook",
+        pk=["event_id"],
+        columns={
+            "event_id": "integer",
+            "ts": "integer",
+            "bid": "real",
+        },
+        segment=Segment.rows(max_rows=10),
+        order_key="ts",
+    )
+
+    def fail_if_refreshed(*args, **kwargs):
+        raise AssertionError("append-only segment 不应全量刷新统计")
+
+    monkeypatch.setattr(table, "_refresh_segment_info", fail_if_refreshed)
+    table.write([
+        {"event_id": 1, "ts": 10, "bid": 1.1},
+        {"event_id": 2, "ts": 20, "bid": 1.2},
+    ])
+    table.write([
+        {"event_id": 3, "ts": 5, "bid": 1.0},
+    ])
+
+    segment = table.segments()[0]
+    assert segment["row_count"] == 3
+    assert segment["stats"]["ts"] == {"min": 5, "max": 20}
+    assert segment["stats"]["bid"] == {"min": 1.0, "max": 1.2}
+    db.close()
+
+
+def test_segment_mixed_type_stats_remain_conservative(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "mixed",
+        pk=["event_id"],
+        columns={"event_id": "integer", "value": "text"},
+        segment=Segment.rows(max_rows=10),
+    )
+
+    table.write({"event_id": 1, "value": 10})
+    table.write({"event_id": 2, "value": "text"})
+    table.write({"event_id": 3, "value": 20})
+
+    assert table.segments()[0]["stats"]["value"] == {
+        "min": None,
+        "max": None,
+        "complete": False,
+    }
+    db.close()
+
+
+def test_sqlite_write_pragmas_default_and_override(tmp_path):
+    default_db = Database(_uri(tmp_path, "default.iosql"))
+    default_table = default_db.table(
+        "rows",
+        pk=["id"],
+        columns={"id": "integer"},
+    )
+    default_table.write({"id": 1})
+
+    for physical_db in [
+        default_table.table_meta_db,
+        next(iter(default_table._db_parts.values())),
+    ]:
+        with physical_db.get_connection() as conn:
+            assert conn.execute("pragma journal_mode").fetchone()[0] == "wal"
+            assert conn.execute("pragma synchronous").fetchone()[0] == 1
+    default_db.close()
+
+    full_db = Database(
+        _uri(tmp_path, "full.iosql"),
+        pragma_dict={"synchronous": "full"},
+    )
+    full_table = full_db.table(
+        "rows",
+        pk=["id"],
+        columns={"id": "integer"},
+    )
+    full_table.write({"id": 1})
+    with full_table.table_meta_db.get_connection() as conn:
+        assert conn.execute("pragma journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("pragma synchronous").fetchone()[0] == 2
+    full_db.close()

@@ -28,6 +28,7 @@ from .sql import (
     suggest_data_columns,
     getsql_query_table, quoted_sql_text, sql_literal,
     getarg_diclist_insertmany,
+    getarg_diclist_insertmany_known_fields,
     suggest_columns
 )
 from .const import META_TABLE_NAME
@@ -488,8 +489,13 @@ class Table:
             return
 
         default_values = self.default_values()
-        od_fields, list_values = getarg_diclist_insertmany(batch_data,
-                                                           default_values)
+        prepared = getarg_diclist_insertmany_known_fields(
+            batch_data,
+            default_values,
+        )
+        if prepared is None:
+            prepared = getarg_diclist_insertmany(batch_data, default_values)
+        od_fields, list_values = prepared
         fields = list(od_fields.keys())
         sql = getsqlarg_dict_insertmany(self._table_name, fields, replace=replace, ignore=ignore)
         # list_values = [tuple(kv.values()) for kv in batch_data] 
@@ -525,26 +531,50 @@ class Table:
             return
 
         default_values = self.default_values()
-        od_fields, list_values = getarg_diclist_insertmany(batch_data, default_values)
+        prepared = getarg_diclist_insertmany_known_fields(
+            batch_data,
+            default_values,
+        )
+        if prepared is None:
+            prepared = getarg_diclist_insertmany(batch_data, default_values)
+        od_fields, list_values = prepared
         fields = list(od_fields.keys())
         sql = getsqlarg_dict_insertmany(self._table_name, fields, replace=replace, ignore=ignore)
         
         try:
-            self._executemany_on_connection(cursor, conn, sql, list_values)
+            self._executemany_on_connection(
+                cursor,
+                conn,
+                sql,
+                list_values,
+                commit=False,
+            )
         except NoSuchTable as e:
             if ensure_table:
                 # Note 这里忽略了not_null等参数, 用了默认数值
                 # 用户能传的只有 columns(包含了not_null等信息), pk
                 columns = suggest_columns(od_fields)
                 self._create_table_on_connection(cursor, conn, columns, **kwargs)
-                self._executemany_on_connection(cursor, conn, sql, list_values)
+                self._executemany_on_connection(
+                    cursor,
+                    conn,
+                    sql,
+                    list_values,
+                    commit=False,
+                )
             else:
                 raise e
         except NoSuchColumn as e:
             if ensure_column:
                 self._ensure_columns_on_connection(cursor, conn, od_fields)
                 # self.ensure_columns_like(batch_data[0])
-                self._executemany_on_connection(cursor, conn, sql, list_values)
+                self._executemany_on_connection(
+                    cursor,
+                    conn,
+                    sql,
+                    list_values,
+                    commit=False,
+                )
             else:
                  raise e
 
@@ -658,8 +688,8 @@ class Table:
                         ensure_column=ensure_column, **kwargs
                     )
                 
-                # 提交整个事务
-                if commit and own_transaction:
+                # 连接池不能把未结束事务放回池中；外层 transaction() 存在时由外层提交。
+                if own_transaction:
                     conn.commit()
                     
             except Exception as e:

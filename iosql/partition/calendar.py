@@ -1,4 +1,5 @@
 import re
+from functools import lru_cache
 from typing import Any, Dict
 import arrow
 from .base import Partition
@@ -82,6 +83,9 @@ class CalendarPartition(Partition):
         count, unit = self.parse_every(self.every or self.default_every_for_fmt(fmt))
         self._every_count = count
         self._every_unit = unit
+        self._key_for_value = lru_cache(maxsize=4096)(
+            self._key_for_value_uncached
+        )
 
     @classmethod
     def parse_every(cls, every: Any) -> tuple[int, str]:
@@ -160,6 +164,10 @@ class CalendarPartition(Partition):
         }[self._every_unit]
         return {plural: self._every_count}
     
+    def _key_for_value_uncached(self, value: Any) -> str:
+        dt = arrow.get(value).to(self.tz)
+        return self._bucket_start(dt).format(self.fmt)
+
     def get_key(self, row: Dict[str, Any]) -> str:
         """Get partition key as formatted string.
         
@@ -169,8 +177,13 @@ class CalendarPartition(Partition):
         Returns:
             Formatted partition key string
         """
-        dt = arrow.get(row[self.TS_COL]).to(self.tz)
-        return self._bucket_start(dt).format(self.fmt)
+        value = row[self.TS_COL]
+        try:
+            return self._key_for_value(value)
+        except TypeError:
+            # 非 hashable 自定义日期对象仍走兼容路径。
+            dt = arrow.get(value).to(self.tz)
+            return self._bucket_start(dt).format(self.fmt)
     
     def get_range(self, key: str) -> tuple[int, int]:
         """Get [start_ms, end_ms) range for partition key.

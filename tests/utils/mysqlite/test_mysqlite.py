@@ -1,4 +1,5 @@
 import os
+import sqlite3
 import threading
 import pytest
 from iosql.utils.mysqlite import Database
@@ -235,6 +236,27 @@ class TestInsert:
         ], ensure_table=True)
 
         assert db['data5'].column_info()['column_type']['value'] == 'float'
+
+    def test_insert_all_batches_are_one_atomic_transaction(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['atomic'].create_table([
+            {'name': 'id', 'type': 'integer'},
+            {'name': 'value', 'type': 'text'},
+        ], pk=['id'])
+        db['atomic'].insert({'id': 1, 'value': 'before'})
+
+        with pytest.raises(sqlite3.IntegrityError):
+            db['atomic'].insert_all(
+                [
+                    {'id': 2, 'value': 'must rollback'},
+                    {'id': 1, 'value': 'duplicate'},
+                ],
+                batch_size=1,
+            )
+
+        assert db['atomic'].select_all('*', order_by='id') == [
+            {'id': 1, 'value': 'before'},
+        ]
 
 
 class TestDelete:

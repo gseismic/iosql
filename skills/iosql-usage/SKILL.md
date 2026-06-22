@@ -227,6 +227,15 @@ with table.write_buffer(max_rows=10_000) as buf:
 # mode="upsert"/"replace"：覆盖写；当前不支持 Segment.rows 表
 ```
 
+大批量写入建议：
+
+- 日线历史回灌从每批 `50_000` 行开始测，按年分区通常优于按日创建大量小文件。
+- orderbook/tick 使用 append-only，建议每批 `50_000` 至 `100_000` 行，并配置 `Segment.rows(max_rows=...)`。
+- iosql 默认 SQLite 写入配置是 `WAL + synchronous=NORMAL`；更强断电保障可传 `Database(..., pragma_dict={"journal_mode": "wal", "synchronous": "full"})`。
+- 目标盘必须运行仓库 `benchmarks/benchmark_write.py`，不要用系统盘测试结果推断 ext4 HDD。
+- 批次和磁盘比较使用 `benchmarks/sweep_write.py`，可同时传多个 `--root` 并生成 JSON/Markdown 排名。
+- 详细选择和命令见 [write-performance.md](references/write-performance.md)。
+
 ### 5. 查询
 
 **时序查询（timeseries 表）**：
@@ -341,4 +350,5 @@ with Database("sqlite://db/test.iosql") as db:
   - `07_partition_string_repartition_cli.py` —— 字符串 partition + CLI 重分区
   - `finance/` —— 金融场景：K线、orderbook、财报、新闻
 - **错误排查**：[troubleshooting.md](references/troubleshooting.md)
+- **写入性能**：[write-performance.md](references/write-performance.md) —— 2500 万行日线、orderbook、ext4 HDD benchmark、批次/分区/segment/PRAGMA 最佳实践
 - **API 签名**：[api-reference.md](references/api-reference.md)

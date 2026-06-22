@@ -112,6 +112,15 @@ class TestCalendarPartition:
         key = p.get_key(row)
         assert key == '202401'
 
+    def test_get_key_caches_repeated_calendar_values(self):
+        p = CalendarPartition(fmt='YYYY', tz='Asia/Shanghai', ts_col='date')
+        row = {'date': '2024-01-15'}
+        hits_before = p._key_for_value.cache_info().hits
+
+        assert p.get_key(row) == '2024'
+        assert p.get_key(row) == '2024'
+        assert p._key_for_value.cache_info().hits == hits_before + 1
+
     def test_get_range(self):
         p = CalendarPartition(fmt='YYYYMMDD', tz='UTC', ts_col='date')
         key = '20240115'

@@ -18,7 +18,7 @@ class DatabaseConnectionPool:
         self._created_connections = 0
         self._checked_out = 0
         self._lock = threading.Lock()
-        self._pragma_dict = pragma_dict or {}
+        self._pragma_dict = pragma_dict if pragma_dict is not None else {}
         self._conn_kwargs = kwargs
         self._closed = False
 

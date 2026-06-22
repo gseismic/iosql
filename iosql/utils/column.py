@@ -61,6 +61,14 @@ def suggest_column_types(data, column_type=None, n_check=None):
     out_column_types = OrderedDict()
 
     column_type = column_type or {}
+    if column_type:
+        data_fields = set()
+        rows_to_check = data if n_check is None else data[:n_check]
+        for row in rows_to_check:
+            data_fields.update(row)
+        if data_fields.issubset(column_type):
+            return OrderedDict(column_type)
+
     kvalue_types = sqlite_types_of_data(data, n_check)
     for column, type_by_data in kvalue_types.items():
         if column in column_type:
