@@ -2,6 +2,7 @@ import pytest
 
 from iosql import Database, Partition, Segment
 from iosql.exception import BadArgument
+from iosql.partition import RangePartition
 
 
 def _uri(tmp_path, name="partitioned.iosql"):
@@ -56,6 +57,37 @@ def test_range_partition_contract_has_no_time_key_and_prunes(tmp_path):
     assert plan["skipped_partitions"] == [0, 2000]
     assert [item["logical_part"] for item in plan["candidate_segments"]] == [1000]
 
+    db.close()
+
+
+def test_insert_all_computes_partition_key_once_per_row(tmp_path):
+    class CountingRangePartition(RangePartition):
+        def __init__(self):
+            super().__init__(width=1000, column="seq")
+            self.calls = 0
+
+        def get_key(self, row):
+            self.calls += 1
+            return super().get_key(row)
+
+    db = Database(_uri(tmp_path))
+    table = db["metrics"]
+    partition = CountingRangePartition()
+    rows = [
+        {"seq": 10, "value": 1.0},
+        {"seq": 1010, "value": 2.0},
+        {"seq": 2010, "value": 3.0},
+    ]
+
+    result = table.insert_all(
+        rows,
+        pk=["seq"],
+        partition=partition,
+        column_type={"seq": "integer", "value": "real"},
+    )
+
+    assert partition.calls == len(rows)
+    assert result.partitions_touched == [0, 1000, 2000]
     db.close()
 
 
@@ -282,6 +314,60 @@ def test_segment_append_uses_incremental_manifest_stats(tmp_path, monkeypatch):
     assert segment["row_count"] == 3
     assert segment["stats"]["ts"] == {"min": 5, "max": 20}
     assert segment["stats"]["bid"] == {"min": 1.0, "max": 1.2}
+    db.close()
+
+
+def test_segment_stats_columns_limit_optional_stats_and_keep_pruning_keys(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "orderbook",
+        pk=["event_id"],
+        columns={
+            "event_id": "integer",
+            "symbol": "text",
+            "ts": "integer",
+            "sequence": "integer",
+            "price": "real",
+            "size": "integer",
+        },
+        partition="duration(ts,every=1day)",
+        segment=Segment.rows(
+            max_rows=2,
+            stats_columns=["sequence"],
+        ),
+        order_key="ts",
+    )
+
+    table.write([
+        {
+            "event_id": index,
+            "symbol": "A",
+            "ts": 1_767_225_600_000 + index,
+            "sequence": index,
+            "price": 10.0 + index,
+            "size": 100 + index,
+        }
+        for index in range(4)
+    ])
+
+    segments = table.segments()
+    assert set(segments[0]["stats"]) == {"ts", "sequence"}
+    plan = table.explain_select(
+        where={
+            "field": "sequence",
+            "op": "between_and",
+            "value": [2, 3],
+        },
+    ).to_dict()
+    assert {item["segment_id"] for item in plan["scanned_segments"]} == {1}
+    assert {item["segment_id"] for item in plan["skipped_segments"]} == {0}
+
+    price_plan = table.explain_select(
+        where={"field": "price", "op": ">", "value": 1000},
+    ).to_dict()
+    assert {
+        item["segment_id"] for item in price_plan["scanned_segments"]
+    } == {0, 1}
     db.close()
 
 

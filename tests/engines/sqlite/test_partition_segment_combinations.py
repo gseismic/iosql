@@ -499,10 +499,21 @@ class TestSegmentOnly:
         assert s.max_rows == 500_000
         assert s.target_rows == 500_000
         assert s.min_rows == 500_000
+        assert s.stats_columns is None
 
         s2 = Segment.rows(max_rows=1000, target_rows=800, min_rows=200)
         assert s2.target_rows == 800
         assert s2.min_rows == 200
+
+        s3 = Segment.rows(
+            max_rows=1000,
+            stats_columns=["ts", "sequence", "ts"],
+        )
+        assert s3.stats_columns == ["ts", "sequence"]
+        assert Segment.from_dict(s3.to_dict()) == s3
+        assert Segment.rows(stats_columns="ts").stats_columns == ["ts"]
+        with pytest.raises(BadArgument):
+            Segment.rows(stats_columns=[""])
 
         # 约束校验
         with pytest.raises(BadArgument):

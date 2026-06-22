@@ -202,7 +202,12 @@ Partition.range("seq", every=10000)
 from iosql import Segment
 
 # 三级阈值配置
-Segment.rows(max_rows=500_000, target_rows=400_000, min_rows=300_000)
+Segment.rows(
+    max_rows=500_000,
+    target_rows=400_000,
+    min_rows=300_000,
+    stats_columns=["ts", "sequence"],
+)
 ```
 
 | 参数 | 默认值 | 说明 |
@@ -212,7 +217,20 @@ Segment.rows(max_rows=500_000, target_rows=400_000, min_rows=300_000)
 | `target_rows` | `max_rows` | 目标行数 |
 | `min_rows` | `min(target_rows, max_rows)` | 最小行数 |
 
+签名：
+
+```python
+Segment.rows(
+    max_rows=500_000,
+    target_rows=None,
+    min_rows=None,
+    stats_columns=None,
+)
+```
+
 约束：`max_rows >= target_rows >= min_rows > 0`
+
+`stats_columns=None` 默认统计全部列。显式列表可减少高频宽表的 min/max 维护成本；partition column、time、`order_key`、`session_column` 会自动补入必要统计列。
 
 ---
 

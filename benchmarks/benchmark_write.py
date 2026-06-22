@@ -239,7 +239,10 @@ def create_table(db: Database, workload: str, segment_rows: int):
             "size": "integer",
         },
         partition="duration(ts,every=1day)",
-        segment=Segment.rows(max_rows=segment_rows),
+        segment=Segment.rows(
+            max_rows=segment_rows,
+            stats_columns=["ts", "sequence"],
+        ),
         order_key="ts",
         conflict="append",
     )

@@ -115,7 +115,10 @@ book = db.table(
         "size": "integer",
     },
     partition="duration(ts,every=1day)",
-    segment=Segment.rows(max_rows=1_000_000),
+    segment=Segment.rows(
+        max_rows=1_000_000,
+        stats_columns=["ts", "sequence"],
+    ),
     order_key="ts",
     conflict="append",
 )
@@ -130,6 +133,7 @@ with book.write_buffer(max_rows=100_000) as buffer:
 - append-only 是高吞吐前提；`Segment.rows` 当前不支持高效跨 segment upsert。
 - `write_buffer` 的 `max_rows` 是内存 flush 阈值，不是 SQLite 持久化 WAL。
 - segment 可从 100 万行开始测；宽表可降低到 20 万至 50 万行，窄表可提高。
+- 默认会为所有列维护 min/max。宽表只需要按时间/序列裁剪时，使用 `stats_columns` 限制统计列；未统计字段仍可查询，但查询计划会保守扫描。
 - 写入顺序尽量与 `order_key` 一致，晚到数据会扩大 segment 范围并降低查询裁剪效率。
 - 不要每条事件调用一次 `write()`；HDD 上应聚合到至少数千行，通常 5 万至 10 万行更合适。
 

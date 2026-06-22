@@ -346,11 +346,8 @@ class Table(BaseTable):
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
         rows = self._add_extra_data(data, extra_data)
-        partitions_touched = (
-            contract.parts_for(rows) if contract else self._parts_for_runtime_partition(rows, partition)
-        )
 
-        self.do_insert_all(
+        partitions_touched = self.do_insert_all(
             rows,
             pk=pk,
             partition=partition,
@@ -1126,13 +1123,27 @@ class Table(BaseTable):
         return info
 
     def _batch_column_stats(self, rows, table_spec):
-        columns = list(table_spec.columns or {})
-        seen = set(columns)
-        for row in rows:
-            for column in row:
-                if column not in seen:
-                    columns.append(column)
-                    seen.add(column)
+        configured = table_spec.segment.stats_columns
+        if configured is None:
+            columns = list(table_spec.columns or {})
+            seen = set(columns)
+            for row in rows:
+                for column in row:
+                    if column not in seen:
+                        columns.append(column)
+                        seen.add(column)
+        else:
+            required = []
+            partition = table_spec.to_partition()
+            if partition is not None:
+                required.append(partition.TS_COL)
+            if table_spec.time:
+                required.append(table_spec.time.name)
+            if table_spec.order_key:
+                required.append(table_spec.order_key)
+            if table_spec.session_column:
+                required.append(table_spec.session_column)
+            columns = list(dict.fromkeys(list(configured) + required))
 
         stats = {}
         for column in columns:
@@ -2155,6 +2166,8 @@ class Table(BaseTable):
                 )
         _t2 = time.time()
         logger.debug(f"Insert Time: {_t2 - _t1}")
+        keys = list(partitioned_data)
+        return keys if len(keys) <= 1 else sorted(keys)
 
     def _do_insert_segmented(
         self,

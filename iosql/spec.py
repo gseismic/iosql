@@ -432,6 +432,7 @@ class Segment:
     max_rows: int = 500_000
     target_rows: Optional[int] = None
     min_rows: Optional[int] = None
+    stats_columns: Optional[List[str]] = None
 
     def __post_init__(self):
         self.kind = str(self.kind or "rows").lower()
@@ -440,6 +441,14 @@ class Segment:
         self.max_rows = int(self.max_rows)
         self.target_rows = int(self.target_rows or self.max_rows)
         self.min_rows = int(self.min_rows or min(self.target_rows, self.max_rows))
+        if self.stats_columns is not None:
+            if isinstance(self.stats_columns, str):
+                self.stats_columns = [self.stats_columns]
+            self.stats_columns = list(dict.fromkeys(
+                str(column).strip() for column in self.stats_columns
+            ))
+            if any(not column for column in self.stats_columns):
+                raise BadArgument("segment stats_columns must not contain empty names")
         if self.max_rows <= 0:
             raise BadArgument("segment max_rows must be positive")
         if self.target_rows <= 0:
@@ -453,12 +462,14 @@ class Segment:
 
     @classmethod
     def rows(cls, max_rows: int = 500_000, target_rows: Optional[int] = None,
-             min_rows: Optional[int] = None) -> "Segment":
+             min_rows: Optional[int] = None,
+             stats_columns: Optional[List[str]] = None) -> "Segment":
         return cls(
             kind="rows",
             max_rows=max_rows,
             target_rows=target_rows,
             min_rows=min_rows,
+            stats_columns=stats_columns,
         )
 
     def to_physical_layout(self) -> PhysicalLayout:
@@ -474,6 +485,11 @@ class Segment:
             "max_rows": self.max_rows,
             "target_rows": self.target_rows,
             "min_rows": self.min_rows,
+            "stats_columns": (
+                list(self.stats_columns)
+                if self.stats_columns is not None
+                else None
+            ),
         }
 
     @classmethod
@@ -485,6 +501,7 @@ class Segment:
             max_rows=data.get("max_rows", data.get("max_rows_per_file", 500_000)),
             target_rows=data.get("target_rows", data.get("target_rows_per_file")),
             min_rows=data.get("min_rows", data.get("min_rows_per_file")),
+            stats_columns=data.get("stats_columns"),
         )
 
 

@@ -231,6 +231,7 @@ with table.write_buffer(max_rows=10_000) as buf:
 
 - 日线历史回灌从每批 `50_000` 行开始测，按年分区通常优于按日创建大量小文件。
 - orderbook/tick 使用 append-only，建议每批 `50_000` 至 `100_000` 行，并配置 `Segment.rows(max_rows=...)`。
+- 高频宽表可用 `Segment.rows(..., stats_columns=["ts", "sequence"])` 限制 min/max 统计开销；partition/time/order/session 字段会自动保留。
 - iosql 默认 SQLite 写入配置是 `WAL + synchronous=NORMAL`；更强断电保障可传 `Database(..., pragma_dict={"journal_mode": "wal", "synchronous": "full"})`。
 - 目标盘必须运行仓库 `benchmarks/benchmark_write.py`，不要用系统盘测试结果推断 ext4 HDD。
 - 批次和磁盘比较使用 `benchmarks/sweep_write.py`，可同时传多个 `--root` 并生成 JSON/Markdown 排名。
@@ -315,7 +316,7 @@ with Database("sqlite://db/test.iosql") as db:
 - 查询 API 优先表达业务条件：`symbols/start/end/date/session/where/order_by/limit`。
 - 复杂 where 优先使用受支持的 dict/list/`Case` 或文本 where，不要拼接原始 SQL。
 - 代码结构按层理解：`iosql.core.query` 是通用查询 AST/where 解析；`iosql.engines.sqlite` / `iosql.engines.postgresql` 是引擎实现；旧 `iosql.query` / `iosql.sqlite` / `iosql.postgresql` 包已删除。
-- `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数，合理配置以控制文件大小。
+- `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数和可选 `stats_columns`，合理配置以控制文件大小及统计开销。
 - `repartition_to()` 写入新库，不要假设它会原地修改源库。
 - 测试必须覆盖写入结果、查询结果和必要的 `explain()` 裁剪信息。
 - 修改核心行为时，至少跑相关 sqlite 契约测试、partition 测试和 mysqlite 测试。

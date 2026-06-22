@@ -236,7 +236,10 @@ book = db.table(
         "size": "integer",
     },
     partition="duration(ts,every=1day)",
-    segment=Segment.rows(max_rows=1_000_000),
+    segment=Segment.rows(
+        max_rows=1_000_000,
+        stats_columns=["ts", "sequence"],
+    ),
     order_key="ts",
     conflict="append",
 )
@@ -295,6 +298,8 @@ python benchmarks/sweep_write.py daily \
 扫描默认删除每个组合的临时数据库，只保留汇总 JSON 和同名 Markdown；确认最佳参数后，再在 G1 上运行 2500 万行完整测试。
 
 比较 ext4 与 NTFS 时必须保持 workload、行数、batch size 和 profile 相同。Linux 本地 ext4 通常更适合 SQLite WAL，但最终以目标机器实测为准。HDD 单盘建议每张逻辑表保持单 writer，避免多个导入任务并行制造随机寻道。
+
+`Segment.rows()` 默认统计所有列的 min/max，以支持任意字段裁剪。高频宽表如果只按时间、序列等字段查询，可通过 `stats_columns` 限制可选统计列；partition column、time、`order_key` 和 `session_column` 会自动保留。未统计字段仍可查询，只是不能依靠 segment stats 跳过文件。
 
 ### 查询
 
