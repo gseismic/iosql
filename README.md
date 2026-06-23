@@ -315,7 +315,7 @@ python benchmarks/stress_open_files.py \
 
 2026-06-23 修复进程预算与并发 LRU 后再次在 G1 验证：进程预算 `16`，5000 分区
 和 500 个遗弃实例下，真实连接峰值 `15`，FD `4 -> 48 -> 4`，分区峰值 `5`；
-Linux 默认 `ulimit -n=1024` 全量测试为 `273 passed, 14 skipped`。
+Linux 默认 `ulimit -n=1024` 最终全量测试为 `278 passed, 14 skipped`。
 
 先用较小样本自动比较 G1/ext4 与 Z1/NTFS，并扫描批次和 durability：
 

@@ -39,6 +39,12 @@ def test_existing_database_example_is_self_contained(script, expected):
         "IOSQL_TARGET_URI",
     ]:
         env.pop(name, None)
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = os.pathsep.join(
+        value
+        for value in [str(PROJECT_ROOT), existing_pythonpath]
+        if value
+    )
 
     result = subprocess.run(
         [sys.executable, script],

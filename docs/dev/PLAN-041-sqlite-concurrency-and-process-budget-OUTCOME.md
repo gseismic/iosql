@@ -124,11 +124,11 @@ ulimit -n=1024
 结果：
 
 ```text
-273 passed, 14 skipped in 106.04s
+278 passed, 14 skipped in 303.72s
 ```
 
 全量测试包含 1 万分区遗留用例、新增并发测试、进程预算低 RLIMIT 子进程测试和
-repartition 异常关闭测试。
+repartition 异常关闭测试，以及 4 个现有库追加/重分区自包含示例测试。
 
 ### G1 ext4 HDD
 

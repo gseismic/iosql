@@ -234,7 +234,7 @@ PLAN-041 并发与进程预算复验（2026-06-23）：
 | 进程 FD | baseline `4`，peak `48`，final `4` |
 | 分区 / 单表连接峰值 | `5` / `6` |
 | 压测耗时 | `63.559715s` |
-| Linux 全量测试 | `273 passed, 14 skipped` |
+| Linux 全量测试 | `278 passed, 14 skipped` |
 
 ## ext4 HDD 与 NTFS
 
