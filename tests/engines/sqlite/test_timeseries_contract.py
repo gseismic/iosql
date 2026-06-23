@@ -1,4 +1,7 @@
+import threading
+
 import pytest
+import iosql.database as database_module
 
 from iosql import (
     CalendarPartition,
@@ -876,6 +879,7 @@ def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
         _uri(tmp_path),
         max_open_partitions=3,
         max_connections_per_file=1,
+        max_process_connections=4,
     )
     ticks = db.timeseries(
         "ticks",
@@ -909,6 +913,85 @@ def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
     )
     assert ticks.table_meta_db.get_connection_pool_status()["created_connections"] <= 1
     assert ticks.meta_db.get_connection_pool_status()["created_connections"] <= 1
+    assert db.get_process_connection_budget_status()[
+        "open_process_connections"
+    ] <= 4
+
+
+def test_many_partition_scan_is_thread_safe(tmp_path):
+    db = Database(
+        _uri(tmp_path),
+        max_open_partitions=2,
+        max_connections_per_file=2,
+        max_process_connections=16,
+    )
+    ticks = db.table(
+        "ticks",
+        pk=["id"],
+        columns={"id": "integer", "ts": "integer"},
+        partition="range(ts,width=10)",
+    )
+    ticks.write([{"id": value, "ts": value} for value in range(100)])
+    barrier = threading.Barrier(12)
+    errors = []
+
+    def scan():
+        try:
+            barrier.wait()
+            for _ in range(5):
+                assert len(ticks.select("*", where=None, to_dict=True)) == 100
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [threading.Thread(target=scan) for _ in range(12)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert ticks._open_part_db_count() <= 2
+
+
+def test_many_partition_concurrent_writes_do_not_close_active_pools(tmp_path):
+    db = Database(
+        _uri(tmp_path),
+        max_open_partitions=2,
+        max_connections_per_file=2,
+        max_process_connections=16,
+    )
+    ticks = db.table(
+        "ticks",
+        pk=["id"],
+        columns={"id": "integer", "ts": "integer"},
+        partition="range(ts,width=10)",
+    )
+    barrier = threading.Barrier(4)
+    errors = []
+
+    def write(worker):
+        try:
+            barrier.wait()
+            ticks.write([
+                {"id": worker * 100 + offset, "ts": worker * 100 + offset}
+                for offset in range(30)
+            ])
+        except BaseException as error:
+            errors.append(error)
+
+    threads = [
+        threading.Thread(target=write, args=(worker,))
+        for worker in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert len(ticks.select("*", where=None, to_dict=True)) == 120
 
 
 @pytest.mark.parametrize(
@@ -920,6 +1003,9 @@ def test_many_partition_scan_keeps_part_db_cache_bounded(tmp_path):
         ("max_connections_per_file", 0),
         ("max_connections_per_file", False),
         ("max_connections_per_file", "2"),
+        ("max_process_connections", 0),
+        ("max_process_connections", True),
+        ("max_process_connections", "32"),
     ],
 )
 def test_sqlite_file_limits_require_positive_integers(tmp_path, option, value):
@@ -927,10 +1013,19 @@ def test_sqlite_file_limits_require_positive_integers(tmp_path, option, value):
         Database(_uri(tmp_path), **{option: value})
 
 
-def test_repartition_to_writes_new_database_without_touching_source(tmp_path):
+def test_repartition_to_writes_new_database_without_touching_source(
+    tmp_path,
+    monkeypatch,
+):
     source_uri = _uri(tmp_path, "source.iosql")
     target_uri = _uri(tmp_path, "target.iosql")
-    db = Database(source_uri)
+    db = Database(
+        source_uri,
+        pragma_dict={"synchronous": "full"},
+        max_open_partitions=2,
+        max_connections_per_file=1,
+        max_process_connections=7,
+    )
     ticks = db.timeseries(
         "ticks",
         time="ts",
@@ -948,11 +1043,25 @@ def test_repartition_to_writes_new_database_without_touching_source(tmp_path):
     ])
 
     new_spec = ticks.spec().with_partition(every="1s")
+    created = []
+    real_database = Database
+
+    class TrackingDatabase(real_database):
+        def __init__(self, uri, *args, **kwargs):
+            super().__init__(uri, *args, **kwargs)
+            created.append((self, kwargs))
+
+    monkeypatch.setattr(database_module, "Database", TrackingDatabase)
     result = ticks.repartition_to(target_uri, spec=new_spec)
 
     assert result.rows_copied == 3
     assert result.partitions_created == [0, 1000, 2000]
     assert ticks.table_parts() == [0]
+    assert created[0][1]["pragma_dict"]["synchronous"] == "full"
+    assert created[0][1]["max_open_partitions"] == 2
+    assert created[0][1]["max_connections_per_file"] == 1
+    assert created[0][1]["max_process_connections"] == 7
+    assert created[0][0]._tables == {}
 
     target = Database(target_uri)
     assert target.table("ticks").query(order_by="ts").to_list() == [
@@ -960,6 +1069,41 @@ def test_repartition_to_writes_new_database_without_touching_source(tmp_path):
         {"symbol": "AAPL", "ts": 1500, "price": 2.0},
         {"symbol": "MSFT", "ts": 2500, "price": 3.0},
     ]
+
+
+def test_repartition_to_closes_target_database_on_write_error(tmp_path, monkeypatch):
+    source_uri = _uri(tmp_path, "source-error.iosql")
+    target_uri = _uri(tmp_path, "target-error.iosql")
+    db = Database(source_uri)
+    ticks = db.table(
+        "ticks",
+        pk=["id"],
+        columns={"id": "integer"},
+    )
+    ticks.write({"id": 1})
+    created = []
+    real_database = Database
+
+    class FailingDatabase(real_database):
+        def __init__(self, uri, *args, **kwargs):
+            super().__init__(uri, *args, **kwargs)
+            created.append(self)
+
+        def table(self, *table_args, **table_kwargs):
+            table = super().table(*table_args, **table_kwargs)
+
+            def fail_write(*write_args, **write_kwargs):
+                raise RuntimeError("write failed")
+
+            table.write = fail_write
+            return table
+
+    monkeypatch.setattr(database_module, "Database", FailingDatabase)
+
+    with pytest.raises(RuntimeError, match="write failed"):
+        ticks.repartition_to(target_uri)
+
+    assert created[0]._tables == {}
 
 
 def test_write_buffer_flushes_by_row_threshold(tmp_path):

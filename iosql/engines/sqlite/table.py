@@ -4,11 +4,13 @@ import copy
 import json
 import math
 import os
+import threading
 import time
 import warnings
 
 # from itertools import chain
 from collections import OrderedDict
+from contextlib import contextmanager
 
 import arrow
 
@@ -42,6 +44,7 @@ from ...utils.column import suggest_sqlite_column_types
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite import Database as MyDatabase
 from ...utils.mysqlite.const import _DEFAULT_PRAGMA as _MYSQLITE_DEFAULT_PRAGMA
+from ...utils.schema import parse_db_schema
 
 # from mysqlite import Database as MyDatabase
 from ...utils.mysqlite.exception import DuplicateColumn, NoSuchColumn, NoSuchTable
@@ -172,6 +175,7 @@ class Table(BaseTable):
         pragma_dict = kwargs.pop("pragma_dict", None)
         max_open_partitions = kwargs.pop("max_open_partitions", 5)
         max_connections_per_file = kwargs.pop("max_connections_per_file", 1)
+        max_process_connections = kwargs.pop("max_process_connections", 32)
         self._num_opened_max_allowed = self._positive_int_option(
             "max_open_partitions",
             max_open_partitions,
@@ -180,12 +184,19 @@ class Table(BaseTable):
             "max_connections_per_file",
             max_connections_per_file,
         )
+        self._max_process_connections = self._positive_int_option(
+            "max_process_connections",
+            max_process_connections,
+        )
         self._pragma_dict = copy.deepcopy(_MYSQLITE_DEFAULT_PRAGMA)
         self._pragma_dict.update(pragma_dict or {})
         self._meta_db = None
         self._table_meta_db = None
         self._db_parts = OrderedDict()
         self._db_parts_status = OrderedDict()
+        self._db_parts_leases = {}
+        self._db_parts_condition = threading.Condition(threading.RLock())
+        self._db_parts_closing = False
         self._declared_spec = None
         # New partition system
         self._partition = None
@@ -207,6 +218,10 @@ class Table(BaseTable):
     @property
     def max_connections_per_file(self):
         return self._max_connections_per_file
+
+    @property
+    def max_process_connections(self):
+        return self._max_process_connections
 
     def connect(self):
         """连接
@@ -230,15 +245,28 @@ class Table(BaseTable):
         self._meta_db = self.get_meta_db()
 
     def close(self):
-        if self._table_meta_db and not self._table_meta_db.is_closed():
-            self._table_meta_db.close()
-        if self._meta_db and not self._meta_db.is_closed():
-            self._meta_db.close()
-        for _, db in list(self._db_parts.items()):
-            if db and not db.is_closed():
-                db.close()
-        self._db_parts.clear()
-        self._db_parts_status.clear()
+        with self._db_parts_condition:
+            while self._db_parts_closing:
+                self._db_parts_condition.wait(timeout=0.1)
+            self._db_parts_closing = True
+            while any(self._db_parts_leases.values()):
+                self._db_parts_condition.wait(timeout=0.1)
+            part_databases = list(self._db_parts.values())
+            self._db_parts.clear()
+            self._db_parts_status.clear()
+            self._db_parts_leases.clear()
+        try:
+            if self._table_meta_db and not self._table_meta_db.is_closed():
+                self._table_meta_db.close()
+            if self._meta_db and not self._meta_db.is_closed():
+                self._meta_db.close()
+            for db in part_databases:
+                if db and not db.is_closed():
+                    db.close()
+        finally:
+            with self._db_parts_condition:
+                self._db_parts_closing = False
+                self._db_parts_condition.notify_all()
 
     def _load_partition(self) -> Partition | None:
         """Load partition from table metadata.
@@ -1018,13 +1046,13 @@ class Table(BaseTable):
         part_dbfile = self._get_part_dbfile(part_key)
         if not os.path.isfile(part_dbfile):
             return 0
-        db = self.get_part_db(part_dbfile, auto_commit=False)
-        try:
-            rows = db[_PART_DATA_TABLE_NAME].query(
-                f'select COUNT(*) from {_PART_DATA_TABLE_NAME};'
-            )
-        except NoSuchTable:
-            return 0
+        with self._part_db(part_dbfile, auto_commit=False) as db:
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].query(
+                    f'select COUNT(*) from {_PART_DATA_TABLE_NAME};'
+                )
+            except NoSuchTable:
+                return 0
         if not rows:
             return 0
         return dict(rows[0]).get('COUNT(*)', 0)
@@ -1038,18 +1066,18 @@ class Table(BaseTable):
         if not os.path.isfile(part_dbfile):
             return None, None
 
-        db = self.get_part_db(part_dbfile, auto_commit=False)
         field = self._quote_identifier(spec.time.name)
-        try:
-            rows = db[_PART_DATA_TABLE_NAME].query(
-                (
-                    f'select MIN({field}) as time_min, '
-                    f'MAX({field}) as time_max from {_PART_DATA_TABLE_NAME};'
-                ),
-                to_dict=True,
-            )
-        except NoSuchTable:
-            return None, None
+        with self._part_db(part_dbfile, auto_commit=False) as db:
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].query(
+                    (
+                        f'select MIN({field}) as time_min, '
+                        f'MAX({field}) as time_max from {_PART_DATA_TABLE_NAME};'
+                    ),
+                    to_dict=True,
+                )
+            except NoSuchTable:
+                return None, None
         if not rows:
             return None, None
         row = rows[0]
@@ -1064,18 +1092,18 @@ class Table(BaseTable):
         if not os.path.isfile(part_dbfile):
             return None, None
 
-        db = self.get_part_db(part_dbfile, auto_commit=False)
         field = self._quote_identifier(spec.session_column)
-        try:
-            rows = db[_PART_DATA_TABLE_NAME].query(
-                (
-                    f'select MIN({field}) as session_min, '
-                    f'MAX({field}) as session_max from {_PART_DATA_TABLE_NAME};'
-                ),
-                to_dict=True,
-            )
-        except NoSuchTable:
-            return None, None
+        with self._part_db(part_dbfile, auto_commit=False) as db:
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].query(
+                    (
+                        f'select MIN({field}) as session_min, '
+                        f'MAX({field}) as session_max from {_PART_DATA_TABLE_NAME};'
+                    ),
+                    to_dict=True,
+                )
+            except NoSuchTable:
+                return None, None
         if not rows:
             return None, None
         row = rows[0]
@@ -1091,7 +1119,6 @@ class Table(BaseTable):
         if not os.path.isfile(part_dbfile):
             return {}
 
-        db = self.get_part_db(part_dbfile, auto_commit=False)
         projections = []
         for column in columns:
             field = self._quote_identifier(column)
@@ -1099,13 +1126,14 @@ class Table(BaseTable):
             alias_max = self._quote_identifier(f'{column}__max')
             projections.append(f'MIN({field}) as {alias_min}')
             projections.append(f'MAX({field}) as {alias_max}')
-        try:
-            rows = db[_PART_DATA_TABLE_NAME].query(
-                f"select {', '.join(projections)} from {_PART_DATA_TABLE_NAME};",
-                to_dict=True,
-            )
-        except NoSuchTable:
-            return {}
+        with self._part_db(part_dbfile, auto_commit=False) as db:
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].query(
+                    f"select {', '.join(projections)} from {_PART_DATA_TABLE_NAME};",
+                    to_dict=True,
+                )
+            except NoSuchTable:
+                return {}
         if not rows:
             return {}
 
@@ -1290,14 +1318,14 @@ class Table(BaseTable):
         )
         for ref in self._physical_part_refs([logical_part]):
             part_dbfile = self._get_part_dbfile(ref.part_key)
-            db = self.get_part_db(part_dbfile, auto_commit=False)
-            try:
-                rows = db[_PART_DATA_TABLE_NAME].query(
-                    query.sql,
-                    params=query.params,
-                )
-            except NoSuchTable:
-                continue
+            with self._part_db(part_dbfile, auto_commit=False) as db:
+                try:
+                    rows = db[_PART_DATA_TABLE_NAME].query(
+                        query.sql,
+                        params=query.params,
+                    )
+                except NoSuchTable:
+                    continue
             if rows:
                 return ref
         return None
@@ -1900,13 +1928,11 @@ class Table(BaseTable):
                 f"SQL: {query.sql}; params={query.params}"
             )
             part_table_name = _PART_DATA_TABLE_NAME
-            db = self.get_part_db(part_dbfile, auto_commit=False)
-            # part_data = db[part_table_name].query(sql, to_dict=True)
-
-            part_data = db[part_table_name].query(
-                query.sql,
-                params=query.params,
-            )
+            with self._part_db(part_dbfile, auto_commit=False) as db:
+                part_data = db[part_table_name].query(
+                    query.sql,
+                    params=query.params,
+                )
             data.extend(part_data)
 
         return data
@@ -1930,31 +1956,31 @@ class Table(BaseTable):
                 f"{part_dbfile}: {ref.part_key}: "
                 f"SQL: {query.sql}; params={query.params}"
             )
-            db = self.get_part_db(part_dbfile, auto_commit=False)
-            try:
-                part_data = db[_PART_DATA_TABLE_NAME].query(
-                    query.sql,
-                    params=query.params,
-                )
-            except NoSuchTable:
-                continue
+            with self._part_db(part_dbfile, auto_commit=False) as db:
+                try:
+                    part_data = db[_PART_DATA_TABLE_NAME].query(
+                        query.sql,
+                        params=query.params,
+                    )
+                except NoSuchTable:
+                    continue
             data.extend(part_data)
         return data
 
     def create_index(self, column, order="asc", exist_ok=True):
         for ref in self._physical_part_refs():
             part_dbfile = self._get_part_dbfile(ref.part_key)
-            part_db = self.get_part_db(part_dbfile, auto_commit=True)
-            part_db[_PART_DATA_TABLE_NAME].create_index(
-                column, order, exist_ok=exist_ok
-            )
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                part_db[_PART_DATA_TABLE_NAME].create_index(
+                    column, order, exist_ok=exist_ok
+                )
 
     def drop_index(self, column):
         dropped = 0
         for ref in self._physical_part_refs():
             part_dbfile = self._get_part_dbfile(ref.part_key)
-            part_db = self.get_part_db(part_dbfile, auto_commit=True)
-            dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
         return dropped
 
     def upsert_all(
@@ -2076,38 +2102,38 @@ class Table(BaseTable):
 
         for ref in need_refs:
             part_dbfile = self._get_part_dbfile(ref.part_key)
-            db = self.get_part_db(part_dbfile, auto_commit=True)
-            part_table = db[_PART_DATA_TABLE_NAME]
+            with self._part_db(part_dbfile, auto_commit=True) as db:
+                part_table = db[_PART_DATA_TABLE_NAME]
 
-            select_query = build_select_cases_query(
-                _PART_DATA_TABLE_NAME, "COUNT(*)", cases, column_types
-            )
-            count_before = part_table.query(
-                select_query.sql,
-                params=select_query.params,
-            )
-            count = dict(count_before[0])["COUNT(*)"] if count_before else 0
+                select_query = build_select_cases_query(
+                    _PART_DATA_TABLE_NAME, "COUNT(*)", cases, column_types
+                )
+                count_before = part_table.query(
+                    select_query.sql,
+                    params=select_query.params,
+                )
+                count = dict(count_before[0])["COUNT(*)"] if count_before else 0
 
-            if count > 0:
-                delete_query = build_delete_query(
-                    _PART_DATA_TABLE_NAME, cases, column_types
-                )
-                logger.debug(
-                    f"{part_dbfile}: DELETE: {delete_query.sql}; "
-                    f"params={delete_query.params}"
-                )
-                db[_PART_DATA_TABLE_NAME].execute_params(
-                    delete_query.sql,
-                    delete_query.params,
-                )
-                total_deleted += count
-                if ref.segment_id >= 0:
-                    self._refresh_segment_info(
-                        ref.logical_part,
-                        ref.segment_id,
-                        ref.part_key,
-                        layout,
+                if count > 0:
+                    delete_query = build_delete_query(
+                        _PART_DATA_TABLE_NAME, cases, column_types
                     )
+                    logger.debug(
+                        f"{part_dbfile}: DELETE: {delete_query.sql}; "
+                        f"params={delete_query.params}"
+                    )
+                    db[_PART_DATA_TABLE_NAME].execute_params(
+                        delete_query.sql,
+                        delete_query.params,
+                    )
+                    total_deleted += count
+            if count > 0 and ref.segment_id >= 0:
+                self._refresh_segment_info(
+                    ref.logical_part,
+                    ref.segment_id,
+                    ref.part_key,
+                    layout,
+                )
 
         return total_deleted
 
@@ -2314,19 +2340,17 @@ class Table(BaseTable):
                 )
 
         part_dbfile = self._get_part_dbfile(part)
-        part_db = self.get_part_db(part_dbfile, auto_commit=True)
-        # part_db = MyDatabase(part_dbfile, auto_commit=True, pragma_dict=self._pragma_dict)
         try:
             part_table_name = _PART_DATA_TABLE_NAME
-            part_db[part_table_name].insert_all(
-                part_data,
-                replace=replace,
-                ignore=ignore,
-                batch_size=batch_size,
-                commit=commit,
-                # ensure_table=True # [@2024-03-30 21:34:30] FIXED
-                ensure_table=False,
-            )
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                part_db[part_table_name].insert_all(
+                    part_data,
+                    replace=replace,
+                    ignore=ignore,
+                    batch_size=batch_size,
+                    commit=commit,
+                    ensure_table=False,
+                )
         except NoSuchTable:
             # part的表不存在
             #   第一次创建，主表可能也不存在
@@ -2341,24 +2365,22 @@ class Table(BaseTable):
             )
             # 确保表格建好后，才写meta，确保不删列(不支持)情况下，meta中有的信息, 表中都有
             self.do_create_table(part_dbfile, part_table_name, createtable_meta, alter)
-            # 首次探测不存在的表时 mysqlite 会缓存空 table_info。
-            part_db[part_table_name]._invalidate_cache()
 
             # update meta
             meta_part = part if logical_part is None else logical_part
             self._update_meta(meta_part, part_column, partition, createtable_meta)
 
             # write data
-            # db = MyDatabase(part_dbfile, auto_commit=True, pragma_dict=self._pragma_dict)
-            part_db[part_table_name].insert_all(
-                part_data,
-                replace=replace,
-                ignore=ignore,
-                batch_size=batch_size,
-                commit=commit,
-                ensure_table=False,  # [@2024-03-30 21:34:46]
-                # ensure_table=False
-            )
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                part_db[part_table_name]._invalidate_cache()
+                part_db[part_table_name].insert_all(
+                    part_data,
+                    replace=replace,
+                    ignore=ignore,
+                    batch_size=batch_size,
+                    commit=commit,
+                    ensure_table=False,
+                )
         except NoSuchColumn as e:
             # add column for all partition-table
             # alter table
@@ -2388,16 +2410,15 @@ class Table(BaseTable):
             meta_part = part if logical_part is None else logical_part
             self._update_meta(meta_part, part_column, partition, createtable_meta)
 
-            # write data
-            # db = MyDatabase(part_dbfile, auto_commit=True, pragma_dict=self._pragma_dict)
-            part_db[part_table_name].insert_all(
-                part_data,
-                replace=replace,
-                ignore=ignore,
-                batch_size=batch_size,
-                commit=commit,
-                ensure_table=False,
-            )
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                part_db[part_table_name].insert_all(
+                    part_data,
+                    replace=replace,
+                    ignore=ignore,
+                    batch_size=batch_size,
+                    commit=commit,
+                    ensure_table=False,
+                )
 
     def _update_meta(self, part_key, ts_col, partition, createtable_meta):
         # 更新table创建的meta信息，直接覆盖
@@ -2543,11 +2564,11 @@ class Table(BaseTable):
     def _rows_from_part_dbfile(self, part_dbfile):
         if not os.path.isfile(part_dbfile):
             return []
-        db = self.get_part_db(part_dbfile, auto_commit=False)
-        try:
-            rows = db[_PART_DATA_TABLE_NAME].select('*', where=None, to_dict=True)
-        except NoSuchTable:
-            return []
+        with self._part_db(part_dbfile, auto_commit=False) as db:
+            try:
+                rows = db[_PART_DATA_TABLE_NAME].select('*', where=None, to_dict=True)
+            except NoSuchTable:
+                return []
         return [dict(row) for row in rows]
 
     def _part_rows(self, part):
@@ -2623,19 +2644,30 @@ class Table(BaseTable):
 
         from ...database import Database
 
-        target_db = Database(target_uri, verbose=self.verbose)
-        target_table = target_db.table(table_name, spec=target_spec)
-        rows_copied = 0
-        for part in self.table_parts():
-            rows = self._part_rows(part)
-            for start in range(0, len(rows), batch_size):
-                batch = rows[start:start + batch_size]
-                if batch:
-                    target_table.write(batch, mode=mode)
-                    rows_copied += len(batch)
+        target_schema, _ = parse_db_schema(target_uri)
+        target_options = {"verbose": self.verbose}
+        if target_schema in ["sqlite", "sqlite3"]:
+            target_options.update({
+                "pragma_dict": self._pragma_dict,
+                "max_open_partitions": self._num_opened_max_allowed,
+                "max_connections_per_file": self._max_connections_per_file,
+                "max_process_connections": self._max_process_connections,
+            })
+        target_db = Database(target_uri, **target_options)
+        try:
+            target_table = target_db.table(table_name, spec=target_spec)
+            rows_copied = 0
+            for part in self.table_parts():
+                rows = self._part_rows(part)
+                for start in range(0, len(rows), batch_size):
+                    batch = rows[start:start + batch_size]
+                    if batch:
+                        target_table.write(batch, mode=mode)
+                        rows_copied += len(batch)
 
-        partitions_created = target_table.table_parts()
-        target_db.close()
+            partitions_created = target_table.table_parts()
+        finally:
+            target_db.close()
         return RepartitionResult(
             source_uri=self._uri,
             target_uri=target_uri,
@@ -2657,13 +2689,13 @@ class Table(BaseTable):
         for ref in self._physical_part_refs():
             logger.info(f"Altering Table Schema: {ref.part_key} ..")
             part_dbfile = self._get_part_dbfile(ref.part_key)
-            part_db = self.get_part_db(part_dbfile, auto_commit=True)
-            for column, type_ in data_suggested_types.items():
-                try:
-                    part_db[_PART_DATA_TABLE_NAME].add_column(column, type_)
-                    logger.info(f"Added {column} {type_}")
-                except DuplicateColumn:
-                    pass
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                for column, type_ in data_suggested_types.items():
+                    try:
+                        part_db[_PART_DATA_TABLE_NAME].add_column(column, type_)
+                        logger.info(f"Added {column} {type_}")
+                    except DuplicateColumn:
+                        pass
 
     def suggest_column_types(self, data, column_type, n_suggest_check=None):
         return suggest_sqlite_column_types(
@@ -2709,14 +2741,13 @@ class Table(BaseTable):
             }
             mysqlite_columns.append(dic)
 
-        db = self.get_part_db(part_dbfile, auto_commit=True)
-        # sqlite3.OperationalError: unable to open database file
-        db[part_table_name].create_table(
-            mysqlite_columns,
-            pk=createtable_meta["pk"],
-            save_meta=True,
-            table_comment=None,
-        )
+        with self._part_db(part_dbfile, auto_commit=True) as db:
+            db[part_table_name].create_table(
+                mysqlite_columns,
+                pk=createtable_meta["pk"],
+                save_meta=True,
+                table_comment=None,
+            )
 
     @property
     def table_meta_db(self):
@@ -2731,6 +2762,7 @@ class Table(BaseTable):
                 verbose=self.verbose,
                 pragma_dict=self._pragma_dict,
                 max_connections=self._max_connections_per_file,
+                max_process_connections=self._max_process_connections,
             )
         else:
             pass
@@ -2748,45 +2780,76 @@ class Table(BaseTable):
                 verbose=self.verbose,
                 pragma_dict=self._pragma_dict,
                 max_connections=self._max_connections_per_file,
+                max_process_connections=self._max_process_connections,
             )
         return self._meta_db
 
-    def get_part_db(self, part_dbfile, auto_commit=True):
-        if part_dbfile not in self._db_parts or self._db_parts[part_dbfile].is_closed():
-            self._prune_part_db_cache(exclude={part_dbfile})
-            db = MyDatabase(
-                part_dbfile,
-                pragma_dict=self._pragma_dict,
-                auto_commit=auto_commit,
-                max_connections=self._max_connections_per_file,
-            )
-            self._db_parts[part_dbfile] = db
-            self._db_parts_status[part_dbfile] = True
-        else:
-            self._db_parts[part_dbfile].auto_commit = auto_commit
-            self._db_parts.move_to_end(part_dbfile)
-            self._db_parts_status[part_dbfile] = True
+    @contextmanager
+    def _part_db(self, part_dbfile, auto_commit=True):
+        db = self._acquire_part_db(part_dbfile, auto_commit)
+        try:
+            yield db
+        finally:
+            with self._db_parts_condition:
+                leases = self._db_parts_leases.get(part_dbfile, 0)
+                if leases <= 1:
+                    self._db_parts_leases[part_dbfile] = 0
+                else:
+                    self._db_parts_leases[part_dbfile] = leases - 1
+                self._db_parts_condition.notify_all()
 
-        return self._db_parts[part_dbfile]
+    def _acquire_part_db(self, part_dbfile, auto_commit):
+        while True:
+            db_to_close = None
+            with self._db_parts_condition:
+                while self._db_parts_closing:
+                    self._db_parts_condition.wait(timeout=0.1)
+                db = self._db_parts.get(part_dbfile)
+                if db is not None and not db.is_closed():
+                    db.auto_commit = auto_commit
+                    self._db_parts.move_to_end(part_dbfile)
+                    self._db_parts_status[part_dbfile] = True
+                    self._db_parts_leases[part_dbfile] = (
+                        self._db_parts_leases.get(part_dbfile, 0) + 1
+                    )
+                    return db
 
-    def _prune_part_db_cache(self, exclude=None):
-        exclude = set(exclude or [])
-        while self._open_part_db_count(exclude=exclude) >= self._num_opened_max_allowed:
-            key_to_close = None
-            for key, db in self._db_parts.items():
-                if key in exclude:
+                if self._open_part_db_count_locked() < self._num_opened_max_allowed:
+                    db = MyDatabase(
+                        part_dbfile,
+                        pragma_dict=self._pragma_dict,
+                        auto_commit=auto_commit,
+                        max_connections=self._max_connections_per_file,
+                        max_process_connections=self._max_process_connections,
+                    )
+                    self._db_parts[part_dbfile] = db
+                    self._db_parts_status[part_dbfile] = True
+                    self._db_parts_leases[part_dbfile] = 1
+                    return db
+
+                for key, candidate in list(self._db_parts.items()):
+                    if self._db_parts_leases.get(key, 0) != 0:
+                        continue
+                    if candidate and not candidate.is_closed():
+                        db_to_close = candidate
+                        del self._db_parts[key]
+                        self._db_parts_status.pop(key, None)
+                        self._db_parts_leases.pop(key, None)
+                        logger.debug(f"Clean up, closing {key} ..")
+                        break
+
+                if db_to_close is None:
+                    self._db_parts_condition.wait(timeout=0.1)
                     continue
-                if db and not db.is_closed():
-                    key_to_close = key
-                    break
-            if key_to_close is None:
-                return
-            logger.debug(f"Clean up, closing {key_to_close} ..")
-            self._db_parts[key_to_close].close()
-            del self._db_parts[key_to_close]
-            self._db_parts_status.pop(key_to_close, None)
+
+            db_to_close.close()
 
     def _open_part_db_count(self, exclude=None):
+        exclude = set(exclude or [])
+        with self._db_parts_condition:
+            return self._open_part_db_count_locked(exclude)
+
+    def _open_part_db_count_locked(self, exclude=None):
         exclude = set(exclude or [])
         return sum(
             1

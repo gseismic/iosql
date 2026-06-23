@@ -8,6 +8,7 @@ from .spec import TableContract, TableSpec
 
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
 _DEFAULT_MAX_CONNECTIONS_PER_FILE = 1
+_DEFAULT_MAX_PROCESS_CONNECTIONS = 32
 
 
 def _normalize_pk(value):
@@ -30,6 +31,7 @@ class Database(object):
         pragma_dict=None,
         max_open_partitions=_DEFAULT_MAX_OPEN_PARTITIONS,
         max_connections_per_file=_DEFAULT_MAX_CONNECTIONS_PER_FILE,
+        max_process_connections=_DEFAULT_MAX_PROCESS_CONNECTIONS,
     ):
         self._uri = uri
         self._table_cls = Database.get_engine(uri)
@@ -43,6 +45,7 @@ class Database(object):
         if not sqlite_engine and (
             max_open_partitions != _DEFAULT_MAX_OPEN_PARTITIONS
             or max_connections_per_file != _DEFAULT_MAX_CONNECTIONS_PER_FILE
+            or max_process_connections != _DEFAULT_MAX_PROCESS_CONNECTIONS
         ):
             raise BadArgument(
                 "SQLite file limits are only supported by the SQLite engine"
@@ -54,6 +57,10 @@ class Database(object):
         self._max_connections_per_file = self._positive_int(
             "max_connections_per_file",
             max_connections_per_file,
+        )
+        self._max_process_connections = self._positive_int(
+            "max_process_connections",
+            max_process_connections,
         )
         self._pragma_dict = pragma_dict
 
@@ -73,6 +80,7 @@ class Database(object):
                 table_options.update({
                     "max_open_partitions": self._max_open_partitions,
                     "max_connections_per_file": self._max_connections_per_file,
+                    "max_process_connections": self._max_process_connections,
                 })
                 if self._pragma_dict is not None:
                     table_options["pragma_dict"] = self._pragma_dict
@@ -176,6 +184,16 @@ class Database(object):
         for _, table in list(self._tables.items()):
             table.close()
         self._tables.clear()
+
+    def get_process_connection_budget_status(self):
+        if self._uri_schema not in ["sqlite", "sqlite3"]:
+            raise BadArgument(
+                "SQLite connection budget is only supported by the SQLite engine"
+            )
+        from .utils.mysqlite.connection_pool import (
+            get_process_connection_budget_status,
+        )
+        return get_process_connection_budget_status()
 
     @classmethod
     def get_engine(cls, uri):

@@ -76,7 +76,11 @@ table.delete(where="order_id=1 AND line_id=2")
 ## 连接池
 
 ```python
-db = Database("demo.sqlite3", max_connections=4)
+db = Database(
+    "demo.sqlite3",
+    max_connections=4,
+    max_process_connections=32,
+)
 
 with db.get_connection() as conn:
     conn.execute("SELECT 1")
@@ -84,9 +88,15 @@ with db.get_connection() as conn:
 db.force_close_all_connections()
 ```
 
-连接池用于减少重复打开 SQLite 文件的成本，并避免长时间运行时泄露文件句柄。`max_connections` 是单个 `Database` 实例的连接总数上限。
+连接池用于减少重复打开 SQLite 文件的成本，并避免长时间运行时泄露文件句柄。
+`max_connections` 是单个 `Database` 实例的连接上限；
+`max_process_connections` 是进程内所有 mysqlite 连接池共享的真实连接预算。
+预算耗尽时会回收其他池的空闲连接。
 
-可通过 `db.get_connection_pool_status()` 和 `db.is_connection_pool_healthy()` 查看连接池状态。`force_close_all_connections()` 会关闭连接池并使当前 `Database` 实例不可复用。更多说明见 `CONNECTION_POOL_CLEANUP.md`。
+可通过 `db.get_connection_pool_status()`、`db.get_process_connection_budget_status()`
+和 `db.is_connection_pool_healthy()` 查看状态。`force_close_all_connections()`
+会关闭连接池并使当前 `Database` 实例不可复用。更多说明见
+`CONNECTION_POOL_CLEANUP.md`。
 
 ## 事务
 

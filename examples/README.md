@@ -18,6 +18,8 @@
 | `06_row_segment_late_data.py` | 高级 | 仅按行数滚动 segment，展示晚到数据、`__all__` 逻辑分区和 stats pruning。 |
 | `07_partition_string_repartition_cli.py` | 高级 | 使用字符串 partition，并通过 CLI `repartition --partition --target` 生成新布局。 |
 | `08_doctor_time_first_suggestions.py` | 高级 | 展示 `doctor` 如何对历史 `partition_key` 表优先推荐 `calendar(date,...)`。 |
+| `09_existing_database_append.py` | 进阶 | 独立准备并关闭一个示例库，再按已有持久化契约重新打开并增量写入。 |
+| `10_existing_database_repartition.py` | 高级 | 独立准备已有源库，重新打开后离线重分区到新的目标库。 |
 
 ## 金融示例
 
@@ -51,12 +53,16 @@ python examples/05_partition_segments_smoke.py
 python examples/06_row_segment_late_data.py
 python examples/07_partition_string_repartition_cli.py
 python examples/08_doctor_time_first_suggestions.py
+python examples/09_existing_database_append.py
+python examples/10_existing_database_repartition.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
 ## 运行时数据
 
-示例会写入 `examples/runtime/`，该目录不需要提交。每个脚本启动时会清理自己的示例库，便于重复运行。
+示例会写入 `examples/runtime/`，该目录不需要提交。每个脚本只清理自己拥有的默认
+示例路径，便于独立重复运行。`09`、`10` 可通过环境变量指向真实已有库；此时不会
+清理外部源库，重分区也只写新的目标 URI。
 
 ## 低层 mysqlite 示例
 

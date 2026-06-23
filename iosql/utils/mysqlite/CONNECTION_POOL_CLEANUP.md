@@ -4,14 +4,20 @@
 
 `iosql.utils.mysqlite` 使用有上限的 SQLite 连接池，避免长时间运行或多分区扫描时无限打开 SQLite 文件。连接通过 `with db.get_connection()` 借出，退出上下文后归还连接池。
 
-连接池不再按线程永久缓存连接；`max_connections` 表示同一 `Database` 实例最多创建的 SQLite 连接总数。
+连接池不再按线程永久缓存连接；`max_connections` 表示同一 `Database` 实例最多
+创建的 SQLite 连接总数，`max_process_connections` 表示进程内所有连接池共享的
+真实连接预算。预算耗尽时会优先关闭其他池的空闲连接。
 
 ## 基本使用
 
 ```python
 from iosql.utils.mysqlite import Database
 
-db = Database("example.db", max_connections=4)
+db = Database(
+    "example.db",
+    max_connections=4,
+    max_process_connections=32,
+)
 
 with db.get_connection() as conn:
     conn.execute("SELECT 1")
@@ -33,7 +39,9 @@ db.force_close_all_connections()
 
 ```python
 status = db.get_connection_pool_status()
+process_status = db.get_process_connection_budget_status()
 print(status)
+print(process_status)
 print(db.is_connection_pool_healthy())
 ```
 

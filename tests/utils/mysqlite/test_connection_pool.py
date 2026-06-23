@@ -1,9 +1,13 @@
 import os
+import gc
 import threading
 import time
 import pytest
 import sqlite3
-from iosql.utils.mysqlite.connection_pool import DatabaseConnectionPool
+from iosql.utils.mysqlite.connection_pool import (
+    DatabaseConnectionPool,
+    get_process_connection_budget_status,
+)
 
 
 TEST_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -131,6 +135,109 @@ class TestConnectionPool:
         assert not thread.is_alive()
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeError)
+
+    def test_close_during_connection_validation_does_not_deadlock(self, tmp_path):
+        pool = DatabaseConnectionPool(
+            str(tmp_path / 'close-race.sqlite3'),
+            max_connections=1,
+        )
+        with pool.get_connection():
+            pass
+
+        entered = threading.Event()
+        release = threading.Event()
+        errors = []
+        original_is_alive = pool._is_connection_alive
+
+        def delayed_is_alive(conn):
+            entered.set()
+            release.wait(timeout=1)
+            return original_is_alive(conn)
+
+        pool._is_connection_alive = delayed_is_alive
+        thread = threading.Thread(
+            target=lambda: self._try_pool_checkout(pool, errors)
+        )
+        thread.start()
+        assert entered.wait(timeout=1)
+
+        pool.force_close_all_connections()
+        release.set()
+        thread.join(timeout=1)
+
+        assert not thread.is_alive()
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+
+    def test_process_budget_reclaims_idle_connections_across_pools(self, tmp_path):
+        pools = [
+            DatabaseConnectionPool(
+                str(tmp_path / f'pool-{index}.sqlite3'),
+                max_connections=1,
+                max_process_connections=3,
+            )
+            for index in range(10)
+        ]
+        try:
+            for item in pools:
+                with item.get_connection() as conn:
+                    conn.execute('select 1')
+
+            status = get_process_connection_budget_status()
+            created = sum(
+                item.get_pool_status()['created_connections']
+                for item in pools
+            )
+
+            assert status['max_process_connections'] == 3
+            assert status['open_process_connections'] <= 3
+            assert created <= 3
+        finally:
+            for item in pools:
+                item.force_close_all_connections()
+
+    def test_abandoned_pool_returns_process_budget(self, tmp_path):
+        gc.collect()
+        baseline = get_process_connection_budget_status()[
+            'open_process_connections'
+        ]
+        pool = DatabaseConnectionPool(
+            str(tmp_path / 'abandoned.sqlite3'),
+            max_connections=1,
+            max_process_connections=3,
+        )
+        with pool.get_connection() as conn:
+            conn.execute('select 1')
+
+        del pool
+        gc.collect()
+
+        assert get_process_connection_budget_status()[
+            'open_process_connections'
+        ] == baseline
+
+    def test_process_budget_uses_smallest_active_limit(self, tmp_path):
+        large_pool = DatabaseConnectionPool(
+            str(tmp_path / 'large.sqlite3'),
+            max_connections=4,
+            max_process_connections=8,
+        )
+        small_pool = DatabaseConnectionPool(
+            str(tmp_path / 'small.sqlite3'),
+            max_connections=1,
+            max_process_connections=2,
+        )
+        try:
+            status = get_process_connection_budget_status()
+            assert status['max_process_connections'] == 2
+        finally:
+            small_pool.force_close_all_connections()
+
+        try:
+            status = get_process_connection_budget_status()
+            assert status['max_process_connections'] == 8
+        finally:
+            large_pool.force_close_all_connections()
 
     @staticmethod
     def _try_pool_checkout(pool, errors):

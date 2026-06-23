@@ -22,6 +22,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from iosql import Database  # noqa: E402
+from iosql.utils.mysqlite.connection_pool import (  # noqa: E402
+    get_process_connection_budget_status,
+)
 
 
 def parse_args():
@@ -31,6 +34,7 @@ def parse_args():
     parser.add_argument("--abandoned-instances", type=int, default=150)
     parser.add_argument("--max-open-partitions", type=int, default=5)
     parser.add_argument("--max-connections-per-file", type=int, default=1)
+    parser.add_argument("--max-process-connections", type=int, default=32)
     parser.add_argument("--gc-every", type=int, default=10)
     parser.add_argument("--cleanup", action="store_true")
     return parser.parse_args()
@@ -46,6 +50,7 @@ def validate_args(args):
     _positive("abandoned-instances", args.abandoned_instances)
     _positive("max-open-partitions", args.max_open_partitions)
     _positive("max-connections-per-file", args.max_connections_per_file)
+    _positive("max-process-connections", args.max_process_connections)
     _positive("gc-every", args.gc_every)
 
 
@@ -63,12 +68,22 @@ class FdMonitor:
         self._thread = threading.Thread(target=self._sample, daemon=True)
         self.baseline = fd_count()
         self.peak = self.baseline
+        self.peak_process_connections = get_process_connection_budget_status()[
+            "open_process_connections"
+        ]
 
     def _sample(self):
         while not self._stop.is_set():
             current = fd_count()
             if current is not None:
                 self.peak = current if self.peak is None else max(self.peak, current)
+            process_connections = get_process_connection_budget_status()[
+                "open_process_connections"
+            ]
+            self.peak_process_connections = max(
+                self.peak_process_connections,
+                process_connections,
+            )
             self._stop.wait(self._interval)
 
     def __enter__(self):
@@ -99,6 +114,7 @@ def run_stress(args, emit=True):
     run_dir.mkdir()
 
     baseline = fd_count()
+    process_budget_before = get_process_connection_budget_status()
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     peak_open_partitions = 0
     peak_connections = 0
@@ -109,6 +125,7 @@ def run_stress(args, emit=True):
             f"sqlite://{run_dir}/many-parts.iosql",
             max_open_partitions=args.max_open_partitions,
             max_connections_per_file=args.max_connections_per_file,
+            max_process_connections=args.max_process_connections,
         )
         table = db.table(
             "ticks",
@@ -153,6 +170,7 @@ def run_stress(args, emit=True):
                 f"sqlite://{run_dir}/abandoned-{index}.iosql",
                 max_open_partitions=args.max_open_partitions,
                 max_connections_per_file=args.max_connections_per_file,
+                max_process_connections=args.max_process_connections,
             )
             abandoned_table = abandoned_db.table(
                 "ticks",
@@ -184,6 +202,10 @@ def run_stress(args, emit=True):
         "abandoned_instances": args.abandoned_instances,
         "max_open_partitions": args.max_open_partitions,
         "max_connections_per_file": args.max_connections_per_file,
+        "max_process_connections": args.max_process_connections,
+        "process_connection_budget_before": process_budget_before,
+        "process_connection_budget": get_process_connection_budget_status(),
+        "peak_process_connections": monitor.peak_process_connections,
         "peak_open_partitions": peak_open_partitions,
         "peak_connections": peak_connections,
         "fd_baseline": baseline,

@@ -183,11 +183,14 @@ db = Database(
     "sqlite:///media/lsl/G1/market.iosql",
     max_open_partitions=5,
     max_connections_per_file=1,
+    max_process_connections=32,
 )
 ```
 
 - `max_open_partitions` 限制每张表同时缓存的分区数据库数量，并以 LRU 淘汰。
 - `max_connections_per_file` 限制每个 SQLite 文件的连接数。
+- `max_process_connections` 限制进程内所有数据库和表的真实 SQLite 连接总数；预算
+  用尽时会回收其他池的空闲连接，默认 `32`。
 - WAL 模式下每条连接可能同时打开数据库、`-wal`、`-shm`，单表可按
   `(max_open_partitions + 2) * max_connections_per_file * 3` 粗估 FD 上限。
 - 多线程读取确实需要同文件并发时，可将 `max_connections_per_file` 调到 `2`，
@@ -202,7 +205,8 @@ python benchmarks/stress_open_files.py \
   --partitions 500 \
   --abandoned-instances 150 \
   --max-open-partitions 5 \
-  --max-connections-per-file 1
+  --max-connections-per-file 1 \
+  --max-process-connections 32
 ```
 
 G1 权威验证（2026-06-22，提交 `6326a4d`）：
@@ -219,6 +223,18 @@ G1 权威验证（2026-06-22，提交 `6326a4d`）：
 | Linux 全量测试 | `263 passed, 14 skipped` |
 
 该结果验证的是文件描述符预算和回收，不代表日线或 orderbook 的 rows/s。
+
+PLAN-041 并发与进程预算复验（2026-06-23）：
+
+| 项目 | 结果 |
+|------|------|
+| 进程预算 | `16` |
+| 分区 / 遗弃实例 | `5000` / `500` |
+| 进程连接峰值 | `15` |
+| 进程 FD | baseline `4`，peak `48`，final `4` |
+| 分区 / 单表连接峰值 | `5` / `6` |
+| 压测耗时 | `63.559715s` |
+| Linux 全量测试 | `273 passed, 14 skipped` |
 
 ## ext4 HDD 与 NTFS
 

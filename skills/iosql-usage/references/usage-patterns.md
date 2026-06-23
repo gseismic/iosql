@@ -459,6 +459,40 @@ result = table.repartition_to(
 
 `layout_report()` 只做诊断。`repartition_to()` 写新库，适合离线迁移和验证，不要假设它会原地修改源库。
 
+## 已有库继续写入
+
+重新打开已有库时，不要再次声明一套可能冲突的契约。直接按表名读取持久化
+`TableSpec`：
+
+```python
+db = Database("sqlite://db/market.iosql")
+if "ticks" not in db.table_names():
+    raise RuntimeError("ticks 不存在")
+
+ticks = db.table("ticks")
+print(ticks.spec())
+ticks.write(new_rows, mode="ignore")
+db.close()
+```
+
+已有库重分区同样先读取原契约，再生成新契约并写到不同 URI：
+
+```python
+source_db = Database("sqlite://db/market.iosql")
+source = source_db.table("ticks")
+target_spec = source.spec().with_partition(every="1hour")
+result = source.repartition_to(
+    "sqlite://db/market-hourly.iosql",
+    spec=target_spec,
+    batch_size=50_000,
+)
+source_db.close()
+```
+
+完整且互相独立的示例见 `09_existing_database_append.py` 和
+`10_existing_database_repartition.py`。默认模式会先准备并关闭各自的示例源库，
+再以“已有库”方式重新打开；设置环境变量后可指向真实库，且不会清理外部源库。
+
 ## PostgreSQL 引擎
 
 iosql 支持 PostgreSQL 作为后端引擎：
@@ -499,7 +533,9 @@ db.close()
 - 需要动态建表时传 `ensure_table=True`。
 - 需要动态加列时传 `ensure_column=True`。
 - 批量写入优先 `insert_all()`。
-- 多线程或长期进程关注 `get_pool_status()`、`is_pool_healthy()` 和 `close()`。
+- 多线程或长期进程关注 `get_connection_pool_status()`、
+  `get_process_connection_budget_status()`、`is_connection_pool_healthy()` 和
+  `close()`。
 - 事务用 `with db.transaction():` 上下文管理器。
 
 ## 测试建议

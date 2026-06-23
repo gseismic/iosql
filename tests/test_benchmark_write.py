@@ -1,4 +1,10 @@
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from benchmarks.benchmark_write import daily_batches, run_benchmark
 from benchmarks.stress_open_files import run_stress
@@ -89,6 +95,7 @@ def test_open_file_stress_keeps_partition_cache_and_fds_bounded(tmp_path):
             abandoned_instances=10,
             max_open_partitions=2,
             max_connections_per_file=1,
+            max_process_connections=8,
             gc_every=2,
             cleanup=True,
         ),
@@ -97,5 +104,64 @@ def test_open_file_stress_keeps_partition_cache_and_fds_bounded(tmp_path):
 
     assert report["peak_open_partitions"] <= 2
     assert report["peak_connections"] <= 4
+    assert report["peak_process_connections"] <= 8
+    assert (
+        report["process_connection_budget"]["open_process_connections"]
+        <= report["process_connection_budget_before"]["open_process_connections"]
+    )
     assert report["fd_final"] <= report["fd_baseline"] + 3
     assert not tmp_path.joinpath(report["run_dir"]).exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="需要 resource.RLIMIT_NOFILE")
+def test_process_budget_prevents_emfile_with_many_active_tables(tmp_path):
+    script = textwrap.dedent(
+        f"""
+        import resource
+        from iosql import Database
+        from iosql.utils.mysqlite.connection_pool import (
+            get_process_connection_budget_status,
+        )
+
+        hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+        resource.setrlimit(resource.RLIMIT_NOFILE, (128, hard))
+        db = Database(
+            "sqlite://{tmp_path}/many-tables.iosql",
+            max_open_partitions=1,
+            max_connections_per_file=1,
+        )
+        for index in range(50):
+            table = db.table(
+                f"ticks_{{index}}",
+                pk=["id"],
+                columns={{"id": "integer", "ts": "integer"}},
+                partition="range(ts,width=10)",
+            )
+            table.write({{"id": index, "ts": index}})
+        databases = []
+        for index in range(25):
+            item = Database(
+                f"sqlite://{tmp_path}/active-{{index}}.iosql",
+                max_open_partitions=1,
+                max_connections_per_file=1,
+            )
+            item.table(
+                "ticks",
+                pk=["id"],
+                columns={{"id": "integer"}},
+            ).write({{"id": index}})
+            databases.append(item)
+        status = get_process_connection_budget_status()
+        assert status["open_process_connections"] <= 32
+        """
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+    assert result.returncode == 0, result.stderr

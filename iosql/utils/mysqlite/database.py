@@ -10,7 +10,10 @@ from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
 import sqlite3
 from contextlib import contextmanager
-from .connection_pool import DatabaseConnectionPool
+from .connection_pool import (
+    DatabaseConnectionPool,
+    get_process_connection_budget_status,
+)
 from . import table
 from .logger import logger
 from .const import _DEFAULT_PRAGMA 
@@ -66,6 +69,7 @@ class Database(object):
     def __init__(self, db_file: str, auto_commit: bool = True, verbose: int = 1,
                  pragma_dict: Optional[Dict[str, Any]] = None, 
                  wal: bool = True, max_connections: int = 10, 
+                 max_process_connections: int = 32,
                  timeout: float = 5.0, **kwargs):
         """
         初始化数据库实例
@@ -77,6 +81,7 @@ class Database(object):
             pragma_dict: 自定义PRAGMA设置
             wal: 启用WAL模式
             max_connections: 最大连接数
+            max_process_connections: 进程内所有 mysqlite 池共享的最大连接数
             timeout: 连接超时时间（秒）
             **kwargs: 其他连接参数
         """
@@ -100,6 +105,7 @@ class Database(object):
         self._pool = DatabaseConnectionPool(
             str(self.db_file), 
             max_connections=max_connections,
+            max_process_connections=max_process_connections,
             pragma_dict=self._pragma_dict,
             **self._kwargs
         )
@@ -328,6 +334,10 @@ class Database(object):
                 'db_file': str(self.db_file),
             }
         return self._pool.get_pool_status()
+
+    def get_process_connection_budget_status(self) -> Dict[str, int]:
+        """返回当前进程内所有 mysqlite 连接池共享的连接预算。"""
+        return get_process_connection_budget_status()
 
     def is_connection_pool_healthy(self) -> bool:
         """检查连接池是否没有超过配置的连接数上限"""

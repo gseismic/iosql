@@ -321,11 +321,11 @@ from iosql.utils.mysqlite import Database
 
 db = Database("data.sqlite3")
 # 检查连接池状态
-status = db.get_pool_status()
+status = db.get_connection_pool_status()
 print(status)  # 查看活跃/闲置连接数
 
 # 检查健康度
-if not db.is_pool_healthy():
+if not db.is_connection_pool_healthy():
     db.close()
     db = Database("data.sqlite3")  # 重新创建
 ```
@@ -345,14 +345,16 @@ if not db.is_pool_healthy():
 
 **排查**：
 
-1. 主 API 显式设置 `Database(..., max_open_partitions=5, max_connections_per_file=1)`。
+1. 主 API 显式设置 `Database(..., max_open_partitions=5, max_connections_per_file=1, max_process_connections=32)`。
 2. `max_open_partitions` 是单表分区数据库缓存上限，分区按 LRU 自动关闭。
 3. `max_connections_per_file` 是每个 SQLite 文件的连接池上限；WAL 模式下每条连接
    可能对应数据库、WAL、SHM 三个文件描述符。
-4. 使用上下文管理器或显式 `db.close()`，不要依赖进程退出或垃圾回收。
-5. 运行 `python benchmarks/stress_open_files.py --root <目标盘>`，检查报告中的
-   `fd_peak`、`fd_final` 和 `peak_open_partitions`。
-6. 不要直接修改 `_num_opened_max_allowed` 私有字段，也不要把提高 `ulimit -n`
+4. `max_process_connections` 是跨数据库、跨表共享的真实连接预算；预算满时自动回收
+   其他池的空闲连接。
+5. 使用上下文管理器或显式 `db.close()`，不要依赖进程退出或垃圾回收。
+6. 运行 `python benchmarks/stress_open_files.py --root <目标盘>`，检查报告中的
+   `fd_peak`、`fd_final`、`peak_process_connections` 和 `peak_open_partitions`。
+7. 不要直接修改 `_num_opened_max_allowed` 私有字段，也不要把提高 `ulimit -n`
    当作库内资源泄漏的解决方案。
 
 ## 测试相关

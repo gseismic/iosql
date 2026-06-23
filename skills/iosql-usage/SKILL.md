@@ -233,7 +233,8 @@ with table.write_buffer(max_rows=10_000) as buf:
 - orderbook/tick 使用 append-only，建议每批 `50_000` 至 `100_000` 行，并配置 `Segment.rows(max_rows=...)`。
 - 高频宽表可用 `Segment.rows(..., stats_columns=["ts", "sequence"])` 限制 min/max 统计开销；partition/time/order/session 字段会自动保留。
 - iosql 默认 SQLite 写入配置是 `WAL + synchronous=NORMAL`；更强断电保障可传 `Database(..., pragma_dict={"journal_mode": "wal", "synchronous": "full"})`。
-- 主 API 默认 `max_open_partitions=5`、`max_connections_per_file=1`，在进程内限制分区数据库和单文件连接数；不要依赖提高 `ulimit -n`，也不要直接修改私有字段。
+- 主 API 默认 `max_open_partitions=5`、`max_connections_per_file=1`、`max_process_connections=32`，分别限制单表分区缓存、单文件连接池和进程真实连接总数；不要依赖提高 `ulimit -n`，也不要直接修改私有字段。
+- 分区 LRU 使用租约保护并发访问；同一逻辑表仍建议单 writer，多线程读取可按需提高 `max_connections_per_file`，但总数受进程预算约束。
 - 长期进程必须使用上下文管理器或显式 `db.close()`；弱引用清理只负责避免遗弃对象被注册表永久保活。
 - 目标盘必须运行仓库 `benchmarks/benchmark_write.py`，不要用系统盘测试结果推断 ext4 HDD。
 - 批次和磁盘比较使用 `benchmarks/sweep_write.py`，可同时传多个 `--root` 并生成 JSON/Markdown 排名。
@@ -352,6 +353,8 @@ with Database("sqlite://db/test.iosql") as db:
   - `05_partition_segments_smoke.py` —— 逻辑分区 + 物理 segment
   - `06_row_segment_late_data.py` —— 纯 row segment + 晚到数据
   - `07_partition_string_repartition_cli.py` —— 字符串 partition + CLI 重分区
+  - `09_existing_database_append.py` —— 自包含地模拟已有库并按持久化契约继续写入
+  - `10_existing_database_repartition.py` —— 自包含地模拟已有源库并重分区到新目标
   - `finance/` —— 金融场景：K线、orderbook、财报、新闻
 - **错误排查**：[troubleshooting.md](references/troubleshooting.md)
 - **写入性能**：[write-performance.md](references/write-performance.md) —— 2500 万行日线、orderbook、ext4 HDD benchmark、批次/分区/segment/PRAGMA 最佳实践

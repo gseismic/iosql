@@ -15,7 +15,7 @@
 
 ## 核心入口
 
-### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1)`
+### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32)`
 
 数据库入口。支持 `sqlite://` 和 `postgresql://` URI。
 
@@ -30,10 +30,12 @@
 | `pragma_dict` | `dict`/`None` | 仅 SQLite；覆盖默认 balanced PRAGMA，例如 `{"synchronous": "full"}` |
 | `max_open_partitions` | `int` | 仅 SQLite；每张表最多缓存的打开分区数据库数，默认 `5` |
 | `max_connections_per_file` | `int` | 仅 SQLite；每个 SQLite 文件的连接池上限，默认 `1` |
+| `max_process_connections` | `int` | 仅 SQLite；进程内所有 mysqlite 池共享的真实连接预算，默认 `32` |
 
-两个资源参数必须是正整数。分区数据库按 LRU 淘汰；两个元数据库不计入
-`max_open_partitions`。WAL 模式通常还会打开 `-wal` 和 `-shm`，因此文件描述符
-数量高于连接数。
+三个资源参数必须是正整数。分区数据库按带租约的线程安全 LRU 淘汰；两个元数据库
+不计入 `max_open_partitions`，但计入 `max_process_connections`。多个活跃实例
+配置不同时，当前进程采用其中最小的进程预算。WAL 模式通常还会打开 `-wal` 和
+`-shm`，因此文件描述符数量高于连接数。
 
 **上下文管理器**：
 
@@ -71,6 +73,11 @@ with Database("sqlite://db/test.iosql") as db:
 #### `Database.close()`
 
 关闭所有表和连接。
+
+#### `Database.get_process_connection_budget_status()`
+
+返回 SQLite 进程级连接预算状态，包括 `max_process_connections`、
+`open_process_connections` 和 `registered_pools`。
 
 ---
 
@@ -393,7 +400,12 @@ Segment.rows(
 ```python
 from iosql.utils.mysqlite import Database
 
-db = Database("path/to/data.sqlite3", auto_commit=True, max_connections=10)
+db = Database(
+    "path/to/data.sqlite3",
+    auto_commit=True,
+    max_connections=4,
+    max_process_connections=32,
+)
 table = db["table_name"]
 
 # CRUD
@@ -407,8 +419,9 @@ table.update(new_values, where)
 table.delete(where)
 
 # 连接池
-db.get_pool_status()
-db.is_pool_healthy()
+db.get_connection_pool_status()
+db.get_process_connection_budget_status()
+db.is_connection_pool_healthy()
 db.force_close_all_connections()
 
 # 事务

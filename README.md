@@ -256,6 +256,7 @@ db = Database(
     "sqlite:///media/lsl/G1/market.iosql",
     max_open_partitions=5,
     max_connections_per_file=1,
+    max_process_connections=32,
     pragma_dict={
         "journal_mode": "wal",
         "synchronous": "full",
@@ -267,13 +268,16 @@ db = Database(
 ```
 
 `max_open_partitions` 是每张逻辑表允许缓存的分区数据库数量，
-`max_connections_per_file` 是每个 SQLite 文件的连接池上限。默认值分别为 `5`
-和 `1`，由 iosql 在进程内强制执行，不依赖提高 `ulimit -n`。WAL 模式下每条
+`max_connections_per_file` 是每个 SQLite 文件的连接池上限，
+`max_process_connections` 是所有 mysqlite 连接池共享的进程级真实连接预算。
+默认值分别为 `5`、`1` 和 `32`，由 iosql 在进程内强制执行，不依赖提高
+`ulimit -n`。WAL 模式下每条
 SQLite 连接可能同时占用数据库、WAL 和 SHM 文件描述符；包含两个元数据库时，
 单表稳态 FD 预算可粗略按
 `(max_open_partitions + 2) * max_connections_per_file * 3` 估算。
 
-大量分区扫描使用 LRU 淘汰旧分区连接。`Database.close()` 或上下文管理器仍是
+进程预算耗尽时会跨连接池回收空闲连接；大量分区扫描使用带租约的线程安全 LRU，
+不会关闭其他线程正在使用的分区。`Database.close()` 或上下文管理器仍是
 确定性释放资源的首选方式；低层清理注册表使用弱引用，遗弃对象不会再被全局注册表
 永久保活，但不应以垃圾回收替代正常的生命周期管理。
 
@@ -300,13 +304,18 @@ python benchmarks/stress_open_files.py \
   --partitions 500 \
   --abandoned-instances 150 \
   --max-open-partitions 5 \
-  --max-connections-per-file 1
+  --max-connections-per-file 1 \
+  --max-process-connections 32
 ```
 
 2026-06-22 在 G1（`/dev/sdb1`、ext4、USB HDD `Elements 25A1`）验证提交
 `6326a4d`：默认 `ulimit -n=1024` 下，5000 分区写入/全扫描并连续遗弃 500 个
 数据库实例，`fd_peak=41`、`fd_final=4`、`peak_open_partitions=5`，未出现
 `Too many open files`。同环境 Linux 全量测试为 `263 passed, 14 skipped`。
+
+2026-06-23 修复进程预算与并发 LRU 后再次在 G1 验证：进程预算 `16`，5000 分区
+和 500 个遗弃实例下，真实连接峰值 `15`，FD `4 -> 48 -> 4`，分区峰值 `5`；
+Linux 默认 `ulimit -n=1024` 全量测试为 `273 passed, 14 skipped`。
 
 先用较小样本自动比较 G1/ext4 与 Z1/NTFS，并扫描批次和 durability：
 
@@ -478,6 +487,8 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 | `06_row_segment_late_data.py` | 纯 row segment、晚到数据和 stats pruning。 |
 | `07_partition_string_repartition_cli.py` | 字符串 partition 和 CLI `repartition --partition`。 |
 | `08_doctor_time_first_suggestions.py` | `doctor` 对历史 `partition_key` 表优先推荐时间分区。 |
+| `09_existing_database_append.py` | 独立模拟已有库，重新打开持久化契约后继续增量写入。 |
+| `10_existing_database_repartition.py` | 独立模拟已有源库，重新打开后重分区到新目标库。 |
 
 金融场景示例位于 `examples/finance/`：
 
@@ -501,6 +512,8 @@ python examples/05_partition_segments_smoke.py
 python examples/06_row_segment_late_data.py
 python examples/07_partition_string_repartition_cli.py
 python examples/08_doctor_time_first_suggestions.py
+python examples/09_existing_database_append.py
+python examples/10_existing_database_repartition.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
