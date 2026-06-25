@@ -215,7 +215,8 @@ print(f"seen={result.rows_seen}, written={result.rows_written}")
 1. 使用 `table.segments()` 检查哪些 segment 是 sealed 状态。
 2. 晚到数据会进入新的 active segment，查询时可能扫描多个重叠 segment。
 3. 纯新增数据场景使用默认 append 性能最优。
-4. 需要覆盖写时，暂时关闭 segment 或先离线重分区。
+4. 如果晚到数据导致同一范围扫描多个 segment，可显式执行 `table.compact()` 重写当前可见 segment。
+5. 需要覆盖写时，暂时关闭 segment 或先离线重分区。
 
 ### WriteResult 返回 layout_warnings
 
@@ -271,6 +272,66 @@ db = Database("mysql://localhost/db")  # EngineNotExist
 3. 首次使用需要 `db.timeseries("name", ...)` 或 `db.table("name", pk=..., ...)` 创建表。
 4. 使用 `Database.table_names()` 查看数据库中已存在的表。
 
+## SQLite 到 PostgreSQL 迁移
+
+### 缺少 psycopg2
+
+**症状**：迁移到 PostgreSQL 时报 `ModuleNotFoundError: psycopg2`。
+
+**排查**：
+
+```bash
+python -m pip install "iosql[postgresql]"
+```
+
+### migrate_to 找不到表契约
+
+**症状**：`migrate_to requires a TableContract`。
+
+**原因**：源表不是通过 `Database.table(..., pk=..., columns=...)` 或 `timeseries(...)` 创建，缺少持久化契约。
+
+**排查**：
+
+1. 使用 `source.table("name").spec()` 检查源表契约。
+2. 对无契约的历史表，先用 `Database.table("name", spec=...)` 声明兼容契约。
+3. 再执行 `source.migrate_to("postgresql://...")`。
+
+### PostgreSQL 迁移太慢或内存压力大
+
+**说明**：`migrate_to()` 会按 `batch_size` 从 SQLite 物理文件逐批读取，不会一次性载入全库。海量 K 线建议从 `50_000` 行批次开始测试。
+
+```python
+source.to_postgresql(
+    "postgresql://user:pass@localhost:5432/market",
+    batch_size=50_000,
+)
+```
+
+CLI：
+
+```bash
+iosql migrate -s sqlite://db/market.iosql \
+  --target postgresql://user:pass@localhost:5432/market \
+  --batch-size 50000
+```
+
+### row-count 校验失败
+
+**症状**：`verify="row-count"` 或 `iosql migrate --verify row-count` 抛出
+`row-count verification failed`。
+
+**常见原因**：
+
+1. 目标表在迁移前已有旧数据。
+2. 使用 `ignore` / `upsert` 导致目标实际新增行数少于源行数。
+3. 迁移期间源 SQLite 库仍有写入，源行数发生变化。
+
+**排查**：
+
+1. 先执行 `iosql migrate ... --dry-run` 确认源表行数和批次数。
+2. 对全量迁移使用空目标表或独立目标表名。
+3. 迁移窗口内暂停源库写入，再执行 `--verify row-count`。
+
 ## 分区维护
 
 ### repartition_to 后原库未变化
@@ -285,6 +346,33 @@ result = source_table.repartition_to("sqlite://new_db.iosql", spec=new_spec)
 print(result.rows_copied)  # 新库中的行数
 # 原库的 source_table 不受影响
 ```
+
+### compact 后仍看到 obsolete segment
+
+**症状**：`table.compact()` 后，`segments(include_obsolete=True)` 仍显示旧 segment，磁盘文件也还存在。
+
+**说明**：这是预期行为。compact 会在原库内写入新 generation，并把旧 segment 标记为 `obsolete`。默认查询、`segments()`、`layout_report()` 不再使用 obsolete segment；`compact()` 本身不会物理删除旧 SQLite 文件。
+
+**排查**：
+
+1. 使用 `table.segments()` 查看当前可见 segment。
+2. 使用 `table.segments(include_obsolete=True)` 审计旧 segment 状态。
+3. 对结果敏感的数据先比较 compact 前后的查询结果。
+4. 使用 `table.validate(deep=True)` 或 `iosql validate --deep` 校验当前可见 segment。
+5. 使用 `table.cleanup_obsolete()` 或 `iosql cleanup-obsolete` 预览可释放空间。
+6. 确认校验通过后再执行 `table.cleanup_obsolete(dry_run=False)` 或 `iosql cleanup-obsolete --yes`。
+7. 不要把 compact 理解为 `VACUUM`；它整理 iosql segment 布局，释放磁盘需要显式 cleanup。
+
+### cleanup-obsolete 拒绝删除
+
+**症状**：`cleanup_obsolete(dry_run=False)` 或 `iosql cleanup-obsolete --yes` 抛出校验失败。
+
+**排查**：
+
+1. 先运行 `table.validate(deep=True).to_dict()` 或 `iosql validate -s DB -t TABLE --deep` 查看具体错误。
+2. 如果是 `row_count_mismatch`、`time_min_mismatch`、`stats_min_mismatch` 等错误，说明当前可见 segment 的 manifest 与物理文件不一致，不应删除 obsolete 文件。
+3. 如果只是想预览可释放空间，使用默认 dry-run，不要传 `--yes`。
+4. 只有确认当前可见 segment 可被查询且校验问题已修复后，才重新执行清理。
 
 ### layout_report 的 recommendation 误解
 

@@ -764,6 +764,105 @@ def test_segment_layout_splits_oversized_logical_partition(tmp_path):
     }
 
 
+def test_compact_kline_late_data_rewrites_segments_and_improves_pruning(tmp_path):
+    db = Database(_uri(tmp_path))
+    bars = db.timeseries(
+        "bars",
+        time="ts",
+        primary_key=["symbol", "timeframe", "ts"],
+        columns={
+            "symbol": "text",
+            "timeframe": "text",
+            "ts": "integer",
+            "close": "float",
+        },
+        partition_every="1day",
+        target_rows_per_file=3,
+        min_rows_per_file=1,
+        max_rows_per_file=3,
+    )
+
+    bars.write([
+        {"symbol": "AAPL", "timeframe": "1m", "ts": ts, "close": float(ts)}
+        for ts in [1000, 2000, 3000, 4000, 5000, 6000]
+    ])
+    bars.write({
+        "symbol": "AAPL",
+        "timeframe": "1m",
+        "ts": 2500,
+        "close": 25.0,
+    })
+
+    before_rows = bars.query(
+        start=2000,
+        end=2600,
+        order_by="ts",
+    ).to_list()
+    before_plan = bars.query(start=2000, end=2600, order_by="ts").explain()
+    assert {
+        item["segment_id"] for item in before_plan.scanned_segments
+    } == {0, 2}
+
+    result = bars.compact()
+
+    assert result.rows_read == 7
+    assert result.rows_written == 7
+    assert result.old_segments == 3
+    assert result.obsolete_segments == 3
+    assert bars.query(start=2000, end=2600, order_by="ts").to_list() == before_rows
+
+    after_plan = bars.query(start=2000, end=2600, order_by="ts").explain()
+    assert len(after_plan.scanned_segments) == 1
+    assert {
+        item["state"] for item in after_plan.scanned_segments
+    } == {"sealed"}
+    assert {
+        item["segment_id"] for item in after_plan.scanned_segments
+    }.isdisjoint({0, 1, 2})
+    assert [item["state"] for item in bars.segments()] == [
+        "sealed",
+        "sealed",
+        "sealed",
+    ]
+    assert [item["state"] for item in bars.segments(include_obsolete=True)].count(
+        "obsolete"
+    ) == 3
+
+    db.close()
+
+
+def test_timeseries_query_iter_batches_matches_to_list(tmp_path):
+    db = Database(_uri(tmp_path))
+    bars = db.timeseries(
+        "bars",
+        time="ts",
+        primary_key=["symbol", "ts"],
+        columns={
+            "symbol": "text",
+            "ts": "integer",
+            "close": "float",
+        },
+        partition_every="1day",
+        target_rows_per_file=2,
+        min_rows_per_file=1,
+        max_rows_per_file=2,
+    )
+    bars.write([
+        {"symbol": "AAPL", "ts": ts, "close": float(ts)}
+        for ts in [1000, 2000, 3000, 4000, 5000]
+    ])
+
+    query = bars.query(start=1000, end=5000, order_by="ts", limit=4)
+    batches = list(query.iter_batches(batch_size=2))
+    rows = [row for batch in batches for row in batch]
+
+    assert [len(batch) for batch in batches] == [2, 2]
+    assert rows == query.to_list()
+    assert list(query.iter_rows(batch_size=3)) == query.to_list()
+
+    db.close()
+
+
 def test_segment_default_write_appends_duplicate_primary_key(tmp_path):
     _, ticks = _segmented_ticks(tmp_path)
     ticks.write([

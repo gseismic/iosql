@@ -1,6 +1,8 @@
+import csv
 import json
 import os
 
+import iosql.cli as cli_module
 from typer.testing import CliRunner
 
 from iosql.cli import app
@@ -50,6 +52,10 @@ def test_cli_help_lists_operational_commands():
     result = _invoke("--help")
     assert result.exit_code == 0, result.output
     assert "tables" in result.output, result.output
+    assert "validate" in result.output
+    assert "compact" in result.output
+    assert "cleanup-obsolete" in result.output
+    assert "migrate" in result.output
     assert "repartition" in result.output
     assert "index" in result.output
 
@@ -173,6 +179,375 @@ def test_cli_explain_query_export_and_import(tmp_path):
     assert result.exit_code == 0, result.output
     rows = json.loads(result.output)
     assert rows[0]["price"] == 150.0
+
+
+def test_cli_compact_marks_old_segments_obsolete(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke("compact", "-s", str(db_path), "-t", "ticks")
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["rows_read"] == 4
+    assert summary["rows_written"] == 4
+    assert summary["old_segments"] == 2
+    assert summary["new_segments"] == 2
+    assert summary["obsolete_segments"] == 2
+
+    result = _invoke("segments", "-s", str(db_path), "-t", "ticks")
+    assert result.exit_code == 0, result.output
+    visible = json.loads(result.output)
+    assert len(visible) == 2
+    assert {item["state"] for item in visible} == {"sealed"}
+
+    result = _invoke(
+        "segments",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "--include-obsolete",
+    )
+    assert result.exit_code == 0, result.output
+    all_segments = json.loads(result.output)
+    assert [item["state"] for item in all_segments].count("obsolete") == 2
+    assert [item["state"] for item in all_segments].count("sealed") == 2
+
+    result = _invoke("validate", "-s", str(db_path), "-t", "ticks", "--deep")
+    assert result.exit_code == 0, result.output
+    validation = json.loads(result.output)
+    assert validation["ok"] is True
+    assert validation["checked_segments"] == 2
+
+    result = _invoke("cleanup-obsolete", "-s", str(db_path), "-t", "ticks")
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.output)
+    assert preview["dry_run"] is True
+    assert preview["candidate_segments"] == 2
+    assert preview["files_deleted"] == 0
+    assert preview["bytes_reclaimable"] > 0
+    assert all(os.path.exists(path) for path in preview["files"])
+
+    result = _invoke("cleanup-obsolete", "-s", str(db_path), "-t", "ticks", "--yes")
+    assert result.exit_code == 0, result.output
+    cleanup = json.loads(result.output)
+    assert cleanup["dry_run"] is False
+    assert cleanup["candidate_segments"] == 2
+    assert cleanup["files_deleted"] >= 2
+    assert cleanup["manifest_rows_deleted"] == 2
+    assert all(not os.path.exists(path) for path in preview["files"])
+
+    result = _invoke(
+        "segments",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "--include-obsolete",
+    )
+    assert result.exit_code == 0, result.output
+    cleaned_segments = json.loads(result.output)
+    assert [item["state"] for item in cleaned_segments] == ["sealed", "sealed"]
+
+
+def test_cli_export_streams_jsonl_csv_and_json_batches(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+    where = json.dumps({"field": "symbol", "op": "==", "value": "AAPL"})
+
+    jsonl_path = tmp_path / "aapl.jsonl"
+    result = _invoke(
+        "export",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-o",
+        str(jsonl_path),
+        "--where",
+        where,
+        "--format",
+        "jsonl",
+        "--batch-size",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["rows"] == 2
+    assert summary["batch_size"] == 1
+    jsonl_rows = [
+        json.loads(line)
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["symbol"] for row in jsonl_rows] == ["AAPL", "AAPL"]
+
+    csv_path = tmp_path / "aapl.csv"
+    result = _invoke(
+        "export",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-o",
+        str(csv_path),
+        "--where",
+        where,
+        "--fields",
+        "symbol,ts",
+        "--format",
+        "csv",
+        "--batch-size",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    with csv_path.open("r", encoding="utf-8", newline="") as file:
+        csv_rows = list(csv.DictReader(file))
+    assert [row["symbol"] for row in csv_rows] == ["AAPL", "AAPL"]
+    assert set(csv_rows[0]) == {"symbol", "ts"}
+
+    json_path = tmp_path / "aapl.json"
+    result = _invoke(
+        "export",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-o",
+        str(json_path),
+        "--where",
+        where,
+        "--format",
+        "json",
+        "--batch-size",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    rows = json.loads(json_path.read_text(encoding="utf-8"))
+    assert [row["symbol"] for row in rows] == ["AAPL", "AAPL"]
+
+
+def test_cli_import_streams_jsonl_csv_and_keeps_json_compat(tmp_path, monkeypatch):
+    db_path = _make_sample_db(tmp_path)
+
+    def fail_read_rows(*args, **kwargs):
+        raise AssertionError("_read_rows must not be used by import")
+
+    monkeypatch.setattr(cli_module, "_read_rows", fail_read_rows)
+
+    jsonl_path = tmp_path / "new_rows.jsonl"
+    jsonl_path.write_text(
+        "\n".join([
+            json.dumps({"symbol": "GOOG", "ts": 1735862400000, "price": 150.0}),
+            json.dumps({"symbol": "AMZN", "ts": 1735862401000, "price": 151.0}),
+            json.dumps({"symbol": "META", "ts": 1735862402000, "price": 152.0}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    result = _invoke(
+        "import",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-f",
+        str(jsonl_path),
+        "--mode",
+        "append",
+        "--batch-size",
+        "2",
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary == {
+        "rows_seen": 3,
+        "rows_written": 3,
+        "mode": "append",
+        "batch_size": 2,
+    }
+
+    csv_path = tmp_path / "more_rows.csv"
+    csv_path.write_text(
+        "symbol,ts,price\nNFLX,1735862403000,153.0\nORCL,1735862404000,154.0\n",
+        encoding="utf-8",
+    )
+    result = _invoke(
+        "import",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-f",
+        str(csv_path),
+        "--format",
+        "csv",
+        "--batch-size",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["rows_seen"] == 2
+
+    json_path = tmp_path / "json_rows.json"
+    json_path.write_text(
+        json.dumps([
+            {"symbol": "IBM", "ts": 1735862405000, "price": 155.0},
+        ]),
+        encoding="utf-8",
+    )
+    result = _invoke(
+        "import",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-f",
+        str(json_path),
+        "--batch-size",
+        "1",
+    )
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output)["rows_seen"] == 1
+
+    result = _invoke(
+        "query",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "--where",
+        json.dumps({"field": "symbol", "op": "in", "value": ["GOOG", "ORCL", "IBM"]}),
+        "--order-by",
+        "ts",
+    )
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)
+    assert [row["symbol"] for row in rows] == ["GOOG", "ORCL", "IBM"]
+
+    result = _invoke(
+        "import",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-f",
+        str(jsonl_path),
+        "--batch-size",
+        "0",
+    )
+    assert result.exit_code == 1
+    assert "batch-size 必须大于 0" in result.output
+
+
+class _FakeTargetTable:
+    def __init__(self, table_name):
+        self.table_name = table_name
+        self.batches = []
+
+    def write(self, rows, mode=None):
+        self.batches.append(list(rows))
+
+    def count_rows(self, where=None):
+        return sum(len(batch) for batch in self.batches)
+
+
+class _FakeTargetDatabase:
+    def __init__(self):
+        self.tables = {}
+        self.closed = False
+
+    def table(self, table_name, spec=None):
+        self.tables.setdefault(table_name, _FakeTargetTable(table_name))
+        return self.tables[table_name]
+
+    def close(self):
+        self.closed = True
+
+
+def test_cli_migrate_to_postgresql_uri_with_table_mapping(tmp_path, monkeypatch):
+    db_path = _make_sample_db(tmp_path)
+    fake_target = _FakeTargetDatabase()
+    monkeypatch.setattr(
+        Database,
+        "_new_migration_target",
+        lambda self, target_uri: fake_target,
+    )
+
+    result = _invoke(
+        "migrate",
+        "-s",
+        str(db_path),
+        "--target",
+        "postgresql://user:pass@localhost:5432/market",
+        "-t",
+        "ticks:pg_ticks",
+        "--batch-size",
+        "2",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["rows_copied"] == 4
+    assert payload["batches"] == 2
+    assert payload["tables"][0]["table"] == "ticks"
+    assert payload["tables"][0]["target_table"] == "pg_ticks"
+    assert [len(batch) for batch in fake_target.tables["pg_ticks"].batches] == [2, 2]
+    assert fake_target.closed is True
+
+
+def test_cli_migrate_dry_run_and_verify_row_count(tmp_path, monkeypatch):
+    db_path = _make_sample_db(tmp_path)
+    monkeypatch.setattr(
+        Database,
+        "_new_migration_target",
+        lambda self, target_uri: (_ for _ in ()).throw(
+            AssertionError("dry-run should not create target database")
+        ),
+    )
+
+    result = _invoke(
+        "migrate",
+        "-s",
+        str(db_path),
+        "--target",
+        "postgresql://user:pass@localhost:5432/market",
+        "-t",
+        "ticks:pg_ticks",
+        "--batch-size",
+        "3",
+        "--dry-run",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["dry_run"] is True
+    assert payload["rows_copied"] == 0
+    assert payload["source_rows"] == 4
+    assert payload["batches"] == 2
+    assert payload["tables"][0]["target_table"] == "pg_ticks"
+
+    fake_target = _FakeTargetDatabase()
+    monkeypatch.setattr(
+        Database,
+        "_new_migration_target",
+        lambda self, target_uri: fake_target,
+    )
+    result = _invoke(
+        "migrate",
+        "-s",
+        str(db_path),
+        "--target",
+        "postgresql://user:pass@localhost:5432/market",
+        "-t",
+        "ticks:pg_ticks",
+        "--batch-size",
+        "3",
+        "--verify",
+        "row-count",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["verified"] is True
+    assert payload["source_rows"] == 4
+    assert payload["target_rows"] == 4
+    assert payload["tables"][0]["verify"] == "row-count"
 
 
 def test_cli_doctor_fix_and_index_check(tmp_path):

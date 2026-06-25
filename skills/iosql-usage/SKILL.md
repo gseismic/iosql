@@ -1,6 +1,6 @@
 ---
 name: iosql-usage
-description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, layout_report, repartition_to, spec, table_parts, delete, truncate, create_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
+description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, validate, cleanup_obsolete, layout_report, repartition_to, spec, table_parts, delete, truncate, create_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
 ---
 
 # iosql 使用指南
@@ -93,6 +93,7 @@ for part_key, part_data in partitioned_data.items():
 | **入口** | `Database(uri)` | 创建/打开数据库，`sqlite://` 或 `postgresql://` URI |
 | | `Database.table(name, **opts)` | 创建/获取表（核心入口） |
 | | `Database.timeseries(name, time=..., primary_key=..., **opts)` | 时序 helper 快捷版 |
+| | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库 |
 | **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
 | | `table.write_buffer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
 | | `table.insert_all(rows, ...)` | 低层写入（需明确传 pk/partition） |
@@ -100,15 +101,22 @@ for part_key, part_data in partitioned_data.items():
 | | `table.delete(where)` | 条件删除（传 None 已废弃，改用 truncate） |
 | | `table.truncate(confirm=True)` | 清空表（需显式确认） |
 | **查询** | `table.query(...).to_list()` / `.explain()` | 时序高层查询（timeseries 表） |
+| | `table.query(...).iter_batches(batch_size=...)` | 时序查询批量迭代 |
 | | `table.select(fields, where, order_by, limit, to_dict)` | 底层条件查询（所有表） |
+| | `table.iter_select(...)` / `iter_select_batches(...)` | 底层流式查询（所有表） |
 | | `table.select_all(fields, where)` | 等价于 select(to_dict=True) |
 | | `table.explain_select(fields, where, order_by, limit)` | 查询计划/分区裁剪分析 |
 | | `table.latest(symbols, as_of, by, columns)` | 最新截面查询 |
 | | `table.asof(...)` | latest 的别名 |
 | **诊断** | `table.spec()` | 获取当前表契约 |
-| | `table.segments()` | 获取物理 segment 清单 |
+| | `table.segments(include_obsolete=False)` | 获取物理 segment 清单 |
 | | `table.table_parts()` | 获取逻辑分区列表 |
+| | `table.validate(deep=False, include_obsolete=False)` | 校验 manifest 与物理 segment 文件 |
 | | `table.layout_report()` | 分区诊断报告（行数、推荐） |
+| | `table.compact(partition=None, target_rows=None)` | 显式整理 row segment，旧 segment 标记 obsolete |
+| | `table.cleanup_obsolete(partition=None, dry_run=True, validate=True)` | 安全清理 compact 后的 obsolete 文件 |
+| | `table.count_rows()` | 统计当前可见行数；SQLite 按物理 segment 执行 `count(*)` |
+| | `table.migrate_to(target_uri, target_table=None, verify=None, dry_run=False)` | 迁移单表到目标库 |
 | | `table.repartition_to(target_uri, spec)` | 按新策略重分区到新库 |
 | **维护** | `table.create_index(column, order)` | 为所有分区创建索引 |
 | | `Database.table_names()` | 列出数据库中所有表 |
@@ -123,7 +131,7 @@ iosql --help
 python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 ```
 
-CLI 只支持 SQLite 目录库，`--source` 可传本地路径或 `sqlite://...` / `sqlite3://...`。如果输入 `postgresql://...` 等其他 URI，应直接拒绝，不要自动包装成 SQLite 路径。
+CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径或 `sqlite://...` / `sqlite3://...`。如果 source 输入 `postgresql://...` 等其他 URI，应直接拒绝，不要自动包装成 SQLite 路径。`iosql migrate --target` 例外，目标可传 `postgresql://...`。
 
 | 类别 | 命令 | 说明 |
 |------|------|------|
@@ -132,11 +140,15 @@ CLI 只支持 SQLite 目录库，`--source` 可传本地路径或 `sqlite://...`
 | | `iosql layout -s DB -t TABLE` | 输出 `layout_report()` |
 | | `iosql parts -s DB -t TABLE` | 输出逻辑分区 |
 | | `iosql segments -s DB -t TABLE` | 输出物理 segment |
+| | `iosql validate -s DB -t TABLE --deep` | 深度校验 manifest、SQLite 文件和 stats |
 | **查询** | `iosql explain -s DB -t TABLE --where JSON` | 输出 `explain_select()` 查询计划 |
 | | `iosql query -s DB -t TABLE --where JSON --format jsonl` | 查询小规模结果 |
-| **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append` | 写入既有契约表 |
-| | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON` | 导出查询结果 |
+| **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append --batch-size 50000` | 批处理读取并写入既有契约表 |
+| | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON --batch-size 50000` | 批处理导出查询结果 |
 | **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
+| | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation |
+| | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件 |
+| | `iosql migrate -s DB --target postgresql://... [--dry-run] [--verify row-count]` | 迁移 SQLite iosql 库到 PostgreSQL |
 | | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份 |
 | | `iosql restore --backup BACKUP --target DB` | 目录级恢复 |
@@ -147,8 +159,9 @@ CLI 只支持 SQLite 目录库，`--source` 可传本地路径或 `sqlite://...`
 - `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。
 - 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。
 - `restore` 覆盖已有目标时必须使用 `--replace --yes`。
-- `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`。
-- `query/export` 适合排查和小规模导出；当前不是流式大数据导出入口。
+- `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验。
+- `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取，CSV 会按契约列类型做基础转换。
+- `query` 适合排查和小规模输出到终端；`export` 使用 `--batch-size` 批处理写文件，适合无全局排序的大结果集导出。
 - 复杂 where 优先传 JSON 或 `@file`，例如 `--where '{"field":"symbol","op":"==","value":"AAPL"}'`。
 
 ## 工作流
@@ -261,6 +274,10 @@ where = [
 ]
 rows = ticks.select("*", where=where, order_by="ts", limit=100, to_dict=True)
 plan = ticks.explain_select("*", where=where, order_by="ts")
+
+# 大结果集批量读取
+for batch in ticks.iter_select_batches("*", where=where, batch_size=50_000, to_dict=True):
+    process(batch)
 ```
 
 **金融截面查询**：
@@ -298,12 +315,66 @@ rows = futures.query(session="2026-01-06", symbols="AU").to_list()
 report = table.layout_report()
 print(report.total_rows, report.recommendation)
 
+result = table.compact()
+print(result.rows_read, result.rows_written, result.new_segments)
+validation = table.validate(deep=True)
+print(validation.ok, validation.errors)
+preview = table.cleanup_obsolete()
+print(preview.bytes_reclaimable)
+print(table.segments(include_obsolete=True))
+
 new_spec = table.spec().with_partition(partition="duration(ts,every=1hour)")
 result = table.repartition_to("sqlite://db/hourly.iosql", spec=new_spec)
 print(result.rows_copied, result.partitions_created)
 ```
 
-### 8. 清理
+### 8. SQLite 迁移到 PostgreSQL
+
+安装 PostgreSQL 可选依赖：
+
+```bash
+python -m pip install "iosql[postgresql]"
+```
+
+Python：
+
+```python
+source = Database("sqlite://db/market.iosql")
+result = source.to_postgresql(
+    "postgresql://user:pass@localhost:5432/market",
+    tables=["daily_bars", "kline_1m"],  # 不传则迁移全库
+    batch_size=50_000,
+    verify="row-count",                 # 可选：校验源/目标行数
+)
+print(result.rows_copied, result.batches, result.verified)
+source.close()
+```
+
+迁移前预览，不连接目标库：
+
+```python
+plan = source.to_postgresql(
+    "postgresql://user:pass@localhost:5432/market",
+    dry_run=True,
+    batch_size=50_000,
+)
+print(plan.source_rows, plan.batches)
+```
+
+CLI：
+
+```bash
+iosql migrate \
+  -s sqlite://db/market.iosql \
+  --target postgresql://user:pass@localhost:5432/market \
+  --table kline_1m:pg_kline_1m \
+  --batch-size 50000 \
+  --verify row-count
+```
+
+也可以用 `iosql migrate ... --dry-run` 输出表、源行数和批次数估算。
+
+### 9. 清理
 
 ```python
 # 关闭（推荐）
@@ -321,7 +392,13 @@ with Database("sqlite://db/test.iosql") as db:
 - 复杂 where 优先使用受支持的 dict/list/`Case` 或文本 where，不要拼接原始 SQL。
 - 代码结构按层理解：`iosql.core.query` 是通用查询 AST/where 解析；`iosql.engines.sqlite` / `iosql.engines.postgresql` 是引擎实现；旧 `iosql.query` / `iosql.sqlite` / `iosql.postgresql` 包已删除。
 - `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数和可选 `stats_columns`，合理配置以控制文件大小及统计开销。
+- `compact()` 只整理当前可见 row segment，生成新的 sealed generation，并把旧 segment 标记为 `obsolete`；默认查询和 `segments()` 不扫描 obsolete；需要释放旧文件时先 `validate(deep=True)`，再用 `cleanup_obsolete(dry_run=False)`。
+- 大结果集读取优先用 `iter_select_batches()` / `query(...).iter_batches()` 或 CLI `export --batch-size`；带全局 `order_by` 的跨 segment 查询仍可能需要 Python 层合并排序。
+- 大文件导入优先用 `iosql import --batch-size` 读取 JSONL/CSV；JSON 数组兼容但不适合数 GB 文件。
 - `repartition_to()` 写入新库，不要假设它会原地修改源库。
+- SQLite 到 PostgreSQL 迁移优先用 `Database.migrate_to()` / `to_postgresql()`；迁移按 `batch_size` 逐批读取 SQLite 物理文件，适合海量 K 线，不会一次性载入全库。生产迁移建议先 `dry_run=True` 预览，再用 `verify="row-count"` 校验源/目标行数。
+- PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。
+- PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边界；`calendar(...)` 支持 `text` / `date` / `timestamp` 目标列，text 日期列不要混用 ISO 与 compact 格式。
 - 测试必须覆盖写入结果、查询结果和必要的 `explain()` 裁剪信息。
 - 修改核心行为时，至少跑相关 sqlite 契约测试、partition 测试和 mysqlite 测试。
 - `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
@@ -355,6 +432,8 @@ with Database("sqlite://db/test.iosql") as db:
   - `07_partition_string_repartition_cli.py` —— 字符串 partition + CLI 重分区
   - `09_existing_database_append.py` —— 自包含地模拟已有库并按持久化契约继续写入
   - `10_existing_database_repartition.py` —— 自包含地模拟已有源库并重分区到新目标
+  - `11_sqlite_to_postgresql_migration.py` —— SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询；未设置 `POSTGRES_DSN` 时只执行 dry-run
+  - `12_sqlite_postgresql_roundtrip.py` —— SQLite -> PostgreSQL -> SQLite 双向转换；未设置 `POSTGRES_DSN` 时只执行 dry-run
   - `finance/` —— 金融场景：K线、orderbook、财报、新闻
 - **错误排查**：[troubleshooting.md](references/troubleshooting.md)
 - **写入性能**：[write-performance.md](references/write-performance.md) —— 2500 万行日线、orderbook、ext4 HDD benchmark、批次/分区/segment/PRAGMA 最佳实践

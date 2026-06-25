@@ -937,6 +937,7 @@ class SegmentInfo:
     stats: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     sealed: bool = False
     generation: int = 0
+    state: str = "active"
     created_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -953,6 +954,7 @@ class SegmentInfo:
             "stats": dict(self.stats or {}),
             "sealed": self.sealed,
             "generation": self.generation,
+            "state": self.state,
         }
 
 
@@ -1019,6 +1021,128 @@ class LayoutReport:
 
 
 @dataclass
+class CompactResult:
+    table: str
+    partitions: List[Any] = field(default_factory=list)
+    rows_read: int = 0
+    rows_written: int = 0
+    old_segments: int = 0
+    new_segments: int = 0
+    obsolete_segments: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "table": self.table,
+            "partitions": list(self.partitions),
+            "rows_read": self.rows_read,
+            "rows_written": self.rows_written,
+            "old_segments": self.old_segments,
+            "new_segments": self.new_segments,
+            "obsolete_segments": self.obsolete_segments,
+        }
+
+
+@dataclass
+class ValidationIssue:
+    severity: str
+    code: str
+    message: str
+    logical_part: Optional[Any] = None
+    segment_id: Optional[int] = None
+    part_key: Optional[str] = None
+    path: Optional[str] = None
+    expected: Optional[Any] = None
+    actual: Optional[Any] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = {
+            "severity": self.severity,
+            "code": self.code,
+            "message": self.message,
+            "logical_part": self.logical_part,
+            "segment_id": self.segment_id,
+            "part_key": self.part_key,
+            "path": self.path,
+            "expected": self.expected,
+            "actual": self.actual,
+        }
+        return {key: value for key, value in data.items() if value is not None}
+
+
+@dataclass
+class SegmentValidationResult:
+    table: str
+    deep: bool = False
+    include_obsolete: bool = False
+    checked_segments: int = 0
+    errors: List[ValidationIssue] = field(default_factory=list)
+    warnings: List[ValidationIssue] = field(default_factory=list)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+    def add_error(self, code: str, message: str, **kwargs) -> None:
+        self.errors.append(
+            ValidationIssue(
+                severity="error",
+                code=code,
+                message=message,
+                **kwargs,
+            )
+        )
+
+    def add_warning(self, code: str, message: str, **kwargs) -> None:
+        self.warnings.append(
+            ValidationIssue(
+                severity="warning",
+                code=code,
+                message=message,
+                **kwargs,
+            )
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "table": self.table,
+            "deep": self.deep,
+            "include_obsolete": self.include_obsolete,
+            "ok": self.ok,
+            "checked_segments": self.checked_segments,
+            "errors": [item.to_dict() for item in self.errors],
+            "warnings": [item.to_dict() for item in self.warnings],
+        }
+
+
+@dataclass
+class CleanupResult:
+    table: str
+    dry_run: bool = True
+    partitions: List[Any] = field(default_factory=list)
+    candidate_segments: int = 0
+    files: List[str] = field(default_factory=list)
+    files_deleted: int = 0
+    bytes_reclaimable: int = 0
+    bytes_deleted: int = 0
+    manifest_rows_deleted: int = 0
+    skipped: List[Dict[str, Any]] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "table": self.table,
+            "dry_run": self.dry_run,
+            "partitions": list(self.partitions),
+            "candidate_segments": self.candidate_segments,
+            "files": list(self.files),
+            "files_deleted": self.files_deleted,
+            "bytes_reclaimable": self.bytes_reclaimable,
+            "bytes_deleted": self.bytes_deleted,
+            "manifest_rows_deleted": self.manifest_rows_deleted,
+            "skipped": list(self.skipped),
+        }
+
+
+@dataclass
 class RepartitionResult:
     source_uri: str
     target_uri: str
@@ -1033,4 +1157,84 @@ class RepartitionResult:
             "table": self.table,
             "rows_copied": self.rows_copied,
             "partitions_created": list(self.partitions_created),
+        }
+
+
+@dataclass
+class TableMigrationResult:
+    table: str
+    target_table: Optional[str] = None
+    source_uri: Optional[str] = None
+    target_uri: Optional[str] = None
+    rows_copied: int = 0
+    batches: int = 0
+    source_rows: Optional[int] = None
+    target_rows: Optional[int] = None
+    verify: Optional[str] = None
+    verified: Optional[bool] = None
+    dry_run: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "table": self.table,
+            "target_table": self.target_table or self.table,
+            "source_uri": self.source_uri,
+            "target_uri": self.target_uri,
+            "rows_copied": self.rows_copied,
+            "batches": self.batches,
+            "source_rows": self.source_rows,
+            "target_rows": self.target_rows,
+            "verify": self.verify,
+            "verified": self.verified,
+            "dry_run": self.dry_run,
+        }
+
+
+@dataclass
+class MigrationResult:
+    source_uri: str
+    target_uri: str
+    tables: List[TableMigrationResult] = field(default_factory=list)
+    verify: Optional[str] = None
+    dry_run: bool = False
+
+    @property
+    def rows_copied(self) -> int:
+        return sum(item.rows_copied for item in self.tables)
+
+    @property
+    def batches(self) -> int:
+        return sum(item.batches for item in self.tables)
+
+    @property
+    def source_rows(self) -> Optional[int]:
+        if any(item.source_rows is None for item in self.tables):
+            return None
+        return sum(item.source_rows or 0 for item in self.tables)
+
+    @property
+    def target_rows(self) -> Optional[int]:
+        if any(item.target_rows is None for item in self.tables):
+            return None
+        return sum(item.target_rows or 0 for item in self.tables)
+
+    @property
+    def verified(self) -> Optional[bool]:
+        values = [item.verified for item in self.tables if item.verified is not None]
+        if not values:
+            return None
+        return all(values)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "source_uri": self.source_uri,
+            "target_uri": self.target_uri,
+            "rows_copied": self.rows_copied,
+            "batches": self.batches,
+            "source_rows": self.source_rows,
+            "target_rows": self.target_rows,
+            "verify": self.verify,
+            "verified": self.verified,
+            "dry_run": self.dry_run,
+            "tables": [item.to_dict() for item in self.tables],
         }

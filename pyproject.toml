@@ -17,6 +17,11 @@ dependencies = [
     "loguru>=0.7.0",
 ]
 
+[project.optional-dependencies]
+postgresql = [
+    "psycopg2-binary>=2.9",
+]
+
 [project.urls]
 Homepage = "http://github.com/gseismic/iosql"
 Repository = "http://github.com/gseismic/iosql"

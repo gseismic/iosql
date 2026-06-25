@@ -45,6 +45,17 @@ def _parse_uri(raw: str) -> str:
     return f"sqlite://{value}"
 
 
+def _parse_migration_target_uri(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        _fail("目标 URI 不能为空")
+    if value.startswith(("sqlite://", "sqlite3://", "postgresql://")):
+        return value
+    if "://" in value:
+        _fail("migrate 目标只支持 sqlite://、sqlite3:// 或 postgresql://")
+    return f"sqlite://{value}"
+
+
 def _uri_to_path(uri: str) -> Path:
     if uri.startswith("sqlite://"):
         return Path(uri[len("sqlite://"):])
@@ -121,6 +132,16 @@ def _parse_json_or_text(value: str) -> Any:
         return text
 
 
+def _parse_partition_value(value: str) -> Any:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return text
+
+
 def _require_table(db: Database, table: str):
     if table not in db.table_names():
         _fail(f"表不存在: {table}")
@@ -152,32 +173,124 @@ def _normalize_write_mode(mode: str) -> str:
     return value
 
 
+def _normalize_verify_mode(value: Optional[str]) -> Optional[str]:
+    if value in [None, ""]:
+        return None
+    verify = str(value).strip().lower()
+    if verify in ["none", "false", "0"]:
+        return None
+    if verify != "row-count":
+        _fail(f"不支持的校验模式: {value}")
+    return verify
+
+
+def _parse_table_mapping(values: List[str]) -> Optional[Any]:
+    if not values:
+        return None
+    mapping = {}
+    names = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        if ":" in text:
+            source, target = [item.strip() for item in text.split(":", 1)]
+            if not source or not target:
+                _fail(f"无效表映射: {value}")
+            mapping[source] = target
+        else:
+            names.append(text)
+    if mapping and names:
+        _fail("--table 不能混用普通表名和 source:target 映射")
+    return mapping if mapping else names
+
+
 def _read_rows(path: Path, format_: str) -> List[Dict[str, Any]]:
+    return list(_iter_read_rows(path, format_))
+
+
+def _iter_read_rows(path: Path, format_: str) -> Iterable[Dict[str, Any]]:
     fmt = _normalize_row_format(format_, path)
     if not path.exists():
         _fail(f"输入文件不存在: {path}")
 
     if fmt == "json":
-        data = json.loads(path.read_text(encoding="utf-8"))
+        with path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
         if isinstance(data, dict):
-            return [data]
+            yield data
+            return
         if isinstance(data, list) and all(isinstance(item, dict) for item in data):
-            return [dict(item) for item in data]
+            for item in data:
+                yield dict(item)
+            return
         _fail("JSON 输入必须是对象或对象数组")
 
     if fmt == "jsonl":
-        rows = []
-        for line_no, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if not line.strip():
-                continue
-            item = json.loads(line)
-            if not isinstance(item, dict):
-                _fail(f"JSONL 第 {line_no} 行不是对象")
-            rows.append(item)
-        return rows
+        with path.open("r", encoding="utf-8") as file:
+            for line_no, line in enumerate(file, 1):
+                if not line.strip():
+                    continue
+                item = json.loads(line)
+                if not isinstance(item, dict):
+                    _fail(f"JSONL 第 {line_no} 行不是对象")
+                yield item
+        return
 
     with path.open("r", encoding="utf-8", newline="") as file:
-        return [dict(row) for row in csv.DictReader(file)]
+        for row in csv.DictReader(file):
+            yield dict(row)
+
+
+def _iter_row_batches(
+    path: Path,
+    format_: str,
+    batch_size: int,
+) -> Iterable[List[Dict[str, Any]]]:
+    batch: List[Dict[str, Any]] = []
+    for row in _iter_read_rows(path, format_):
+        batch.append(row)
+        if len(batch) >= batch_size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
+def _coerce_import_batch(
+    batch: List[Dict[str, Any]],
+    table_spec,
+) -> List[Dict[str, Any]]:
+    column_types = dict(getattr(table_spec, "columns", None) or {})
+    if not column_types:
+        return batch
+    return [
+        {
+            key: _coerce_import_value(value, column_types.get(key), key)
+            for key, value in row.items()
+        }
+        for row in batch
+    ]
+
+
+def _coerce_import_value(value: Any, type_: Any, column: str) -> Any:
+    if type_ is None or not isinstance(value, str):
+        return value
+    if value == "":
+        return None
+
+    normalized = str(type_).strip().lower()
+    try:
+        if normalized in {"integer", "int", "bigint", "smallint"}:
+            return int(value)
+        if normalized in {"float", "real", "double", "numeric", "decimal"}:
+            return float(value)
+        if normalized in {"boolean", "bool"}:
+            return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+    except ValueError as exc:
+        _fail(f"字段 {column} 无法转换为 {type_}: {value}")
+        raise AssertionError("unreachable") from exc
+    return value
 
 
 def _row_fields(rows: Iterable[Dict[str, Any]]) -> List[str]:
@@ -231,6 +344,57 @@ def _write_rows(path: Path, rows: List[Dict[str, Any]], format_: str) -> None:
         path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
         return
     path.write_text(_rows_to_csv(rows), encoding="utf-8")
+
+
+def _write_row_batches(
+    path: Path,
+    batches: Iterable[List[Dict[str, Any]]],
+    format_: str,
+) -> int:
+    fmt = _normalize_row_format(format_, path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows_written = 0
+
+    with path.open("w", encoding="utf-8", newline="") as file:
+        if fmt == "json":
+            file.write("[\n")
+            first = True
+            for batch in batches:
+                for row in batch:
+                    if not first:
+                        file.write(",\n")
+                    file.write(
+                        json.dumps(row, ensure_ascii=False, default=_json_default)
+                    )
+                    first = False
+                    rows_written += 1
+            file.write("\n]\n" if rows_written else "]\n")
+            return rows_written
+
+        if fmt == "jsonl":
+            for batch in batches:
+                for row in batch:
+                    file.write(
+                        json.dumps(row, ensure_ascii=False, default=_json_default)
+                    )
+                    file.write("\n")
+                    rows_written += 1
+            return rows_written
+
+        writer = None
+        for batch in batches:
+            if not batch:
+                continue
+            if writer is None:
+                writer = csv.DictWriter(
+                    file,
+                    fieldnames=_row_fields(batch),
+                    extrasaction="ignore",
+                )
+                writer.writeheader()
+            writer.writerows(batch)
+            rows_written += len(batch)
+        return rows_written
 
 
 def _part_db_paths(source_path: Path, table_name: str) -> List[Path]:
@@ -772,12 +936,151 @@ def parts(
 def segments(
     source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
     table: str = typer.Option(..., "--table", "-t", help="表名"),
+    include_obsolete: bool = typer.Option(
+        False,
+        "--include-obsolete",
+        help="同时输出 compact 后的 obsolete segment",
+    ),
 ):
     """列出物理 segment。"""
     source_uri, _ = _require_source(source)
     db = Database(source_uri)
     try:
-        _echo_json(_require_table(db, table).segments())
+        _echo_json(
+            _require_table(db, table).segments(
+                include_obsolete=include_obsolete,
+            )
+        )
+    finally:
+        db.close()
+
+
+@app.command()
+def compact(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="表名"),
+    partition: str = typer.Option(
+        "",
+        "--partition",
+        help="只整理指定 logical partition；默认整理全表",
+    ),
+    target_rows: Optional[int] = typer.Option(
+        None,
+        "--target-rows",
+        help="新 segment 目标行数，默认使用表契约 target_rows",
+    ),
+):
+    """整理 row segment，生成新 generation 并标记旧 segment 为 obsolete。"""
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        result = _require_table(db, table).compact(
+            partition=_parse_partition_value(partition),
+            target_rows=target_rows,
+        )
+        _echo_json(result.to_dict())
+    finally:
+        db.close()
+
+
+@app.command()
+def validate(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="表名"),
+    deep: bool = typer.Option(False, "--deep", help="执行 SQLite 文件和统计深度校验"),
+    include_obsolete: bool = typer.Option(
+        False,
+        "--include-obsolete",
+        help="同时校验 compact 后的 obsolete segment",
+    ),
+):
+    """校验表 manifest 与物理 segment 文件。"""
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        result = _require_table(db, table).validate(
+            deep=deep,
+            include_obsolete=include_obsolete,
+        )
+        _echo_json(result.to_dict())
+        if not result.ok:
+            raise typer.Exit(2)
+    finally:
+        db.close()
+
+
+@app.command()
+def cleanup_obsolete(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="表名"),
+    partition: str = typer.Option(
+        "",
+        "--partition",
+        help="只清理指定 logical partition；默认清理全表",
+    ),
+    yes: bool = typer.Option(False, "--yes", help="确认删除 obsolete segment 文件"),
+    no_validate: bool = typer.Option(
+        False,
+        "--no-validate",
+        help="删除前不执行当前可见 segment 深度校验",
+    ),
+):
+    """安全清理 compact 后的 obsolete segment 文件。"""
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        result = _require_table(db, table).cleanup_obsolete(
+            partition=_parse_partition_value(partition),
+            dry_run=not yes,
+            validate=not no_validate,
+        )
+        _echo_json(result.to_dict())
+    finally:
+        db.close()
+
+
+@app.command()
+def migrate(
+    source: str = typer.Option(..., "--source", "-s", help="SQLite 源库 URI 或路径"),
+    target: str = typer.Option(
+        ...,
+        "--target",
+        help="目标库 URI，支持 postgresql:// 或 sqlite://",
+    ),
+    table: List[str] = typer.Option(
+        None,
+        "--table",
+        "-t",
+        help="迁移指定表；可用 source:target 重命名，可重复传入",
+    ),
+    batch_size: int = typer.Option(10_000, "--batch-size", help="迁移批大小"),
+    mode: str = typer.Option("append", "--mode", help="append/ignore/upsert/replace"),
+    verify: Optional[str] = typer.Option(
+        None,
+        "--verify",
+        help="迁移后校验模式；目前支持 row-count",
+    ),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只预览迁移计划，不连接目标库"),
+):
+    """把 SQLite iosql 库迁移到 PostgreSQL 或另一个 iosql 目标库。"""
+    source_uri, _ = _require_source(source)
+    target_uri = _parse_migration_target_uri(target)
+    write_mode = _normalize_write_mode(mode)
+    verify_mode = _normalize_verify_mode(verify)
+    if batch_size <= 0:
+        _fail("batch-size 必须大于 0")
+
+    db = Database(source_uri)
+    try:
+        result = db.migrate_to(
+            target_uri,
+            tables=_parse_table_mapping(table or []),
+            mode=write_mode,
+            batch_size=batch_size,
+            verify=verify_mode,
+            dry_run=dry_run,
+        )
+        _echo_json(result.to_dict())
     finally:
         db.close()
 
@@ -831,11 +1134,28 @@ def export_data(
     order_by: str = typer.Option("", "--order-by", help="排序字段"),
     limit: Optional[int] = typer.Option(None, "--limit", help="限制返回行数"),
     format_: str = typer.Option("auto", "--format", help="json/jsonl/csv/auto"),
+    batch_size: int = typer.Option(10_000, "--batch-size", help="流式导出批大小"),
 ):
-    """导出查询结果。"""
-    rows = _query_rows(source, table, fields, where, order_by, limit)
-    _write_rows(output, rows, format_)
-    _echo_json({"rows": len(rows), "output": str(output)})
+    """流式导出查询结果。"""
+    if batch_size <= 0:
+        _fail("batch-size 必须大于 0")
+
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        t = _require_table(db, table)
+        batches = t.iter_select_batches(
+            fields,
+            where=_parse_json_or_text(where),
+            order_by=order_by or None,
+            limit=limit,
+            batch_size=batch_size,
+            to_dict=True,
+        )
+        rows = _write_row_batches(output, batches, format_)
+    finally:
+        db.close()
+    _echo_json({"rows": rows, "output": str(output), "batch_size": batch_size})
 
 
 @app.command(name="import")
@@ -848,7 +1168,6 @@ def import_data(
     batch_size: int = typer.Option(10_000, "--batch-size", help="写入批大小"),
 ):
     """导入 JSON、JSONL 或 CSV 到既有表。"""
-    rows = _read_rows(file, format_)
     write_mode = _normalize_write_mode(mode)
     if batch_size <= 0:
         _fail("batch-size 必须大于 0")
@@ -858,17 +1177,25 @@ def import_data(
     rows_written = 0
     try:
         t = _require_table(db, table)
-        if not t.spec():
+        table_spec = t.spec()
+        if not table_spec:
             _fail(f"表无契约，无法使用 table.write(): {table}")
-        for start in range(0, len(rows), batch_size):
-            batch = rows[start:start + batch_size]
+        rows_seen = 0
+        for batch in _iter_row_batches(file, format_, batch_size):
             if not batch:
                 continue
+            batch = _coerce_import_batch(batch, table_spec)
+            rows_seen += len(batch)
             result = t.write(batch, mode=write_mode)
             rows_written += result.rows_seen
     finally:
         db.close()
-    _echo_json({"rows_seen": len(rows), "rows_written": rows_written, "mode": write_mode})
+    _echo_json({
+        "rows_seen": rows_seen,
+        "rows_written": rows_written,
+        "mode": write_mode,
+        "batch_size": batch_size,
+    })
 
 
 @app.command()

@@ -9,7 +9,7 @@
 - **物理 row segment**：同一 logical partition 可按行数自动拆成多个 SQLite 文件，也可以不配置 logical partition，仅用 `__all__` + row segment 控制文件大小。
 - **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
 - **批量写入**：`insert_all()` 和 `write_buffer()` 可直接使用表契约写入。
-- **布局维护**：`layout_report()` 检查分区行数，`repartition_to()` 可生成新的分区布局。
+- **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
 - **时序 helper**：`Database.timeseries()` 保留为快捷封装，适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 
 ## Partition 与 Segment 的关系
@@ -76,6 +76,12 @@ daily_bars/
 
 ```bash
 python -m pip install -e .
+```
+
+需要 PostgreSQL 迁移或 PostgreSQL 引擎时安装可选依赖：
+
+```bash
+python -m pip install -e ".[postgresql]"
 ```
 
 构建 wheel：
@@ -357,7 +363,33 @@ segments = table.segments()
 
 `where` 支持 dict/list/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
 
-`segments()` 返回物理文件级 manifest，包含 logical partition、segment id、文件 key、行数和列级 `stats`。`explain_select()` 同时返回 logical partitions 和 physical segments 的候选/扫描/跳过信息。
+`segments()` 返回物理文件级 manifest，包含 logical partition、segment id、文件 key、行数、状态和列级 `stats`。`explain_select()` 同时返回 logical partitions 和 physical segments 的候选/扫描/跳过信息。compact 后默认只返回当前可见 segment；需要检查旧文件时可用 `segments(include_obsolete=True)`。
+
+### Row Segment Compaction
+
+金融 K 线、tick、orderbook 等 append-only 场景中，晚到数据会进入新的 active/delta segment。这样可以保证写入简单可靠，但同一时间范围可能需要扫描多个 segment。显式调用 `compact()` 可把当前可见 segment 按 `order_key` / time / 主键重新排序并写入新 generation：
+
+```python
+result = table.compact()
+print(result.rows_read, result.rows_written, result.new_segments)
+
+all_segments = table.segments(include_obsolete=True)
+```
+
+`compact()` 成功后会把旧 segment 标记为 `obsolete`，默认查询、`segments()`、`layout_report()` 和 `repartition_to()` 都只使用新 segment。`compact()` 本身不会物理删除旧 SQLite 文件；append-only 表中如果已经存在跨 segment 重复主键，compact 会把重复主键分到不同新 segment，保持现有查询结果不变。
+
+需要释放 compact 后的旧文件时，先执行深度校验，再清理 obsolete segment。`cleanup_obsolete()` 默认 dry-run，只预览候选文件和可释放字节；真正删除必须显式传 `dry_run=False`。删除前默认会校验当前可见 segment 的 SQLite integrity、row_count 和 manifest stats，校验失败会拒绝删除旧文件：
+
+```python
+validation = table.validate(deep=True)
+assert validation.ok, validation.to_dict()
+
+preview = table.cleanup_obsolete()
+print(preview.bytes_reclaimable, preview.files)
+
+cleanup = table.cleanup_obsolete(dry_run=False)
+print(cleanup.files_deleted, cleanup.bytes_deleted)
+```
 
 `timeseries()` helper 额外提供业务查询：
 
@@ -404,6 +436,50 @@ snapshot = ticks.latest(
 
 `session=` 会编译成对 `session_column` 的等值或 `in` 条件，可与 `symbols`、`start/end`、`date`、`where`、`latest()` 和 `asof()` 组合。新写入的 segment 会记录 `session_min/session_max`，`explain()` 可显示 `pruned_by_segment_session_range`。
 
+### 流式查询和导出
+
+大结果集优先使用批量迭代接口，避免 `select()` / `to_list()` 一次性持有全部行：
+
+```python
+for batch in ticks.query(start=start, end=end).iter_batches(batch_size=50_000):
+    process(batch)
+
+for row in table.iter_select(
+    "*",
+    where={"field": "ts", "op": ">=", "value": start},
+    batch_size=50_000,
+    to_dict=True,
+):
+    process_one(row)
+```
+
+CLI `export` 会批处理写文件，适合导出多年 K 线、tick 或回测输入：
+
+```bash
+iosql export \
+  -s sqlite://database/market.iosql \
+  -t ticks \
+  -o ticks.jsonl \
+  --where '{"field":"ts","op":">=","value":1735689600000}' \
+  --batch-size 50000
+```
+
+无全局 `order_by` 时，查询按分区/segment 分批读取。跨多个 segment 使用全局 `order_by` 时，为保证排序正确性，仍会在 Python 层合并排序后再按批输出。
+
+CLI `import` 会批处理读取 JSONL/CSV 并写入既有契约表，适合 vendor 历史文件和离线回补包：
+
+```bash
+iosql import \
+  -s sqlite://database/market.iosql \
+  -t ticks \
+  -f ticks.jsonl \
+  --format jsonl \
+  --batch-size 50000 \
+  --mode append
+```
+
+CSV 导入会按表契约中的 `columns` 对 integer/float/bool 做基础类型转换；JSON 对象或对象数组仍兼容，但超大文件推荐使用 JSONL 或 CSV。
+
 ### 日历分区
 
 如果数据使用日期字符串，可以直接使用 `Partition.calendar(...)`；对应 `timeseries()` 快捷版本见 `examples/02_calendar_events.py`：
@@ -440,10 +516,99 @@ rows = events.select(
 report = table.layout_report()
 print(report.total_rows, report.recommendation)
 
+compact_result = table.compact()
+print(compact_result.rows_read, compact_result.rows_written)
+
+validation = table.validate(deep=True)
+print(validation.ok, validation.errors)
+
+preview = table.cleanup_obsolete()
+print(preview.bytes_reclaimable)
+
 new_spec = table.spec().with_partition(partition="duration(ts,every=1hour)")
 result = table.repartition_to("sqlite://database/market-hourly.iosql", spec=new_spec)
 print(result.rows_copied, result.partitions_created)
 ```
+
+CLI 整理 row segment：
+
+```bash
+iosql compact -s sqlite://database/market.iosql -t ticks
+iosql validate -s sqlite://database/market.iosql -t ticks --deep
+iosql segments -s sqlite://database/market.iosql -t ticks --include-obsolete
+iosql cleanup-obsolete -s sqlite://database/market.iosql -t ticks        # dry-run
+iosql cleanup-obsolete -s sqlite://database/market.iosql -t ticks --yes  # 执行删除
+```
+
+### SQLite 迁移到 PostgreSQL
+
+已有 SQLite 版 iosql 库可以直接迁移到 PostgreSQL。表契约会复用源库的主键、列类型、分区和排序字段；源库不会被修改。
+
+```python
+from iosql import Database
+
+source = Database("sqlite://database/market.iosql")
+
+result = source.to_postgresql(
+    "postgresql://user:pass@localhost:5432/market",
+    tables=["daily_bars", "kline_1m"],   # 不传则迁移全库
+    batch_size=50_000,
+    verify="row-count",                  # 可选：迁移后校验源/目标行数
+)
+
+print(result.rows_copied, result.batches, result.verified)
+source.close()
+```
+
+迁移前可以先预览，不连接目标库：
+
+```python
+plan = source.to_postgresql(
+    "postgresql://user:pass@localhost:5432/market",
+    dry_run=True,
+    batch_size=50_000,
+)
+print(plan.source_rows, plan.batches)
+```
+
+单表迁移：
+
+```python
+ticks = source.table("kline_1m")
+result = ticks.migrate_to(
+    "postgresql://user:pass@localhost:5432/market",
+    target_table="pg_kline_1m",
+    batch_size=50_000,
+)
+```
+
+PostgreSQL 作为源库写回 SQLite 时，需要重新绑定同一份表契约：
+
+```python
+spec = source.table("kline_1m").spec()
+pg = Database("postgresql://user:pass@localhost:5432/market")
+pg.table("pg_kline_1m", spec=spec)
+result = pg.migrate_to(
+    "sqlite://database/from-postgresql.iosql",
+    tables={"pg_kline_1m": "kline_1m"},
+    verify="row-count",
+    batch_size=50_000,
+)
+pg.close()
+```
+
+CLI：
+
+```bash
+iosql migrate \
+  -s sqlite://database/market.iosql \
+  --target postgresql://user:pass@localhost:5432/market \
+  --table kline_1m:pg_kline_1m \
+  --batch-size 50000 \
+  --verify row-count
+```
+
+也可以先执行 `iosql migrate ... --dry-run` 查看表、源行数和批次数估算。
 
 CLI 重分区推荐使用 `--partition`：
 
@@ -489,6 +654,8 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 | `08_doctor_time_first_suggestions.py` | `doctor` 对历史 `partition_key` 表优先推荐时间分区。 |
 | `09_existing_database_append.py` | 独立模拟已有库，重新打开持久化契约后继续增量写入。 |
 | `10_existing_database_repartition.py` | 独立模拟已有源库，重新打开后重分区到新目标库。 |
+| `11_sqlite_to_postgresql_migration.py` | SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询。 |
+| `12_sqlite_postgresql_roundtrip.py` | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
 
 金融场景示例位于 `examples/finance/`：
 
@@ -514,8 +681,13 @@ python examples/07_partition_string_repartition_cli.py
 python examples/08_doctor_time_first_suggestions.py
 python examples/09_existing_database_append.py
 python examples/10_existing_database_repartition.py
+python examples/11_sqlite_to_postgresql_migration.py
+python examples/12_sqlite_postgresql_roundtrip.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
+
+`11_sqlite_to_postgresql_migration.py` 未设置 `POSTGRES_DSN` 时只执行 SQLite 源库准备和 dry-run；设置 `POSTGRES_DSN` 后会重建 PostgreSQL 示例表 `iosql_example_migration_ticks` 并执行真实迁移。
+`12_sqlite_postgresql_roundtrip.py` 未设置 `POSTGRES_DSN` 时只执行 dry-run；设置后会演示 `sqlite -> postgresql -> sqlite` 双向转换。
 
 低层 SQLite 工具示例位于 `examples/mysqlite/`，用于 `iosql.utils.mysqlite` 的 schema-on-write、批量写入、冲突处理和连接池清理。它们不是新的主 API 入口。
 
@@ -540,12 +712,25 @@ database/
 
 - 核心 `Database.table(...)` 不需要 `time` 字段；分区字段由 `Partition.*(...)` 指定。
 - `timeseries()` 仍保留为 helper，适合需要 `query(start/end/date)`、`latest()`、`asof()` 的业务场景。
-- 多分区查询支持全局 `order_by` 和 `limit`，但结果会在 Python 层合并排序，扫描范围应尽量通过时间条件收窄。
-- 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment。
+- 多分区查询支持全局 `order_by` 和 `limit`，但带全局排序时结果会在 Python 层合并排序；大结果集无排序导出优先使用 `iter_select_batches()` 或 CLI `export --batch-size`。
+- 大文件导入优先使用 JSONL/CSV 和 `iosql import --batch-size`；JSON 数组格式保持兼容但不推荐用于数 GB 文件。
+- 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment，可用 `compact()` 显式整理为新的 sealed generation，再用 `validate(deep=True)` / `cleanup_obsolete()` 释放旧文件。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
 - `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
-- PostgreSQL URI 格式为 `postgresql://user:pass@host:port/dbname`，与 SQLite 引擎共享同一套分区和查询 API。
-- `Segment.rows` 表当前不支持 `upsert`/`replace` 覆盖写；需要覆盖写时请关闭 segment 或使用 `append`/`ignore`。
+- PostgreSQL URI 格式为 `postgresql://user:pass@host:port/dbname`；SQLite 到 PostgreSQL 迁移优先使用 `Database.migrate_to()` / `to_postgresql()` 或 `iosql migrate`，生产迁移建议先 `--dry-run`，再用 `--verify row-count` 校验。
+- PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。
+
+### 生产迁移 checklist
+
+1. 源表必须有持久化契约：`source.table("name").spec()` 不应为 `None`。
+2. 先执行 `dry_run=True` 或 `iosql migrate --dry-run`，确认表名、源行数和批次数。
+3. 使用新的目标表名或确认目标表为空，再执行全量迁移。
+4. 对全量迁移启用 `verify="row-count"` 或 `--verify row-count`。
+5. 迁移窗口内暂停源库写入，避免校验期间源行数变化。
+6. PostgreSQL `table_names()` 只返回逻辑表；native partition 子表不需要用户直接操作。
+7. `calendar(...)` 迁移支持 `text` / `date` / `timestamp` 目标列的 native range 边界；text 日期建议统一使用 ISO 日期（如 `2026-01-05`）或 compact 日期（如 `20260105`），不要在同一列混用格式。
+
+- `Segment.rows` 表当前不支持 `upsert`/`replace` 覆盖写；`compact()` 不做去重，只整理 append-only 数据布局。需要覆盖写时请关闭 segment 或使用 `append`/`ignore`。
 
 ## 变更记录
 

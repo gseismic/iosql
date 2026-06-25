@@ -1,7 +1,9 @@
+import os
+
 import pytest
 
 from iosql import Database, Partition, Segment
-from iosql.exception import BadArgument
+from iosql.exception import BadArgument, UnsafeOperation
 from iosql.partition import RangePartition
 
 
@@ -251,6 +253,234 @@ def test_row_segment_late_data_scans_overlapping_segments_and_skips_others(tmp_p
         "__all____000001": "pruned_by_segment_stats",
     }
     assert plan["requires_global_sort"] is True
+
+    db.close()
+
+
+def test_row_segment_compact_preserves_duplicate_primary_keys(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=4),
+        order_key="event_id",
+    )
+
+    table.write([
+        {"event_id": 1, "seq": 1, "kind": "base"},
+        {"event_id": 2, "seq": 2, "kind": "base"},
+        {"event_id": 3, "seq": 3, "kind": "base"},
+        {"event_id": 4, "seq": 4, "kind": "base"},
+    ])
+    table.write({"event_id": 1, "seq": 5, "kind": "duplicate"})
+
+    before = table.select("*", where=None, order_by="seq", to_dict=True)
+    result = table.compact(target_rows=4)
+
+    assert result.rows_read == 5
+    assert result.rows_written == 5
+    assert result.old_segments == 2
+    assert result.new_segments == 2
+    assert result.obsolete_segments == 2
+    assert table.select("*", where=None, order_by="seq", to_dict=True) == before
+
+    visible = table.segments()
+    assert len(visible) == 2
+    assert all(item["state"] == "sealed" for item in visible)
+    all_segments = table.segments(include_obsolete=True)
+    assert [item["state"] for item in all_segments].count("obsolete") == 2
+    assert [item["state"] for item in all_segments].count("sealed") == 2
+
+    db.close()
+
+
+def test_row_segment_validate_and_cleanup_obsolete_files(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": 1, "seq": 1, "kind": "base"},
+        {"event_id": 2, "seq": 2, "kind": "base"},
+        {"event_id": 3, "seq": 3, "kind": "base"},
+        {"event_id": 4, "seq": 4, "kind": "base"},
+    ])
+
+    before = table.select("*", where=None, order_by="event_id", to_dict=True)
+    table.compact()
+
+    validation = table.validate(deep=True)
+    assert validation.ok, validation.to_dict()
+    assert validation.checked_segments == 2
+
+    preview = table.cleanup_obsolete()
+    assert preview.dry_run is True
+    assert preview.candidate_segments == 2
+    assert preview.files_deleted == 0
+    assert preview.bytes_reclaimable > 0
+    assert all(os.path.exists(path) for path in preview.files)
+
+    result = table.cleanup_obsolete(dry_run=False)
+    assert result.dry_run is False
+    assert result.candidate_segments == 2
+    assert result.files_deleted >= 2
+    assert result.manifest_rows_deleted == 2
+    assert result.bytes_deleted > 0
+    assert all(not os.path.exists(path) for path in preview.files)
+    assert table.select("*", where=None, order_by="event_id", to_dict=True) == before
+    assert [item["state"] for item in table.segments(include_obsolete=True)] == [
+        "sealed",
+        "sealed",
+    ]
+
+    db.close()
+
+
+def test_deep_validate_detects_manifest_row_count_mismatch(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": 1, "seq": 1},
+        {"event_id": 2, "seq": 2},
+    ])
+    segment = table.segments()[0]
+    table.table_meta_db["_iosql_segments"].execute_params(
+        (
+            "update _iosql_segments set row_count = ? "
+            "where table_name = ? and logical_part = ? and segment_id = ?"
+        ),
+        [999, "events", segment["logical_part"], segment["segment_id"]],
+        commit=True,
+    )
+
+    validation = table.validate(deep=True)
+
+    assert not validation.ok
+    assert [issue.code for issue in validation.errors] == ["row_count_mismatch"]
+    assert validation.errors[0].expected == 999
+    assert validation.errors[0].actual == 2
+
+    db.close()
+
+
+def test_cleanup_obsolete_rejects_when_visible_segment_invalid(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": 1, "seq": 1},
+        {"event_id": 2, "seq": 2},
+        {"event_id": 3, "seq": 3},
+        {"event_id": 4, "seq": 4},
+    ])
+    table.compact()
+    preview = table.cleanup_obsolete()
+    visible = table.segments()[0]
+    table.table_meta_db["_iosql_segments"].execute_params(
+        (
+            "update _iosql_segments set row_count = ? "
+            "where table_name = ? and logical_part = ? and segment_id = ?"
+        ),
+        [999, "events", visible["logical_part"], visible["segment_id"]],
+        commit=True,
+    )
+
+    with pytest.raises(UnsafeOperation, match="validation failed"):
+        table.cleanup_obsolete(dry_run=False)
+
+    assert all(os.path.exists(path) for path in preview.files)
+    assert [item["state"] for item in table.segments(include_obsolete=True)].count(
+        "obsolete"
+    ) == 2
+
+    db.close()
+
+
+def test_iter_select_batches_streams_rows_and_honors_limit(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": idx, "seq": idx, "kind": "trade"}
+        for idx in range(1, 7)
+    ])
+
+    where = {"field": "seq", "op": ">=", "value": 2}
+    batches = list(table.iter_select_batches(
+        "event_id,seq",
+        where=where,
+        batch_size=2,
+        limit=3,
+        to_dict=True,
+    ))
+    rows = [row for batch in batches for row in batch]
+
+    assert [len(batch) for batch in batches] == [2, 1]
+    assert rows == table.select(
+        "event_id,seq",
+        where=where,
+        limit=3,
+        to_dict=True,
+    )
+    assert list(table.iter_select_batches(
+        "*",
+        where=where,
+        batch_size=2,
+        limit=0,
+        to_dict=True,
+    )) == []
+
+    ordered_rows = list(table.iter_select(
+        "*",
+        where=None,
+        order_by="seq desc",
+        batch_size=2,
+        limit=4,
+        to_dict=True,
+    ))
+    assert ordered_rows == table.select(
+        "*",
+        where=None,
+        order_by="seq desc",
+        limit=4,
+        to_dict=True,
+    )
+
+    db.close()
+
+
+def test_compact_rejects_non_segment_table(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "items",
+        pk=["id"],
+        columns={"id": "integer", "value": "text"},
+    )
+    table.write({"id": 1, "value": "a"})
+
+    with pytest.raises(BadArgument, match="Segment.rows"):
+        table.compact()
 
     db.close()
 

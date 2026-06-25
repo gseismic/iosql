@@ -20,6 +20,8 @@
 | `08_doctor_time_first_suggestions.py` | 高级 | 展示 `doctor` 如何对历史 `partition_key` 表优先推荐 `calendar(date,...)`。 |
 | `09_existing_database_append.py` | 进阶 | 独立准备并关闭一个示例库，再按已有持久化契约重新打开并增量写入。 |
 | `10_existing_database_repartition.py` | 高级 | 独立准备已有源库，重新打开后离线重分区到新的目标库。 |
+| `11_sqlite_to_postgresql_migration.py` | 高级 | SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询。 |
+| `12_sqlite_postgresql_roundtrip.py` | 高级 | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
 
 ## 金融示例
 
@@ -55,8 +57,13 @@ python examples/07_partition_string_repartition_cli.py
 python examples/08_doctor_time_first_suggestions.py
 python examples/09_existing_database_append.py
 python examples/10_existing_database_repartition.py
+python examples/11_sqlite_to_postgresql_migration.py
+python examples/12_sqlite_postgresql_roundtrip.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
+
+`11_sqlite_to_postgresql_migration.py` 未设置 `POSTGRES_DSN` 时只执行 SQLite 源库准备和 dry-run；设置 `POSTGRES_DSN` 后会重建示例目标表并执行真实 PostgreSQL 迁移和行数校验。
+`12_sqlite_postgresql_roundtrip.py` 未设置 `POSTGRES_DSN` 时只执行 dry-run；设置后会演示 `sqlite -> postgresql -> sqlite` 双向转换。
 
 ## 运行时数据
 

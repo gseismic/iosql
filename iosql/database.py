@@ -3,7 +3,7 @@ import os
 from .utils.schema import parse_db_schema
 from .exception import BadArgument, EngineNotExist
 from .engines import sqlite
-from .spec import TableContract, TableSpec
+from .spec import MigrationResult, TableContract, TableSpec
 
 
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
@@ -17,6 +17,17 @@ def _normalize_pk(value):
     if isinstance(value, str):
         return [value]
     return list(value)
+
+
+def _normalize_migration_verify(verify):
+    if verify in [None, False, ""]:
+        return None
+    value = str(verify).strip().lower()
+    if value in ["none", "false", "0"]:
+        return None
+    if value != "row-count":
+        raise BadArgument("verify only supports row-count")
+    return value
 
 
 class Database(object):
@@ -170,6 +181,32 @@ class Database(object):
         self.close()
 
     def table_names(self):
+        if self._uri_schema == "postgresql":
+            try:
+                import psycopg2
+            except ImportError as e:
+                raise BadArgument(
+                    "PostgreSQL support requires psycopg2"
+                ) from e
+            with psycopg2.connect(self._uri) as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        """
+                        select c.relname
+                        from pg_class c
+                        join pg_namespace n on n.oid = c.relnamespace
+                        where n.nspname = 'public'
+                          and c.relkind in ('r', 'p')
+                          and not exists (
+                              select 1
+                              from pg_inherits i
+                              where i.inhrelid = c.oid
+                          )
+                        order by c.relname
+                        """
+                    )
+                    return [row[0] for row in cursor.fetchall()]
+
         _, options = parse_db_schema(self._uri)
         db_path = os.path.join(options.get('path') or '', options.get('db') or '')
         if not os.path.isdir(db_path):
@@ -194,6 +231,95 @@ class Database(object):
             get_process_connection_budget_status,
         )
         return get_process_connection_budget_status()
+
+    def migrate_to(self, target_uri, tables=None, mode='append',
+                   batch_size=10_000, verify=None, dry_run=False):
+        verify = _normalize_migration_verify(verify)
+        table_mapping = self._migration_table_mapping(tables)
+        if dry_run:
+            results = []
+            for source_name, target_name in table_mapping.items():
+                source_table = self.table(source_name)
+                spec = source_table.spec()
+                if not spec:
+                    raise BadArgument(
+                        f'migrate_to requires a TableContract: {source_name}'
+                    )
+                results.append(
+                    source_table._migration_dry_run_result(
+                        target_uri=target_uri,
+                        target_name=target_name,
+                        batch_size=batch_size,
+                        verify=verify,
+                    )
+                )
+            return MigrationResult(
+                source_uri=self._uri,
+                target_uri=target_uri,
+                tables=results,
+                verify=verify,
+                dry_run=True,
+            )
+
+        target_db = self._new_migration_target(target_uri)
+        results = []
+        try:
+            for source_name, target_name in table_mapping.items():
+                source_table = self.table(source_name)
+                spec = source_table.spec()
+                if not spec:
+                    raise BadArgument(
+                        f'migrate_to requires a TableContract: {source_name}'
+                    )
+                target_table = target_db.table(target_name, spec=spec)
+                results.append(
+                    source_table._migrate_to_target_table(
+                        target_table,
+                        target_uri=target_uri,
+                        target_name=target_name,
+                        mode=mode,
+                        batch_size=batch_size,
+                        verify=verify,
+                    )
+                )
+        finally:
+            target_db.close()
+        return MigrationResult(
+            source_uri=self._uri,
+            target_uri=target_uri,
+            tables=results,
+            verify=verify,
+            dry_run=False,
+        )
+
+    def to_postgresql(self, target_uri, tables=None, mode='append',
+                      batch_size=10_000, verify=None, dry_run=False):
+        target_schema, _ = parse_db_schema(target_uri)
+        if target_schema != 'postgresql':
+            raise BadArgument('to_postgresql requires a postgresql:// target uri')
+        return self.migrate_to(
+            target_uri,
+            tables=tables,
+            mode=mode,
+            batch_size=batch_size,
+            verify=verify,
+            dry_run=dry_run,
+        )
+
+    def _migration_table_mapping(self, tables):
+        if tables is None:
+            names = self.table_names()
+            if not names:
+                raise BadArgument('migrate_to found no source tables')
+            return {name: name for name in names}
+        if isinstance(tables, dict):
+            return dict(tables)
+        if isinstance(tables, str):
+            return {tables: tables}
+        return {name: name for name in list(tables)}
+
+    def _new_migration_target(self, target_uri):
+        return Database(target_uri)
 
     @classmethod
     def get_engine(cls, uri):

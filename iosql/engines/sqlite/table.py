@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import os
+import sqlite3
 import threading
 import time
 import warnings
@@ -27,6 +28,8 @@ from ...logger import default_logger as logger
 from ...partition import CalendarPartition, DurationPartition, Partition
 from ...core.query import Case, CaseExpression, Where, get_case_range
 from ...spec import (
+    CleanupResult,
+    CompactResult,
     DEFAULT_LOGICAL_PART,
     LayoutReport,
     PartitionStats,
@@ -35,6 +38,8 @@ from ...spec import (
     QuerySpec,
     RepartitionResult,
     TableContract,
+    TableMigrationResult,
+    SegmentValidationResult,
     SegmentInfo,
     TableSpec,
     WriteResult,
@@ -86,8 +91,27 @@ class _TableQuery:
             to_dict=True,
         )
 
-    def iter_rows(self):
-        return iter(self.to_list())
+    def iter_rows(self, batch_size=10_000):
+        where = self._table._compile_query_where(self._query_spec)
+        return self._table.iter_select(
+            self._query_spec.columns,
+            where=where,
+            order_by=self._query_spec.order_by,
+            limit=self._query_spec.limit,
+            batch_size=batch_size,
+            to_dict=True,
+        )
+
+    def iter_batches(self, batch_size=10_000):
+        where = self._table._compile_query_where(self._query_spec)
+        return self._table.iter_select_batches(
+            self._query_spec.columns,
+            where=where,
+            order_by=self._query_spec.order_by,
+            limit=self._query_spec.limit,
+            batch_size=batch_size,
+            to_dict=True,
+        )
 
     def spec(self):
         return self._query_spec
@@ -197,6 +221,7 @@ class Table(BaseTable):
         self._db_parts_leases = {}
         self._db_parts_condition = threading.Condition(threading.RLock())
         self._db_parts_closing = False
+        self._compact_lock = threading.RLock()
         self._declared_spec = None
         # New partition system
         self._partition = None
@@ -556,8 +581,752 @@ class Table(BaseTable):
             group_by=group_by,
         )
 
-    def segments(self):
-        return [ref.to_dict() for ref in self._physical_part_refs()]
+    def segments(self, include_obsolete=False):
+        return [
+            ref.to_dict()
+            for ref in self._physical_part_refs(
+                include_obsolete=include_obsolete,
+            )
+        ]
+
+    def compact(self, partition=None, target_rows=None):
+        spec = self.spec()
+        if not spec:
+            raise BadArgument('compact requires a TableContract')
+        if not spec.segment:
+            raise BadArgument('compact requires Segment.rows')
+
+        target_rows = self._compact_target_rows(spec, target_rows)
+        partitions = self._compact_partitions(partition)
+        result = CompactResult(table=self._table_name, partitions=list(partitions))
+
+        with self._compact_lock:
+            for logical_part in partitions:
+                part_result = self._compact_partition(
+                    logical_part,
+                    spec,
+                    target_rows,
+                )
+                result.rows_read += part_result.rows_read
+                result.rows_written += part_result.rows_written
+                result.old_segments += part_result.old_segments
+                result.new_segments += part_result.new_segments
+                result.obsolete_segments += part_result.obsolete_segments
+        return result
+
+    def validate(self, deep=False, include_obsolete=False):
+        result = SegmentValidationResult(
+            table=self._table_name,
+            deep=bool(deep),
+            include_obsolete=bool(include_obsolete),
+        )
+        for ref in self._physical_part_refs(include_obsolete=include_obsolete):
+            result.checked_segments += 1
+            self._validate_segment_ref(ref, result)
+            if deep:
+                self._validate_segment_ref_deep(ref, result)
+        return result
+
+    def cleanup_obsolete(self, partition=None, dry_run=True, validate=True):
+        spec = self.spec()
+        if not spec:
+            raise BadArgument('cleanup_obsolete requires a TableContract')
+        if not spec.segment:
+            raise BadArgument('cleanup_obsolete requires Segment.rows')
+
+        requested_parts = (
+            self._compact_partitions(partition)
+            if partition is not None
+            else None
+        )
+        refs = [
+            info for info in self._segment_infos(
+                requested_parts,
+                include_obsolete=True,
+            )
+            if info.state == 'obsolete'
+        ]
+        result = CleanupResult(
+            table=self._table_name,
+            dry_run=bool(dry_run),
+            partitions=(
+                list(requested_parts)
+                if requested_parts is not None
+                else sorted({ref.logical_part for ref in refs}, key=str)
+            ),
+            candidate_segments=len(refs),
+        )
+
+        for ref in refs:
+            files = self._segment_cleanup_files(ref)
+            result.files.extend(files)
+            result.bytes_reclaimable += sum(self._file_size(path) for path in files)
+
+        if dry_run or not refs:
+            return result
+
+        if validate:
+            validation = self.validate(deep=True, include_obsolete=False)
+            if not validation.ok:
+                first = validation.errors[0]
+                raise UnsafeOperation(
+                    'cleanup_obsolete validation failed before deletion: '
+                    f'{first.code}: {first.message}'
+                )
+
+        deleted_refs = []
+        for ref in refs:
+            if not self._is_safe_part_path(ref.path):
+                result.skipped.append({
+                    'part_key': ref.part_key,
+                    'path': ref.path,
+                    'reason': 'unsafe_path',
+                })
+                continue
+            if not self._close_part_db_if_idle(ref.path):
+                result.skipped.append({
+                    'part_key': ref.part_key,
+                    'path': ref.path,
+                    'reason': 'active_lease',
+                })
+                continue
+
+            files = self._segment_cleanup_files(ref)
+            if not files:
+                deleted_refs.append(ref)
+                continue
+
+            deleted_all = True
+            bytes_deleted = 0
+            files_deleted = 0
+            for path in files:
+                try:
+                    size = self._file_size(path)
+                    os.remove(path)
+                    bytes_deleted += size
+                    files_deleted += 1
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    deleted_all = False
+                    result.skipped.append({
+                        'part_key': ref.part_key,
+                        'path': path,
+                        'reason': f'delete_failed: {exc}',
+                    })
+                    break
+            result.bytes_deleted += bytes_deleted
+            result.files_deleted += files_deleted
+            if deleted_all:
+                deleted_refs.append(ref)
+
+        result.manifest_rows_deleted = self._delete_segment_manifest_rows(deleted_refs)
+        return result
+
+    def iter_rows(self, batch_size=10_000):
+        if isinstance(batch_size, bool):
+            raise BadArgument('batch_size must be a positive integer')
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise BadArgument('batch_size must be a positive integer')
+
+        for ref in self._physical_part_refs():
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            offset = 0
+            while True:
+                with self._part_db(part_dbfile, auto_commit=False) as db:
+                    try:
+                        rows = db[_PART_DATA_TABLE_NAME].query(
+                            (
+                                f'select * from {_PART_DATA_TABLE_NAME} '
+                                'limit ? offset ?'
+                            ),
+                            params=[batch_size, offset],
+                            to_dict=True,
+                        )
+                    except NoSuchTable:
+                        rows = []
+                if not rows:
+                    break
+                batch = [dict(row) for row in rows]
+                yield batch
+                if len(batch) < batch_size:
+                    break
+                offset += len(batch)
+
+    def count_rows(self):
+        total = 0
+        for ref in self._physical_part_refs():
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            with self._part_db(part_dbfile, auto_commit=False) as db:
+                try:
+                    total += db[_PART_DATA_TABLE_NAME].count()
+                except NoSuchTable:
+                    continue
+        return total
+
+    def migrate_to(self, target_uri, target_table=None, mode='append',
+                   batch_size=10_000, verify=None, dry_run=False):
+        spec = self.spec()
+        if not spec:
+            raise BadArgument('migrate_to requires a TableContract')
+        verify = self._normalize_migration_verify(verify)
+        table_name = target_table or self._table_name
+        if dry_run:
+            return self._migration_dry_run_result(
+                target_uri=target_uri,
+                target_name=table_name,
+                batch_size=batch_size,
+                verify=verify,
+            )
+
+        from ...database import Database
+
+        target_db = Database(target_uri)
+        try:
+            target = target_db.table(table_name, spec=spec)
+            return self._migrate_to_target_table(
+                target,
+                target_uri=target_uri,
+                target_name=table_name,
+                mode=mode,
+                batch_size=batch_size,
+                verify=verify,
+            )
+        finally:
+            target_db.close()
+
+    def _migrate_to_target_table(self, target_table, target_uri=None,
+                                 target_name=None, mode='append',
+                                 batch_size=10_000, verify=None):
+        batch_size = self._normalize_migration_batch_size(batch_size)
+        verify = self._normalize_migration_verify(verify)
+
+        source_rows = self.count_rows() if verify == 'row-count' else None
+        rows_copied = 0
+        batches = 0
+        for batch in self.iter_rows(batch_size=batch_size):
+            if not batch:
+                continue
+            target_table.write(batch, mode=mode)
+            rows_copied += len(batch)
+            batches += 1
+        result = TableMigrationResult(
+            table=self._table_name,
+            target_table=target_name or getattr(
+                target_table,
+                'table_name',
+                self._table_name,
+            ),
+            source_uri=self._uri,
+            target_uri=target_uri,
+            rows_copied=rows_copied,
+            batches=batches,
+            source_rows=source_rows,
+            verify=verify,
+        )
+        if verify == 'row-count':
+            target_rows = target_table.count_rows()
+            result.target_rows = target_rows
+            result.verified = (
+                source_rows == rows_copied
+                and target_rows == source_rows
+            )
+            if not result.verified:
+                raise BadArgument(
+                    'row-count verification failed: '
+                    f'table={self._table_name}, source_rows={source_rows}, '
+                    f'rows_copied={rows_copied}, target_rows={target_rows}'
+                )
+        return result
+
+    def _migration_dry_run_result(self, target_uri=None, target_name=None,
+                                  batch_size=10_000, verify=None):
+        batch_size = self._normalize_migration_batch_size(batch_size)
+        verify = self._normalize_migration_verify(verify)
+        source_rows = self.count_rows()
+        return TableMigrationResult(
+            table=self._table_name,
+            target_table=target_name or self._table_name,
+            source_uri=self._uri,
+            target_uri=target_uri,
+            rows_copied=0,
+            batches=math.ceil(source_rows / batch_size) if source_rows else 0,
+            source_rows=source_rows,
+            target_rows=None,
+            verify=verify,
+            verified=None,
+            dry_run=True,
+        )
+
+    def _normalize_migration_batch_size(self, batch_size):
+        if isinstance(batch_size, bool):
+            raise BadArgument('batch_size must be a positive integer')
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise BadArgument('batch_size must be a positive integer')
+        return batch_size
+
+    def _normalize_migration_verify(self, verify):
+        if verify in [None, False, '']:
+            return None
+        value = str(verify).strip().lower()
+        if value in ['none', 'false', '0']:
+            return None
+        if value != 'row-count':
+            raise BadArgument('verify only supports row-count')
+        return value
+
+    def _compact_target_rows(self, spec, target_rows):
+        layout = spec.physical_layout
+        target = layout.target_rows_per_file if target_rows is None else target_rows
+        if isinstance(target, bool):
+            raise BadArgument('compact target_rows must be a positive integer')
+        target = int(target)
+        if target <= 0:
+            raise BadArgument('compact target_rows must be a positive integer')
+        if target > layout.max_rows_per_file:
+            raise BadArgument('compact target_rows must be <= segment max_rows')
+        return target
+
+    def _compact_partitions(self, partition):
+        if partition is None:
+            return list(self.table_parts())
+        if isinstance(partition, (list, tuple, set)):
+            return list(partition)
+        return [partition]
+
+    def _compact_partition(self, logical_part, spec, target_rows):
+        refs = self._physical_part_refs([logical_part])
+        if not refs:
+            return CompactResult(table=self._table_name, partitions=[logical_part])
+        if any(ref.segment_id < 0 for ref in refs):
+            raise BadArgument('compact does not support legacy non-segment files')
+
+        rows = []
+        for ref in refs:
+            rows.extend(
+                self._rows_from_part_dbfile(self._get_part_dbfile(ref.part_key))
+            )
+
+        rows = self._compact_sort_rows(rows, spec)
+        chunks = self._compact_row_chunks(
+            rows,
+            spec.primary_key,
+            target_rows,
+        )
+
+        result = CompactResult(
+            table=self._table_name,
+            partitions=[logical_part],
+            rows_read=len(rows),
+            old_segments=len(refs),
+        )
+        new_infos = []
+        try:
+            new_infos = self._write_compact_chunks(
+                logical_part,
+                chunks,
+                spec,
+            )
+            self._mark_segments_obsolete(refs)
+        except Exception:
+            self._mark_segments_obsolete(new_infos)
+            raise
+
+        result.rows_written = sum(info.row_count for info in new_infos)
+        result.new_segments = len(new_infos)
+        result.obsolete_segments = len(refs)
+        return result
+
+    def _compact_sort_rows(self, rows, spec):
+        if not rows:
+            return []
+        fields = []
+        for field in [
+            spec.order_key,
+            spec.time.name if spec.time else None,
+            spec.partition.column if spec.partition else None,
+        ]:
+            if field and field not in fields:
+                fields.append(field)
+        for field in spec.primary_key:
+            if field not in fields:
+                fields.append(field)
+        if not fields:
+            return list(rows)
+
+        def sort_key(row):
+            return tuple(self._row_sort_value(row, field) for field in fields)
+
+        try:
+            return sorted(rows, key=sort_key)
+        except TypeError:
+            return sorted(
+                rows,
+                key=lambda row: tuple(str(row.get(field)) for field in fields),
+            )
+
+    def _compact_row_chunks(self, rows, primary_key, target_rows):
+        chunks = []
+        current = []
+        current_keys = set()
+        for row in rows:
+            pk_value = None
+            if primary_key:
+                try:
+                    pk_value = tuple(row[field] for field in primary_key)
+                except KeyError as e:
+                    raise MissingPrimaryKey(
+                        f'compact row missing primary key column `{e.args[0]}`'
+                    ) from e
+            if current and (
+                len(current) >= target_rows
+                or (pk_value is not None and pk_value in current_keys)
+            ):
+                chunks.append(current)
+                current = []
+                current_keys = set()
+            current.append(row)
+            if pk_value is not None:
+                current_keys.add(pk_value)
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _write_compact_chunks(self, logical_part, chunks, spec):
+        if not chunks:
+            return []
+
+        partition = spec.to_partition()
+        part_column = partition.TS_COL if partition else None
+        layout = spec.physical_layout
+        next_segment_id = self._next_segment_id(logical_part)
+        generation = self._next_segment_generation(logical_part)
+        part_kwargs = {
+            'alter': spec.schema_policy == 'evolve',
+            'column_type': dict(spec.columns or {}),
+            'table_contract': spec.to_dict(),
+        }
+        new_infos = []
+        for chunk in chunks:
+            part_key = self._segment_part_key(logical_part, next_segment_id)
+            path = self._get_part_dbfile(part_key)
+            if os.path.exists(path):
+                raise UnsafeOperation(f'compact target segment already exists: {path}')
+            segment = SegmentInfo(
+                logical_part=logical_part,
+                segment_id=next_segment_id,
+                part_key=part_key,
+                path=path,
+                row_count=0,
+                sealed=True,
+                generation=generation,
+                state='sealed',
+            )
+            info = self._write_segment_rows(
+                segment,
+                logical_part,
+                part_column,
+                chunk,
+                spec.primary_key,
+                partition,
+                False,
+                False,
+                True,
+                layout,
+                part_kwargs,
+            )
+            info.sealed = True
+            info.state = 'sealed'
+            info.generation = generation
+            self._upsert_segment_info(info)
+            new_infos.append(info)
+            next_segment_id += 1
+        return new_infos
+
+    def _next_segment_id(self, logical_part):
+        segments = self._segment_infos(
+            [logical_part],
+            include_obsolete=True,
+        )
+        if not segments:
+            return 0
+        return max(info.segment_id for info in segments) + 1
+
+    def _next_segment_generation(self, logical_part):
+        segments = self._segment_infos(
+            [logical_part],
+            include_obsolete=True,
+        )
+        if not segments:
+            return 1
+        return max(info.generation for info in segments) + 1
+
+    def _mark_segments_obsolete(self, refs):
+        for ref in refs:
+            if ref.segment_id < 0:
+                continue
+            ref.sealed = True
+            ref.state = 'obsolete'
+            self._upsert_segment_info(ref)
+
+    def _validate_segment_ref(self, ref, result):
+        if ref.segment_id >= 0 and ref.state not in ['active', 'sealed', 'obsolete']:
+            result.add_error(
+                'invalid_segment_state',
+                f'invalid segment state: {ref.state}',
+                **self._segment_issue_context(ref),
+            )
+        if not ref.part_key:
+            result.add_error(
+                'missing_part_key',
+                'segment part_key is empty',
+                **self._segment_issue_context(ref),
+            )
+        if not self._is_safe_part_path(ref.path):
+            result.add_error(
+                'unsafe_path',
+                'segment path is outside table parts directory',
+                **self._segment_issue_context(ref),
+            )
+
+    def _validate_segment_ref_deep(self, ref, result):
+        if not os.path.isfile(ref.path):
+            self._add_segment_issue(
+                result,
+                ref,
+                'segment_file_missing',
+                'segment file does not exist',
+            )
+            return
+
+        integrity = self._sqlite_integrity_check(ref.path)
+        if integrity != ['ok']:
+            self._add_segment_issue(
+                result,
+                ref,
+                'sqlite_integrity_failed',
+                'SQLite integrity_check failed',
+                expected='ok',
+                actual=integrity,
+            )
+
+        if not self._data_table_exists(ref.path):
+            self._add_segment_issue(
+                result,
+                ref,
+                'data_table_missing',
+                f'SQLite table `{_PART_DATA_TABLE_NAME}` does not exist',
+            )
+            return
+
+        self._validate_segment_row_count(ref, result)
+        self._validate_segment_time_bounds(ref, result)
+        self._validate_segment_session_bounds(ref, result)
+        self._validate_segment_stats(ref, result)
+
+    def _validate_segment_row_count(self, ref, result):
+        actual = self._data_file_row_count(ref.part_key)
+        if int(ref.row_count or 0) != int(actual or 0):
+            self._add_segment_issue(
+                result,
+                ref,
+                'row_count_mismatch',
+                'manifest row_count does not match physical COUNT(*)',
+                expected=ref.row_count,
+                actual=actual,
+            )
+
+    def _validate_segment_time_bounds(self, ref, result):
+        actual_min, actual_max = self._data_file_time_range(ref.part_key)
+        if not self._values_equal(ref.time_min, actual_min):
+            self._add_segment_issue(
+                result,
+                ref,
+                'time_min_mismatch',
+                'manifest time_min does not match physical MIN(time)',
+                expected=ref.time_min,
+                actual=actual_min,
+            )
+        if not self._values_equal(ref.time_max, actual_max):
+            self._add_segment_issue(
+                result,
+                ref,
+                'time_max_mismatch',
+                'manifest time_max does not match physical MAX(time)',
+                expected=ref.time_max,
+                actual=actual_max,
+            )
+
+    def _validate_segment_session_bounds(self, ref, result):
+        actual_min, actual_max = self._data_file_session_range(ref.part_key)
+        if not self._values_equal(ref.session_min, actual_min):
+            self._add_segment_issue(
+                result,
+                ref,
+                'session_min_mismatch',
+                'manifest session_min does not match physical MIN(session)',
+                expected=ref.session_min,
+                actual=actual_min,
+            )
+        if not self._values_equal(ref.session_max, actual_max):
+            self._add_segment_issue(
+                result,
+                ref,
+                'session_max_mismatch',
+                'manifest session_max does not match physical MAX(session)',
+                expected=ref.session_max,
+                actual=actual_max,
+            )
+
+    def _validate_segment_stats(self, ref, result):
+        for column, bounds in (ref.stats or {}).items():
+            if not isinstance(bounds, dict):
+                self._add_segment_issue(
+                    result,
+                    ref,
+                    'stats_invalid',
+                    f'manifest stats for `{column}` is not an object',
+                    actual=bounds,
+                )
+                continue
+            if bounds.get('complete') is False:
+                continue
+
+            actual = self._data_file_column_bounds(ref.part_key, column)
+            if actual is None:
+                self._add_segment_issue(
+                    result,
+                    ref,
+                    'stats_column_missing',
+                    f'cannot read physical stats for `{column}`',
+                )
+                continue
+
+            for key in ['min', 'max']:
+                if not self._values_equal(bounds.get(key), actual.get(key)):
+                    self._add_segment_issue(
+                        result,
+                        ref,
+                        f'stats_{key}_mismatch',
+                        f'manifest stats `{column}.{key}` does not match physical data',
+                        expected=bounds.get(key),
+                        actual=actual.get(key),
+                    )
+
+    def _add_segment_issue(self, result, ref, code, message, **kwargs):
+        method = result.add_warning if ref.state == 'obsolete' else result.add_error
+        method(
+            code,
+            message,
+            **self._segment_issue_context(ref, **kwargs),
+        )
+
+    def _segment_issue_context(self, ref, **kwargs):
+        context = {
+            'logical_part': ref.logical_part,
+            'segment_id': ref.segment_id,
+            'part_key': ref.part_key,
+            'path': ref.path,
+        }
+        context.update(kwargs)
+        return context
+
+    def _sqlite_integrity_check(self, path):
+        try:
+            with sqlite3.connect(path) as conn:
+                rows = conn.execute('PRAGMA integrity_check;').fetchall()
+        except sqlite3.Error as exc:
+            return [str(exc)]
+        return [row[0] for row in rows]
+
+    def _data_table_exists(self, path):
+        try:
+            with sqlite3.connect(path) as conn:
+                row = conn.execute(
+                    (
+                        "select name from sqlite_master "
+                        "where type = 'table' and name = ?"
+                    ),
+                    [_PART_DATA_TABLE_NAME],
+                ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+
+    def _data_file_column_bounds(self, part_key, column):
+        path = self._get_part_dbfile(part_key)
+        if not os.path.isfile(path):
+            return None
+        field = self._quote_identifier(column)
+        table_name = self._quote_identifier(_PART_DATA_TABLE_NAME)
+        try:
+            with sqlite3.connect(path) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    (
+                        f'select MIN({field}) as stat_min, '
+                        f'MAX({field}) as stat_max from {table_name};'
+                    )
+                ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return {'min': None, 'max': None}
+        return {'min': row['stat_min'], 'max': row['stat_max']}
+
+    def _values_equal(self, left, right):
+        return left == right
+
+    def _segment_cleanup_files(self, ref):
+        if not self._is_safe_part_path(ref.path):
+            return []
+        paths = [ref.path, f'{ref.path}-wal', f'{ref.path}-shm']
+        return [path for path in paths if os.path.exists(path)]
+
+    def _file_size(self, path):
+        try:
+            return os.path.getsize(path)
+        except OSError:
+            return 0
+
+    def _is_safe_part_path(self, path):
+        base = os.path.realpath(self.table_part_path)
+        real = os.path.realpath(path)
+        return real.startswith(base + os.sep)
+
+    def _close_part_db_if_idle(self, part_dbfile):
+        db_to_close = None
+        with self._db_parts_condition:
+            if self._db_parts_leases.get(part_dbfile, 0):
+                return False
+            db_to_close = self._db_parts.pop(part_dbfile, None)
+            self._db_parts_status.pop(part_dbfile, None)
+            self._db_parts_leases.pop(part_dbfile, None)
+        if db_to_close and not db_to_close.is_closed():
+            db_to_close.close()
+        return True
+
+    def _delete_segment_manifest_rows(self, refs):
+        if not refs:
+            return 0
+        try:
+            table = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME]
+            for ref in refs:
+                table.execute_params(
+                    (
+                        f'delete from {_TABLE_SEGMENT_TABLE_NAME} '
+                        'where table_name = ? '
+                        'and logical_part = ? '
+                        'and segment_id = ?'
+                    ),
+                    [self._table_name, ref.logical_part, ref.segment_id],
+                    commit=True,
+                )
+        except NoSuchTable:
+            return 0
+        return len(refs)
 
     def _latest_rows(self, query_spec, columns, by):
         table_spec = self.spec()
@@ -947,6 +1716,12 @@ class Table(BaseTable):
                 stats = {}
         if not isinstance(stats, dict):
             stats = {}
+        state = row.get('state')
+        if state is None:
+            state = 'sealed' if self._bool_value(row.get('sealed')) else 'active'
+        state = str(state or 'active').lower()
+        if state not in ['active', 'sealed', 'obsolete']:
+            state = 'sealed' if self._bool_value(row.get('sealed')) else 'active'
         return SegmentInfo(
             logical_part=row['logical_part'],
             segment_id=int(row['segment_id']),
@@ -960,10 +1735,11 @@ class Table(BaseTable):
             stats=stats,
             sealed=self._bool_value(row.get('sealed')),
             generation=int(row.get('generation') or 0),
+            state=state,
             created_at=row.get('created_at'),
         )
 
-    def _segment_infos(self, logical_parts=None):
+    def _segment_infos(self, logical_parts=None, include_obsolete=False):
         try:
             rows = self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].query(
                 f'select * from {_TABLE_SEGMENT_TABLE_NAME} where table_name = ?',
@@ -981,6 +1757,8 @@ class Table(BaseTable):
             ]
 
         infos = [self._segment_from_row(row) for row in rows]
+        if not include_obsolete:
+            infos = [info for info in infos if info.state != 'obsolete']
         return sorted(
             infos,
             key=lambda item: (self._part_token(item.logical_part), item.segment_id),
@@ -992,8 +1770,11 @@ class Table(BaseTable):
     def _segment_to_plan_item(self, info):
         return info.to_dict()
 
-    def _segment_info(self, logical_part, segment_id):
-        for info in self._segment_infos([logical_part]):
+    def _segment_info(self, logical_part, segment_id, include_obsolete=False):
+        for info in self._segment_infos(
+            [logical_part],
+            include_obsolete=include_obsolete,
+        ):
             if info.segment_id == segment_id:
                 return info
         return None
@@ -1016,6 +1797,7 @@ class Table(BaseTable):
 
     def _upsert_segment_info(self, info):
         now = arrow.now().format("YYYY-MM-DD HH:mm:ss")
+        state = self._normalized_segment_state(info)
         row = {
             'table_name': self._table_name,
             'logical_part': info.logical_part,
@@ -1032,6 +1814,7 @@ class Table(BaseTable):
             'updated_at': now,
             'sealed': int(bool(info.sealed)),
             'generation': info.generation,
+            'state': state,
         }
         self.table_meta_db[_TABLE_SEGMENT_TABLE_NAME].insert(
             row,
@@ -1041,6 +1824,12 @@ class Table(BaseTable):
             ensure_column=True,
             commit=True,
         )
+
+    def _normalized_segment_state(self, info):
+        state = str(info.state or '').lower()
+        if state == 'obsolete':
+            return 'obsolete'
+        return 'sealed' if info.sealed else 'active'
 
     def _data_file_row_count(self, part_key):
         part_dbfile = self._get_part_dbfile(part_key)
@@ -1152,6 +1941,10 @@ class Table(BaseTable):
         session_min, session_max = self._data_file_session_range(part_key)
         stats = self._data_file_column_stats(part_key)
         existing = self._segment_info(logical_part, segment_id)
+        sealed = (
+            bool(existing and existing.sealed)
+            or row_count >= layout.max_rows_per_file
+        )
         info = SegmentInfo(
             logical_part=logical_part,
             segment_id=segment_id,
@@ -1163,9 +1956,12 @@ class Table(BaseTable):
             session_min=session_min,
             session_max=session_max,
             stats=stats,
-            sealed=(
-                bool(existing and existing.sealed)
-                or row_count >= layout.max_rows_per_file
+            sealed=sealed,
+            generation=existing.generation if existing else 0,
+            state=(
+                existing.state
+                if existing and existing.state == 'obsolete'
+                else ('sealed' if sealed else 'active')
             ),
             created_at=existing.created_at if existing else None,
         )
@@ -1274,6 +2070,7 @@ class Table(BaseTable):
             session_max = session_stats.get('max')
 
         row_count = segment.row_count + len(rows)
+        sealed = segment.sealed or row_count >= layout.max_rows_per_file
         info = SegmentInfo(
             logical_part=segment.logical_part,
             segment_id=segment.segment_id,
@@ -1285,8 +2082,9 @@ class Table(BaseTable):
             session_min=session_min,
             session_max=session_max,
             stats=stats,
-            sealed=segment.sealed or row_count >= layout.max_rows_per_file,
+            sealed=sealed,
             generation=segment.generation,
+            state='sealed' if sealed else 'active',
             created_at=segment.created_at,
         )
         self._upsert_segment_info(info)
@@ -1390,6 +2188,7 @@ class Table(BaseTable):
             capacity = layout.max_rows_per_file - active.row_count
             if capacity <= 0:
                 active.sealed = True
+                active.state = 'sealed'
                 self._upsert_segment_info(active)
                 continue
 
@@ -1412,12 +2211,20 @@ class Table(BaseTable):
     def _active_segment_for(self, logical_part, layout):
         segments = self._segment_infos([logical_part])
         for info in reversed(segments):
-            if not info.sealed and info.row_count < layout.max_rows_per_file:
+            if (
+                info.state == 'active'
+                and not info.sealed
+                and info.row_count < layout.max_rows_per_file
+            ):
                 return info
 
         next_segment_id = 0
-        if segments:
-            next_segment_id = max(item.segment_id for item in segments) + 1
+        all_segments = self._segment_infos(
+            [logical_part],
+            include_obsolete=True,
+        )
+        if all_segments:
+            next_segment_id = max(item.segment_id for item in all_segments) + 1
         part_key = self._segment_part_key(logical_part, next_segment_id)
         return SegmentInfo(
             logical_part=logical_part,
@@ -1446,16 +2253,19 @@ class Table(BaseTable):
             session_max=session_max,
             stats=stats,
             sealed=True,
+            state='sealed',
         )
 
-    def _physical_part_refs(self, logical_parts=None):
+    def _physical_part_refs(self, logical_parts=None, include_obsolete=False):
         parts = self.table_parts() if logical_parts is None else list(logical_parts)
         refs = []
         for part in parts:
             legacy = self._legacy_segment_info(part)
             if legacy is not None:
                 refs.append(legacy)
-        refs.extend(self._segment_infos(parts))
+        refs.extend(
+            self._segment_infos(parts, include_obsolete=include_obsolete)
+        )
 
         order = {self._part_token(part): index for index, part in enumerate(parts)}
         return sorted(
@@ -1574,6 +2384,97 @@ class Table(BaseTable):
     def select_all(self, fields, where, limit=None, to_dict=False, **kwargs):
         return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
 
+    def iter_select(
+        self,
+        fields,
+        where,
+        limit=None,
+        order_by=None,
+        to_dict=False,
+        batch_size=10_000,
+        **kwargs,
+    ):
+        for batch in self.iter_select_batches(
+            fields,
+            where,
+            limit=limit,
+            order_by=order_by,
+            to_dict=to_dict,
+            batch_size=batch_size,
+            **kwargs,
+        ):
+            for row in batch:
+                yield row
+
+    def iter_select_batches(
+        self,
+        fields,
+        where,
+        limit=None,
+        order_by=None,
+        to_dict=False,
+        batch_size=10_000,
+        **kwargs,
+    ):
+        batch_size = self._normalize_batch_size(batch_size)
+        limit = self._normalize_limit(limit)
+        if limit == 0:
+            return
+
+        if order_by:
+            rows = self.select(
+                fields,
+                where,
+                limit=limit,
+                order_by=order_by,
+                to_dict=to_dict,
+                **kwargs,
+            )
+            for start in range(0, len(rows), batch_size):
+                yield rows[start:start + batch_size]
+            return
+
+        meta = self.get_table_meta()
+        if not meta:
+            return
+        column_types = {
+            key: item["type"] for key, item in meta["column_info"].items()
+        }
+        w = Where(where)
+        fetch_fields, project_fields = self._select_fields_with_order(
+            fields,
+            None,
+            column_types,
+        )
+
+        emitted = 0
+        pending = []
+        for rows in self._iter_select_raw_batches(
+            fetch_fields,
+            w,
+            column_types,
+            batch_size,
+        ):
+            if not rows:
+                continue
+            if project_fields is not None:
+                rows = self._project_fields(rows, project_fields)
+            if to_dict:
+                rows = [dict(item) for item in rows]
+
+            for row in rows:
+                if limit is not None and emitted >= limit:
+                    break
+                pending.append(row)
+                emitted += 1
+                if len(pending) >= batch_size:
+                    yield pending
+                    pending = []
+            if limit is not None and emitted >= limit:
+                break
+        if pending:
+            yield pending
+
     def select(self, fields, where, limit=None, order_by=None, to_dict=False, **kwargs):
         """查询完所有 And([case..]) 然后组合
             And([case..])为一个基本查询单位[向数据库请求]
@@ -1649,6 +2550,14 @@ class Table(BaseTable):
         if limit < 0:
             raise BadArgument('limit must be non-negative')
         return limit
+
+    def _normalize_batch_size(self, batch_size):
+        if isinstance(batch_size, bool):
+            raise BadArgument('batch_size must be a positive integer')
+        batch_size = int(batch_size)
+        if batch_size <= 0:
+            raise BadArgument('batch_size must be a positive integer')
+        return batch_size
 
     def _select_fields_with_order(self, fields, order_by, column_types):
         project_fields = self._plain_select_fields(fields)
@@ -1936,6 +2845,83 @@ class Table(BaseTable):
             data.extend(part_data)
 
         return data
+
+    def _iter_select_raw_batches(self, fields, where_obj, column_types, batch_size):
+        for ref, query in self._select_queries_for_where(
+            fields,
+            where_obj,
+            column_types,
+        ):
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            logger.debug(
+                f"{part_dbfile}: {ref.part_key}: "
+                f"SQL: {query.sql}; params={query.params}"
+            )
+            yield from self._iter_part_query_batches(
+                part_dbfile,
+                query,
+                batch_size,
+            )
+
+    def _select_queries_for_where(self, fields, where_obj, column_types):
+        if not where_obj.or_and_cases:
+            for ref in self._get_select_part_refs(None):
+                yield (
+                    ref,
+                    build_select_cases_query(
+                        _PART_DATA_TABLE_NAME,
+                        fields,
+                        None,
+                        column_types,
+                    ),
+                )
+            return
+
+        if len(where_obj.or_and_cases) > 1:
+            refs_by_key = OrderedDict()
+            for cases in where_obj.or_and_cases:
+                for ref in self._get_select_part_refs(cases):
+                    refs_by_key[self._segment_lookup_key(ref)] = ref
+            query = build_select_or_cases_query(
+                _PART_DATA_TABLE_NAME,
+                fields,
+                where_obj.or_and_cases,
+                column_types,
+            )
+            for ref in refs_by_key.values():
+                yield ref, query
+            return
+
+        cases = where_obj.or_and_cases[0]
+        query = build_select_cases_query(
+            _PART_DATA_TABLE_NAME,
+            fields,
+            cases,
+            column_types,
+        )
+        for ref in self._get_select_part_refs(cases):
+            yield ref, query
+
+    def _iter_part_query_batches(self, part_dbfile, query, batch_size):
+        offset = 0
+        base_sql = query.sql.rstrip().rstrip(';')
+        while True:
+            sql = f'{base_sql} limit ? offset ?'
+            params = list(query.params) + [batch_size, offset]
+            with self._part_db(part_dbfile, auto_commit=False) as db:
+                try:
+                    rows = db[_PART_DATA_TABLE_NAME].query(
+                        sql,
+                        params=params,
+                    )
+                except NoSuchTable:
+                    rows = []
+            if not rows:
+                break
+            yield list(rows)
+            if len(rows) < batch_size:
+                break
+            offset += len(rows)
 
     def _select_or_cases(self, fields, or_cases, column_types):
         refs_by_key = OrderedDict()

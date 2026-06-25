@@ -3,6 +3,7 @@ import pytest
 import psycopg2
 from psycopg2 import sql
 
+from iosql import Database, Partition, Segment
 from iosql.partition import DurationPartition
 from iosql.engines.postgresql import Table
 
@@ -92,3 +93,127 @@ def test_postgresql_partition_insert_and_query(pg_table):
     assert len(filtered) == 1
     assert filtered[0]['symbol'] == 'SYM1'
     assert filtered[0]['value'] == pytest.approx(1.0)
+
+
+def test_sqlite_to_postgresql_migration_verify_and_query(tmp_path):
+    table_name = 'iosql_test_migration_ticks'
+    _drop_table(POSTGRES_URI, table_name)
+    source_uri = f"sqlite://{tmp_path}/source.iosql"
+
+    try:
+        with Database(source_uri) as source:
+            ticks = source.table(
+                table_name,
+                pk=['symbol', 'ts'],
+                columns={'symbol': 'text', 'ts': 'integer', 'price': 'float'},
+                partition=Partition.duration('ts', every='1day'),
+                segment=Segment.rows(max_rows=2, target_rows=2, min_rows=1),
+                order_key='ts',
+            )
+            ticks.write([
+                {'symbol': 'AAPL', 'ts': 1735689600000, 'price': 187.4},
+                {'symbol': 'MSFT', 'ts': 1735689601000, 'price': 420.3},
+                {'symbol': 'AAPL', 'ts': 1735776000000, 'price': 189.1},
+                {'symbol': 'MSFT', 'ts': 1735776001000, 'price': 421.0},
+            ])
+            source_spec = ticks.spec()
+
+            plan = source.to_postgresql(
+                POSTGRES_URI,
+                tables={table_name: table_name},
+                dry_run=True,
+                batch_size=2,
+            )
+            assert plan.dry_run is True
+            assert plan.source_rows == 4
+            assert plan.batches == 2
+
+            result = source.to_postgresql(
+                POSTGRES_URI,
+                tables={table_name: table_name},
+                verify='row-count',
+                batch_size=2,
+            )
+            assert result.verified is True
+            assert result.source_rows == 4
+            assert result.target_rows == 4
+
+        with Database(POSTGRES_URI) as target:
+            names = target.table_names()
+            assert table_name in names
+            assert not any(
+                name.startswith(f'{table_name}_p_')
+                for name in names
+            )
+
+            target_table = target.table(table_name, spec=source_spec)
+            assert target_table.count_rows() == 4
+            rows = target_table.select(
+                ['symbol', 'ts', 'price'],
+                where={'field': 'symbol', 'op': '==', 'value': 'AAPL'},
+                order_by='ts',
+            )
+            assert [row['price'] for row in rows] == [187.4, 189.1]
+
+            roundtrip_uri = f"sqlite://{tmp_path}/roundtrip.iosql"
+            roundtrip_result = target.migrate_to(
+                roundtrip_uri,
+                tables={table_name: 'ticks_from_postgresql'},
+                verify='row-count',
+                batch_size=2,
+            )
+            assert roundtrip_result.verified is True
+            assert roundtrip_result.source_rows == 4
+            assert roundtrip_result.target_rows == 4
+
+        with Database(roundtrip_uri) as roundtrip:
+            copied = roundtrip.table('ticks_from_postgresql')
+            assert copied.count_rows() == 4
+    finally:
+        _drop_table(POSTGRES_URI, table_name)
+
+
+def test_sqlite_calendar_text_migration_verify_and_query(tmp_path):
+    table_name = 'iosql_test_migration_events'
+    _drop_table(POSTGRES_URI, table_name)
+    source_uri = f"sqlite://{tmp_path}/calendar_source.iosql"
+
+    try:
+        with Database(source_uri) as source:
+            events = source.table(
+                table_name,
+                pk=['event_date', 'name'],
+                columns={'event_date': 'text', 'name': 'text', 'city': 'text'},
+                partition=Partition.calendar(
+                    'event_date',
+                    every='1day',
+                    timezone='UTC',
+                ),
+                order_key='event_date',
+            )
+            events.write([
+                {'event_date': '2026-01-05', 'name': 'open', 'city': 'Shanghai'},
+                {'event_date': '2026-01-06', 'name': 'review', 'city': 'Beijing'},
+                {'event_date': '2026-01-06', 'name': 'close', 'city': 'Shanghai'},
+            ])
+
+            result = source.to_postgresql(
+                POSTGRES_URI,
+                tables={table_name: table_name},
+                verify='row-count',
+                batch_size=2,
+            )
+            assert result.verified is True
+            assert result.source_rows == 3
+            assert result.target_rows == 3
+
+        with Database(POSTGRES_URI) as target:
+            table = target.table(table_name)
+            rows = table.select(
+                ['event_date', 'name'],
+                where={'field': 'event_date', 'op': '==', 'value': '2026-01-06'},
+                order_by='name',
+            )
+            assert [row['name'] for row in rows] == ['close', 'review']
+    finally:
+        _drop_table(POSTGRES_URI, table_name)

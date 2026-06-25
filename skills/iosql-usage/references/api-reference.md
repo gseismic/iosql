@@ -23,6 +23,12 @@
 
 **PostgreSQL URI 格式**：`postgresql://user:pass@host:port/dbname`
 
+PostgreSQL 功能需要安装可选依赖：
+
+```bash
+python -m pip install "iosql[postgresql]"
+```
+
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` 或 `"postgresql://user:pass@localhost:5432/mydb"` |
@@ -70,6 +76,8 @@ with Database("sqlite://db/test.iosql") as db:
 
 列出数据库中已存在的表名。
 
+PostgreSQL 后端只返回用户逻辑表，不返回 native partition 子表。
+
 #### `Database.close()`
 
 关闭所有表和连接。
@@ -78,6 +86,33 @@ with Database("sqlite://db/test.iosql") as db:
 
 返回 SQLite 进程级连接预算状态，包括 `max_process_connections`、
 `open_process_connections` 和 `registered_pools`。
+
+#### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> MigrationResult`
+
+把当前 iosql 库迁移到目标库。典型用途是 SQLite 到 PostgreSQL：
+
+```python
+source = Database("sqlite://db/market.iosql")
+result = source.migrate_to(
+    "postgresql://user:pass@localhost:5432/market",
+    tables=["daily_bars", "kline_1m"],  # None 表示全库
+    batch_size=50_000,
+    verify="row-count",
+)
+```
+
+`tables` 可传：
+
+- `None`：迁移全库。
+- `["ticks", "daily"]`：迁移指定表，目标表同名。
+- `{"ticks": "pg_ticks"}`：源表到目标表映射。
+
+`dry_run=True` 只统计源表行数和估算批次数，不连接目标库。`verify="row-count"`
+会在迁移后比较源/目标行数，结果写入 `source_rows`、`target_rows` 和 `verified`。
+
+`to_postgresql(target_uri, ...)` 是只接受 `postgresql://` 目标的语义别名。
+PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要先
+用 `db.table("name", spec=...)` 绑定同一份 `TableContract`。
 
 ---
 
@@ -112,6 +147,8 @@ with Database("sqlite://db/test.iosql") as db:
 |------|------|
 | `query` | `(symbols=None, start=None, end=None, date=None, session=None, columns='*', where=None, order_by=None, limit=None) -> TableQuery` |
 | `select` | `(fields, where, limit=None, order_by=None, to_dict=False, **kwargs) -> list` |
+| `iter_select` | `(fields, where, limit=None, order_by=None, to_dict=False, batch_size=10_000) -> Iterator` |
+| `iter_select_batches` | `(fields, where, limit=None, order_by=None, to_dict=False, batch_size=10_000) -> Iterator[list]` |
 | `select_all` | `(fields, where, limit=None, to_dict=False, **kwargs) -> list` |
 | `explain_select` | `(fields='*', where=None, order_by=None, limit=None) -> QueryPlan` |
 | `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery` |
@@ -123,8 +160,13 @@ with Database("sqlite://db/test.iosql") as db:
 |------|------|--------|
 | `spec` | `() -> TableContract\|None` | 表契约 |
 | `table_parts` | `() -> list` | 逻辑分区列表 |
-| `segments` | `() -> list[dict]` | 物理 segment 清单 |
+| `segments` | `(include_obsolete=False) -> list[dict]` | 物理 segment 清单 |
+| `validate` | `(deep=False, include_obsolete=False) -> SegmentValidationResult` | 校验 manifest 与物理文件 |
 | `layout_report` | `() -> LayoutReport` | 分区诊断报告 |
+| `compact` | `(partition=None, target_rows=None) -> CompactResult` | 整理 row segment |
+| `cleanup_obsolete` | `(partition=None, dry_run=True, validate=True) -> CleanupResult` | 清理 obsolete segment 文件 |
+| `count_rows` | `(where=None) -> int` | 统计当前可见行数；PostgreSQL 支持 where |
+| `migrate_to` | `(target_uri, target_table=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> TableMigrationResult` | 迁移单表 |
 | `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |
 
@@ -139,7 +181,26 @@ with Database("sqlite://db/test.iosql") as db:
 | `.to_list()` | `list[dict]` - 查询结果 |
 | `.explain()` | `QueryPlan` - 查询计划 |
 | `.iter_rows()` | `Iterator[dict]` |
+| `.iter_batches(batch_size=10_000)` | `Iterator[list[dict]]` |
 | `.spec()` | `QuerySpec` - 查询规格 |
+
+### 流式查询
+
+```python
+for row in table.iter_select("*", where=None, batch_size=50_000, to_dict=True):
+    ...
+
+for batch in table.iter_select_batches("*", where=None, batch_size=50_000, to_dict=True):
+    ...
+
+for batch in table.query(start=start, end=end).iter_batches(batch_size=50_000):
+    ...
+```
+
+- `iter_select_batches()` 每批最多返回 `batch_size` 行。
+- 无全局 `order_by` 时按分区/segment 分页读取，适合大结果集。
+- 有 `order_by` 时为保证全局排序正确性，会复用 `select()` 的合并排序结果，再按批输出。
+- `limit` 会跨 batch 生效。
 
 ### `LatestQuery` 对象
 
@@ -178,6 +239,10 @@ Partition.duration("ts", every="1day")
 Partition.calendar("date", every="1day", timezone="Asia/Shanghai")
 Partition.range("seq", every=10000)
 ```
+
+PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边界；
+`calendar(...)` 支持 `text` / `date` / `timestamp` 目标列。text 日期列应统一
+使用 ISO 日期（如 `2026-01-05`）或 compact 日期（如 `20260105`）。
 
 ### `DurationPartition`
 
@@ -244,6 +309,76 @@ Segment.rows(
 约束：`max_rows >= target_rows >= min_rows > 0`
 
 `stats_columns=None` 默认统计全部列。显式列表可减少高频宽表的 min/max 维护成本；partition column、time、`order_key`、`session_column` 会自动补入必要统计列。
+
+### Row Segment Compaction
+
+```python
+result = table.compact(partition=None, target_rows=None)
+```
+
+- 只支持启用 `Segment.rows(...)` 的 SQLite 表。
+- `partition=None` 表示整理所有 logical partition。
+- `target_rows=None` 时使用表契约里的 `target_rows_per_file`。
+- compact 会把当前可见 segment 重写为新 generation 的 sealed segment。
+- 旧 segment 标记为 `obsolete`；默认查询、`segments()`、`layout_report()` 不再使用它们。
+- `segments(include_obsolete=True)` 可查看旧 segment 状态。
+- compact 本身不删除旧 SQLite 文件；需要释放磁盘时使用 `cleanup_obsolete()`。
+- compact 不做主键去重，不开放 `upsert/replace`；append-only 表中跨 segment 重复主键会被保留。
+
+返回：
+
+```python
+CompactResult(
+    table="ticks",
+    partitions=[0],
+    rows_read=1000,
+    rows_written=1000,
+    old_segments=4,
+    new_segments=3,
+    obsolete_segments=4,
+)
+```
+
+### Segment Validate / Cleanup
+
+```python
+validation = table.validate(deep=True, include_obsolete=False)
+preview = table.cleanup_obsolete()
+cleanup = table.cleanup_obsolete(dry_run=False)
+```
+
+- `validate(deep=False)` 只做 manifest 级检查。
+- `validate(deep=True)` 会检查当前可见 segment 的文件存在性、SQLite `integrity_check`、`data` 表、`row_count`、time/session 范围和 manifest stats。
+- `include_obsolete=True` 会把 obsolete segment 纳入校验；obsolete 的深度问题以 warning 记录，不影响默认查询。
+- `cleanup_obsolete()` 默认 dry-run，不删除文件。
+- `cleanup_obsolete(dry_run=False)` 删除前默认执行 `validate(deep=True)`；校验失败会抛出 `UnsafeOperation`。
+- 清理只删除 obsolete segment 主文件及同名 `-wal`/`-shm` 文件，并删除对应 manifest 行。
+
+返回：
+
+```python
+SegmentValidationResult(
+    table="ticks",
+    deep=True,
+    include_obsolete=False,
+    checked_segments=3,
+    errors=[],
+    warnings=[],
+)
+
+CleanupResult(
+    table="ticks",
+    dry_run=False,
+    partitions=[0],
+    candidate_segments=4,
+    files=[".../ticks/data/0__000001.sqlite3"],
+    files_deleted=4,
+    bytes_reclaimable=104857600,
+    bytes_deleted=104857600,
+    manifest_rows_deleted=4,
+    skipped=[],
+)
+```
 
 ---
 
@@ -336,6 +471,37 @@ Segment.rows(
 | `table` | `str` | 表名 |
 | `rows_copied` | `int` | 复制的行数 |
 | `partitions_created` | `list` | 在目标库创建的分区 |
+
+### `MigrationResult`
+
+| 字段/属性 | 类型 | 说明 |
+|------|------|------|
+| `source_uri` | `str` | 源库 URI |
+| `target_uri` | `str` | 目标库 URI |
+| `tables` | `list[TableMigrationResult]` | 各表迁移结果 |
+| `rows_copied` | `int` | 总迁移行数 |
+| `batches` | `int` | 总写入批次数 |
+| `source_rows` | `int\|None` | 源表总行数；dry-run 或 row-count 校验时可用 |
+| `target_rows` | `int\|None` | 目标表总行数；row-count 校验时可用 |
+| `verify` | `str\|None` | 校验模式 |
+| `verified` | `bool\|None` | 校验是否通过 |
+| `dry_run` | `bool` | 是否为预览结果 |
+
+### `TableMigrationResult`
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `table` | `str` | 源表名 |
+| `target_table` | `str` | 目标表名 |
+| `source_uri` | `str` | 源 URI |
+| `target_uri` | `str` | 目标 URI |
+| `rows_copied` | `int` | 迁移行数 |
+| `batches` | `int` | 写入批次数 |
+| `source_rows` | `int\|None` | 源表行数 |
+| `target_rows` | `int\|None` | 目标表行数 |
+| `verify` | `str\|None` | 校验模式 |
+| `verified` | `bool\|None` | 校验是否通过 |
+| `dry_run` | `bool` | 是否为预览结果 |
 
 ---
 
