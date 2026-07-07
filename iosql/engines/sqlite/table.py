@@ -4,6 +4,7 @@ import copy
 import json
 import math
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -292,6 +293,75 @@ class Table(BaseTable):
             with self._db_parts_condition:
                 self._db_parts_closing = False
                 self._db_parts_condition.notify_all()
+
+    def rename(self, new_name, exist_ok=False, overwrite=False):
+        """重命名 SQLite 逻辑表目录并刷新表内 manifest。"""
+        new_name = self._validate_rename_table_name(new_name)
+        old_name = self._table_name
+        if new_name == old_name:
+            if exist_ok:
+                return self
+            raise BadArgument('rename target is the current table')
+        if overwrite and exist_ok:
+            raise BadArgument('rename cannot use overwrite and exist_ok together')
+
+        source_path = self.table_path
+        target_path = os.path.join(self.db_path, new_name)
+        if not self._is_safe_table_path(target_path):
+            raise UnsafeOperation(f'unsafe table rename target: {target_path}')
+        if not os.path.isdir(source_path):
+            raise BadArgument(f'table does not exist: {old_name}')
+        if os.path.exists(target_path):
+            if not overwrite:
+                raise BadArgument(f'table already exists: {new_name}')
+            if not os.path.isdir(target_path):
+                raise UnsafeOperation(
+                    f'table rename target exists and is not a directory: {target_path}'
+                )
+
+        self.close()
+        if os.path.exists(target_path):
+            shutil.rmtree(target_path)
+        os.replace(source_path, target_path)
+
+        self._table_name = new_name
+        self.connect()
+        self._rename_table_manifest(old_name, new_name)
+        self._partition = self._load_partition()
+        return self
+
+    def _validate_rename_table_name(self, name):
+        value = str(name or '').strip()
+        if not value:
+            raise BadArgument('table name must not be empty')
+        if value in ['.', '..']:
+            raise BadArgument(f'invalid table name: {name}')
+        if value.startswith('__'):
+            raise BadArgument('table name must not start with __')
+        if os.sep in value or (os.altsep and os.altsep in value):
+            raise BadArgument(f'invalid table name: {name}')
+        return value
+
+    def _is_safe_table_path(self, path):
+        base = os.path.realpath(self.db_path)
+        real = os.path.realpath(path)
+        return os.path.dirname(real) == base
+
+    def _rename_table_manifest(self, old_name, new_name):
+        for table_name in [
+            _TABLE_META_TABLE_NAME,
+            _TABLE_PART_TABLE_NAME,
+            _TABLE_PART_COLUMN_RANGE_TABLE_NAME,
+            _TABLE_SEGMENT_TABLE_NAME,
+        ]:
+            try:
+                self.table_meta_db[table_name].execute_params(
+                    f'update {table_name} set table_name = ? where table_name = ?',
+                    [new_name, old_name],
+                    commit=True,
+                )
+            except NoSuchTable:
+                continue
 
     def _load_partition(self) -> Partition | None:
         """Load partition from table metadata.

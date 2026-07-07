@@ -38,6 +38,33 @@ simple/data/
 
 以下按组合方式提供完整代码示例。
 
+## 重命名 database/table
+
+```python
+from iosql import Database
+
+db = Database("sqlite://db/market.iosql")
+
+# 重命名 SQLite 目录库；当前 db.uri 会刷新到新路径。
+db.rename("market-renamed.iosql")
+
+# 重命名逻辑表；SQLite 会移动表目录并更新 manifest。
+table = db.rename_table("ticks", "ticks_2026")
+table.rename("ticks")
+
+db.close()
+```
+
+CLI：
+
+```bash
+iosql rename-database -s db/market.iosql --target market-renamed.iosql
+iosql rename-table -s db/market.iosql -t ticks --new-table ticks_2026
+```
+
+覆盖已有目标需要显式确认：Python 传 `overwrite=True`；CLI 传
+`--overwrite --yes`。
+
 ## 毫秒时序表：原始 Table 版
 
 ```python

@@ -18,12 +18,22 @@ class BaseTable(metaclass=ABCMeta):
     def __exit__(self, exc_type, exc_value, exc_tb):
         self.close()
 
+    def _rebind_uri(self, uri):
+        self._uri = uri
+        self._uri_schema, self._uri_options = parse_db_schema(uri)
+        self.connect()
+        return self
+
     @abstractmethod
     def connect(self):
         raise NotImplementedError()
 
     @abstractmethod
     def close(self):
+        raise NotImplementedError()
+
+    @abstractmethod
+    def rename(self, new_name, exist_ok=False, overwrite=False):
         raise NotImplementedError()
 
     @abstractmethod

@@ -1,7 +1,8 @@
 import os
+import shutil
 
 from .utils.schema import parse_db_schema
-from .exception import BadArgument, EngineNotExist
+from .exception import BadArgument, EngineNotExist, UnsafeOperation
 from .engines import sqlite
 from .spec import MigrationResult, TableContract, TableSpec
 
@@ -28,6 +29,21 @@ def _normalize_migration_verify(verify):
     if value != "row-count":
         raise BadArgument("verify only supports row-count")
     return value
+
+
+def _sqlite_path_from_uri(uri):
+    schema, options = parse_db_schema(uri)
+    if schema not in ["sqlite", "sqlite3"]:
+        raise BadArgument("rename is only supported by the SQLite engine")
+    if options.get("memory"):
+        raise BadArgument("in-memory SQLite database cannot be renamed")
+    return os.path.abspath(
+        os.path.join(options.get("path") or "", options.get("db") or "")
+    )
+
+
+def _sqlite_uri_from_path(schema, path):
+    return f"{schema}://{os.path.abspath(path)}"
 
 
 class Database(object):
@@ -74,6 +90,10 @@ class Database(object):
             max_process_connections,
         )
         self._pragma_dict = pragma_dict
+
+    @property
+    def uri(self):
+        return self._uri
 
     @staticmethod
     def _positive_int(name, value):
@@ -216,6 +236,92 @@ class Database(object):
             if os.path.isdir(os.path.join(db_path, item))
             and not item.startswith('__')
         ])
+
+    def rename(self, new_uri_or_name, exist_ok=False, overwrite=False):
+        """重命名当前 SQLite 目录库。
+
+        `new_uri_or_name` 可以是完整的 `sqlite://...` URI，也可以是当前库父目录
+        下的新目录名。重命名后当前 `Database` 实例会指向新 URI。
+        """
+        if self._uri_schema not in ["sqlite", "sqlite3"]:
+            raise BadArgument("Database.rename is only supported by SQLite")
+        if overwrite and exist_ok:
+            raise BadArgument("rename cannot use overwrite and exist_ok together")
+
+        source_path = _sqlite_path_from_uri(self._uri)
+        target_path = self._resolve_rename_database_target(new_uri_or_name)
+        if source_path == target_path:
+            if exist_ok:
+                return self
+            raise BadArgument("rename target is the current database")
+        if os.path.realpath(target_path).startswith(
+            os.path.realpath(source_path) + os.sep
+        ):
+            raise UnsafeOperation("rename target must not be inside the source database")
+        if not os.path.isdir(source_path):
+            raise BadArgument(f"database does not exist: {source_path}")
+        if os.path.exists(target_path):
+            if not overwrite:
+                raise BadArgument(f"rename target already exists: {target_path}")
+            if not os.path.isdir(target_path):
+                raise UnsafeOperation(
+                    f"rename target exists and is not a directory: {target_path}"
+                )
+            shutil.rmtree(target_path)
+
+        cached_tables = list(self._tables.values())
+        for table in cached_tables:
+            table.close()
+        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+        os.replace(source_path, target_path)
+        self._uri = _sqlite_uri_from_path(self._uri_schema, target_path)
+        self._table_cls = Database.get_engine(self._uri)
+        for table in cached_tables:
+            table._rebind_uri(self._uri)
+            if hasattr(table, "_load_partition"):
+                table._partition = table._load_partition()
+        return self
+
+    def _resolve_rename_database_target(self, new_uri_or_name):
+        value = str(new_uri_or_name or "").strip()
+        if not value:
+            raise BadArgument("rename target must not be empty")
+        if "://" in value:
+            schema, _ = parse_db_schema(value)
+            if schema not in ["sqlite", "sqlite3"]:
+                raise BadArgument("Database.rename target must be sqlite:// or sqlite3://")
+            return _sqlite_path_from_uri(value)
+
+        source_path = _sqlite_path_from_uri(self._uri)
+        if os.path.isabs(value) or os.sep in value or (os.altsep and os.altsep in value):
+            return os.path.abspath(value)
+        return os.path.abspath(os.path.join(os.path.dirname(source_path), value))
+
+    def rename_table(self, old_name, new_name, exist_ok=False, overwrite=False):
+        """重命名逻辑表并维护当前 Database 的表对象缓存。"""
+        old_name = str(old_name or "").strip()
+        new_name = str(new_name or "").strip()
+        if not old_name or not new_name:
+            raise BadArgument("table names must not be empty")
+        if old_name == new_name:
+            if exist_ok:
+                return self.table(old_name)
+            raise BadArgument("rename target is the current table")
+        if overwrite and exist_ok:
+            raise BadArgument("rename_table cannot use overwrite and exist_ok together")
+        if old_name not in self.table_names():
+            raise BadArgument(f"table does not exist: {old_name}")
+
+        table = self[old_name]
+        cached_target = self._tables.get(new_name)
+        if cached_target is not None and cached_target is not table and overwrite:
+            cached_target.close()
+            self._tables.pop(new_name, None)
+
+        table.rename(new_name, exist_ok=exist_ok, overwrite=overwrite)
+        self._tables.pop(old_name, None)
+        self._tables[new_name] = table
+        return table
 
     def close(self):
         for _, table in list(self._tables.items()):

@@ -1,1 +1,1 @@
-- [ ] 增加databse/table重命名功能
+- [x] 增加 database/table 重命名功能

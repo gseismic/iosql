@@ -78,6 +78,23 @@ with Database("sqlite://db/test.iosql") as db:
 
 PostgreSQL 后端只返回用户逻辑表，不返回 native partition 子表。
 
+#### `Database.rename(new_uri_or_name, exist_ok=False, overwrite=False) -> Database`
+
+重命名当前 SQLite 目录库。`new_uri_or_name` 可以是完整 `sqlite://...`
+URI，也可以是当前库父目录下的新目录名；重命名成功后当前 `Database`
+实例的 `uri` 会刷新到新路径，已缓存的表对象也会重新绑定到新目录。
+
+PostgreSQL database 重命名不通过 iosql 执行。目标已存在时默认抛出
+`BadArgument`；需要覆盖时传 `overwrite=True`。
+
+#### `Database.rename_table(old_name, new_name, exist_ok=False, overwrite=False) -> Table`
+
+重命名逻辑表并维护当前 `Database` 的表缓存。SQLite 后端会移动表目录并更新
+表内 manifest 的 `table_name` 字段；PostgreSQL 后端会重命名真实关系表，
+native partition 模式下会同步重命名旧表名前缀的子分区表。
+
+目标表已存在时默认抛出 `BadArgument`；需要覆盖时传 `overwrite=True`。
+
 #### `Database.close()`
 
 关闭所有表和连接。
@@ -166,6 +183,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `compact` | `(partition=None, target_rows=None) -> CompactResult` | 整理 row segment |
 | `cleanup_obsolete` | `(partition=None, dry_run=True, validate=True) -> CleanupResult` | 清理 obsolete segment 文件 |
 | `count_rows` | `(where=None) -> int` | 统计当前可见行数；PostgreSQL 支持 where |
+| `rename` | `(new_name, exist_ok=False, overwrite=False) -> Table` | 重命名当前逻辑表 |
 | `migrate_to` | `(target_uri, target_table=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> TableMigrationResult` | 迁移单表 |
 | `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |

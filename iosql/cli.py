@@ -868,6 +868,53 @@ def tables(
             typer.echo(name)
 
 
+@app.command("rename-database")
+def rename_database(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    target: str = typer.Option(..., "--target", help="新的数据库 URI、路径或同级目录名"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="覆盖已有目标目录"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="确认覆盖操作"),
+):
+    """重命名 SQLite 目录库。"""
+    source_uri, source_path = _require_source(source)
+    if overwrite and not yes:
+        _fail("覆盖已有目标目录需要同时传 --overwrite --yes")
+    db = Database(source_uri)
+    try:
+        db.rename(target, overwrite=overwrite)
+        _echo_json({
+            "source": str(source_path),
+            "target_uri": db.uri,
+            "overwritten": bool(overwrite),
+        })
+    finally:
+        db.close()
+
+
+@app.command("rename-table")
+def rename_table(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="原表名"),
+    new_table: str = typer.Option(..., "--new-table", help="新表名"),
+    overwrite: bool = typer.Option(False, "--overwrite", help="覆盖已有目标表目录"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="确认覆盖操作"),
+):
+    """重命名逻辑表。"""
+    source_uri, _ = _require_source(source)
+    if overwrite and not yes:
+        _fail("覆盖已有目标表需要同时传 --overwrite --yes")
+    db = Database(source_uri)
+    try:
+        renamed = db.rename_table(table, new_table, overwrite=overwrite)
+        _echo_json({
+            "table": table,
+            "new_table": renamed.table_name,
+            "overwritten": bool(overwrite),
+        })
+    finally:
+        db.close()
+
+
 @app.command()
 def spec(
     source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),

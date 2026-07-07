@@ -135,6 +135,23 @@ db.close()
 
 ## 常用 API
 
+### 重命名
+
+```python
+db.rename("market-renamed.iosql")        # SQLite 目录库改名
+db.rename_table("ticks", "ticks_2026")   # 逻辑表改名并维护缓存
+db.table("ticks_2026").rename("ticks")   # 也可直接在 Table 上改名
+```
+
+CLI：
+
+```bash
+iosql rename-database -s database/market.iosql --target market-renamed.iosql
+iosql rename-table -s database/market.iosql -t ticks --new-table ticks_2026
+```
+
+SQLite table 重命名会移动表目录并更新表内 manifest；database 重命名会移动整个目录库并刷新当前 `Database` 实例 URI。覆盖已有目标时需要显式传 `overwrite=True`；CLI 对应 `--overwrite --yes`。
+
 ### 创建或打开表
 
 ```python

@@ -72,6 +72,105 @@ class Table(BaseTable):
         """Close database connection."""
         if self._conn and not self._conn.closed:
             self._conn.close()
+
+    def rename(self, new_name, exist_ok=False, overwrite=False):
+        """Rename the PostgreSQL table and matching native partition children."""
+        new_name = self._validate_relation_name(new_name)
+        old_name = self._table_name
+        if new_name == old_name:
+            if exist_ok:
+                return self
+            raise BadArgument('rename target is the current table')
+        if overwrite and exist_ok:
+            raise BadArgument('rename cannot use overwrite and exist_ok together')
+
+        conn = self.connect()
+        cursor = conn.cursor()
+        if not self._relation_exists(old_name):
+            raise BadArgument(f'table does not exist: {old_name}')
+        if self._relation_exists(new_name):
+            if not overwrite:
+                raise BadArgument(f'table already exists: {new_name}')
+            cursor.execute(
+                sql.SQL('DROP TABLE {} CASCADE').format(sql.Identifier(new_name))
+            )
+
+        child_renames = self._native_partition_child_renames(old_name, new_name)
+        for _, target_child in child_renames:
+            if self._relation_exists(target_child):
+                if not overwrite:
+                    raise BadArgument(f'table already exists: {target_child}')
+                cursor.execute(
+                    sql.SQL('DROP TABLE {} CASCADE').format(sql.Identifier(target_child))
+                )
+
+        cursor.execute(
+            sql.SQL('ALTER TABLE {} RENAME TO {}').format(
+                sql.Identifier(old_name),
+                sql.Identifier(new_name),
+            )
+        )
+        for old_child, new_child in child_renames:
+            cursor.execute(
+                sql.SQL('ALTER TABLE {} RENAME TO {}').format(
+                    sql.Identifier(old_child),
+                    sql.Identifier(new_child),
+                )
+            )
+
+        self._table_name = new_name
+        self._table_created = True
+        return self
+
+    def _validate_relation_name(self, name):
+        value = str(name or '').strip()
+        if not value:
+            raise BadArgument('table name must not be empty')
+        if '\x00' in value or '.' in value:
+            raise BadArgument(f'invalid table name: {name}')
+        return value
+
+    def _relation_exists(self, name):
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            select 1
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = %s
+              and c.relname = %s
+              and c.relkind in ('r', 'p')
+            limit 1
+            """,
+            ('public', name),
+        )
+        return cursor.fetchone() is not None
+
+    def _native_partition_child_renames(self, old_name, new_name):
+        if self.partition_mode != self.PARTITION_MODE_NATIVE:
+            return []
+        old_prefix = f'{old_name}_p_'
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            select child.relname
+            from pg_inherits i
+            join pg_class parent on parent.oid = i.inhparent
+            join pg_class child on child.oid = i.inhrelid
+            join pg_namespace n on n.oid = child.relnamespace
+            where n.nspname = %s
+              and parent.relname = %s
+            order by child.relname
+            """,
+            ('public', old_name),
+        )
+        renames = []
+        for (child_name,) in cursor.fetchall():
+            if child_name.startswith(old_prefix):
+                renames.append((child_name, f'{new_name}{child_name[len(old_name):]}'))
+        return renames
     
     def pragma(self, key, value=None):
         """PostgreSQL does not use PRAGMA, but we keep the interface for compatibility."""

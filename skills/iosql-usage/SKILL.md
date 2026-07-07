@@ -1,6 +1,6 @@
 ---
 name: iosql-usage
-description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, validate, cleanup_obsolete, layout_report, repartition_to, spec, table_parts, delete, truncate, create_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
+description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, validate, cleanup_obsolete, layout_report, repartition_to, rename, rename_table, spec, table_parts, delete, truncate, create_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
 ---
 
 # iosql 使用指南
@@ -93,6 +93,7 @@ for part_key, part_data in partitioned_data.items():
 | **入口** | `Database(uri)` | 创建/打开数据库，`sqlite://` 或 `postgresql://` URI |
 | | `Database.table(name, **opts)` | 创建/获取表（核心入口） |
 | | `Database.timeseries(name, time=..., primary_key=..., **opts)` | 时序 helper 快捷版 |
+| | `Database.rename(new_uri_or_name)` / `Database.rename_table(old, new)` / `table.rename(new)` | 重命名 SQLite 目录库或逻辑表；table 重命名会更新 manifest |
 | | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库 |
 | **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
 | | `table.write_buffer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
@@ -136,6 +137,8 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 | 类别 | 命令 | 说明 |
 |------|------|------|
 | **发现** | `iosql tables -s DB` | 列出逻辑表 |
+| | `iosql rename-database -s DB --target NEW_DB` | 重命名 SQLite 目录库；覆盖目标需 `--overwrite --yes` |
+| | `iosql rename-table -s DB -t OLD --new-table NEW` | 重命名逻辑表；覆盖目标需 `--overwrite --yes` |
 | | `iosql spec -s DB -t TABLE` | 输出表契约 JSON |
 | | `iosql layout -s DB -t TABLE` | 输出 `layout_report()` |
 | | `iosql parts -s DB -t TABLE` | 输出逻辑分区 |
