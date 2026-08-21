@@ -3,24 +3,56 @@ from typing import List
 from ...exception import BadArgument
 
 
+# 用户语言 → 内部规范形式。归一化在 Case 构造入口完成，
+# 保证下游（分区裁剪 get_case_range / SQL 编译 _OP_SQL）不再收到未知 op
+_OP_ALIASES = {
+    'eq': '==',
+    '=': '==',
+    'neq': '!=',
+    'gt': '>',
+    'ge': '>=',
+    'lt': '<',
+    'le': '<=',
+    'between': 'between_and',
+    'range': 'between_and',
+}
+
+_CANONICAL_OPS = ('==', '!=', '>', '>=', '<', '<=', 'between_and', 'in')
+
+_LEGAL_OPS_DISPLAY = '==, !=, >, >=, <, <=, between, in'
+
+_BAD_OP_EXAMPLE = '{"field": "ts", "op": "between", "value": [1, 10]}'
+
+
+def normalize_case_op(op):
+    key = str(op).strip()
+    canonical = _OP_ALIASES.get(key, key)
+    if canonical not in _CANONICAL_OPS:
+        raise BadArgument(
+            f"不支持的 op `{op}`。合法 op: {_LEGAL_OPS_DISPLAY}。"
+            f"示例: {_BAD_OP_EXAMPLE}"
+        )
+    return canonical
+
+
 class Case(object):
     """
     用于描述单个查询条件
     example:
         case = {
             'field': 'date'
-            'op': 'between_and',
+            'op': 'between',
             'value': ['2020-03-08', '2021-10-10']
             'rank': 0,
         }
         case = {
             'field': 'close'
-            'op': '=',
+            'op': '==',
             'value': '[[open]]'
         }
         case = {
             'field': 'date'
-            'op': 'between_and',
+            'op': 'between',
             'value': {
                 'value': 'open',
                 'type': 'variable/const'
@@ -33,9 +65,9 @@ class Case(object):
     def __init__(self, field, op, value, rank=0):
         # rank: -1，优先级最低 [[open ]]
         self.field = field
-        self.op = op
+        self.op = normalize_case_op(op)
         self.value = self._parse_value(value)
-        self.check_field_tvalue(op, self.value['value'])
+        self.check_field_tvalue(self.op, self.value['value'])
         self.rank = self._default_rank if rank < 0 else rank
 
     def cid(self):
@@ -47,7 +79,10 @@ class Case(object):
         if isinstance(value, (int, float, bool, str, tuple, list)):
             o_value = self._parse_nondict_value(value)
         elif isinstance(value, dict):
-            assert 'value' in value
+            if 'value' not in value:
+                raise BadArgument(
+                    f"Case value dict 需要 `value` 键，得到 {value}"
+                )
             __value = value['value']
             if 'type' not in value:
                 o_value = self._parse_nondict_value(__value)
@@ -65,7 +100,7 @@ class Case(object):
         elif isinstance(value, str):
             o = re.match(r'\[\[(.*?)\]\]', value)
             if o:
-                o_value = { 
+                o_value = {
                     'value': o.group(1).strip(),
                     'type': 'variable'
                 }
@@ -77,13 +112,23 @@ class Case(object):
 
     def check_field_tvalue(self, op, value):
         if op == 'between_and':
-            assert isinstance(value, (tuple, list))
-            assert len(value) == 2
+            if not isinstance(value, (tuple, list)) or len(value) != 2:
+                raise BadArgument(
+                    'op `between` 需要长度为 2 的列表值，'
+                    f'示例: {_BAD_OP_EXAMPLE}'
+                )
         elif op == 'in':
-            assert isinstance(value, (tuple, list))
-            assert len(value) >= 1
+            if not isinstance(value, (tuple, list)) or len(value) < 1:
+                raise BadArgument(
+                    'op `in` 需要非空列表值，'
+                    '示例: {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]}'
+                )
         else:
-            assert isinstance(value, (int, float, str))
+            if not isinstance(value, (int, float, str)):
+                raise BadArgument(
+                    f'op `{op}` 的值必须是 int/float/str，'
+                    f'得到 {type(value).__name__}: {value}'
+                )
 
     def __rmul__(self, other):
         return CaseExpression('and', other, self)

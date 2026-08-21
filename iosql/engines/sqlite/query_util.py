@@ -73,16 +73,25 @@ def build_case_subquery(case, column_types):
     field_sql = _quote_sql_identifier(field)
 
     if op == 'between_and':
-        assert isinstance(value, (list, tuple))
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            raise BadArgument(
+                'op `between` 需要长度为 2 的列表值，'
+                '示例: {"field": "ts", "op": "between", "value": [1, 10]}'
+            )
         return SqlQuery(f'{field_sql} between ? and ?', [value[0], value[1]])
 
     if op == 'in':
-        assert isinstance(value, (list, tuple))
+        if not isinstance(value, (list, tuple)) or not value:
+            raise BadArgument(
+                'op `in` 需要非空列表值，'
+                '示例: {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]}'
+            )
         placeholders = ','.join(['?'] * len(value))
         return SqlQuery(f'{field_sql} in ({placeholders})', list(value))
 
     if case.value['type'] == 'variable':
-        assert isinstance(value, str)
+        if not isinstance(value, str):
+            raise BadArgument('variable 类型条件值必须是字段名字符串')
         _column_type(column_types, value)
         rhs = _quote_sql_identifier(value)
         params = []
@@ -93,7 +102,11 @@ def build_case_subquery(case, column_types):
     try:
         op_sql = _OP_SQL[op]
     except KeyError as e:
-        raise BadArgument(f'Unsupported op `{op}`') from e
+        raise BadArgument(
+            f"不支持的 op `{op}`。"
+            "合法 op: ==, !=, >, >=, <, <=, between, in。"
+            '示例: {"field": "ts", "op": "between", "value": [1, 10]}'
+        ) from e
     return SqlQuery(f'{field_sql} {op_sql} {rhs}', params)
 
 
