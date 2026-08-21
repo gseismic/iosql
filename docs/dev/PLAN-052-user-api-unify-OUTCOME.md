@@ -88,6 +88,15 @@
 5. PostgreSQL 引擎未实现 evolve 三语义与类型冲突检查（计划非目标：SQLite 后端优先）。
 6. timeseries() 默认不再隐式建 segment 属有意行为变化，已在 README 记录；存量库不受影响（契约持久化于 meta）。
 
+## Review 轮（2026-08-22，commit `e8d8385`）
+
+全量代码 review + 多线程场景测试后加固：
+
+- **并发演进竞争修复**：并发线程同时给不同新分区写各自新列时，各自基于过时 `current_meta` 快照建分区文件——互相缺列且 meta 后写覆盖丢列。新增 `_schema_lock` 串行化 `_do_insert_part` 的 NoSuchTable/NoSuchColumn 冷路径，并在锁内**重读** current_meta（入口快照在等锁期间可能已被刷新）。稳态插入不经过异常分支，热路径零锁开销。
+- **时区一致性**：`timeseries()` 显式传 calendar 分区时，TimeColumn 时区优先取分区自身 tz。
+- **新增 `tests/test_plan052_concurrency.py` 13 例**：不同/相同分区并发写、barrier 同步双线程并发加不同新列（3 轮 ×10 次复跑稳定）、同分区分支并发加列、读并发于演进 ALTER、首次分区创建竞争、`max_open_partitions=2` 下 LRU 驱逐并发写、latest 并发只读、独立 write_buffer、Case 归一化线程安全、iter_select limit+columns 组合、空表 select、calendar 分区 tz 一致性。
+- 全量回归 **345 passed, 16 skipped**。
+
 ## 提交记录
 
 | commit | 内容 |
@@ -97,4 +106,7 @@
 | `c24d594` | Case op 归一化白名单堵静默失效链（T3a） |
 | `7b6f1af` | select 家族默认值/columns 别名/弃用 + evolve 三语义 + 写入错误指引（T3c/T4/T5） |
 | `e07fe58` | docs: 设计文档与 PLAN-052 入库 |
-| 本次收尾 | 回归修复 + tests/test_user_api_unify.py + 示例收敛 + README + 版本 0.3.0 + 本 OUTCOME |
+| `0fadb5f` | 回归修复 + tests/test_user_api_unify.py（24 例）+ 测试断言更新 |
+| `6c6cbc6` | 示例全面收敛（T6a，14 个文件） |
+| `de4e72b` | README 收敛 + 版本 0.3.0 + 本 OUTCOME（T6b/T7） |
+| `e8d8385` | review 轮：并发演进竞争修复（_schema_lock）+ 多线程场景测试 13 例 |
