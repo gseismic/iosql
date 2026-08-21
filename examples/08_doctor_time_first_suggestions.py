@@ -1,11 +1,15 @@
-"""高级：doctor 对历史 partition_key 表优先给出时间分区建议。"""
+"""高级：doctor 对历史 partition_key 表优先给出时间分区建议。
+
+高级用法仍可直接构造 TableContract/PhysicalLayout；本例演示用
+db.table() 快捷参数表达同样的契约。
+"""
 
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 
-from iosql import Database, PhysicalLayout, TableContract, TimeColumn
+from iosql import Database, Segment, TimeColumn
 
 
 RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
@@ -21,44 +25,39 @@ def reset_database():
 def run():
     reset_database()
 
-    db = Database(SOURCE_URI)
-    spec = TableContract(
-        primary_key=["symbol", "date"],
-        time=TimeColumn("date", unit="date", timezone="Asia/Shanghai"),
-        partition="range(partition_key,width=1)",
-        columns={
-            "symbol": "text",
-            "date": "text",
-            "partition_key": "integer",
-            "close": "float",
-        },
-        order_key="date",
-        physical_layout=PhysicalLayout(
-            target_rows_per_file=8,
-            min_rows_per_file=5,
-            max_rows_per_file=10,
-        ),
-    )
-    table = db.table("daily_bars", spec=spec)
-    rows = []
-    for day in range(4):
-        date = f"2025-01-{day + 1:02d}"
-        rows.extend([
-            {
-                "symbol": "AAPL",
-                "date": date,
-                "partition_key": day,
-                "close": 100 + day,
+    with Database(SOURCE_URI) as db:
+        table = db.table(
+            "daily_bars",
+            pk=["symbol", "date"],
+            time=TimeColumn("date", unit="date", timezone="Asia/Shanghai"),
+            partition="range(partition_key,width=1)",
+            columns={
+                "symbol": "text",
+                "date": "text",
+                "partition_key": "integer",
+                "close": "float",
             },
-            {
-                "symbol": "MSFT",
-                "date": date,
-                "partition_key": day,
-                "close": 200 + day,
-            },
-        ])
-    table.write(rows)
-    db.close()
+            order_key="date",
+            segment=Segment.rows(max_rows=10, target_rows=8, min_rows=5),
+        )
+        rows = []
+        for day in range(4):
+            date = f"2025-01-{day + 1:02d}"
+            rows.extend([
+                {
+                    "symbol": "AAPL",
+                    "date": date,
+                    "partition_key": day,
+                    "close": 100 + day,
+                },
+                {
+                    "symbol": "MSFT",
+                    "date": date,
+                    "partition_key": day,
+                    "close": 200 + day,
+                },
+            ])
+        table.write(rows)
 
     command = [
         sys.executable,

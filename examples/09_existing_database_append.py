@@ -38,24 +38,16 @@ def prepare_demo_database():
 def run():
     prepare_demo_database()
 
-    db = Database(
+    # 直接信任 API 的错误路径：无契约时 write() 会给出修复指引，
+    # 不需要手动检查 spec is None。
+    with Database(
         DB_URI,
         max_open_partitions=5,
         max_connections_per_file=1,
         max_process_connections=32,
-    )
-    try:
-        if TABLE_NAME not in db.table_names():
-            raise RuntimeError(
-                f"已有库中不存在表 {TABLE_NAME!r}。请通过 "
-                "IOSQL_EXISTING_URI / IOSQL_EXISTING_TABLE 指向兼容的 ticks 表。"
-            )
-
-        # 不再传 columns/pk/partition，直接读取库中持久化的 TableSpec。
+    ) as db:
         ticks = db.table(TABLE_NAME)
         spec = ticks.spec()
-        if spec is None:
-            raise RuntimeError(f"表 {TABLE_NAME!r} 没有持久化契约，不能使用 write()")
 
         result = ticks.write(
             {
@@ -66,7 +58,6 @@ def run():
             mode="ignore",
         )
         latest = ticks.select(
-            "*",
             where={"field": "symbol", "op": "==", "value": "AAPL"},
             order_by="ts desc",
             limit=3,
@@ -78,8 +69,6 @@ def run():
         print("本次看到/写入:", result.rows_seen, result.rows_written)
         print("AAPL 最新记录:", latest)
         print("进程连接预算:", db.get_process_connection_budget_status())
-    finally:
-        db.close()
 
 
 if __name__ == "__main__":
