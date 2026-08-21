@@ -228,6 +228,9 @@ class Table(BaseTable):
         self._db_parts_condition = threading.Condition(threading.RLock())
         self._db_parts_closing = False
         self._compact_lock = threading.RLock()
+        # schema 演进锁：只串行化 NoSuchTable/NoSuchColumn 冷路径，
+        # 防止并发加列时基于过时 meta 快照互相覆盖；稳态插入不经过这些分支
+        self._schema_lock = threading.RLock()
         self._declared_spec = None
         # New partition system
         self._partition = None
@@ -3504,48 +3507,53 @@ class Table(BaseTable):
             #   主表存在，只是该part的表不存在
             # 所以此种情况下，写入主表数据，且part表
             # alter = True 时，还需要检查column是否一致
-            data_suggested_types = self.suggest_column_types(
-                part_data, column_type=column_type, n_suggest_check=n_suggest_check
-            )
-            createtable_meta = build_createtable_meta(
-                data_suggested_types, pk=pk, partition=partition, **kwargs
-            )
-            if current_meta:
-                # evolve 语义一：新分区文件必须包含存量全部列，
-                # 相对存量的新列补齐到旧分区，保证旧分区缺失列读为 NULL
-                #（否则 SQLite 双引号字面量会把缺失列静默变成字符串）
-                fresh_types = {
-                    col: type_
-                    for col, type_ in data_suggested_types.items()
-                    if col not in current_meta["column_info"]
-                }
-                new_column_info = current_meta["column_info"]
-                for col, item in createtable_meta["column_info"].items():
-                    if col not in new_column_info:
-                        new_column_info[col] = item
-                createtable_meta["column_info"] = new_column_info
-                if fresh_types:
-                    self._add_columns_for_all_partitions(fresh_types)
-            self._sync_contract_columns(createtable_meta)
-
-            # 确保表格建好后，才写meta，确保不删列(不支持)情况下，meta中有的信息, 表中都有
-            self.do_create_table(part_dbfile, part_table_name, createtable_meta, alter)
-
-            # update meta
-            meta_part = part if logical_part is None else logical_part
-            self._update_meta(meta_part, part_column, partition, createtable_meta)
-
-            # write data
-            with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                part_db[part_table_name]._invalidate_cache()
-                part_db[part_table_name].insert_all(
-                    part_data,
-                    replace=replace,
-                    ignore=ignore,
-                    batch_size=batch_size,
-                    commit=commit,
-                    ensure_table=False,
+            # _schema_lock 串行化建分区/演进：并发线程各自基于过时
+            # current_meta 快照建文件会互相丢列并覆盖 meta
+            with self._schema_lock:
+                # 进锁重读 meta：函数入口的快照可能已被并发演进刷新
+                current_meta = self.get_table_meta()
+                data_suggested_types = self.suggest_column_types(
+                    part_data, column_type=column_type, n_suggest_check=n_suggest_check
                 )
+                createtable_meta = build_createtable_meta(
+                    data_suggested_types, pk=pk, partition=partition, **kwargs
+                )
+                if current_meta:
+                    # evolve 语义一：新分区文件必须包含存量全部列，
+                    # 相对存量的新列补齐到旧分区，保证旧分区缺失列读为 NULL
+                    #（否则 SQLite 双引号字面量会把缺失列静默变成字符串）
+                    fresh_types = {
+                        col: type_
+                        for col, type_ in data_suggested_types.items()
+                        if col not in current_meta["column_info"]
+                    }
+                    new_column_info = current_meta["column_info"]
+                    for col, item in createtable_meta["column_info"].items():
+                        if col not in new_column_info:
+                            new_column_info[col] = item
+                    createtable_meta["column_info"] = new_column_info
+                    if fresh_types:
+                        self._add_columns_for_all_partitions(fresh_types)
+                self._sync_contract_columns(createtable_meta)
+
+                # 确保表格建好后，才写meta，确保不删列(不支持)情况下，meta中有的信息, 表中都有
+                self.do_create_table(part_dbfile, part_table_name, createtable_meta, alter)
+
+                # update meta
+                meta_part = part if logical_part is None else logical_part
+                self._update_meta(meta_part, part_column, partition, createtable_meta)
+
+                # write data
+                with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                    part_db[part_table_name]._invalidate_cache()
+                    part_db[part_table_name].insert_all(
+                        part_data,
+                        replace=replace,
+                        ignore=ignore,
+                        batch_size=batch_size,
+                        commit=commit,
+                        ensure_table=False,
+                    )
         except NoSuchColumn as e:
             # add column for all partition-table
             # alter table
@@ -3553,38 +3561,43 @@ class Table(BaseTable):
             if not alter:
                 raise e
 
-            data_suggested_types = self.suggest_column_types(
-                part_data, column_type=column_type, n_suggest_check=n_suggest_check
-            )
-            self._add_columns_for_all_partitions(data_suggested_types)
-
-            createtable_meta = build_createtable_meta(
-                data_suggested_types, pk=pk, partition=partition, **kwargs
-            )
-
-            # 数据库中没有的列增加，但已经有的，且insert数据没有的字段，并不会删除
-            # 所以要更新 createtable_meta
-            if current_meta:
-                new_column_info = current_meta["column_info"]
-                for col, item in createtable_meta["column_info"].items():
-                    if col not in new_column_info:
-                        new_column_info[col] = item
-                createtable_meta["column_info"] = new_column_info
-            self._sync_contract_columns(createtable_meta)
-
-            # update meta
-            meta_part = part if logical_part is None else logical_part
-            self._update_meta(meta_part, part_column, partition, createtable_meta)
-
-            with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                part_db[part_table_name].insert_all(
-                    part_data,
-                    replace=replace,
-                    ignore=ignore,
-                    batch_size=batch_size,
-                    commit=commit,
-                    ensure_table=False,
+            # 与 NoSuchTable 分支共用 _schema_lock：加列期间禁止其他线程
+            # 基于旧快照建新分区或再加列
+            with self._schema_lock:
+                # 进锁重读 meta：函数入口的快照可能已被并发演进刷新
+                current_meta = self.get_table_meta()
+                data_suggested_types = self.suggest_column_types(
+                    part_data, column_type=column_type, n_suggest_check=n_suggest_check
                 )
+                self._add_columns_for_all_partitions(data_suggested_types)
+
+                createtable_meta = build_createtable_meta(
+                    data_suggested_types, pk=pk, partition=partition, **kwargs
+                )
+
+                # 数据库中没有的列增加，但已经有的，且insert数据没有的字段，并不会删除
+                # 所以要更新 createtable_meta
+                if current_meta:
+                    new_column_info = current_meta["column_info"]
+                    for col, item in createtable_meta["column_info"].items():
+                        if col not in new_column_info:
+                            new_column_info[col] = item
+                    createtable_meta["column_info"] = new_column_info
+                self._sync_contract_columns(createtable_meta)
+
+                # update meta
+                meta_part = part if logical_part is None else logical_part
+                self._update_meta(meta_part, part_column, partition, createtable_meta)
+
+                with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                    part_db[part_table_name].insert_all(
+                        part_data,
+                        replace=replace,
+                        ignore=ignore,
+                        batch_size=batch_size,
+                        commit=commit,
+                        ensure_table=False,
+                    )
 
     def _update_meta(self, part_key, ts_col, partition, createtable_meta):
         # 更新table创建的meta信息，直接覆盖

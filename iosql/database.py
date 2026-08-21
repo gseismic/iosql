@@ -275,11 +275,12 @@ class Database(object):
                 ).to_partition()
 
         if isinstance(time, str):
-            time_column = TimeColumn(
-                time,
-                unit='date' if _is_calendar_partition(partition) else 'ms',
-                timezone=timezone,
-            )
+            if _is_calendar_partition(partition):
+                # calendar 分区以自身 tz 为准，避免与显式 partition 的时区漂移
+                tz = getattr(partition, 'tz', None) or timezone
+                time_column = TimeColumn(time, unit='date', timezone=tz)
+            else:
+                time_column = TimeColumn(time, unit='ms', timezone=timezone)
         else:
             time_column = time
 
