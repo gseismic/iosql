@@ -946,8 +946,8 @@ def test_cli_doctor_prefers_time_partition_for_range_time_table(tmp_path):
     assert "suggestions:" in result.output
     assert "1. 推荐: 按时间列 date 使用 5day" in result.output
     assert "max/avg≈5" in result.output
-    assert "--partition 'calendar(date,every=5day,tz=Asia/Shanghai)'" in result.output
-    assert "--partition 'calendar(date,every=1week,tz=Asia/Shanghai)'" in result.output
+    assert "--partition 'calendar(date,every=5day,timezone=Asia/Shanghai)'" in result.output
+    assert "--partition 'calendar(date,every=1week,timezone=Asia/Shanghai)'" in result.output
     assert "--partition 'range(partition_key,width=5)'" in result.output
     assert result.output.index("calendar(date,every=5day") < result.output.index(
         "range(partition_key,width=5)"

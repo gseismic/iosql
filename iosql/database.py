@@ -6,7 +6,11 @@ from .utils.schema import parse_db_schema
 from .exception import BadArgument, EngineNotExist, UnsafeOperation
 from .engines import sqlite
 from .partition import Partition
-from .spec import MigrationResult, Segment, TableContract
+from .spec import MigrationResult, Segment, TableContract, TimeColumn, PartitionSpec
+
+
+def _is_calendar_partition(partition):
+    return getattr(partition, 'PARTITION_TYPE', None) == 'calendar'
 
 
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
@@ -264,8 +268,20 @@ class Database(object):
                     timezone=timezone,
                 )
             else:
-                # duration 分区按 UTC 对齐，无时区概念
-                partition = Partition.duration(time, every=partition_every)
+                # duration 分区按 UTC 对齐，无时区概念；
+                # 经 PartitionSpec 构造以支持 "1s"/"1day" 等字符串间隔
+                partition = PartitionSpec(
+                    column=time, every=partition_every, kind='duration',
+                ).to_partition()
+
+        if isinstance(time, str):
+            time_column = TimeColumn(
+                time,
+                unit='date' if _is_calendar_partition(partition) else 'ms',
+                timezone=timezone,
+            )
+        else:
+            time_column = time
 
         return self.table(
             table_name,
@@ -278,7 +294,7 @@ class Database(object):
             conflict=conflict,
             schema_policy=schema_policy,
             force_partition=force_partition,
-            time=time,
+            time=time_column,
             symbol_column=symbol_column,
             session_column=session_column,
         )

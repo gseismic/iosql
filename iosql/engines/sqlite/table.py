@@ -465,7 +465,11 @@ class Table(BaseTable):
                 )
 
     def _ensure_contract_type_compatible(self, contract, rows):
-        """evolve 语义三：契约已固化类型的列遇到不兼容数据时报错，而非静默变更语义。"""
+        """evolve 语义三：契约已固化类型的列遇到不兼容数据时报错。
+
+        放行规则：同型、数值互通(int/float)、数字写入 text 声明列
+        （SQLite TEXT affinity 转换，既有宽松用法依赖此行为）。
+        """
         declared = {
             str(column).lower(): str(type_).lower()
             for column, type_ in (contract.columns or {}).items()
@@ -491,6 +495,8 @@ class Table(BaseTable):
             if declared_type == inferred_type:
                 continue
             if declared_type in ('integer', 'float') and inferred_type in ('integer', 'float'):
+                continue
+            if declared_type == 'text' and inferred_type in ('integer', 'float'):
                 continue
             raise BadArgument(
                 f"列 `{column}` 类型冲突：契约已固化为 {declared[column]}，"

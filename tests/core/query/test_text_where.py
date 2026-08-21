@@ -13,7 +13,7 @@ def test_text_where_parses_simple_equality():
 
     assert [[_case_tuple(case) for case in cases]
             for cases in where.or_and_cases] == [
-        [("venue", "=", "NASDAQ")]
+        [("venue", "==", "NASDAQ")]
     ]
 
 
@@ -22,7 +22,7 @@ def test_text_where_parses_and_conditions():
 
     assert [[_case_tuple(case) for case in cases]
             for cases in where.or_and_cases] == [
-        [("venue", "=", "NASDAQ"), ("level", "<=", 3)]
+        [("venue", "==", "NASDAQ"), ("level", "<=", 3)]
     ]
 
 
@@ -31,8 +31,8 @@ def test_text_where_parses_or_with_parentheses():
 
     assert [[_case_tuple(case) for case in cases]
             for cases in where.or_and_cases] == [
-        [("side", "=", "bid"), ("level", "=", 1)],
-        [("side", "=", "ask"), ("level", "=", 1)],
+        [("side", "==", "bid"), ("level", "==", 1)],
+        [("side", "==", "ask"), ("level", "==", 1)],
     ]
 
 

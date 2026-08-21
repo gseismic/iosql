@@ -241,7 +241,7 @@ class TestNeitherPartitionNorSegment:
         """无 TableContract 时 write() 会报错。"""
         db = Database(_uri(tmp_path))
         table = db.table("data")  # 无 pk、无 columns
-        with pytest.raises(BadArgument, match="write requires a TableContract"):
+        with pytest.raises(BadArgument, match="没有持久化契约"):
             table.write({"x": 1})
         db.close()
 

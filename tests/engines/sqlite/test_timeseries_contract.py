@@ -589,7 +589,7 @@ def test_table_spec_persists_for_reopen(tmp_path):
 
     assert spec.primary_key == ["symbol", "ts"]
     assert spec.time.name == "ts"
-    assert spec.partition.every == "1day"
+    assert spec.partition.every == 86_400_000
     assert spec.physical_layout.target_rows_per_file == 2
 
 

@@ -42,7 +42,7 @@ def test_parse_and_format_calendar_partition_expr():
     assert spec.column == "event_date"
     assert spec.timezone == "Asia/Shanghai"
     assert runtime_partition.fmt == "YYYYMM"
-    assert spec.to_string() == "calendar(event_date,every=1month,tz=Asia/Shanghai)"
+    assert spec.to_string() == "calendar(event_date,every=1month,timezone=Asia/Shanghai)"
 
 
 def test_calendar_partition_expr_accepts_multi_day_bucket():
@@ -50,7 +50,7 @@ def test_calendar_partition_expr_accepts_multi_day_bucket():
     spec = parse_partition_spec("calendar(date,every=4day,tz=Asia/Shanghai)")
     runtime_partition = spec.to_partition()
 
-    assert spec.to_string() == "calendar(date,every=4day,tz=Asia/Shanghai)"
+    assert spec.to_string() == "calendar(date,every=4day,timezone=Asia/Shanghai)"
     assert runtime_partition.get_key({"date": "2025-01-03"}) == "20250101"
     assert runtime_partition.get_key({"date": "2025-01-05"}) == "20250105"
     assert runtime_partition.to_meta()["every"] == "4day"

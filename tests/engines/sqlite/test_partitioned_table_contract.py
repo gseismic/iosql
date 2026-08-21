@@ -194,7 +194,11 @@ def test_calendar_partition_contract_without_time_prunes_equality(tmp_path):
     assert plan["candidate_partitions"] == ["20260103"]
     assert plan["scanned_partitions"] == ["20260103"]
     assert plan["skipped_partitions"] == ["20260101"]
-    assert "time" not in table.get_table_meta()["table_contract"]
+    assert table.get_table_meta()["table_contract"]["time"] == {
+        "name": "event_date",
+        "unit": "date",
+        "timezone": "UTC",
+    }
 
     db.close()
 
