@@ -45,8 +45,8 @@ from ...spec import (
     TableSpec,
     WriteResult,
 )
-from ...table import BaseTable
-from ...utils.column import suggest_sqlite_column_types
+from ...table import BaseTable, resolve_select_fields
+from ...utils.column import sqlite_type_of_value, suggest_sqlite_column_types
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite import Database as MyDatabase
 from ...utils.mysqlite.const import _DEFAULT_PRAGMA as _MYSQLITE_DEFAULT_PRAGMA
@@ -72,6 +72,11 @@ from .query_util import (
     build_select_cases_query,
     build_select_or_cases_query,
 )
+
+
+def _canon_sqlite_type(type_):
+    value = str(type_).strip().lower()
+    return 'float' if value in ('real', 'double', 'float') else value
 
 
 class _TableQuery:
@@ -459,8 +464,62 @@ class Table(BaseTable):
                     f'current={current_columns[column]} new={type_}'
                 )
 
+    def _ensure_contract_type_compatible(self, contract, rows):
+        """evolve 语义三：契约已固化类型的列遇到不兼容数据时报错，而非静默变更语义。"""
+        declared = {
+            str(column).lower(): str(type_).lower()
+            for column, type_ in (contract.columns or {}).items()
+            if type_ is not None
+        }
+        if not declared:
+            return
+        inferred = {}
+        for row in rows:
+            for column, value in row.items():
+                if value is None:
+                    continue
+                type_ = sqlite_type_of_value(value)
+                key = str(column).lower()
+                existing = inferred.get(key)
+                if existing is None or (existing == 'integer' and type_ == 'float'):
+                    inferred[key] = type_
+        for column, type_ in inferred.items():
+            if column not in declared:
+                continue
+            declared_type = _canon_sqlite_type(declared[column])
+            inferred_type = _canon_sqlite_type(type_)
+            if declared_type == inferred_type:
+                continue
+            if declared_type in ('integer', 'float') and inferred_type in ('integer', 'float'):
+                continue
+            raise BadArgument(
+                f"列 `{column}` 类型冲突：契约已固化为 {declared[column]}，"
+                f"本次数据为 {type_}。"
+                "修复: 转换数据类型，或重新声明契约 columns"
+            )
+
+    def _sync_contract_columns(self, createtable_meta):
+        """evolve 语义二：动态加列后回写契约，保证 spec().columns 恒为实际 schema 的上确界。"""
+        contract = createtable_meta.get('table_contract')
+        if not isinstance(contract, dict):
+            return
+        columns = dict(contract.get('columns') or {})
+        changed = False
+        for column, item in (createtable_meta.get('column_info') or {}).items():
+            type_ = item.get('type') if isinstance(item, dict) else None
+            if type_ is not None and column not in columns:
+                columns[column] = type_
+                changed = True
+        if changed:
+            contract['columns'] = columns
+
     def insert_all(self, data, pk=None, extra_data=None, partition=None,
                    replace=False, ignore=False, commit=True, **kwargs):
+        if replace and ignore:
+            raise BadArgument(
+                'insert_all: replace 与 ignore 互斥，只能传一个；'
+                '高层写入请使用 write(rows, mode=...)'
+            )
         if not data:
             return WriteResult()
         if isinstance(data, dict):
@@ -469,6 +528,7 @@ class Table(BaseTable):
 
         contract = self.spec()
         if contract:
+            self._ensure_contract_type_compatible(contract, data)
             pk = pk if pk is not None else contract.primary_key
             partition = partition if partition is not None else contract.to_partition()
             column_type = dict(contract.columns or {})
@@ -534,7 +594,11 @@ class Table(BaseTable):
 
         spec = self.spec()
         if not spec:
-            raise BadArgument('write requires a TableContract')
+            raise BadArgument(
+                f"表 `{self._table_name}` 没有持久化契约，无法 write()。"
+                "修复: db.table(...) 传入建表参数（pk/columns/partition...）重新声明，"
+                "或 db.table(..., spec=...) 绑定已有契约"
+            )
         if not spec.primary_key:
             raise MissingPrimaryKey('write requires TableContract.primary_key')
 
@@ -597,7 +661,9 @@ class Table(BaseTable):
         )
         return _TableQuery(self, spec)
 
-    def explain_select(self, fields='*', where=None, order_by=None, limit=None):
+    def explain_select(self, fields='*', where=None, order_by=None, limit=None,
+                       columns=None):
+        fields = resolve_select_fields(fields, columns, 'explain_select')
         spec = QuerySpec(
             table=self._table_name,
             columns=fields,
@@ -1447,9 +1513,16 @@ class Table(BaseTable):
         return fields
 
     def _resolve_latest_by_arg(self, by, group_by):
-        if by is not None and group_by is not None and by != group_by:
-            raise BadArgument('latest by and group_by conflict')
-        return group_by if by is None else by
+        if group_by is not None:
+            warnings.warn(
+                "latest(group_by=) 已废弃：group_by 是 by 的别名，请改用 by=",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            if by is not None and by != group_by:
+                raise BadArgument('latest by and group_by conflict')
+            return group_by
+        return by
 
     def _ensure_latest_fields(self, row, fields):
         missing = [field for field in fields if field not in row]
@@ -1601,7 +1674,12 @@ class Table(BaseTable):
 
     def _query_time_column(self, table_spec):
         if not table_spec or not table_spec.time:
-            raise MissingTimeColumn('query start/end/date requires TableSpec.time')
+            raise MissingTimeColumn(
+                f"表 `{self._table_name}` 没有 time 契约，query(start/end/date) "
+                "与 latest()/asof() 需要它。"
+                "修复: 建表时传 time=\"ts\"，或使用 duration/calendar 分区"
+                "（可自动反推 time）"
+            )
         return table_spec.time
 
     def _query_session_column(self, table_spec):
@@ -2451,19 +2529,27 @@ class Table(BaseTable):
             if self._segment_lookup_key(ref) not in excluded
         ]
 
-    def select_all(self, fields, where, limit=None, to_dict=False, **kwargs):
+    def select_all(self, fields='*', where=None, limit=None, to_dict=False, **kwargs):
+        warnings.warn(
+            "select_all() 已废弃：等价于 select(fields, where, to_dict=True)，"
+            "请改用 select(to_dict=True)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
 
     def iter_select(
         self,
-        fields,
-        where,
+        fields='*',
+        where=None,
         limit=None,
         order_by=None,
         to_dict=False,
         batch_size=10_000,
+        columns=None,
         **kwargs,
     ):
+        fields = resolve_select_fields(fields, columns, 'iter_select')
         for batch in self.iter_select_batches(
             fields,
             where,
@@ -2478,14 +2564,16 @@ class Table(BaseTable):
 
     def iter_select_batches(
         self,
-        fields,
-        where,
+        fields='*',
+        where=None,
         limit=None,
         order_by=None,
         to_dict=False,
         batch_size=10_000,
+        columns=None,
         **kwargs,
     ):
+        fields = resolve_select_fields(fields, columns, 'iter_select_batches')
         batch_size = self._normalize_batch_size(batch_size)
         limit = self._normalize_limit(limit)
         if limit == 0:
@@ -2545,17 +2633,14 @@ class Table(BaseTable):
         if pending:
             yield pending
 
-    def select(self, fields, where, limit=None, order_by=None, to_dict=False, **kwargs):
-        """查询完所有 And([case..]) 然后组合
-            And([case..])为一个基本查询单位[向数据库请求]
-            where = {'field': 'date',..}
-        where = {
-            'field': 'date'
-            'op': 'between_and',
-            'value': '2020'
-            'rank': 1
-        }
+    def select(self, fields='*', where=None, limit=None, order_by=None,
+               to_dict=False, columns=None, **kwargs):
+        """条件查询，返回行列表（急切求值）。
+
+        fields/where 均可省略：select() 即全表查询；
+        columns= 是 fields= 的别名（与 query(columns=) 对齐），两者同传冲突报错。
         """
+        fields = resolve_select_fields(fields, columns, 'select')
         # step1. 找到各part记录到的字段最大最小数值, 排除不需要查询的part
         # step2. 查找各个And([case..])的数据
         #       处理where以后, [And([case..])]之间不应有包含关系，否则可以直接去掉被包含的
@@ -3419,6 +3504,24 @@ class Table(BaseTable):
             createtable_meta = build_createtable_meta(
                 data_suggested_types, pk=pk, partition=partition, **kwargs
             )
+            if current_meta:
+                # evolve 语义一：新分区文件必须包含存量全部列，
+                # 相对存量的新列补齐到旧分区，保证旧分区缺失列读为 NULL
+                #（否则 SQLite 双引号字面量会把缺失列静默变成字符串）
+                fresh_types = {
+                    col: type_
+                    for col, type_ in data_suggested_types.items()
+                    if col not in current_meta["column_info"]
+                }
+                new_column_info = current_meta["column_info"]
+                for col, item in createtable_meta["column_info"].items():
+                    if col not in new_column_info:
+                        new_column_info[col] = item
+                createtable_meta["column_info"] = new_column_info
+                if fresh_types:
+                    self._add_columns_for_all_partitions(fresh_types)
+            self._sync_contract_columns(createtable_meta)
+
             # 确保表格建好后，才写meta，确保不删列(不支持)情况下，meta中有的信息, 表中都有
             self.do_create_table(part_dbfile, part_table_name, createtable_meta, alter)
 
@@ -3461,6 +3564,7 @@ class Table(BaseTable):
                     if col not in new_column_info:
                         new_column_info[col] = item
                 createtable_meta["column_info"] = new_column_info
+            self._sync_contract_columns(createtable_meta)
 
             # update meta
             meta_part = part if logical_part is None else logical_part

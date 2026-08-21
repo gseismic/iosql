@@ -1,5 +1,17 @@
 from abc import ABCMeta, abstractmethod
+from .exception import BadArgument
 from .utils.schema import parse_db_schema
+
+
+def resolve_select_fields(fields, columns, func_name):
+    """select 家族共用：columns= 是 fields= 的别名，两者同传冲突时报错。"""
+    if columns is None:
+        return fields
+    if fields not in ('*', None):
+        raise BadArgument(
+            f'{func_name}: fields 与 columns 只能传一个'
+        )
+    return columns
 
 
 class BaseTable(metaclass=ABCMeta):

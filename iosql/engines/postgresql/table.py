@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import re
 import math
+import warnings
 from typing import Any, Dict, List, Optional
 import arrow
 import psycopg2
 from psycopg2 import sql
 
-from ...table import BaseTable
+from ...table import BaseTable, resolve_select_fields
 from ...partition import Partition, DurationPartition, CalendarPartition
 from ...core.query import Where
 from ...exception import BadArgument, InvalidUriSchema
@@ -310,7 +311,11 @@ class Table(BaseTable):
 
         spec = self.spec()
         if not spec:
-            raise BadArgument('write requires a TableContract')
+            raise BadArgument(
+                f"表 `{self._table_name}` 没有持久化契约，无法 write()。"
+                "修复: db.table(...) 传入建表参数（pk/columns/partition...）重新声明，"
+                "或 db.table(..., spec=...) 绑定已有契约"
+            )
         if mode is None:
             mode = spec.conflict
         mode = str(mode or 'append').lower()
@@ -350,6 +355,11 @@ class Table(BaseTable):
     def insert_all(self, data, pk=None, extra_data=None, partition=None,
                    replace=False, ignore=False, commit=True, **kwargs):
         """Insert multiple rows with partitioning."""
+        if replace and ignore:
+            raise BadArgument(
+                'insert_all: replace 与 ignore 互斥，只能传一个；'
+                '高层写入请使用 write(rows, mode=...)'
+            )
         if not data:
             return WriteResult()
         if isinstance(data, dict):
@@ -645,13 +655,19 @@ class Table(BaseTable):
         db_name = self._uri_options.get('db', 'default')
         return os.path.join(base_dir, db_name, self._table_name, f'{part_key}.sqlite3')
     
-    def select_all(self, fields, where=None, limit=None, **kwargs):
-        """Query all data matching the conditions."""
+    def select_all(self, fields='*', where=None, limit=None, **kwargs):
+        warnings.warn(
+            "select_all() 已废弃：等价于 select(fields, where, to_dict=True)，"
+            "请改用 select(to_dict=True)",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
-    
-    def select(self, fields, where=None, limit=None, order_by=None,
-               to_dict=True, **kwargs):
+
+    def select(self, fields='*', where=None, limit=None, order_by=None,
+               to_dict=True, columns=None, **kwargs):
         """Query data with where conditions."""
+        fields = resolve_select_fields(fields, columns, 'select')
         query, params = self._select_query(
             fields,
             where,
@@ -661,14 +677,15 @@ class Table(BaseTable):
         conn = self.connect()
         cursor = conn.cursor()
         cursor.execute(query, params)
-        columns = [desc[0] for desc in cursor.description]
+        columns_ = [desc[0] for desc in cursor.description]
         rows = cursor.fetchall()
         if not to_dict:
             return rows
-        return [dict(zip(columns, row)) for row in rows]
+        return [dict(zip(columns_, row)) for row in rows]
 
-    def iter_select(self, fields, where=None, limit=None, order_by=None,
-                    to_dict=True, batch_size=10_000, **kwargs):
+    def iter_select(self, fields='*', where=None, limit=None, order_by=None,
+                    to_dict=True, batch_size=10_000, columns=None, **kwargs):
+        fields = resolve_select_fields(fields, columns, 'iter_select')
         for batch in self.iter_select_batches(
             fields,
             where,
@@ -681,8 +698,9 @@ class Table(BaseTable):
             for row in batch:
                 yield row
 
-    def iter_select_batches(self, fields, where=None, limit=None, order_by=None,
-                            to_dict=True, batch_size=10_000, **kwargs):
+    def iter_select_batches(self, fields='*', where=None, limit=None, order_by=None,
+                            to_dict=True, batch_size=10_000, columns=None, **kwargs):
+        fields = resolve_select_fields(fields, columns, 'iter_select_batches')
         batch_size = self._normalize_batch_size(batch_size)
         limit = self._normalize_limit(limit)
         if limit == 0:
