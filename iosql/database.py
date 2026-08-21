@@ -1,10 +1,12 @@
 import os
 import shutil
+import warnings
 
 from .utils.schema import parse_db_schema
 from .exception import BadArgument, EngineNotExist, UnsafeOperation
 from .engines import sqlite
-from .spec import MigrationResult, TableContract, TableSpec
+from .partition import Partition
+from .spec import MigrationResult, Segment, TableContract
 
 
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
@@ -132,7 +134,16 @@ class Database(object):
         conflict='append',
         schema_policy='evolve',
         force_partition=False,
+        time=None,
+        symbol_column=None,
+        session_column=None,
     ):
+        """创建或打开逻辑表（主入口）。
+
+        `time` / `symbol_column` / `session_column` 让契约感知能力
+        （query()/latest()/asof()）无需 timeseries() 即可使用；
+        duration/calendar 分区还会在未显式声明 time 时自动反推。
+        """
         table = self[table_name]
         shortcut_values = [
             pk,
@@ -141,6 +152,9 @@ class Database(object):
             partition,
             segment,
             order_key,
+            time,
+            symbol_column,
+            session_column,
         ]
         if spec is not None and any(value is not None for value in shortcut_values):
             raise BadArgument('Database.table: spec conflicts with shortcut arguments')
@@ -158,6 +172,13 @@ class Database(object):
                 and normalized_pk != normalized_primary_key
             ):
                 raise BadArgument('Database.table: pk and primary_key conflict')
+            contract_kwargs = {}
+            if time is not None:
+                contract_kwargs['time'] = time
+            if symbol_column is not None:
+                contract_kwargs['symbol_column'] = symbol_column
+            if session_column is not None:
+                contract_kwargs['session_column'] = session_column
             table.use_contract(TableContract(
                 primary_key=normalized_pk if normalized_pk is not None else normalized_primary_key,
                 columns=columns or {},
@@ -166,33 +187,101 @@ class Database(object):
                 order_key=order_key,
                 conflict=conflict,
                 schema_policy=schema_policy,
+                **contract_kwargs,
             ))
         return table
 
-    def timeseries(self, table_name, time, primary_key, columns=None,
-                   partition_every='1day', timezone='UTC',
-                   schema_policy='evolve', symbol_column='symbol',
-                   session_column=None,
-                   target_rows_per_file=400_000,
-                   min_rows_per_file=300_000,
-                   max_rows_per_file=500_000,
-                   time_unit='ms', partition_kind='duration'):
-        spec = TableSpec.timeseries(
-            time=time,
-            primary_key=primary_key,
+    def timeseries(self, table_name, time, pk=None, primary_key=None,
+                   columns=None, *, partition_every='1day', timezone='UTC',
+                   symbol_column='symbol', session_column=None,
+                   partition=None, segment=None, order_key=None,
+                   conflict='append', schema_policy='evolve',
+                   force_partition=False,
+                   partition_kind=None, time_unit=None,
+                   target_rows_per_file=None, min_rows_per_file=None,
+                   max_rows_per_file=None):
+        """时序语法糖：`table()` 的薄封装。
+
+        等价于 `db.table(..., partition=Partition.duration(time, every=partition_every),
+        order_key=time, time=time, ...)`；calendar 场景传
+        `partition=Partition.calendar(...)`。
+
+        废弃参数（触发 DeprecationWarning，行为等价迁移）：
+        - `partition_kind='calendar'` → 改传 `partition=Partition.calendar(...)`
+        - `time_unit='date'` → 改用 calendar 分区
+        - `target/min/max_rows_per_file` → 改传 `segment=Segment.rows(...)`
+        """
+        normalized_pk = _normalize_pk(pk)
+        normalized_primary_key = _normalize_pk(primary_key)
+        if (
+            normalized_pk is not None
+            and normalized_primary_key is not None
+            and normalized_pk != normalized_primary_key
+        ):
+            raise BadArgument('Database.timeseries: pk and primary_key conflict')
+
+        use_calendar = False
+        if partition_kind is not None:
+            warnings.warn(
+                "timeseries(partition_kind=...) 已废弃：calendar 场景请传 "
+                "partition=Partition.calendar(...)，duration 为默认行为",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            use_calendar = str(partition_kind).strip().lower() == 'calendar'
+        if time_unit is not None:
+            warnings.warn(
+                "timeseries(time_unit=...) 已废弃：date 场景请使用 calendar 分区 "
+                "(partition=Partition.calendar(...) 或 db.table(partition=...))",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if str(time_unit).strip().lower() == 'date':
+                use_calendar = True
+        if any(value is not None for value in (
+            target_rows_per_file,
+            min_rows_per_file,
+            max_rows_per_file,
+        )):
+            warnings.warn(
+                "timeseries(target/min/max_rows_per_file=...) 已废弃：请改传 "
+                "segment=Segment.rows(max_rows=..., target_rows=..., min_rows=...)",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if segment is None:
+                segment = Segment.rows(
+                    max_rows=max_rows_per_file or 500_000,
+                    target_rows=target_rows_per_file or 400_000,
+                    min_rows=min_rows_per_file or 300_000,
+                )
+
+        if partition is None:
+            if use_calendar:
+                partition = Partition.calendar(
+                    time,
+                    every=partition_every,
+                    timezone=timezone,
+                )
+            else:
+                # duration 分区按 UTC 对齐，无时区概念
+                partition = Partition.duration(time, every=partition_every)
+
+        return self.table(
+            table_name,
+            pk=normalized_pk,
+            primary_key=normalized_primary_key,
             columns=columns,
-            partition_every=partition_every,
-            timezone=timezone,
-            time_unit=time_unit,
-            partition_kind=partition_kind,
+            partition=partition,
+            segment=segment,
+            order_key=order_key or time,
+            conflict=conflict,
             schema_policy=schema_policy,
+            force_partition=force_partition,
+            time=time,
             symbol_column=symbol_column,
             session_column=session_column,
-            target_rows_per_file=target_rows_per_file,
-            min_rows_per_file=min_rows_per_file,
-            max_rows_per_file=max_rows_per_file,
         )
-        return self.table(table_name, spec=spec)
 
     def __enter__(self):
         return self
