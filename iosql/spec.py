@@ -327,7 +327,8 @@ def format_partition_spec(value: Any) -> str:
             f"every={_format_partition_value(every)}",
         ]
         if spec.timezone:
-            parts.append(f"tz={_format_partition_value(spec.timezone)}")
+            # 规范输出用 timezone=（与对象 API 一致）；解析层 tz= 仍兼容
+            parts.append(f"timezone={_format_partition_value(spec.timezone)}")
         if spec.fmt and _calendar_every_from_fmt(spec.fmt) is None:
             parts.append(f"fmt={_format_partition_value(spec.fmt)}")
         return f"calendar({','.join(parts)})"
@@ -648,6 +649,8 @@ class TableContract:
             self.primary_key = [self.primary_key]
         else:
             self.primary_key = list(self.primary_key or [])
+        if isinstance(self.time, str):
+            self.time = TimeColumn(self.time)
         if isinstance(self.time, dict):
             self.time = TimeColumn.from_dict(self.time)
         if isinstance(self.partition, RuntimePartition):
@@ -656,6 +659,26 @@ class TableContract:
             self.partition = PartitionSpec.from_string(self.partition)
         if isinstance(self.partition, dict):
             self.partition = PartitionSpec.from_dict(self.partition)
+        if (
+            self.partition
+            and self.time is None
+            and self.partition.kind in ('duration', 'calendar')
+        ):
+            # duration/calendar 分区列即时间语义，反推 time 契约；
+            # range 分区列不一定是时间，明确不反推
+            self.time = TimeColumn(
+                self.partition.column,
+                unit=(
+                    'date'
+                    if self.partition.kind == 'calendar'
+                    else (self.partition.time_unit or 'ms')
+                ),
+                timezone=(
+                    self.partition.timezone
+                    if self.partition.kind == 'calendar'
+                    else 'UTC'
+                ),
+            )
         if self.partition and self.time:
             self.partition = self.partition.with_time(self.time)
         if isinstance(self.segment, dict):
@@ -810,12 +833,17 @@ class TableContract:
             return cls.from_dict(meta["table_spec"])
 
         partition = PartitionSpec.from_partition_meta(meta.get("partition"))
+        # 与 __post_init__ 的反推规则保持一致：range 分区列不一定是时间，不反推
         time = None
-        if partition and partition.column:
+        if partition and partition.column and partition.kind in ("duration", "calendar"):
             time = TimeColumn(
                 partition.column,
-                unit=partition.time_unit or "ms",
-                timezone=partition.timezone,
+                unit=(
+                    "date"
+                    if partition.kind == "calendar"
+                    else (partition.time_unit or "ms")
+                ),
+                timezone=partition.timezone if partition.kind == "calendar" else "UTC",
             )
         columns = {
             key: item.get("type")
