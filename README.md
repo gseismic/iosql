@@ -4,13 +4,13 @@
 
 ## 特性
 
-- **普通 Table 主入口**：用 `Database.table(..., pk=..., partition=..., segment=...)` 声明主键、列类型、逻辑分区和物理分段。
-- **任意可排序字段分区**：`Partition.range(...)`、`Partition.duration(...)`、`Partition.calendar(...)` 都是普通分区策略，不要求核心 API 存在 `time` 字段。
+- **普通 Table 主入口**：用 `Database.table(..., pk=..., partition=..., segment=..., time=...)` 声明主键、列类型、逻辑分区和物理分段；`time=` / `session_column=` 让契约感知查询直达普通分区表。
+- **任意可排序字段分区**：`Partition.range(...)`、`Partition.duration(...)`、`Partition.calendar(...)` 都是普通分区策略；duration/calendar 分区未声明 time 时会自动反推。
 - **物理 row segment**：同一 logical partition 可按行数自动拆成多个 SQLite 文件，也可以不配置 logical partition，仅用 `__all__` + row segment 控制文件大小。
 - **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
-- **批量写入**：`insert_all()` 和 `write_buffer()` 可直接使用表契约写入。
+- **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`write_buffer()` 缓冲批量写入。
 - **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
-- **时序 helper**：`Database.timeseries()` 保留为快捷封装，适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
+- **时序语法糖**：`Database.timeseries()` 是 `table()` 的薄封装（duration/calendar 分区 + order_key + time），适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 
 ## Partition 与 Segment 的关系
 
@@ -99,38 +99,35 @@ python -m pip wheel . --no-deps -w dist
 ```python
 from iosql import Database, Partition
 
-db = Database("sqlite://database/market.iosql")
+with Database("sqlite://database/market.iosql") as db:
+    ticks = db.table(
+        "ticks",
+        pk=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "price": "float"},
+        partition=Partition.duration("ts", every="1day"),
+    )
 
-ticks = db.table(
-    "ticks",
-    pk=["symbol", "ts"],
-    columns={"symbol": "text", "ts": "integer", "price": "float"},
-    partition=Partition.duration("ts", every="1day"),
-)
+    result = ticks.write([
+        {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
+        {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
+        {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
+    ])
 
-result = ticks.insert_all([
-    {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
-    {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
-    {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
-])
+    # select() 的 fields/where 均可省略；文本 where 支持 == 和 between
+    rows = ticks.select(
+        where="symbol == 'AAPL' and ts between 1735689600000 and 1735776000000",
+        order_by="ts",
+        to_dict=True,
+    )
 
-where = [
-    {"field": "symbol", "op": "==", "value": "AAPL"},
-    {"field": "ts", "op": "between_and", "value": [1735689600000, 1735776000000]},
-]
-rows = ticks.select(
-    "*",
-    where=where,
-    order_by="ts",
-    to_dict=True,
-)
+    plan = ticks.explain_select(
+        where="symbol == 'AAPL' and ts between 1735689600000 and 1735776000000",
+        order_by="ts",
+    )
 
-plan = ticks.explain_select(where=where, order_by="ts")
-
-print(result.rows_seen)
-print(rows)
-print(plan.scanned_partitions)
-db.close()
+    print(result.rows_seen)
+    print(rows)
+    print(plan.scanned_partitions)
 ```
 
 ## 常用 API
@@ -173,10 +170,12 @@ table = db.table(
 
 ```python
 db.table("ticks", pk=["symbol", "ts"], partition="duration(ts,every=1day)")
-db.table("events", pk=["event_date", "name"], partition="calendar(event_date,every=1day,tz=Asia/Shanghai)")
-db.table("daily_bars", pk=["symbol", "date"], partition="calendar(date,every=4day,tz=Asia/Shanghai)")
+db.table("events", pk=["event_date", "name"], partition="calendar(event_date,every=1day,timezone=Asia/Shanghai)")
+db.table("daily_bars", pk=["symbol", "date"], partition="calendar(date,every=4day,timezone=Asia/Shanghai)")
 db.table("items", pk=["id"], partition="range(id,width=100000)")
 ```
+
+字符串 partition 统一示范 `timezone=`（与对象 API 一致）；`tz=` 保留为兼容别名，解析结果相同。
 
 时序数据优先使用 `duration(...)` 或 `calendar(...)`。`range(...)` 主要用于 id、offset、版本号等非时间数值字段；历史库中基于 `partition_key` 的 `range(...)` 可以作为兼容迁移方案。
 
@@ -188,22 +187,32 @@ Partition.calendar("event_date", every="1day", timezone="Asia/Shanghai")
 Partition.range("id", every=100000)
 ```
 
-如果偏好时序业务 helper，可以使用 `timeseries()`。它内部等价于 `Database.table(..., partition=Partition.duration(...), order_key=time)`：
+`timeseries()` 是 `table()` 的薄语法糖：duration 场景等价于 `Database.table(..., partition=Partition.duration(time, every=partition_every), order_key=time, time=time)`。主键推荐 `pk=` 拼写（`primary_key=` 兼容保留）：
 
 ```python
 table = db.timeseries(
     "ticks",
     time="ts",
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
     partition_every="1hour",
 )
 ```
 
+calendar（日期字符串）场景直接传 `partition=Partition.calendar(...)`。以下旧参数已废弃（触发 `DeprecationWarning`，行为等价）：
+
+| 废弃参数 | 迁移写法 |
+| --- | --- |
+| `partition_kind='calendar'` | `partition=Partition.calendar(time, every=..., timezone=...)` |
+| `time_unit='date'` | 同上（使用 calendar 分区表达日期语义） |
+| `target/min/max_rows_per_file` | `segment=Segment.rows(max_rows=..., target_rows=..., min_rows=...)` |
+
 ### 写入
 
 ```python
-table.insert_all({"symbol": "AAPL", "ts": 1735689600000, "price": 187.4})
+# 高层主入口：契约感知，mode 缺省回落表契约 conflict
+table.write({"symbol": "AAPL", "ts": 1735689600000, "price": 187.4})
+table.write(rows, mode="ignore")   # append / ignore / upsert / replace
 
 with table.write_buffer(max_rows=10_000) as buffer:
     buffer.append([
@@ -211,6 +220,8 @@ with table.write_buffer(max_rows=10_000) as buffer:
         {"symbol": "MSFT", "ts": 1735689600000, "price": 420.3},
     ])
 ```
+
+`insert_all()` 是低层基础入口（布尔标志 `replace=`/`ignore=`，两者互斥），供进阶场景使用；日常写入统一使用 `write()`。
 
 ### 大批量写入性能
 
@@ -232,7 +243,7 @@ daily = db.table(
         "volume": "integer",
         "amount": "real",
     },
-    partition="calendar(date,every=1year,tz=Asia/Shanghai)",
+    partition="calendar(date,every=1year,timezone=Asia/Shanghai)",
     order_key="date",
     conflict="append",
 )
@@ -363,11 +374,10 @@ python benchmarks/sweep_write.py daily \
 ```python
 where = [
     {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
-    {"field": "ts", "op": "between_and", "value": [1735689600000, 1735776000000]},
+    {"field": "ts", "op": "between", "value": [1735689600000, 1735776000000]},
     {"field": "venue", "op": "==", "value": "NASDAQ"},
 ]
 rows = table.select(
-    "*",
     where=where,
     order_by="ts desc",
     limit=100,
@@ -377,6 +387,18 @@ rows = table.select(
 plan = table.explain_select(where=where, order_by="ts desc", limit=100)
 segments = table.segments()
 ```
+
+`select(fields, where)` 的两个位置参数均可省略：`select()` 即全表扫描；`columns=` 是 `fields=` 的别名（与 `query(columns=)` 对齐），两者同传冲突报错。返回值语义：`select()` 急切求值并返回完整列表（默认行元组，`to_dict=True` 返回 dict 行）；`query()` 返回惰性 fluent 对象（`.to_list()` / `.iter_batches()` / `.explain()`）。`select_all()` 已废弃，等价于 `select(to_dict=True)`。
+
+dict 条件的合法 op（别名自动归一化，非法 op 在构造时即抛带修复指引的 `BadArgument`）：
+
+| 用户 op | 含义 | 内部别名 |
+| --- | --- | --- |
+| `==` | 等于 | `eq`、`=` |
+| `!=` | 不等于 | `neq` |
+| `>` / `>=` / `<` / `<=` | 比较 | `gt` / `ge` / `lt` / `le` |
+| `between` | 闭区间（值为二元列表） | `between_and`、`range` |
+| `in` | 集合（值为非空列表） | — |
 
 `where` 支持 dict/list/`Case`，也支持受限文本表达式。文本表达式会被解析为内部条件，不会作为原始 SQL 拼接；当前支持比较、`and` / `or`、括号、`between` 和 `in`。
 
@@ -423,7 +445,7 @@ snapshot = table.latest(
 
 开启物理 segment 后，append-only 表不主动跨 sealed segments 查重。需要跨 segment upsert 时，后续应引入全局主键索引和 tombstone。
 
-`latest()` / `asof()` 用于金融截面查询，默认返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。K 线、orderbook 等多维数据可传 `by=["symbol", "timeframe"]` 或 `by=["symbol", "venue"]`，`group_by` 是 `by` 的等价别名。
+`latest()` / `asof()` 用于金融截面查询，默认返回每个 symbol 截至 `as_of` 的最新一行；多 symbol 查询会按传入的 symbol 顺序返回。K 线、orderbook 等多维数据可传 `by=["symbol", "timeframe"]` 或 `by=["symbol", "venue"]`；`group_by=` 已废弃，请统一使用 `by=`。
 
 ### 交易日 / Session
 
@@ -433,7 +455,7 @@ snapshot = table.latest(
 ticks = db.timeseries(
     "futures_ticks",
     time="ts",
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     columns={
         "symbol": "text",
         "ts": "integer",
@@ -509,12 +531,8 @@ events = db.table(
     partition=Partition.calendar("event_date", every="1day", timezone="Asia/Shanghai"),
 )
 
-events.insert_all({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
-rows = events.select(
-    "*",
-    where={"field": "event_date", "op": "==", "value": "2026-01-06"},
-    to_dict=True,
-)
+events.write({"event_date": "2026-01-06", "name": "review", "city": "Beijing"})
+rows = events.query(date="2026-01-06").to_list()
 ```
 
 ### 金融数据建议
@@ -640,7 +658,7 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 ```text
 suggestions:
   1. 推荐: 按时间列 date 使用 4day (max/avg≈4, 目标<=500,000), 估算~465,136 行/分区
-     → iosql repartition --source DB --table daily_bars --partition 'calendar(date,every=4day,tz=Asia/Shanghai)' --replace-source --yes
+     → iosql repartition --source DB --table daily_bars --partition 'calendar(date,every=4day,timezone=Asia/Shanghai)' --replace-source --yes
   2. 兼容: 保留当前数值分区键 partition_key，width=4 (扩大 4 倍), 估算~465,136 行/分区
      → iosql repartition --source DB --table daily_bars --partition 'range(partition_key,width=4)' --replace-source --yes
 ```
@@ -727,8 +745,8 @@ database/
 
 ## 注意事项
 
-- 核心 `Database.table(...)` 不需要 `time` 字段；分区字段由 `Partition.*(...)` 指定。
-- `timeseries()` 仍保留为 helper，适合需要 `query(start/end/date)`、`latest()`、`asof()` 的业务场景。
+- 核心 `Database.table(...)` 不需要 `time` 字段；分区字段由 `Partition.*(...)` 指定。duration/calendar 分区在未显式声明 time 时会自动反推 time 契约（`range` 分区不反推），因此普通分区表也可直接使用 `query(start/end/date)`、`latest()`、`asof()`。
+- `timeseries()` 是 `table()` 的薄语法糖；`partition_kind` / `time_unit` / `*_rows_per_file` 已废弃，迁移写法见"创建或打开表"一节的对照表。
 - 多分区查询支持全局 `order_by` 和 `limit`，但带全局排序时结果会在 Python 层合并排序；大结果集无排序导出优先使用 `iter_select_batches()` 或 CLI `export --batch-size`。
 - 大文件导入优先使用 JSONL/CSV 和 `iosql import --batch-size`；JSON 数组格式保持兼容但不推荐用于数 GB 文件。
 - 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment，可用 `compact()` 显式整理为新的 sealed generation，再用 `validate(deep=True)` / `cleanup_obsolete()` 释放旧文件。
@@ -736,6 +754,20 @@ database/
 - `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
 - PostgreSQL URI 格式为 `postgresql://user:pass@host:port/dbname`；SQLite 到 PostgreSQL 迁移优先使用 `Database.migrate_to()` / `to_postgresql()` 或 `iosql migrate`，生产迁移建议先 `--dry-run`，再用 `--verify row-count` 校验。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。
+
+### 动态扩列（schema_policy='evolve'）语义
+
+默认策略 `evolve` 允许写入时动态加列（`ALTER TABLE ADD COLUMN`，O(1)），语义契约如下：
+
+1. **列集合单调增长**：只允许加列，不允许删列或改列名。新列补齐到所有既有分区文件，旧分区的缺失行读为 `NULL`（与 SQL `union all + null` 语义一致），`explain_select()` 不视为异常。
+2. **契约回写**：动态加列成功后同步更新持久化契约的 `columns`，`spec().columns` 恒为当前实际 schema 的上确界——重开数据库（零仪式场景）不会漂移。
+3. **类型固化与冲突**：未声明列首次写入时推断类型并固化进契约；同列后续数据类型不兼容时抛 `BadArgument`（错误信息含列名、已固化类型、本次类型与修复建议）。数值 int↔float 互通；数字写入 text 声明列由 SQLite TEXT affinity 转换放行。
+
+### 导出面分层
+
+- **用户层**（业务开发）：`Database` / `Partition` / `Segment` / `Where` + 结果类型（`WriteResult`、`QueryPlan`、`LayoutReport` 等）。业务建表优先使用 `db.table(...)` 快捷参数。
+- **高级层**（迁移与诊断）：`TableContract` / `TableSpec` / `PhysicalLayout` / `TimeColumn`，用于跨库绑定契约、手写复杂契约等场景。
+- `Case` 的运算符重载（`*`=and、`+`=or）属内部实现细节，文档与示例不示范；dict / 文本 where 是唯一推荐的条件表达形式。
 
 ### 生产迁移 checklist
 
@@ -751,6 +783,7 @@ database/
 
 ## 变更记录
 
+- v0.3.0 - 用户接口统一（PLAN-052）：`Database.table()` 新增 `time=` / `symbol_column=` / `session_column=`；`timeseries()` 收敛为 `table()` 薄语法糖并补 `pk=` 别名，废弃 `partition_kind` / `time_unit` / `*_rows_per_file`（DeprecationWarning + 等价迁移）；duration/calendar 分区自动反推 time 契约，普通分区表直达 `query()` / `latest()` / `asof()`；`select()` / `iter_select()` / `explain_select()` 参数默认化并新增 `columns=` 别名；dict 条件 op 归一化白名单进 `Case` 构造入口（`between` 容错、非法 op 即时报 `BadArgument` 含修复指引，堵静默失效链）；evolve 动态扩列三语义落地（旧分区 NULL 补齐、契约回写、类型冲突报错）；`write()` 无契约错误附修复指引；`insert_all` 增加 replace/ignore 互斥校验；弃用 `select_all()` 与 `latest(group_by=)`；字符串 partition 规范输出统一为 `timezone=`（解析层 `tz=` 兼容）。
 - v0.2.5 - 修复列类型推断 Bug（用户声明的 `columns` 类型此前被静默忽略）；修复 PostgreSQL URI 解析（此前不可达）；修复元数据查询 SQL 注入（5 处 f-string 改为参数化）；修复 `Partition | None` 在 Python 3.9 上的兼容性；修复 `create_table` 静默空操作；清理重复异常定义和死代码文件。
 - v0.2.4 - 修复查询语义，重组 core/query 与 engines 包结构，删除旧 query/sqlite/postgresql 兼容入口。
 - v0.2.1 - 引入时序表契约、布局诊断、重分区规划和 pyproject 打包入口。
