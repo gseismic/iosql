@@ -87,6 +87,7 @@
 4. `skills/iosql-usage/` 随包分发的技能文档仍含旧示范（tz=、between_and、primary_key 等）：计划范围外未同步，建议下一轮随 skill 更新一并处理。
 5. PostgreSQL 引擎未实现 evolve 三语义与类型冲突检查（计划非目标：SQLite 后端优先）。
 6. timeseries() 默认不再隐式建 segment 属有意行为变化，已在 README 记录；存量库不受影响（契约持久化于 meta）。
+7. select to_dict 默认值翻转（配合 query() fluent 风格推广，消除裸 select() 返回 sqlite3.Row 的人体工学代价）：设计三节与八节自相矛盾，本轮取非破坏的 False；记为 v0.4 候选（见 docs/review/user-api-unify-20260822-design-consistency.md 分歧④）。
 
 ## Review 轮（2026-08-22，commit `e8d8385`）
 

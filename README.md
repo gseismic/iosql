@@ -477,14 +477,13 @@ snapshot = ticks.latest(
 
 ### 流式查询和导出
 
-大结果集优先使用批量迭代接口，避免 `select()` / `to_list()` 一次性持有全部行：
+大结果集优先使用批量迭代接口，避免 `select()` / `to_list()` 一次性持有全部行。`iter_batches()` 是主形态；`iter_select()` / `iter_rows()` 是它的逐行语法糖，逐条处理时更顺手：
 
 ```python
 for batch in ticks.query(start=start, end=end).iter_batches(batch_size=50_000):
     process(batch)
 
 for row in table.iter_select(
-    "*",
     where={"field": "ts", "op": ">=", "value": start},
     batch_size=50_000,
     to_dict=True,
