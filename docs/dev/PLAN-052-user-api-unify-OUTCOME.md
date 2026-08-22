@@ -97,7 +97,8 @@
 - **新增 `tests/test_plan052_concurrency.py` 13 例**：不同/相同分区并发写、barrier 同步双线程并发加不同新列（3 轮 ×10 次复跑稳定）、同分区分支并发加列、读并发于演进 ALTER、首次分区创建竞争、`max_open_partitions=2` 下 LRU 驱逐并发写、latest 并发只读、独立 write_buffer、Case 归一化线程安全、iter_select limit+columns 组合、空表 select、calendar 分区 tz 一致性。
 - 全量回归 **345 passed, 16 skipped**。
 - **A/B 回归守护实证**：将 `_schema_lock` 猴补丁为空锁模拟修复前行为，演进竞争脚本**首轮即复现**缺列（KeyError）；恢复真锁后 **20/20 轮零失败**——证明并发测试对竞争具备真实守护力而非恒绿摆设。死锁审计：`_schema_lock` 仅在这两个异常分支获取；持 `_db_parts_condition` 的路径从不反向等待 `_schema_lock`，无环。
-- **已知限制（既有，非本轮引入）**：meta 整体覆盖模式在其他声明类路径（如 `partition.setter`、运行中 `use_contract` 与并发写交叉）仍存在理论上的 lost-update 窗口；这些是用户驱动的低频声明操作，风险评级低，未纳入本轮范围，留待 meta 存储改造时统一处理。
+- **已知限制（既有，非本轮引入）**：meta 整体覆盖模式在其他声明类路径（如 `partition.setter`、运行中 `use_contract` 与并发写交叉、`force_partition` 覆盖写 table.py `_update_meta` 调用点）仍存在理论上的 lost-update 窗口；这些是用户驱动的低频声明操作，风险评级低，未纳入本轮范围，留待 meta 存储改造时统一处理。
+- **独立复核（2026-08-22）**：由独立子代理按怀疑标准执行全部验证步骤——复跑定向测试（37 passed）、源码级确认两分支加锁与锁内重读、独立编写竞争测试装置复现 A/B 结论（无锁 20/20 失败 / 真锁 20/20 通过）、自证全量 345 passed/16 skipped、三锁死锁审计无环、遗留项逐条判定为范围决策而非缺陷。裁定：**COMPLETE**。
 
 ## 提交记录
 
