@@ -47,19 +47,14 @@ def run():
     if not EXTERNAL_TARGET_URI:
         shutil.rmtree(DEFAULT_TARGET_PATH, ignore_errors=True)
 
-    source_db = Database(
+    with Database(
         SOURCE_URI,
         max_open_partitions=5,
         max_connections_per_file=1,
         max_process_connections=32,
-    )
-    try:
-        if TABLE_NAME not in source_db.table_names():
-            raise RuntimeError(
-                f"源库中不存在表 {TABLE_NAME!r}。请设置 IOSQL_SOURCE_URI "
-                "和 IOSQL_EXISTING_TABLE 指向兼容表。"
-            )
-
+    ) as source_db:
+        # spec() 缺失时 repartition_to 会直接报错并给出指引，
+        # 不需要手动防御。
         target_probe = Database(TARGET_URI)
         try:
             if target_probe.table_names():
@@ -72,30 +67,22 @@ def run():
 
         source = source_db.table(TABLE_NAME)
         source_spec = source.spec()
-        if source_spec is None or source_spec.partition is None:
-            raise RuntimeError("源表必须有持久化契约和分区配置")
-
-        source_rows = source.select("*", where=None, to_dict=True)
-        target_spec = source_spec.with_partition(every="1hour")
+        source_rows = source.select(to_dict=True)
+        target_spec = source_spec.with_partition(partition="duration(ts,every=1hour)")
         result = source.repartition_to(
             TARGET_URI,
             spec=target_spec,
             batch_size=50_000,
         )
 
-        target_db = Database(TARGET_URI)
-        try:
+        with Database(TARGET_URI) as target_db:
             target = target_db.table(TABLE_NAME)
-            target_rows = target.select("*", where=None, to_dict=True)
+            target_rows = target.select(to_dict=True)
             print("源分区:", source_spec.partition.to_string())
             print("目标分区:", target.spec().partition.to_string())
             print("复制行数:", result.rows_copied)
             print("目标分区键:", result.partitions_created)
             print("源/目标行数:", len(source_rows), len(target_rows))
-        finally:
-            target_db.close()
-    finally:
-        source_db.close()
 
 
 if __name__ == "__main__":

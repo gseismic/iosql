@@ -37,48 +37,47 @@ def build_rows():
 def run():
     reset_database()
 
-    db = Database(DB_URI)
-    ticks = db.table(
-        "ticks",
-        pk=["symbol", "ts"],
-        columns={
-            "symbol": "text",
-            "ts": "integer",
-            "price": "float",
-            "volume": "integer",
-        },
-        partition=Partition.duration("ts", every="1day"),
-        segment=Segment.rows(max_rows=32, target_rows=24, min_rows=12),
-        order_key="ts",
-    )
+    with Database(DB_URI) as db:
+        ticks = db.table(
+            "ticks",
+            pk=["symbol", "ts"],
+            columns={
+                "symbol": "text",
+                "ts": "integer",
+                "price": "float",
+                "volume": "integer",
+            },
+            partition=Partition.duration("ts", every="1day"),
+            segment=Segment.rows(max_rows=32, target_rows=24, min_rows=12),
+            order_key="ts",
+        )
 
-    rows = build_rows()
-    result = ticks.insert_all(rows)
-    report = ticks.layout_report()
-    segments = ticks.segments()
-    first_segment = {
-        key: segments[0][key]
-        for key in ["logical_part", "segment_id", "part_key", "row_count", "stats"]
-    }
+        rows = build_rows()
+        result = ticks.write(rows)
+        report = ticks.layout_report()
+        segments = ticks.segments()
+        first_segment = {
+            key: segments[0][key]
+            for key in ["logical_part", "segment_id", "part_key", "row_count", "stats"]
+        }
 
-    start = rows[ROWS_PER_DAY * 2]["ts"]
-    end = rows[ROWS_PER_DAY * 3 - 1]["ts"]
-    where = [
-        {"field": "symbol", "op": "==", "value": "AAPL"},
-        {"field": "ts", "op": "between_and", "value": [start, end]},
-    ]
-    query_rows = ticks.select("*", where=where, order_by="ts", to_dict=True)
-    plan = ticks.explain_select(where=where, order_by="ts")
+        start = rows[ROWS_PER_DAY * 2]["ts"]
+        end = rows[ROWS_PER_DAY * 3 - 1]["ts"]
+        where = [
+            {"field": "symbol", "op": "==", "value": "AAPL"},
+            {"field": "ts", "op": "between", "value": [start, end]},
+        ]
+        query_rows = ticks.select(where=where, order_by="ts", to_dict=True)
+        plan = ticks.explain_select(where=where, order_by="ts")
 
-    print("写入行数:", result.rows_seen)
-    print("逻辑分区:", ticks.table_parts())
-    print("物理 segment 数:", len(segments))
-    print("首个 segment 概览:", first_segment)
-    print("布局建议:", report.recommendation)
-    print("实际扫描分区:", plan.scanned_partitions)
-    print("扫描 segment:", [item["part_key"] for item in plan.scanned_segments])
-    print("AAPL 第 3 天窗口行数:", len(query_rows))
-    db.close()
+        print("写入行数:", result.rows_seen)
+        print("逻辑分区:", ticks.table_parts())
+        print("物理 segment 数:", len(segments))
+        print("首个 segment 概览:", first_segment)
+        print("布局建议:", report.recommendation)
+        print("实际扫描分区:", plan.scanned_partitions)
+        print("扫描 segment:", [item["part_key"] for item in plan.scanned_segments])
+        print("AAPL 第 3 天窗口行数:", len(query_rows))
 
 
 if __name__ == "__main__":

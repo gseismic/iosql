@@ -72,7 +72,7 @@ from iosql import Database, Partition, Segment, TableSpec, TimeColumn
 
 db = Database(f"sqlite://{db_path}")
 spec = TableSpec(
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     time=TimeColumn("ts", unit="ms", timezone="UTC"),
     partition=PartitionSpec.by_time("ts", every="1day"),
     columns={"symbol": "text", "ts": "integer", "price": "float"},
@@ -119,7 +119,7 @@ ticks.write([
 
 where = [
     {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
-    {"field": "ts", "op": "between_and", "value": [1735689600000, 1735776000000]},
+    {"field": "ts", "op": "between", "value": [1735689600000, 1735776000000]},
 ]
 rows = ticks.select("*", where=where, order_by="ts", to_dict=True)
 plan = ticks.explain_select("*", where=where, order_by="ts")
@@ -135,7 +135,7 @@ db = Database(f"sqlite://{db_path}")
 ticks = db.timeseries(
     "ticks",
     time="ts",
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
     partition_every="1day",
 )
@@ -160,7 +160,7 @@ db.close()
 
 ```python
 events = db.table("events", spec=TableSpec(
-    primary_key=["event_date", "name"],
+    pk=["event_date", "name"],
     time=TimeColumn("event_date", unit="date", timezone="Asia/Shanghai"),
     partition=PartitionSpec.by_time(
         "event_date",
@@ -199,7 +199,7 @@ events.write([
 
 rows = events.select(
     "*",
-    where={"field": "seq", "op": "between_and", "value": [0, 20000]},
+    where={"field": "seq", "op": "between", "value": [0, 20000]},
     order_by="seq",
     to_dict=True,
 )
@@ -239,7 +239,7 @@ print("segments:", events.segments())
 # explain 可查看二级裁剪
 plan = events.explain_select(
     "*",
-    where={"field": "seq", "op": "between_and", "value": [0, 3]},
+    where={"field": "seq", "op": "between", "value": [0, 3]},
 )
 print("扫描:", plan.scanned_segments)
 print("跳过:", plan.segment_skip_reasons)
@@ -269,7 +269,7 @@ with ticks.write_buffer(max_rows=4) as buf:
 futures = db.timeseries(
     "futures_ticks",
     time="ts",
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     columns={
         "symbol": "text",
         "ts": "integer",
@@ -293,7 +293,7 @@ snapshot = futures.latest(
 bars = db.timeseries(
     "bars",
     time="ts",
-    primary_key=["symbol", "timeframe", "ts"],
+    pk=["symbol", "timeframe", "ts"],
     columns={
         "symbol": "text",
         "timeframe": "text",
@@ -310,7 +310,7 @@ latest = bars.latest(
 ).to_list()
 ```
 
-`by` 支持多列分组，`group_by` 是等价别名。不传 `by` 时默认按 `symbol_column`（默认 `"symbol"`）分组。
+`by` 支持多列分组（`group_by=` 已废弃，请统一使用 `by=`）。不传 `by` 时默认按 `symbol_column`（默认 `"symbol"`）分组。
 
 ## 写入模式
 
@@ -376,7 +376,7 @@ plan = ticks.explain_select(
     "*",
     where=[
         {"field": "symbol", "op": "in", "value": ["AAPL"]},
-        {"field": "ts", "op": "between_and", "value": [start_ts, end_ts]},
+        {"field": "ts", "op": "between", "value": [start_ts, end_ts]},
     ],
     order_by="ts",
     limit=100,
@@ -403,7 +403,7 @@ print("需要 Python 层 limit:", plan.requires_python_limit)
 ```python
 where = [
     {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
-    {"field": "ts", "op": "between_and", "value": [start, end]},
+    {"field": "ts", "op": "between", "value": [start, end]},
 ]
 
 for batch in ticks.iter_select_batches(
@@ -473,7 +473,7 @@ where = {"field": "symbol", "op": "==", "value": "AAPL"}
 # 列表 → AND 组合
 where = [
     {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
-    {"field": "ts", "op": "between_and", "value": [start, end]},
+    {"field": "ts", "op": "between", "value": [start, end]},
 ]
 
 # 嵌套列表 → OR 组合
@@ -501,7 +501,7 @@ where = "symbol in ('AAPL', 'MSFT') and ts between 1735689600000 and 17357760000
 from iosql import Case, CaseExpression
 
 c1 = Case("symbol", "==", "AAPL")
-c2 = Case("ts", "between_and", [start, end])
+c2 = Case("ts", "between", [start, end])
 
 # AND 组合
 expr = c1 * c2  # 等价于 CaseExpression('and', c1, c2)

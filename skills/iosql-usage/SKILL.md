@@ -92,7 +92,7 @@ for part_key, part_data in partitioned_data.items():
 |------|-----|------|
 | **入口** | `Database(uri)` | 创建/打开数据库，`sqlite://` 或 `postgresql://` URI |
 | | `Database.table(name, **opts)` | 创建/获取表（核心入口） |
-| | `Database.timeseries(name, time=..., primary_key=..., **opts)` | 时序 helper 快捷版 |
+| | `Database.timeseries(name, time=..., pk=..., **opts)` | 时序语法糖：table() 的薄封装（废弃参数迁移见下） |
 | | `Database.rename(new_uri_or_name)` / `Database.rename_table(old, new)` / `table.rename(new)` | 重命名 SQLite 目录库或逻辑表；table 重命名会更新 manifest |
 | | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库 |
 | **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
@@ -103,9 +103,9 @@ for part_key, part_data in partitioned_data.items():
 | | `table.truncate(confirm=True)` | 清空表（需显式确认） |
 | **查询** | `table.query(...).to_list()` / `.explain()` | 时序高层查询（timeseries 表） |
 | | `table.query(...).iter_batches(batch_size=...)` | 时序查询批量迭代 |
-| | `table.select(fields, where, order_by, limit, to_dict)` | 底层条件查询（所有表） |
+| | `table.select(fields="*", where=None, order_by, limit, to_dict, columns=)` | 底层条件查询（所有表）；fields/where 可省略，columns= 是 fields= 别名 |
 | | `table.iter_select(...)` / `iter_select_batches(...)` | 底层流式查询（所有表） |
-| | `table.select_all(fields, where)` | 等价于 select(to_dict=True) |
+| | `table.select_all(fields, where)` | 已废弃：等价于 select(to_dict=True)，触发 DeprecationWarning |
 | | `table.explain_select(fields, where, order_by, limit)` | 查询计划/分区裁剪分析 |
 | | `table.latest(symbols, as_of, by, columns)` | 最新截面查询 |
 | | `table.asof(...)` | latest 的别名 |
@@ -195,8 +195,8 @@ ticks = db.table(
 
 ```python
 "duration(ts,every=1day)"
-"calendar(event_date,every=1day,tz=Asia/Shanghai)"
-"calendar(date,every=4day,tz=Asia/Shanghai)"
+"calendar(event_date,every=1day,timezone=Asia/Shanghai)"
+"calendar(date,every=4day,timezone=Asia/Shanghai)"
 "range(id,width=100000)"
 ```
 
@@ -207,18 +207,20 @@ ticks = db.table(
 ticks = db.timeseries(
     "ticks",
     time="ts",
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "price": "float"},
     partition_every="1day",
 )
 ```
+
+`timeseries()` 是 `table()` 的薄语法糖；calendar 场景传 `partition=Partition.calendar(...)`。废弃参数迁移：`partition_kind='calendar'` / `time_unit='date'` → `partition=Partition.calendar(...)`；`target/min/max_rows_per_file` → `segment=Segment.rows(...)`（触发 DeprecationWarning，行为等价）。
 
 ### 3. 选择分区策略
 
 | 分区类型 | API | 适用场景 | 分区键格式 |
 |---------|-----|---------|-----------|
 | duration | `"duration(ts,every=1hour)"` | 毫秒时间戳 | 整数（对齐边界） |
-| calendar | `"calendar(date,every=1day,tz=Asia/Shanghai)"`、`"calendar(date,every=4day,tz=Asia/Shanghai)"` | 日期字符串 | `YYYYMMDD` 等 |
+| calendar | `"calendar(date,every=1day,timezone=Asia/Shanghai)"`、`"calendar(date,every=4day,timezone=Asia/Shanghai)"` | 日期字符串 | `YYYYMMDD` 等 |
 | range | `"range(seq,width=10000)"` | 任意可排序数值 | 整数（对齐边界） |
 
 ### 4. 写入
@@ -273,7 +275,7 @@ print(plan.scanned_partitions, plan.skipped_partitions)
 ```python
 where = [
     {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
-    {"field": "ts", "op": "between_and", "value": [start, end]},
+    {"field": "ts", "op": "between", "value": [start, end]},
 ]
 rows = ticks.select("*", where=where, order_by="ts", limit=100, to_dict=True)
 plan = ticks.explain_select("*", where=where, order_by="ts")
@@ -305,7 +307,7 @@ row = ticks.latest(symbols="AAPL", as_of=ts).one()
 futures = db.timeseries(
     "futures_ticks",
     time="ts",
-    primary_key=["symbol", "ts"],
+    pk=["symbol", "ts"],
     columns={"symbol": "text", "ts": "integer", "trading_date": "text", "price": "float"},
     session_column="trading_date",
 )
@@ -412,7 +414,7 @@ with Database("sqlite://db/test.iosql") as db:
 
 - ❌ 直接传文件路径给主 API（如 `Database("db/market.iosql")`）→ 必须用 `sqlite://` 前缀
 - ❌ 对已存在表重复声明不同契约 → 用 `db.table("name")` 获取引用而非重新声明
-- ❌ 在写入前未声明 `primary_key` → `write()` 必须有 pk
+- ❌ 在写入前未声明 `pk` → `write()` 必须有主键
 - ❌ 用 `delete(None)` → 已废弃，改用 `truncate(confirm=True)`
 - ❌ 假设 `repartition_to()` 会修改原库 → 它只写新库
 - ❌ 拼接原始 SQL 做 where → 用 dict/list/`Case`/文本表达式

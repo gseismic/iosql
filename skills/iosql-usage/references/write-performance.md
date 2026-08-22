@@ -80,7 +80,7 @@ daily = db.table(
         "volume": "integer",
         "amount": "real",
     },
-    partition="calendar(date,every=1year,tz=Asia/Shanghai)",
+    partition="calendar(date,every=1year,timezone=Asia/Shanghai)",
     order_key="date",
     conflict="append",
 )

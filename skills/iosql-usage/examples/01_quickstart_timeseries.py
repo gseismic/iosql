@@ -18,32 +18,33 @@ def reset_database():
 def run():
     reset_database()
 
-    db = Database(DB_URI)
-    ticks = db.timeseries(
-        "ticks",
-        time="ts",
-        primary_key=["symbol", "ts"],
-        columns={"symbol": "text", "ts": "integer", "price": "float"},
-        partition_every="1day",
-    )
+    with Database(DB_URI) as db:
+        # timeseries() 是 table() 的薄语法糖，等价于
+        # db.table(..., partition=Partition.duration("ts", every="1day"), time="ts")
+        ticks = db.timeseries(
+            "ticks",
+            time="ts",
+            pk=["symbol", "ts"],
+            columns={"symbol": "text", "ts": "integer", "price": "float"},
+            partition_every="1day",
+        )
 
-    result = ticks.write([
-        {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
-        {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
-        {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
-    ])
+        result = ticks.write([
+            {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
+            {"symbol": "AAPL", "ts": 1735776000000, "price": 189.1},
+            {"symbol": "MSFT", "ts": 1735776000000, "price": 420.3},
+        ])
 
-    rows = ticks.query(
-        symbols="AAPL",
-        start=1735689600000,
-        end=1735776000000,
-        order_by="ts",
-    ).to_list()
+        rows = ticks.query(
+            symbols="AAPL",
+            start=1735689600000,
+            end=1735776000000,
+            order_by="ts",
+        ).to_list()
 
-    print("写入行数:", result.rows_seen)
-    print("分区:", ticks.table_parts())
-    print("AAPL 查询结果:", rows)
-    db.close()
+        print("写入行数:", result.rows_seen)
+        print("分区:", ticks.table_parts())
+        print("AAPL 查询结果:", rows)
 
 
 if __name__ == "__main__":

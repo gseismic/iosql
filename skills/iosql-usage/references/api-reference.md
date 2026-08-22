@@ -51,7 +51,7 @@ with Database("sqlite://db/test.iosql") as db:
 # 自动 close()
 ```
 
-#### `Database.table(table_name, spec=None, pk=None, primary_key=None, columns=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve')`
+#### `Database.table(table_name, spec=None, pk=None, primary_key=None, columns=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, time=None, symbol_column=None, session_column=None)`
 
 核心表入口。创建或打开一张分区表。
 
@@ -60,17 +60,22 @@ with Database("sqlite://db/test.iosql") as db:
 | `table_name` | `str` | 表名 |
 | `spec` | `TableSpec`/`TableContract` | 完整表契约对象 |
 | `pk` | `str`/`list[str]` | 主键（与 `spec` 互斥） |
-| `primary_key` | `str`/`list[str]` | 主键别名（与 `spec` 互斥，与 `pk` 二选一） |
+| `primary_key` | `str`/`list[str]` | 主键兼容别名（与 `pk` 同传冲突时报错） |
 | `columns` | `dict[str,str]` | 列名→类型映射 |
 | `partition` | `Partition` | 分区实例 |
 | `segment` | `Segment` | 物理分段配置 |
 | `order_key` | `str` | 排序键（用于 segment 统计） |
 | `conflict` | `str` | 冲突策略：`"append"`/`"upsert"`/`"replace"`/`"ignore"` |
 | `schema_policy` | `str` | Schema 策略：`"evolve"`（自动加列） |
+| `time` | `str`/`TimeColumn` | 时间契约列；duration/calendar 分区未声明时自动反推 |
+| `symbol_column` | `str` | 标的列（默认 `"symbol"`） |
+| `session_column` | `str` | 交易日/session 列（期货夜盘等场景） |
 
-#### `Database.timeseries(table_name, time, primary_key, columns=None, partition_every='1day', timezone='UTC', schema_policy='evolve', symbol_column='symbol', session_column=None, target_rows_per_file=400_000, min_rows_per_file=300_000, max_rows_per_file=500_000, time_unit='ms', partition_kind='duration')`
+#### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None)`
 
-时序表快捷创建入口。内部构造 `TableContract.timeseries()` 后调用 `table(spec=...)`。
+时序语法糖：`table()` 的薄封装，duration 场景等价于 `db.table(..., partition=Partition.duration(time, every=partition_every), order_key=time, time=time)`。calendar 场景传 `partition=Partition.calendar(...)`。
+
+废弃参数（触发 `DeprecationWarning`，行为等价迁移）：`partition_kind='calendar'` / `time_unit='date'` → 改传 `partition=Partition.calendar(...)`；`target/min/max_rows_per_file` → 改传 `segment=Segment.rows(...)`。
 
 #### `Database.table_names() -> list[str]`
 
@@ -163,13 +168,13 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | 方法 | 签名 |
 |------|------|
 | `query` | `(symbols=None, start=None, end=None, date=None, session=None, columns='*', where=None, order_by=None, limit=None) -> TableQuery` |
-| `select` | `(fields, where, limit=None, order_by=None, to_dict=False, **kwargs) -> list` |
-| `iter_select` | `(fields, where, limit=None, order_by=None, to_dict=False, batch_size=10_000) -> Iterator` |
-| `iter_select_batches` | `(fields, where, limit=None, order_by=None, to_dict=False, batch_size=10_000) -> Iterator[list]` |
-| `select_all` | `(fields, where, limit=None, to_dict=False, **kwargs) -> list` |
-| `explain_select` | `(fields='*', where=None, order_by=None, limit=None) -> QueryPlan` |
-| `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery` |
-| `asof` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery` |
+| `select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=False, columns=None, **kwargs) -> list` |
+| `iter_select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=False, batch_size=10_000, columns=None) -> Iterator` |
+| `iter_select_batches` | `(fields='*', where=None, limit=None, order_by=None, to_dict=False, batch_size=10_000, columns=None) -> Iterator[list]` |
+| `select_all` | 已废弃：等价于 `select(fields, where, to_dict=True)`，触发 DeprecationWarning |
+| `explain_select` | `(fields='*', where=None, order_by=None, limit=None, columns=None) -> QueryPlan` |
+| `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery`（`group_by` 已废弃，改用 `by=`） |
+| `asof` | 同 `latest`（别名） |
 
 #### 诊断
 
@@ -642,4 +647,4 @@ db.close()
 | `>=` | `ge` | 标量 | 大于等于 |
 | `<=` | `le` | 标量 | 小于等于 |
 | `in` | — | `list` | 包含于 |
-| `between_and` | — | `[min, max]` | 区间 |
+| `between` | — | `[min, max]` | 闭区间（内部规范形式 `between_and`，自动归一化） |

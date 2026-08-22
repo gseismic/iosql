@@ -24,21 +24,20 @@ def reset_database():
 def run():
     reset_database()
 
-    db = Database(SOURCE_URI)
-    ticks = db.table(
-        "ticks",
-        pk=["symbol", "ts"],
-        columns={"symbol": "text", "ts": "integer", "price": "float"},
-        partition="duration(ts,every=1day)",
-        order_key="ts",
-    )
-    base_ts = 1735689600000
-    ticks.write([
-        {"symbol": "AAPL", "ts": base_ts + hour * 3_600_000, "price": 187 + hour}
-        for hour in range(4)
-    ])
-    print("源库分区:", ticks.spec().partition.to_string())
-    db.close()
+    with Database(SOURCE_URI) as db:
+        ticks = db.table(
+            "ticks",
+            pk=["symbol", "ts"],
+            columns={"symbol": "text", "ts": "integer", "price": "float"},
+            partition="duration(ts,every=1day)",
+            order_key="ts",
+        )
+        base_ts = 1735689600000
+        ticks.write([
+            {"symbol": "AAPL", "ts": base_ts + hour * 3_600_000, "price": 187 + hour}
+            for hour in range(4)
+        ])
+        print("源库分区:", ticks.spec().partition.to_string())
 
     command = [
         sys.executable,
@@ -62,13 +61,10 @@ def run():
     )
     print("CLI 输出:", completed.stdout.strip())
 
-    target_db = Database(TARGET_URI)
-    try:
+    with Database(TARGET_URI) as target_db:
         target = target_db.table("ticks")
         print("目标库分区:", target.spec().partition.to_string())
         print("目标库分区键:", target.table_parts())
-    finally:
-        target_db.close()
 
 
 if __name__ == "__main__":

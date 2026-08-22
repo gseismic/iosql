@@ -61,7 +61,7 @@ db.table("t", pk=["id"], columns={"id": "integer", "val": "float"})
 ticks = db.timeseries(
     "ticks",
     time="ts",                        # 时间列名
-    primary_key=["symbol", "ts"],     # 主键必须包含 time 列
+    pk=["symbol", "ts"],     # 主键必须包含 time 列
     columns={"symbol": "text", "ts": "integer", "price": "float"},
 )
 ```
