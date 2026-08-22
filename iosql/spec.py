@@ -649,8 +649,10 @@ class TableContract:
             self.primary_key = [self.primary_key]
         else:
             self.primary_key = list(self.primary_key or [])
+        time_from_bare_str = False
         if isinstance(self.time, str):
             self.time = TimeColumn(self.time)
+            time_from_bare_str = True
         if isinstance(self.time, dict):
             self.time = TimeColumn.from_dict(self.time)
         if isinstance(self.partition, RuntimePartition):
@@ -668,6 +670,28 @@ class TableContract:
             # range 分区列不一定是时间，明确不反推
             self.time = TimeColumn(
                 self.partition.column,
+                unit=(
+                    'date'
+                    if self.partition.kind == 'calendar'
+                    else (self.partition.time_unit or 'ms')
+                ),
+                timezone=(
+                    self.partition.timezone
+                    if self.partition.kind == 'calendar'
+                    else 'UTC'
+                ),
+            )
+        elif (
+            time_from_bare_str
+            and self.partition
+            and self.partition.kind in ('duration', 'calendar')
+            and self.time.name == self.partition.column
+        ):
+            # 裸字符串 time 只指定列名，unit/tz 以分区语义为准，
+            # 与上方 time is None 的反推规则保持一致；
+            # 列名与分区列不同时不做假设，保留 TimeColumn 默认值
+            self.time = TimeColumn(
+                self.time.name,
                 unit=(
                     'date'
                     if self.partition.kind == 'calendar'

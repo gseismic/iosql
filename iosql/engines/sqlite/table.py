@@ -74,9 +74,39 @@ from .query_util import (
 )
 
 
+# 用户可声明的 SQLite 合法类型名 → 库规范类型。表外的自定义声明
+# （timestamp/json 等）不做强校验，回落宽松行为，避免误拒既有用法
+_SQLITE_TYPE_ALIASES = {
+    'int': 'integer',
+    'integer': 'integer',
+    'bigint': 'integer',
+    'smallint': 'integer',
+    'tinyint': 'integer',
+    'mediumint': 'integer',
+    'boolean': 'integer',
+    'bool': 'integer',
+    'float': 'float',
+    'real': 'float',
+    'double': 'float',
+    'numeric': 'float',
+    'decimal': 'float',
+    'text': 'text',
+    'varchar': 'text',
+    'char': 'text',
+    'string': 'text',
+    'blob': 'blob',
+}
+
+
+# 类型强校验只扫批次头部样本：类型冲突几乎必然在头部显形，且同路径依赖的
+# suggest_column_types 本身就按 n_suggest_check 采样推断，全量扫描只增加热路径成本
+_TYPE_CHECK_SAMPLE_ROWS = 1000
+
+
 def _canon_sqlite_type(type_):
-    value = str(type_).strip().lower()
-    return 'float' if value in ('real', 'double', 'float') else value
+    """声明类型归一到库规范类型（integer/float/text/blob）；无法识别返回 None。"""
+    value = str(type_).strip().lower().split('(', 1)[0].strip()
+    return _SQLITE_TYPE_ALIASES.get(value)
 
 
 class _TableQuery:
@@ -472,6 +502,7 @@ class Table(BaseTable):
 
         放行规则：同型、数值互通(int/float)、数字写入 text 声明列
         （SQLite TEXT affinity 转换，既有宽松用法依赖此行为）。
+        声明侧归一不到规范类型时跳过该列，回落宽松行为。
         """
         declared = {
             str(column).lower(): str(type_).lower()
@@ -481,7 +512,7 @@ class Table(BaseTable):
         if not declared:
             return
         inferred = {}
-        for row in rows:
+        for row in rows[:_TYPE_CHECK_SAMPLE_ROWS]:
             for column, value in row.items():
                 if value is None:
                     continue
@@ -495,6 +526,8 @@ class Table(BaseTable):
                 continue
             declared_type = _canon_sqlite_type(declared[column])
             inferred_type = _canon_sqlite_type(type_)
+            if declared_type is None or inferred_type is None:
+                continue
             if declared_type == inferred_type:
                 continue
             if declared_type in ('integer', 'float') and inferred_type in ('integer', 'float'):
@@ -3507,8 +3540,8 @@ class Table(BaseTable):
             #   主表存在，只是该part的表不存在
             # 所以此种情况下，写入主表数据，且part表
             # alter = True 时，还需要检查column是否一致
-            # _schema_lock 串行化建分区/演进：并发线程各自基于过时
-            # current_meta 快照建文件会互相丢列并覆盖 meta
+            # _schema_lock 只串行化 schema 演进段（建分区/补列/meta 回写）：
+            # 并发线程各自基于过时 current_meta 快照建文件会互相丢列并覆盖 meta
             with self._schema_lock:
                 # 进锁重读 meta：函数入口的快照可能已被并发演进刷新
                 current_meta = self.get_table_meta()
@@ -3543,17 +3576,18 @@ class Table(BaseTable):
                 meta_part = part if logical_part is None else logical_part
                 self._update_meta(meta_part, part_column, partition, createtable_meta)
 
-                # write data
-                with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                    part_db[part_table_name]._invalidate_cache()
-                    part_db[part_table_name].insert_all(
-                        part_data,
-                        replace=replace,
-                        ignore=ignore,
-                        batch_size=batch_size,
-                        commit=commit,
-                        ensure_table=False,
-                    )
+            # 数据写在不持锁：schema 已定型且 ensure_table=False 不再触发改动，
+            # 持锁会让不同分区的初始批量导入线程整个写入期互相串行
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                part_db[part_table_name]._invalidate_cache()
+                part_db[part_table_name].insert_all(
+                    part_data,
+                    replace=replace,
+                    ignore=ignore,
+                    batch_size=batch_size,
+                    commit=commit,
+                    ensure_table=False,
+                )
         except NoSuchColumn as e:
             # add column for all partition-table
             # alter table
@@ -3589,15 +3623,16 @@ class Table(BaseTable):
                 meta_part = part if logical_part is None else logical_part
                 self._update_meta(meta_part, part_column, partition, createtable_meta)
 
-                with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                    part_db[part_table_name].insert_all(
-                        part_data,
-                        replace=replace,
-                        ignore=ignore,
-                        batch_size=batch_size,
-                        commit=commit,
-                        ensure_table=False,
-                    )
+            # 数据写在不持锁：列已补齐且 ensure_table=False 不再触发改动（同 NoSuchTable 分支）
+            with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                part_db[part_table_name].insert_all(
+                    part_data,
+                    replace=replace,
+                    ignore=ignore,
+                    batch_size=batch_size,
+                    commit=commit,
+                    ensure_table=False,
+                )
 
     def _update_meta(self, part_key, ts_col, partition, createtable_meta):
         # 更新table创建的meta信息，直接覆盖

@@ -999,15 +999,22 @@ class Table(BaseTable):
                       partition=partition, **kwargs)
     
     def delete(self, where):
-        """Delete rows matching conditions."""
+        """Delete rows matching conditions.
+
+        where 与 select 同源：dict/list/Case/文本四种形式统一经 Where
+        参数化编译，不做原始 SQL 拼接；None 等价 delete_all。
+        """
         conn = self.connect()
         cursor = conn.cursor()
-        
-        query = f'DELETE FROM {self._table_name}'
+
+        query = sql.SQL('DELETE FROM {}').format(sql.Identifier(self._table_name))
+        params = []
         if where:
-            query += f' WHERE {where}'
-        
-        cursor.execute(query)
+            where_sql, params = self._where_sql(where, self._column_types())
+            if where_sql:
+                query += sql.SQL(' WHERE ') + sql.SQL(where_sql)
+
+        cursor.execute(query, params)
     
     def delete_all(self):
         """Delete all rows."""
