@@ -1,7 +1,8 @@
 import shutil
 import arrow
 import logging
-from iosql import Database, DurationPartition
+from iosql import Database
+from iosql.partition.duration import DurationPartition
 from iosql.utils.mysqlite.exception import NoSuchTable, NoSuchColumn, DuplicateColumn
 
 

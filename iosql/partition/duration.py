@@ -1,5 +1,62 @@
 from typing import Any, Dict, Union
 from .base import Partition
+from ..exception import PartitionSpecError
+
+
+def parse_interval_ms(value: Any) -> int:
+    """把分区周期统一解析为毫秒，支持别名与任意 `Nunit` 形式。
+
+    与 `PartitionSpec`/`timeseries(partition_every=...)` 的解析口径一致，
+    保证 `Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')`
+    行为等价（PLAN-054 N2 统一间隔词汇表）。
+    """
+    if isinstance(value, int):
+        if value <= 0:
+            raise PartitionSpecError("partition duration must be positive")
+        return value
+
+    text = str(value).strip().lower()
+    if text in DurationPartition.INTERVAL_ALIASES:
+        return DurationPartition.INTERVAL_ALIASES[text]
+
+    units = [
+        ("milliseconds", 1),
+        ("millisecond", 1),
+        ("msecs", 1),
+        ("msec", 1),
+        ("ms", 1),
+        ("seconds", 1_000),
+        ("second", 1_000),
+        ("secs", 1_000),
+        ("sec", 1_000),
+        ("s", 1_000),
+        ("minutes", 60_000),
+        ("minute", 60_000),
+        ("mins", 60_000),
+        ("min", 60_000),
+        ("hours", 3_600_000),
+        ("hour", 3_600_000),
+        ("hrs", 3_600_000),
+        ("hr", 3_600_000),
+        ("h", 3_600_000),
+        ("days", 86_400_000),
+        ("day", 86_400_000),
+        ("d", 86_400_000),
+        ("weeks", 604_800_000),
+        ("week", 604_800_000),
+        ("w", 604_800_000),
+    ]
+    for suffix, scale in sorted(units, key=lambda item: len(item[0]), reverse=True):
+        if text.endswith(suffix):
+            number = text[:-len(suffix)] or "1"
+            try:
+                count = int(number)
+            except ValueError as e:
+                raise PartitionSpecError(f"Bad partition duration `{value}`") from e
+            if count <= 0:
+                raise PartitionSpecError("partition duration must be positive")
+            return count * scale
+    raise PartitionSpecError(f"Unsupported partition duration `{value}`")
 
 
 class DurationPartition(Partition):
@@ -68,12 +125,7 @@ class DurationPartition(Partition):
             ts_col: Column name containing timestamp in milliseconds
         """
         self.TS_COL = ts_col
-        if isinstance(interval_ms, str):
-            if interval_ms not in self.INTERVAL_ALIASES:
-                interval_ms = int(interval_ms)
-            else:
-                interval_ms = self.INTERVAL_ALIASES[interval_ms]
-        self.interval_ms = interval_ms
+        self.interval_ms = parse_interval_ms(interval_ms)
     
     def get_key(self, row: Dict[str, Any]) -> int:
         """Get partition key (aligned to interval boundary).

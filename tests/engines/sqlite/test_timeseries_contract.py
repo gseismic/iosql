@@ -4,13 +4,13 @@ import pytest
 import iosql.database as database_module
 
 from iosql import (
-    CalendarPartition,
     Database,
     PartitionSpec,
     PhysicalLayout,
     TableSpec,
     TimeColumn,
 )
+from iosql.partition.calendar import CalendarPartition
 from iosql.exception import (
     BadArgument,
     SchemaConflict,
@@ -241,6 +241,7 @@ def test_raw_table_spec_writes_queries_and_partitions_timeseries(tmp_path):
         time=TimeColumn("ts", unit="ms", timezone="UTC"),
         partition=PartitionSpec.by_time("ts", every="1s"),
         columns={"symbol": "text", "ts": "integer", "price": "float"},
+        symbol_column="symbol",
         physical_layout=PhysicalLayout(
             target_rows_per_file=2,
             min_rows_per_file=1,

@@ -1,242 +1,149 @@
-# HANDOFF — PLAN-052 用户接口统一与稳定（已完成 + review 轮加固）
+# HANDOFF — PLAN-054 用户接口定稿（进行中，未完成）
 
-> **终态说明（2026-08-22）**：PLAN-052 全部任务块（T1~T7）已完成、测试通过并提交；
-> 额外的 ultrawork review 轮修复了一个并发演进竞争缺陷并新增 13 例多线程测试
-> （commit `e8d8385`）。权威结果记录见 `docs/dev/PLAN-052-user-api-unify-OUTCOME.md`。
->
-> **⚠️ 待办（需人工介入，非代码问题）**：ultrawork 的 Oracle 验证通道因子代理后端
-> 断供而不可用——`~/.config/opencode/oh-my-openagent.json` 中全部代理映射到
-> `github-copilot/*`（配额耗尽，报 Insufficient balance）。已将 `oracle` 改映射到
-> 已认证的 `zai-coding-plan/glm-5.2`（原文件备份为同目录 `.before-oracle-fix-20260822`），
-> 但插件在启动时读取配置，**需重启 opencode 会话后生效**。重启后如需正式验证，
-> 重发 ultrawork 验证或手动核对 OUTCOME 即可。其余代理（explore/prometheus 等）
-> 仍指向断供的 github-copilot，如需使用请一并迁移。
+> **交接说明（2026-08-23）**：PLAN-054（用户接口定稿，长期稳定）已实施代码部分 N1~N9 +
+> README 更新（N5/N11），**尚未完成**：全量回归确认、示例兼容性检查、OUTCOME 文档、
+> git 提交。当前工作区有 10 个已修改文件 + 2 个未跟踪文档，**未提交**。
+> 接手者请先读本文档，再读计划/设计文档，从"下一步做什么"开始。
 
 ---
 
 ## 1. 任务是什么
 
-用户要求：根据 `docs/design/user-api-unify-20260822-consolidated.md` 优化代码。
+用户要求：v0.3.0（PLAN-052/053 已实施）后，对用户接口做**最终定稿**——这次定出的接口
+要能稳定、长期不变。评审按三标准进行（一致性/低理解负担/渐进复杂），评审结论与冻结
+边界见设计文档。
 
-- **设计文档（实施依据，必读）**：`docs/design/user-api-unify-20260822-consolidated.md`
-  —— 核心是第三节"接口设计建议"、第五节"测试设计 1-11"、第八节"期望的用户接口"（**可执行验收基准**）。
-- **实施计划**：`docs/dev/PLAN-052-user-api-unify.md` —— 任务块 T1~T7，含依赖顺序。
-- 按 AGENTS.md 规范：实施完成后生成 `docs/dev/PLAN-052-user-api-unify-OUTCOME.md`，按任务块拆中文 commit（commit 消息记录 PLAN 与 OUTCOME 文件），docs/ 目录要提交。
-
-**范围拍板（设计文档第七节）**：只做 SQLite 后端接口稳定；新词汇后端中立；不含 auto-partition；不移除任何公开符号（全部走兼容别名 + DeprecationWarning）。
+- **设计文档（必读）**：`docs/design/user-api-review-20260823-followup.md`
+  —— 含 N1~N10 问题清单、"接口定稿"章节（冻结边界、最小实施集合 11 项）。
+- **实施计划**：`docs/dev/PLAN-054-user-api-finalize.md` —— 11 项实施项 + 验收标准 + 不做清单。
+- 按 AGENTS.md 规范：实施完成后生成 `docs/dev/PLAN-054-user-api-finalize-OUTCOME.md`，
+  中文 commit（消息记录 PLAN 与 OUTCOME 文件），docs/ 目录要提交。
 
 ## 2. 当前系统状态
 
-- 版本：`iosql/version.py` `__version__ = '0.2.5'`（T7 需 bump 到 0.3.0）
-- **测试基线（改动前）**：`308 passed, 16 skipped`（`python -m pytest tests/ -q`，约 2 分钟）
-- git 工作区：已修改 7 个源码文件（见第 3 节），未跟踪 4 个 docs 文件（3 个设计文档 + PLAN-052）
-- Python 3.12 环境，仓库根目录 `/home/lsl/macbook/pai-studio-fin/library/iosql`
-- 测试命令：`python -m pytest tests/ -q`；单点冒烟用 heredoc python 脚本
+- 版本：`iosql/version.py` `__version__ = '0.3.0'`（PLAN-052 已发布）
+- 最近提交：`2b5fa23`（PLAN-053 review 修复）；当前 HEAD 之上有未提交的 PLAN-054 改动
+- 全量测试基线（PLAN-053 OUTCOME）：`345 passed, 16 skipped`
 
-## 3. 已完成的修改（T1/T2/T3/T5 全部 + T4 部分）
+## 3. 已完成（代码已改，未提交）
 
-### 3.1 `iosql/database.py`（T1+T2 完成）
-
-- `Database.table()` 新增 `time=None, symbol_column=None, session_column=None` 三个参数，透传进 `TableContract`（参与 spec= 互斥检查；`time` 支持传字符串，自动转 `TimeColumn`）。
-- `Database.timeseries()` **完全重写**为 `table()` 薄封装：
-  - 新签名：`timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None)`
-  - `primary_key` 从必填变可选（补了 `pk` 别名 + 冲突检查）。
-  - 废弃参数触发 `DeprecationWarning` 且行为等价：`partition_kind='calendar'`→内部转 `Partition.calendar(...)`；`time_unit='date'`→同样转 calendar；`*_rows_per_file`→映射为 `Segment.rows(...)` 传 `segment=`。
-  - **duration 分支不透传 timezone**（duration 分区按 UTC 对齐是文档化行为，设计文档明确不得虚构该参数）。
-  - `order_key` 默认 `time`。
-- imports：新增 `warnings`、`Partition`、`Segment`；移除了不再使用的 `TableSpec`、`CalendarPartition`。
-
-### 3.2 `iosql/spec.py`（T3b 完成）
-
-- `TableContract.__post_init__`：
-  - 新增 `time` 为 str 时自动转 `TimeColumn`。
-  - **partition→time 反推**：`time is None` 且 partition.kind ∈ {duration, calendar} 时，从 `partition.column` 反推 `TimeColumn`（calendar→unit='date'+timezone；duration→unit='ms'+UTC）。**range 明确不反推**（设计开放问题 1 拍板的不对称）。
-- `TableContract.from_table_meta` 的遗留 meta 分支同步了同样的反推规则（原来对 range 也反推，已改为不反推）。
-- `format_partition_spec`：calendar 输出从 `tz=` 改为 `timezone=`（解析层 `tz=` 仍兼容，`_parse_partition_expr_options` 里的 tz→timezone 归一化未动）。
-
-### 3.3 `iosql/core/query/case.py`（T3a 完成）
-
-- 模块级新增：
-  - `_OP_ALIASES`：`eq/=→==`、`neq→!=`、`gt→>`、`ge→>=`、`lt→<`、`le→<=`、`between/range→between_and`
-  - `_CANONICAL_OPS = ('==','!=','>','>=','<','<=','between_and','in')`
-  - `normalize_case_op(op)`：归一化 + 白名单校验，非法 op 抛 `BadArgument`，信息含合法 op 列表（展示用户语言 `between`）与修复示例。
-- `Case.__init__` 入口调用归一化（**堵住静默失效链**：拼错 op 原来会静默通过构造、分区裁剪失效、延迟到 SQL 编译才报错）。
-- `check_field_tvalue` 与 `_parse_value` 的全部裸 `assert` 替换为带指引的 `BadArgument`。
-- 内部唯一 Case 构造点 `table.py` `_pk_cases` 用 `'='`，在别名表内，安全。
-
-### 3.4 `iosql/engines/sqlite/query_util.py`（T3a 完成）
-
-- `build_case_subquery` 的 assert 替换为 BadArgument；`Unsupported op` 错误补合法 op 列表与示例（防御层，正常路径经 Case 归一化后不可达）。
-
-### 3.5 `iosql/engines/sqlite/table.py`（T3c/T5 完成，T4 部分）
-
-- 模块级新增 `_canon_sqlite_type`（real/double→float 归一）。
-- `select / iter_select / iter_select_batches / explain_select`：签名默认化 `fields='*', where=None`；新增 `columns=` 别名（与 `fields` 同传且 fields 非 '*' 时抛 BadArgument）；共用 `resolve_select_fields`（从 `iosql/table.py` 导入）。
-- `select_all`：触发 DeprecationWarning（指向 `select(to_dict=True)`），行为不变。
-- `latest`/`asof` 的 `group_by=`：触发 DeprecationWarning（指向 `by=`），冲突检查保留。
-- `_query_time_column`：`MissingTimeColumn` 错误信息附修复指引（传 time= 或用 duration/calendar 分区自动反推）。
-- `write()` 无契约错误：附两条修复路径（重新声明参数 / `spec=` 绑定）。
-- `insert_all`：`replace=True, ignore=True` 同传抛 BadArgument（互斥）。
-- **T4 evolve 语义三**：`_ensure_contract_type_compatible(contract, rows)` 在 `insert_all` 入口调用——契约已声明类型的列，数据类型不兼容时抛 BadArgument（含列名、契约类型、数据类型、修复建议）。int/float 互通放行，bool 按 integer，None 跳过。
-- **T4 evolve 语义二**：`_sync_contract_columns(createtable_meta)` 把动态新增列回写进 `createtable_meta['table_contract']['columns']`，随 `_update_meta` 持久化。已在 `_do_insert_part` 的 NoSuchTable 分支和 NoSuchColumn 分支接线。
-- **T4 evolve 语义一（进行中，有 bug，见第 4 节）**：NoSuchTable 分支（新分区文件创建路径）加了"合并存量列 + 对旧分区补新列"的逻辑，**但 fresh_types 恒为空，bug 未修**。
-
-### 3.6 `iosql/engines/postgresql/table.py`（同步完成）
-
-- `select / iter_select / iter_select_batches` 同样默认化 + `columns=` 别名；`select_all` 弃用警告；`write()` 无契约指引；`insert_all` 互斥校验。imports 加 `warnings`，`BaseTable` 导入处加 `resolve_select_fields`。
-- 注意 select 内部局部变量从 `columns` 改名为 `columns_` 避免与参数遮蔽。
-
-### 3.7 `iosql/table.py`（BaseTable 模块）
-
-- 新增共享函数 `resolve_select_fields(fields, columns, func_name)`（两个引擎共用）。
-
-## 4. ✅ 已修复的 BUG（evolve 语义一，保留记录供参考）
-
-> **状态更新（2026-08-22 提交前）：已修复并验证通过**——`fresh_types` 计算挪到合并循环之前，且 `data_suggested_types` 的值是类型字符串（直接用 `type_`，不是 `item["type"]`）。冒烟全绿：NULL 补齐、契约回写、重开持久化、类型冲突、数值互通/bool/NULL 不误报、segment 路径补列。以下为原始排查记录。
-
-### 现象
-
-evolve 语义一冒烟测试失败：`KeyError: 'f1'`。场景：
-
-```python
-factors = db.table("factors", pk=["symbol","ts"], columns={"symbol":"text","ts":"integer"},
-                   partition=Partition.duration("ts", every="1day"))
-factors.write([{"symbol":"AAPL","ts":1735689600000}])                     # 分区1: 只有 symbol/ts
-factors.write([{"symbol":"AAPL","ts":1735776000000,"f1":0.3,"f2":0.7}])  # 分区2: 新列
-factors.select(columns=["symbol","ts","f1"], to_dict=True, order_by="ts")
-# 期望: 分区1的 f1 为 None；实际: 旧行返回字符串 'f1'（SQLite 双引号字面量陷阱）
+工作区改动（`git diff --stat`）：
+```
+ README.md                                        | 26 +++++
+ iosql/__init__.py                                | 10 +---
+ iosql/core/query/case.py                         |  2 +-
+ iosql/engines/postgresql/table.py                |  4 +-
+ iosql/engines/sqlite/table.py                    | 41 +++++--
+ iosql/partition/duration.py                      | 64 ++++++---
+ iosql/spec.py                                    | 57 +-------
+ tests/engines/sqlite/test_classic_use.py         |  3 +-
+ tests/engines/sqlite/test_timeseries_contract.py |  3 +-
+ tests/test_user_api_unify.py                     |  3 +-
+```
+未跟踪（需 git add）：
+```
+ docs/design/user-api-review-20260823-followup.md
+ docs/dev/PLAN-054-user-api-finalize.md
 ```
 
-根因链：分区 1 的 SQLite 文件没有 f1 列 → `select "f1" from ...` 在 SQLite 中双引号标识符解析失败后**回退为字符串字面量** → 返回 `'f1'` 字符串而非报错。语义二的契约回写、meta 合并都已工作正常（已验证：meta columns = ['symbol','ts','f1','f2']，新分区文件有全部列），缺的是**把新列 ALTER 进旧分区文件**。
+### 逐项实施状态
 
-### 已定位的根因（sys.settrace 确认，勿重复排查）
+| 项 | 状态 | 变更内容 |
+| --- | --- | --- |
+| N2 统一间隔词汇表 | ✅ 已实施 | `iosql/partition/duration.py` 新增模块函数 `parse_interval_ms()`（通用解析：别名 + 任意 `Nunit`）；`DurationPartition.__init__` 改用它；`iosql/spec.py` 的 `_duration_to_ms` 改为委托 `parse_interval_ms`（删除重复实现，spec.py 净减约 50 行）。效果：`Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')` 行为一致。注意 `parse_interval_ms` 从 `iosql.partition.duration` 导入，spec.py 已加对应 import（无循环导入）。 |
+| N9 修 Case.__repr__ | ✅ 已实施 | `iosql/core/query/case.py` `__repr__` 补右括号，字段加 `!r` 引号：`Case(field='sym', op='==', value={...})` |
+| N6 write_buffer 异常 warn | ✅ 已实施 | `iosql/engines/sqlite/table.py` `_BufferedWriter.__exit__`：异常且 buffer 非空时 `warnings.warn(..., RuntimeWarning)` 提示未 flush 行数 |
+| N4 select 默认 to_dict=True | ✅ 已实施 | `iosql/engines/sqlite/table.py` `select`/`iter_select`/`iter_select_batches` 默认 `to_dict=True`（与 PG 引擎一致）；`to_dict=False` 保留返回 sqlite3.Row 元组。**破坏性变更**：依赖默认 tuple 行的调用方需显式 `to_dict=False`。`select_all`（已废弃）保持 `to_dict=False` 签名不变但内部强制 True。 |
+| N5 PG count_rows 去参 | ✅ 已实施 | `iosql/engines/postgresql/table.py` `count_rows(where=None)` → `count_rows()`（无调用方传 where，内部全部无参调用） |
+| N1 构造器导出收缩 | ✅ 已实施 | `iosql/__init__.py` 不再导出 `DurationPartition`/`CalendarPartition`/`RangePartition`（从 `__all__` 和 import 移除）；仅保留工厂 `Partition.*`。**已同步修改 2 处测试导入**：`tests/engines/sqlite/test_classic_use.py` 改为 `from iosql.partition.duration import DurationPartition`；`tests/engines/sqlite/test_timeseries_contract.py` 改为 `from iosql.partition.calendar import CalendarPartition`。**注意**：若还有别处 `from iosql import DurationPartition` 会报 ImportError，全量回归时留意。 |
+| N3 symbol_column 默认显式化 | ✅ 已实施 | `iosql/spec.py` `TableContract.symbol_column: str = "symbol"` → `Optional[str] = None`；`to_dict` 条件从 `!= "symbol"` 改为 `is not None`；`from_dict`/`from_table_meta` 默认改 None。`iosql/engines/sqlite/table.py` `_latest_rows` 加防护：symbol_column 为 None 且未传 `by=` 时抛 BadArgument（含修复指引）；`_compile_query_where` 的 `symbols` 分支从 `or 'symbol'` 兜底改为 None 时抛 BadArgument。`timeseries()` 保持显式 `symbol_column='symbol'` 默认。**已同步修改 3 处测试**：`test_timeseries_equivalent_to_table_contract`（显式 table 加 symbol_column="symbol"）、`test_table_shortcut_time_and_session_column`（加 symbol_column="symbol"）、`test_raw_table_spec_writes_queries_and_partitions_timeseries`（TableSpec 加 symbol_column="symbol"）。 |
+| N8 explain_select 补业务参数 | ✅ 已实施 | `iosql/engines/sqlite/table.py` `explain_select` 新增 `symbols/start/end/date/session` 参数（透传 QuerySpec），与 `query().explain()` 能力对齐 |
+| N7 upsert_all docstring 标注 | ✅ 已实施 | `iosql/engines/sqlite/table.py` `upsert_all` docstring 增加"O(全表)+Segment.rows 不兼容+推荐 write(mode='upsert')"警告 |
+| N5/N11 README 更新 | ✅ 已实施 | `README.md` 新增两节：`partition 一词三义对照表`、`双引擎支持面`（SQLite vs PostgreSQL 能力对照，PG 定位"迁移目标+基础查询"） |
+| 测试修复 | ✅ 已实施 | 见 N1/N3 行，共改 3 个测试文件（5 处断言/导入） |
 
-`_do_insert_part` 的 `except NoSuchTable:` 分支（`iosql/engines/sqlite/table.py` 约 3495-3542 行）：
+### 已验证（局部）
 
-```python
-if current_meta:
-    new_column_info = current_meta["column_info"]        # ← 这是引用，不是拷贝！
-    for col, item in createtable_meta["column_info"].items():
-        if col not in new_column_info:
-            new_column_info[col] = item                  # ← 就地把 f1/f2 合并进了 current_meta["column_info"]
-    createtable_meta["column_info"] = new_column_info
-    fresh_types = {
-        col: item["type"]
-        for col, item in data_suggested_types.items()
-        if col not in current_meta["column_info"]        # ← 此时 f1/f2 已在里面 → 恒空
-    }
-    if fresh_types:                                      # trace 证实: 恒 False，从未进入
-        self._add_columns_for_all_partitions(fresh_types)
-```
+- 单点验证全部通过：N2 间隔等价、N9 repr、N6 warn、N4 默认 dict、N1 导入收缩、
+  N3 symbol_column None + latest 防护、N8 explain 与 query.explain 裁剪一致。
+- 局部回归通过：`tests/test_user_api_unify.py` + `tests/engines/sqlite/test_timeseries_contract.py`
+  + `tests/engines/sqlite/test_classic_use.py` → **75 passed**。
 
-trace 输出显示 `line 3521 → line 3523` 直接跳转（跳过 3522 的 `_add_columns_for_all_partitions` 调用），证实 `fresh_types` 恒为空。
+## 4. 下一步做什么（按顺序）
 
-### 精确修复方案
+1. **全量回归**（必做，工作区改动大）：
+   ```bash
+   python -m pytest tests/ -q
+   ```
+   预期基线 `345 passed, 16 skipped`。重点留意：
+   - N1 收缩导出后是否有遗漏的 `from iosql import DurationPartition/CalendarPartition/RangePartition`
+     （已改 2 处测试，其余代码/示例若引用需改内部路径）。
+   - N4 默认 to_dict=True 是否有测试断言默认 tuple 行。
+   - N3 symbol_column=None 是否有测试 `query(symbols=)`/`latest(symbols=)` 未声明 symbol_column。
+2. **跑 examples 全量**（README 说 select 默认 dict，示例里显式 to_dict=True 冗余但无害，确认不报错）：
+   ```bash
+   for f in examples/*.py; do python "$f" || echo "FAIL: $f"; done
+   PYTHONPATH=. python examples/finance/01_kline_bars.py
+   ```
+3. **lsp_diagnostics** 检查改动的 6 个源文件（duration.py/spec.py/case.py/sqlite table.py/
+   postgresql table.py/__init__.py）零新增错误。
+4. **补测试**（若全量回归暴露缺口）：
+   - N2：`Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')` 契约等价。
+   - N3：`db.table(...)` 不传 symbol_column → `spec().symbol_column is None`；
+     `latest(symbols=)` 无 symbol_column 时报 BadArgument。
+   - N4：`select()` 默认 dict 行；`select(to_dict=False)` 返回 tuple。
+   - N6：write_buffer 块内异常发 RuntimeWarning。
+   - N8：`explain_select(symbols=..., start=..., end=...)` 与 `query(...).explain()` scanned_partitions 一致。
+5. **写结果文档**：`docs/dev/PLAN-054-user-api-finalize-OUTCOME.md`（按 AGENTS.md 规范，
+   记录逐项变更、验证结果、已知限制）。
+6. **提交**（中文 commit，记录 PLAN 与 OUTCOME 文件，逐条列变更；docs/ 要提交）：
+   ```bash
+   git add README.md iosql/ tests/ docs/design/user-api-review-20260823-followup.md docs/dev/PLAN-054-user-api-finalize.md docs/dev/PLAN-054-user-api-finalize-OUTCOME.md
+   git commit -m "实施 PLAN-054: 用户接口定稿（长期稳定收敛）
+   计划: docs/dev/PLAN-054-user-api-finalize.md
+   结果: docs/dev/PLAN-054-user-api-finalize-OUTCOME.md
+   逐条变更：..."
+   ```
 
-把 `fresh_types` 的计算挪到合并循环**之前**：
+## 5. 冻结边界（本次定稿的承诺，后续不得违反）
 
-```python
-if current_meta:
-    fresh_types = {
-        col: item["type"]
-        for col, item in data_suggested_types.items()
-        if col not in current_meta["column_info"]
-    }
-    for col, item in createtable_meta["column_info"].items():
-        if col not in current_meta["column_info"]:
-            current_meta["column_info"][col] = item
-    createtable_meta["column_info"] = current_meta["column_info"]
-    if fresh_types:
-        self._add_columns_for_all_partitions(fresh_types)
-```
+定稿后**不再改参数名、默认值、方法职责**；新增能力只能以"新方法/新参数"叠加（默认行为=旧行为）。
 
-`_add_columns_for_all_partitions` 内部对 `DuplicateColumn` 是 pass（幂等），安全。修好后注意该分支尾部已有的 `_sync_contract_columns(createtable_meta)` 调用顺序不要破坏。
+- 参数词汇表唯一拼写：`pk` / `columns` / `every` / `timezone` / `between` / `mode`；
+  别名永久保留：`primary_key` / `fields` / `partition_every` / `tz` / `between_and` / 契约侧 `conflict`。
+- 缩写原则：只允许行业级缩写（`pk` 是唯一成员，依据 SQLAlchemy/Django/sqlite-utils 惯例）；
+  其余参数一律全称（`timezone` 而非 `tz`）。
+- 结果对象字段冻结，`to_dict()` 唯一序列化入口，新字段只能追加。
+- 废弃参数只加不减（已废弃的 partition_kind/time_unit/*_rows_per_file/group_by/select_all
+  永久保留 DeprecationWarning，不再计划移除）。
+- 双引擎对称性：PG 引擎方法面不对称是设计意图（迁移目标+基础查询），保留并已文档化；
+  但 `select` 默认值必须统一（本次已统一为 to_dict=True）、`count_rows` 签名已统一（无参）。
 
-### 修复后的验证脚本（直接可跑）
+## 6. 明确不做（冻结边界之外）
 
-```bash
-python - <<'EOF'
-import tempfile
-from iosql import Database, Partition
-from iosql.exception import BadArgument
-tmp = tempfile.mkdtemp()
-with Database(f"sqlite://{tmp}/ev.iosql") as db:
-    factors = db.table("factors", pk=["symbol","ts"], columns={"symbol":"text","ts":"integer"},
-                       partition=Partition.duration("ts", every="1day"))
-    factors.write([{"symbol":"AAPL","ts":1735689600000}])
-    factors.write([{"symbol":"AAPL","ts":1735776000000,"f1":0.3,"f2":0.7}])
-    rows = factors.select(columns=["symbol","ts","f1"], to_dict=True, order_by="ts")
-    assert rows[0]["f1"] is None and rows[1]["f1"] == 0.3, rows
-    assert "f1" in factors.spec().columns
-with Database(f"sqlite://{tmp}/ev.iosql") as db:
-    assert "f1" in db.table("factors").spec().columns   # 重开仍在
-    print("evolve 语义一+二 OK")
+- 不合并 `select()`/`query()`、不合并 `table()`/`timeseries()`
+- 不引入结果对象替换 to_dict flag
+- 不废弃 insert_all/upsert_all
+- mysqlite 不纳入（第三方库定位）
+- PG 引擎不补查询族（query/latest/asof 等）
 
-# 语义三：类型冲突
-with Database(f"sqlite://{tmp}/ev2.iosql") as db:
-    t = db.table("t", pk=["id"], columns={"id":"integer"}, partition=Partition.range("id", every=100))
-    t.write([{"id":1,"x":1}])
-    try:
-        t.write([{"id":2,"x":"abc"}]); raise SystemExit("FAIL")
-    except BadArgument as e:
-        assert "x" in str(e) and "integer" in str(e) and "text" in str(e), e
-    print("evolve 语义三 OK")
-EOF
-```
+## 7. 已知风险与注意
 
-已验证通过的其他冒烟项（修复语义一后应全绿）：T1 time/session_column+query、T3b calendar 反推+query(date=)、range 不反推+MissingTimeColumn 指引、T2 timeseries≡table 契约一致、T2 三类 DeprecationWarning、T3a op 归一化与 BadArgument 指引、T3c select() 免参/columns 别名/文本与 dict where、`tz=`≡`timezone=` 解析等价 + `to_string()` 输出 `timezone=`、write() 无契约指引、insert_all 互斥、select_all/group_by 弃用警告、evolve 数值互通/bool/NULL 不误报。
+- **N4 是破坏性变更**（select 默认返回从 tuple 变 dict）：需在 OUTCOME 和 README 变更记录
+  中显著标注，建议 bump 版本到 0.4.0（当前 0.3.0）。
+- **N3 也是破坏性变更**（symbol_column 默认 None）：`query(symbols=)`/`latest(symbols=)`
+  在未声明 symbol_column 的普通 `db.table()` 上会报错（带修复指引）——这是故意为之
+  （消除隐藏默认），但调用方需显式声明。
+- **N1 收缩导出**：`from iosql import DurationPartition` 现在 ImportError。内部模块
+  `iosql.partition.duration` / `iosql.partition.calendar` / `iosql.partition.range`
+  路径仍可用。
+- 全量回归被中断过一次（当时用户急写交接，未跑完）；**接手第一步就是重跑全量**。
+- 交接时 `git status` 显示 10 modified + 2 untracked，全部属于 PLAN-054，可直接提交。
 
-## 5. 剩余工作（按顺序）
+## 8. 相关文档索引
 
-1. **修第 4 节的 bug**，跑通验证脚本。
-2. **跑全量测试** `python -m pytest tests/ -q`，修复因行为变化破坏的既有测试。**已知预期破坏点**：
-   - `tests/test_partition_string.py:45`：断言 `to_string()` 输出 `tz=Asia/Shanghai` → 现在输出 `timezone=`，需更新断言（第 38 行 parse 断言不用动，解析兼容不变）。
-   - `tests/test_cli.py:949-950`：doctor 建议输出含 `tz=Asia/Shanghai` → 现在会是 `timezone=`，需更新。
-   - 其他 grep 到 `tz=` 的测试（`test_migration.py:442/463/484` 字符串解析、`test_partition.py` 的 `CalendarPartition(tz=...)` 对象构造）**不受影响**：前者解析层兼容，后者内部类参数未改。
-   - 关注 `db.timeseries()` 签名变化对 `tests/engines/sqlite/test_timeseries_contract.py` 的影响：旧调用 `db.timeseries(name, time, primary_key=...)` 仍兼容；`TableContract.timeseries(...)` 类方法**没有改**，仍可用；但 `db.timeseries(..., target_rows_per_file=...)` 现在会发 DeprecationWarning（一般不 fail，除非 -W error）。逐个看失败信息修。
-   - `op` 白名单收紧：如果既有测试用了白名单外的 op 会抛 BadArgument（已 grep 测试源码未发现，但以实际跑为准）。
-   - partition→time 反推改变了 `spec()` 输出：某些断言 `spec.time is None` 的测试可能需要更新。
-3. **新增 `tests/test_user_api_unify.py`**，覆盖设计文档第五节测试 1-11（用 `pytest.warns(DeprecationWarning)` 断言弃用路径）。本会话的冒烟脚本可直接改写成测试。
-4. **T6a 示例收敛**（对照设计文档第八节"场景覆盖对照表"逐行）：
-   - 全部 examples/（不含 mysqlite/）：`insert_all`→`write`；裸 `db.close()`→`with Database(...)`；dict where 的 `"op": "between_and"`→`"between"`、`"op": "="`→`"=="`；字符串 partition 示范 `timezone=`；
-   - 例 08：手写 `TableContract(TimeColumn(...), PhysicalLayout(...))` 改为 `db.table(...)` 快捷参数（T1 已支持 time=/segment=），加注释"高级用法仍可直接构造契约"；
-   - 例 09/10：删掉 `if spec is None: raise RuntimeError(...)` 手动防御代码，直接调用（信任 API 错误指引路径）；
-   - 例 04：`with_partition(every=...)` 改示范 `with_partition(partition=...)`。
-   - 验收：逐个运行 `python examples/XX.py`（11/12 无 POSTGRES_DSN 走 dry-run）；grep 确认无 `between_and`、`op": "="`、`tz=` 示范、quickstart 无裸 `db.close()`。
-5. **T6b README 收敛**：
-   - 合法 op 表（用户语言 `== != > >= < <= between in`）；
-   - timeseries 薄封装说明 + 废弃参数迁移表（partition_kind/time_unit/*_rows_per_file → 新写法）；
-   - "动态扩列语义"小节（三语义：旧分区 NULL 补齐 / 契约回写 / 类型冲突报错）；
-   - 导出面两层示范（用户层：Database/Partition/Segment/Where+结果类型；高级层：TableContract/TableSpec/PhysicalLayout/TimeColumn）；
-   - `query()` 惰性 fluent 对象 vs `select()` 急切列表的差异标注；
-   - `latest(by=)` 唯一拼写；`select()` 参数可省略示例；README 内 `tz=Asia/Shanghai` 示范统一为 `timezone=`。
-   - `skills/iosql-usage/` 随包分发的技能文档也有旧示范（tz=/between_and），计划未列，**不改**（时间充裕可同步，非必须）。
-6. **T7 发布**：`iosql/version.py` bump `'0.3.0'`；README 变更记录加 v0.3.0 条目；全量 pytest + 全部示例运行；写 `docs/dev/PLAN-052-user-api-unify-OUTCOME.md`（逐任务记录结果、测试数字、遗留项）。
-7. **提交**：按任务块拆中文 commit。建议拆分：①T1+T2（database.py）②T3（case.py/query_util.py/spec.py/两引擎 table.py 查询面）③T4（evolve）④T5+新测试 ⑤T6 示例+README ⑥T7 版本+OUTCOME。commit 消息记录 PLAN-052 与 OUTCOME 文件名（遵守 AGENTS.md）。未跟踪的 3 个设计文档 + PLAN-052 一并提交。
-
-## 6. 关键设计约束（不要踩坑）
-
-- **duration 分区无时区概念**：`Partition.duration()` 没有 timezone 参数，`timeseries()` 只有 calendar 分支透传 timezone。别"补齐"这个参数。
-- **range 分区不反推 time**：设计文档开放问题 1 拍板的不对称，`spec.py` 的 `__post_init__` 和 `from_table_meta` 两处都已实现，改动时保持一致。
-- **op 白名单**：canonical 集合 `('==','!=','>','>=','<','<=','between_and','in')`。展示给用户用 `between`（用户语言），内部规范形式 `between_and` 不出现在示例。
-- **类型冲突检查的放行规则**：int↔float 互通、bool→integer、None 跳过、real/double≈float（`_canon_sqlite_type`）。收紧前先跑全量测试。
-- **不改 `iosql.utils.mysqlite` 内部接口**（计划非目标）。
-- **不改 `TableContract.timeseries` 类方法**（保留旧签名，`db.timeseries()` 才是新薄封装）——存量测试在用。
-- PostgreSQL 引擎：`table()` 新参数只是存进契约，不实现 SQLite 特有行为（计划非目标）。
-- 所有弃用路径必须真的发 `DeprecationWarning`（不能静默），测试用 `pytest.warns` 固化。
-- 本仓库有注释审查 hook：设计约束类注释（如"range 不反推"、"SQLite 双引号字面量陷阱"）和公开 API docstring 允许且必要；解释性废话注释会被要求删改。
-
-## 7. 快速上下文索引
-
-| 主题 | 位置 |
-|---|---|
-| 设计文档（验收基准第八节） | `docs/design/user-api-unify-20260822-consolidated.md` |
-| 实施计划 T1-T7 | `docs/dev/PLAN-052-user-api-unify.md` |
-| table()/timeseries() | `iosql/database.py` |
-| 契约/partition 反推/序列化 | `iosql/spec.py`（`TableContract.__post_init__`、`from_table_meta`、`format_partition_spec`） |
-| op 归一化 | `iosql/core/query/case.py`（`normalize_case_op`） |
-| select 家族/evolve/错误指引 | `iosql/engines/sqlite/table.py`（`select` 至 `_do_insert_part`） |
-| **bug 所在** | `iosql/engines/sqlite/table.py` `_do_insert_part` 的 `except NoSuchTable:` 分支（约 3495-3542 行） |
-| 字段别名共享函数 | `iosql/table.py` `resolve_select_fields` |
-| PG 引擎同步 | `iosql/engines/postgresql/table.py` |
-| examples 待收敛清单 | 设计文档第八节末尾"场景覆盖对照表" |
+- 设计（本次）：`docs/design/user-api-review-20260823-followup.md`
+- 计划（本次）：`docs/dev/PLAN-054-user-api-finalize.md`
+- 前序设计（v0.3.0 已实施）：`docs/design/user-api-unify-20260822-consolidated.md`
+- 前序结果（v0.3.0）：`docs/dev/PLAN-052-user-api-unify-OUTCOME.md`
+- 前序修复（v0.3.0 review）：`docs/dev/PLAN-053-v03-review-fixes-OUTCOME.md`

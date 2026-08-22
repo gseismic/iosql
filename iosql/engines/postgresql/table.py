@@ -738,8 +738,8 @@ class Table(BaseTable):
                 break
             offset += len(rows)
 
-    def count_rows(self, where=None):
-        query, params = self._select_query("count(*)", where)
+    def count_rows(self):
+        query, params = self._select_query("count(*)", None)
         conn = self.connect()
         cursor = conn.cursor()
         cursor.execute(query, params)

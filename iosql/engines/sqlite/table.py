@@ -223,6 +223,13 @@ class _BufferedWriter:
     def __exit__(self, exc_type, exc_value, exc_tb):
         if exc_type is None:
             self.flush()
+            return
+        if self._buffer:
+            warnings.warn(
+                f"write_buffer 因异常未 flush {len(self._buffer)} 行缓冲数据",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
 
 class Table(BaseTable):
@@ -704,11 +711,17 @@ class Table(BaseTable):
         return _TableQuery(self, spec)
 
     def explain_select(self, fields='*', where=None, order_by=None, limit=None,
-                       columns=None):
+                       columns=None, symbols=None, start=None, end=None,
+                       date=None, session=None):
         fields = resolve_select_fields(fields, columns, 'explain_select')
         spec = QuerySpec(
             table=self._table_name,
             columns=fields,
+            symbols=symbols,
+            start=start,
+            end=end,
+            date=date,
+            session=session,
             where=where,
             order_by=order_by,
             limit=limit,
@@ -1511,6 +1524,13 @@ class Table(BaseTable):
         if not table_spec:
             raise BadArgument('latest requires a TableSpec')
         symbol_column = table_spec.symbol_column
+        if symbol_column is None and by is None:
+            raise BadArgument(
+                'latest 需要 symbol 分组：表契约未声明 symbol_column。'
+                '修复: db.table(..., symbol_column="symbol") 或 '
+                'db.timeseries(..., symbol_column="symbol")，'
+                '或显式传 latest(by=[...])'
+            )
         group_fields = self._normalize_latest_by(by, symbol_column)
         rows = _TableQuery(self, query_spec).to_list()
         if not rows:
@@ -1645,7 +1665,13 @@ class Table(BaseTable):
         table_spec = self.spec()
 
         if query_spec.symbols is not None:
-            symbol_column = table_spec.symbol_column if table_spec else 'symbol'
+            symbol_column = table_spec.symbol_column if table_spec else None
+            if not symbol_column:
+                raise BadArgument(
+                    'query(symbols=) 需要表契约声明 symbol_column。'
+                    '修复: db.table(..., symbol_column="symbol") 或 '
+                    'db.timeseries(..., symbol_column="symbol")'
+                )
             symbols = query_spec.symbols
             if isinstance(symbols, str) or not isinstance(symbols, (list, tuple, set)):
                 symbols = [symbols]
@@ -2586,7 +2612,7 @@ class Table(BaseTable):
         where=None,
         limit=None,
         order_by=None,
-        to_dict=False,
+        to_dict=True,
         batch_size=10_000,
         columns=None,
         **kwargs,
@@ -2610,7 +2636,7 @@ class Table(BaseTable):
         where=None,
         limit=None,
         order_by=None,
-        to_dict=False,
+        to_dict=True,
         batch_size=10_000,
         columns=None,
         **kwargs,
@@ -2676,11 +2702,12 @@ class Table(BaseTable):
             yield pending
 
     def select(self, fields='*', where=None, limit=None, order_by=None,
-               to_dict=False, columns=None, **kwargs):
+               to_dict=True, columns=None, **kwargs):
         """条件查询，返回行列表（急切求值）。
 
         fields/where 均可省略：select() 即全表查询；
         columns= 是 fields= 的别名（与 query(columns=) 对齐），两者同传冲突报错。
+        默认返回 dict 行（与 PG 引擎一致）；to_dict=False 返回 sqlite3.Row 元组。
         """
         fields = resolve_select_fields(fields, columns, 'select')
         # step1. 找到各part记录到的字段最大最小数值, 排除不需要查询的part
@@ -3170,6 +3197,10 @@ class Table(BaseTable):
         self, kv_list, pk, partition=None, commit=True, **kwargs
     ):
         """Update or insert rows based on primary key.
+
+        注意：实现为全表 SELECT + 内存合并 + REPLACE 写回，复杂度 O(全表)，
+        不适合大表高频 upsert；Segment.rows 表不支持（内部走 replace 会报错）。
+        常规业务优先使用 `write(rows, mode='upsert')`（契约感知）。
 
         Upsert semantics:
         - For each item in kv_list with pk that exists in table: UPDATE (merge fields)

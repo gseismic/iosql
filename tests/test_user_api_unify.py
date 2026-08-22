@@ -57,7 +57,7 @@ def test_timeseries_equivalent_to_table_contract(tmp_path):
         explicit = db.table(
             "b", pk=["symbol", "ts"], columns=_TICK_COLUMNS,
             partition=Partition.duration("ts", every="1day"),
-            order_key="ts", time="ts",
+            order_key="ts", time="ts", symbol_column="symbol",
         ).spec().to_dict()
         assert sugar == explicit
 
@@ -419,6 +419,7 @@ def test_table_shortcut_time_and_session_column(tmp_path):
             partition=Partition.duration("ts", every="1day"),
             time="ts",
             session_column="trading_date",
+            symbol_column="symbol",
         )
         futs.write([{
             "symbol": "AU", "ts": 1767661200000,

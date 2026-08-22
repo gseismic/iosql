@@ -754,6 +754,32 @@ database/
 - PostgreSQL URI 格式为 `postgresql://user:pass@host:port/dbname`；SQLite 到 PostgreSQL 迁移优先使用 `Database.migrate_to()` / `to_postgresql()` 或 `iosql migrate`，生产迁移建议先 `--dry-run`，再用 `--verify row-count` 校验。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。
 
+### partition 一词三义对照表
+
+`partition` 参数在不同方法中含义不同，使用时按下表区分：
+
+| 语境 | 含义 | 示例 |
+| --- | --- | --- |
+| 建表 | **分区策略**（对象或字符串，声明如何路由） | `db.table(..., partition=Partition.duration("ts", every="1day"))` |
+| 维护 | **分区键**（单个 logical partition 的 key，限制作用范围） | `table.compact(partition=<key>)`、`table.cleanup_obsolete(partition=<key>)` |
+| 重分区 | **目标分区策略**（写入新库时的新布局） | `table.repartition_to(target_uri, spec=new_spec)` |
+
+同一参数名承载三种语义是刻意保持的简写；需要精确控制作用范围时，`compact(partition=...)` / `cleanup_obsolete(partition=...)` 也可用 `partitions=` 别名传入分区键列表。
+
+### 双引擎支持面
+
+| 能力 | SQLite 引擎 | PostgreSQL 引擎 |
+| --- | --- | --- |
+| 建表/契约 | `db.table()` 完整 | 迁移绑定 `db.table(name, spec=...)` |
+| 写入 | `write` / `write_buffer` / `insert_all` / `upsert_all` | `write` / `insert_all` / `upsert_all` |
+| 条件查询 | `select` / `iter_select` / `iter_select_batches` | `select` / `iter_select` / `iter_select_batches` |
+| 时序查询 | `query` / `latest` / `asof` | 不支持 |
+| 查询计划 | `explain_select` | 不支持 |
+| 诊断维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` / `truncate` / `delete` / `count_rows` | `delete` / `count_rows` |
+| 迁移 | `migrate_to` / `to_postgresql` | `migrate_to`（作为源写回 SQLite） |
+
+PostgreSQL 引擎定位是**迁移目标 + 基础查询**，时序便捷查询（`query/latest/asof`）仅在 SQLite 侧提供；需要完整业务接口时以 SQLite 目录库为主存储，PG 作为迁移/备份目标。
+
 ### 动态扩列（schema_policy='evolve'）语义
 
 默认策略 `evolve` 允许写入时动态加列（`ALTER TABLE ADD COLUMN`，O(1)），语义契约如下：

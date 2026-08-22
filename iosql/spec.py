@@ -10,6 +10,7 @@ from .partition import (
     RangePartition,
     Partition as RuntimePartition,
 )
+from .partition.duration import parse_interval_ms
 
 
 DEFAULT_LOGICAL_PART = "__all__"
@@ -40,53 +41,7 @@ def _normalize_time_unit(unit: Optional[str]) -> Optional[str]:
 
 
 def _duration_to_ms(value: Any) -> int:
-    if isinstance(value, int):
-        if value <= 0:
-            raise PartitionSpecError("partition duration must be positive")
-        return value
-
-    text = str(value).strip().lower()
-    if text in DurationPartition.INTERVAL_ALIASES:
-        return DurationPartition.INTERVAL_ALIASES[text]
-
-    units = [
-        ("milliseconds", 1),
-        ("millisecond", 1),
-        ("msecs", 1),
-        ("msec", 1),
-        ("ms", 1),
-        ("seconds", 1_000),
-        ("second", 1_000),
-        ("secs", 1_000),
-        ("sec", 1_000),
-        ("s", 1_000),
-        ("minutes", 60_000),
-        ("minute", 60_000),
-        ("mins", 60_000),
-        ("min", 60_000),
-        ("hours", 3_600_000),
-        ("hour", 3_600_000),
-        ("hrs", 3_600_000),
-        ("hr", 3_600_000),
-        ("h", 3_600_000),
-        ("days", 86_400_000),
-        ("day", 86_400_000),
-        ("d", 86_400_000),
-        ("weeks", 604_800_000),
-        ("week", 604_800_000),
-        ("w", 604_800_000),
-    ]
-    for suffix, scale in sorted(units, key=lambda item: len(item[0]), reverse=True):
-        if text.endswith(suffix):
-            number = text[:-len(suffix)] or "1"
-            try:
-                count = int(number)
-            except ValueError as e:
-                raise PartitionSpecError(f"Bad partition duration `{value}`") from e
-            if count <= 0:
-                raise PartitionSpecError("partition duration must be positive")
-            return count * scale
-    raise PartitionSpecError(f"Unsupported partition duration `{value}`")
+    return parse_interval_ms(value)
 
 
 def _to_int_every(value: Any) -> int:
@@ -638,7 +593,7 @@ class TableContract:
     schema_policy: str = "evolve"
     order_key: Optional[str] = None
     conflict: str = "append"
-    symbol_column: str = "symbol"
+    symbol_column: Optional[str] = None
     session_column: Optional[str] = None
     physical_layout: PhysicalLayout = field(default_factory=PhysicalLayout)
     version: int = 1
@@ -823,7 +778,7 @@ class TableContract:
         }
         if self.time is not None:
             data["time"] = self.time.to_dict()
-        if self.symbol_column != "symbol":
+        if self.symbol_column is not None:
             data["symbol_column"] = self.symbol_column
         if self.session_column is not None:
             data["session_column"] = self.session_column
@@ -840,7 +795,7 @@ class TableContract:
             schema_policy=data.get("schema_policy", "evolve"),
             order_key=data.get("order_key"),
             conflict=data.get("conflict", "append"),
-            symbol_column=data.get("symbol_column", "symbol"),
+            symbol_column=data.get("symbol_column"),
             session_column=data.get("session_column"),
             physical_layout=data.get("physical_layout") or {},
             version=data.get("version", 1),
@@ -880,7 +835,7 @@ class TableContract:
             segment=Segment.from_dict(meta.get("segment")),
             columns=columns,
             schema_policy="evolve",
-            symbol_column="symbol",
+            symbol_column=None,
             session_column=None,
         )
 

@@ -171,7 +171,7 @@ class Case(object):
         }
 
     def __repr__(self):
-        return f'Case(field={self.field}, op={self.op}, value={self.value}'
+        return f"Case(field={self.field!r}, op={self.op!r}, value={self.value!r})"
 
 
 class CaseExpression(object):
