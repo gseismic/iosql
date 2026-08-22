@@ -1,9 +1,16 @@
-# HANDOFF — PLAN-052 用户接口统一与稳定（已完成）
+# HANDOFF — PLAN-052 用户接口统一与稳定（已完成 + review 轮加固）
 
-> **终态说明（2026-08-22）**：PLAN-052 全部任务块（T1~T7）已完成、测试通过并提交。
-> 权威结果记录见 `docs/dev/PLAN-052-user-api-unify-OUTCOME.md`；本文保留为过程档案，
-> 第 4 节的 bug 排查记录对后续类似问题仍有参考价值。若你接手的是新任务，请直接读
-> OUTCOME 与设计文档，忽略本文的"剩余工作"清单（均已完成）。
+> **终态说明（2026-08-22）**：PLAN-052 全部任务块（T1~T7）已完成、测试通过并提交；
+> 额外的 ultrawork review 轮修复了一个并发演进竞争缺陷并新增 13 例多线程测试
+> （commit `e8d8385`）。权威结果记录见 `docs/dev/PLAN-052-user-api-unify-OUTCOME.md`。
+>
+> **⚠️ 待办（需人工介入，非代码问题）**：ultrawork 的 Oracle 验证通道因子代理后端
+> 断供而不可用——`~/.config/opencode/oh-my-openagent.json` 中全部代理映射到
+> `github-copilot/*`（配额耗尽，报 Insufficient balance）。已将 `oracle` 改映射到
+> 已认证的 `zai-coding-plan/glm-5.2`（原文件备份为同目录 `.before-oracle-fix-20260822`），
+> 但插件在启动时读取配置，**需重启 opencode 会话后生效**。重启后如需正式验证，
+> 重发 ultrawork 验证或手动核对 OUTCOME 即可。其余代理（explore/prometheus 等）
+> 仍指向断供的 github-copilot，如需使用请一并迁移。
 
 ---
 
