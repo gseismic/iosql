@@ -21,6 +21,10 @@ dependencies = [
 postgresql = [
     "psycopg2-binary>=2.9",
 ]
+ui = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
 
 [project.urls]
 Homepage = "http://github.com/gseismic/iosql"

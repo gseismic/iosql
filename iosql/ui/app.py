@@ -1,0 +1,1126 @@
+"""iosql UI 后端服务层：FastAPI app 工厂与全部 REST 端点。
+
+职责：把 iosql Python API 包装为前端契约（设计文档第 7 节冻结版）可用的
+本地 HTTP 服务；Database 实例为进程单例，lifespan 中创建、shutdown 时 close。
+
+安全模型（设计文档第 5 节双模式防御）：
+1. 主防线——mode="readonly" 时写路由**不注册**，写端点在只读进程中不存在
+   （请求 404），而非被拒（403）；结构性隔离，审计一眼可信。
+2. 纵深——写路由统一挂 ``require_write_mode`` Depends，防未来误挂。
+3. 错误统一 ``{"detail": str, "hint": str|null}``；任何异常路径都不裸奔。
+
+探针实验结论（/tmp/opencode/probe_iosql.py，2026-08-23）：
+- ``select`` 支持 ``"ts desc"`` 方向与逗号分隔多列 order_by（Python 层排序）；
+  keyset 分页因此可透传用户方向：asc 用 cursor op ">"，desc 用 "<"。
+- 全部结果对象（WriteResult/QueryPlan/LayoutReport/CompactResult/CleanupResult/
+  SegmentValidationResult/RepartitionResult/TableContract）均有 to_dict() 且 JSON 安全。
+- 无 time 契约的表调 query()/latest() 会抛 MissingTimeColumn → 端点层先按
+  spec().time is None 门控为 409，避免异常穿透。
+- ``db.table(未知表名)`` 返回 ghost 对象（spec=None/count=0/select=[]），
+  因此存在性校验必须走 db.table_names()，不能依赖 table 方法自身报错。
+- ``with_partition(partition=...)`` 同时接受字符串与 parse_partition_spec 结果对象。
+"""
+from __future__ import annotations
+
+import csv
+import json
+import time
+from contextlib import asynccontextmanager
+from itertools import chain
+from io import StringIO
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterator, Optional
+
+from fastapi import Depends, FastAPI, Query, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+
+from iosql import Case
+from iosql.exception import (
+    BadArgument,
+    IosqlError,
+    MissingTimeColumn,
+    PartitionSpecError,
+    SchemaConflict,
+    TableSpecConflict,
+    UnsafeOperation,
+)
+from iosql.spec import parse_partition_spec
+
+from .deps import require_write_mode
+from .errors import AppError
+from .serializers import (
+    serialize_contract,
+    serialize_layout_report,
+    serialize_partition,
+    serialize_plan,
+    serialize_result,
+    serialize_segments,
+)
+
+# ---------------------------------------------------------------- 常量
+
+MODES = ("readonly", "write")
+
+# where 条件合法 op 白名单（与 iosql Case 归一化入口一致）
+ALLOWED_OPS = ("==", "!=", ">", ">=", "<", "<=", "between", "in")
+
+WRITE_MODES = ("append", "upsert", "replace", "ignore")
+
+# rows 端点单页上限：防止 limit=10^9 拖垮进程（keyset 分页本身每页很小）
+MAX_PAGE_LIMIT = 5000
+MAX_QUERY_LIMIT = 50_000
+
+# chart 流式扫描行数上限：超出直接 422，提示缩小时间窗
+MAX_CHART_SCAN_ROWS = 500_000
+
+# chart 分桶上限（设计文档第 6 节 Charts Tab：≤4000 点渲染 <100ms）
+MAX_CHART_BUCKETS = 4000
+
+DEFAULT_CHART_BUCKETS = 600
+
+EXPORT_BATCH_SIZE = 5000
+
+# 行数缓存 TTL（秒）：Overview 首屏懒加载 count_rows，60s 内复用
+ROW_COUNT_TTL_SECONDS = 60.0
+
+# 模块级行数缓存：key=(db_uri, table_name) → (到期时间戳, 行数)
+_ROW_COUNT_CACHE: dict[tuple[str, str], tuple[float, int]] = {}
+
+_PARTITION_HINT = (
+    "合法示例: duration(ts,every=1hour) / "
+    "calendar(date,every=1day,timezone=Asia/Shanghai) / range(id,width=10000)"
+)
+
+
+# ---------------------------------------------------------------- 请求体模型
+
+
+class RowsBody(BaseModel):
+    """POST /rows 与 /explain 共用请求体。"""
+
+    where: Optional[list[dict[str, Any]]] = None
+    order_by: Optional[str] = None
+    limit: int = 200
+    cursor: Optional[Any] = None
+
+
+class CountBody(BaseModel):
+    where: Optional[list[dict[str, Any]]] = None
+
+
+class QueryBody(BaseModel):
+    symbols: Optional[Any] = None
+    start: Optional[Any] = None
+    end: Optional[Any] = None
+    date: Optional[str] = None
+    session: Optional[str] = None
+    columns: Optional[Any] = None
+    where: Optional[list[dict[str, Any]]] = None
+    order_by: Optional[str] = None
+    limit: int = 1000
+
+
+class LatestBody(BaseModel):
+    symbols: Optional[Any] = None
+    as_of: Optional[Any] = None
+    by: Optional[list[str]] = None
+    columns: Optional[list[str]] = None
+    where: Optional[list[dict[str, Any]]] = None
+    session: Optional[str] = None
+
+
+class ValidateBody(BaseModel):
+    deep: bool = False
+
+
+class WriteBody(BaseModel):
+    rows: list[dict[str, Any]]
+    mode: Optional[str] = None
+
+
+class DeleteBody(BaseModel):
+    where: Optional[list[dict[str, Any]]] = None
+
+
+class TruncateBody(BaseModel):
+    confirm: str = ""
+
+
+class CreateIndexBody(BaseModel):
+    column: str
+    order: str = "asc"
+
+
+class CompactBody(BaseModel):
+    partition: Optional[Any] = None
+    target_rows: Optional[int] = None
+
+
+class CleanupBody(BaseModel):
+    dry_run: bool = True
+    partition: Optional[Any] = None
+
+
+class RepartitionBody(BaseModel):
+    target_uri: str
+    partition_str: str
+
+
+# ---------------------------------------------------------------- 通用 helper
+
+
+def _bad_request(detail: str, hint: str) -> AppError:
+    return AppError(detail=detail, hint=hint, status=422)
+
+
+def normalize_where(raw: Optional[list[dict[str, Any]]]) -> Optional[list[dict[str, Any]]]:
+    """where 归一化校验：list of {field, op, value}，非法即 422 带 hint。"""
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise _bad_request(
+            "where 必须是条件数组",
+            '示例: [{"field":"symbol","op":"==","value":"AAPL"}]',
+        )
+    comps: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict) or "field" not in item or "op" not in item:
+            raise _bad_request(
+                "where 条件必须包含 field 与 op",
+                '示例: {"field":"ts","op":">=","value":1735689600000}',
+            )
+        field = str(item["field"]).strip()
+        op = item["op"]
+        value = item.get("value")
+        if not field:
+            raise _bad_request("where 条件的 field 不能为空", hint="请填写列名")
+        if op not in ALLOWED_OPS:
+            raise _bad_request(
+                f"非法 where 运算符 `{op}`",
+                hint=f"合法 op: {', '.join(ALLOWED_OPS)}；"
+                     '示例: {"field":"symbol","op":"==","value":"AAPL"}',
+            )
+        if op == "between" and (
+            not isinstance(value, (list, tuple)) or len(value) != 2
+        ):
+            raise _bad_request(
+                "between 条件的 value 必须是二元列表 [min, max]",
+                hint='示例: {"field":"ts","op":"between","value":[start,end]}',
+            )
+        if op == "in" and not isinstance(value, list):
+            raise _bad_request(
+                "in 条件的 value 必须是非空列表",
+                hint='示例: {"field":"symbol","op":"in","value":["AAPL","MSFT"]}',
+            )
+        comps.append({"field": field, "op": op, "value": value})
+    return comps or None
+
+
+def get_table(db: Any, name: str) -> Any:
+    """统一的表引用获取：先校验存在性，再裸 db.table(name)。
+
+    绝不传契约参数——避免对已有表重复声明契约触发 TableSpecConflict。
+    探针确认：db.table(未知表名) 会返回 ghost 对象而不报错，所以
+    存在性必须用 db.table_names() 校验。
+    """
+    names = db.table_names()
+    if name not in names:
+        summary = ", ".join(names[:20]) + ("…" if len(names) > 20 else "")
+        raise AppError(
+            detail="表不存在",
+            hint=f"当前库中的表: {summary or '(空库)'}",
+            status=404,
+        )
+    return db.table(name)
+
+
+def table_columns(table: Any, spec: Any) -> list[str]:
+    """表列名清单：优先契约 columns，无契约时抽样一行推断。"""
+    if spec is not None and spec.columns:
+        return list(spec.columns.keys())
+    sample = table.select(limit=1, to_dict=True)
+    return list(sample[0].keys()) if sample else []
+
+
+def resolve_sort_col(
+    table: Any,
+    spec: Any,
+    order_by_raw: Optional[str],
+) -> tuple[str, str, str]:
+    """解析排序列与方向，返回 (col, direction, applied_str)。
+
+    默认列优先级（探针+设计文档）：spec.time.name > order_key > pk[0] > 第一列。
+    keyset 分页只支持单列；多列 order_by 直接 422 说明原因。
+    """
+    if order_by_raw:
+        text = str(order_by_raw).strip()
+        segments = [seg.strip() for seg in text.split(",") if seg.strip()]
+        if len(segments) > 1:
+            raise _bad_request(
+                "keyset 分页仅支持单列排序",
+                hint=f"order_by 请传单列（可带 asc/desc），例如 `ts` 或 `ts desc`；收到: {text}",
+            )
+        tokens = segments[0].split()
+        col = tokens[0]
+        direction = tokens[1].lower() if len(tokens) > 1 else "asc"
+        if direction not in ("asc", "desc"):
+            raise _bad_request(
+                f"非法排序方向 `{direction}`",
+                hint="方向仅支持 asc / desc",
+            )
+        return col, direction, (col if direction == "asc" else f"{col} desc")
+
+    columns = table_columns(table, spec)
+    if spec is not None and spec.time is not None:
+        col = spec.time.name
+    elif spec is not None and spec.order_key:
+        col = spec.order_key
+    elif spec is not None and spec.primary_key:
+        col = spec.primary_key[0]
+    elif columns:
+        col = columns[0]
+    else:
+        raise AppError(
+            detail="无法确定默认排序列",
+            hint="该表没有契约也没有数据，请显式传 order_by",
+            status=409,
+        )
+    return col, "asc", col
+
+
+def cached_row_count(db_uri: str, table: Any, name: str) -> int:
+    """带 TTL 缓存的 count_rows：防止 Overview 首屏被大表拖慢。"""
+    cache_key = (db_uri, name)
+    now = time.monotonic()
+    hit = _ROW_COUNT_CACHE.get(cache_key)
+    if hit is not None and hit[0] > now:
+        return hit[1]
+    count = table.count_rows()
+    _ROW_COUNT_CACHE[cache_key] = (now + ROW_COUNT_TTL_SECONDS, count)
+    return count
+
+
+def invalidate_row_count(db_uri: str, name: str) -> None:
+    """写操作成功后失效对应表的行数缓存。"""
+    _ROW_COUNT_CACHE.pop((db_uri, name), None)
+
+
+def require_time_contract(spec: Any) -> None:
+    """timeseries 快捷查询能力门控：无 time 契约 → 409。"""
+    if spec is None or spec.time is None:
+        raise AppError(
+            detail="该表无 time 契约",
+            hint="timeseries 快捷查询仅适用于时序表；普通表请使用 where 条件查询(/rows)",
+            status=409,
+        )
+
+
+def _parse_int_param(value: Optional[str], label: str) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise _bad_request(
+            f"{label} 必须是整数",
+            hint=f"收到: {value!r}；时间戳请传毫秒整数",
+        ) from exc
+
+
+# ---------------------------------------------------------------- 错误 handler
+
+
+def _register_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(AppError)
+    async def handle_app_error(request: Request, exc: AppError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status,
+            content={"detail": exc.detail, "hint": exc.hint},
+        )
+
+    @app.exception_handler(IosqlError)
+    async def handle_iosql_error(request: Request, exc: IosqlError) -> JSONResponse:
+        # iosql 异常映射：参数类→422，冲突/危险操作→409，其余→400；
+        # hint 给类型化修复指引，避免用户面对裸异常字符串
+        if isinstance(exc, BadArgument):
+            status = 422
+        elif isinstance(exc, (UnsafeOperation, TableSpecConflict, SchemaConflict)):
+            status = 409
+        else:
+            status = 400
+        hints: dict[type, str] = {
+            MissingTimeColumn: "timeseries 快捷查询仅适用于声明了 time 契约的表",
+            TableSpecConflict: "不要对已存在的表重复声明不同契约；打开表请用不带契约参数的 db.table(name)",
+            UnsafeOperation: "该操作有数据安全风险，请按界面预览-确认流程执行",
+        }
+        hint = next((h for t, h in hints.items() if isinstance(exc, t)), None)
+        return JSONResponse(
+            status_code=status,
+            content={"detail": str(exc), "hint": hint},
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        first = exc.errors()[:3]
+        summary = "; ".join(
+            f"{'.'.join(str(loc) for loc in err.get('loc', []))}: {err.get('msg', '')}"
+            for err in first
+        )
+        return JSONResponse(
+            status_code=422,
+            content={"detail": "请求体校验失败", "hint": summary},
+        )
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        # 兜底防线：未预期异常也保持 {detail,hint} 形状，不让堆栈直泄给前端
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"内部错误: {exc}", "hint": "请查看服务端日志定位问题"},
+        )
+
+
+# ---------------------------------------------------------------- lifespan
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    from iosql import Database
+
+    # 进程单例：uvicorn 单 worker 下整个进程只有这一个 Database 连接池
+    db = Database(app.state.db_uri)
+    app.state.db = db
+    try:
+        yield
+    finally:
+        db.close()
+        app.state.db = None
+
+
+# ---------------------------------------------------------------- 只读端点
+
+
+def _register_read_routes(app: FastAPI) -> None:
+    @app.get("/api/db")
+    def get_db_info(request: Request) -> dict:
+        db = request.app.state.db
+        return {
+            "uri": db.uri,
+            "mode": request.app.state.mode,
+            "table_count": len(db.table_names()),
+        }
+
+    @app.get("/api/tables")
+    def list_tables(request: Request) -> dict:
+        db = request.app.state.db
+        db_uri = db.uri
+        tables = []
+        for name in db.table_names():
+            table = get_table(db, name)
+            spec = table.spec()
+            row_count = cached_row_count(db_uri, table, name)
+            partition = spec.partition if spec is not None else None
+            partition_data = serialize_partition(partition)
+            tables.append({
+                "name": name,
+                "row_count": row_count,
+                "part_count": len(table.table_parts()),
+                "segment_count": len(table.segments()),
+                "partition_str": (
+                    partition_data["str"] if partition_data else None
+                ),
+                "has_time": spec is not None and spec.time is not None,
+                "columns": [
+                    {"name": col, "type": str(typ)}
+                    for col, typ in (spec.columns or {}).items()
+                ] if spec is not None else [],
+                "order_key": spec.order_key if spec is not None else None,
+                "pk": list(spec.primary_key) if spec is not None else [],
+            })
+        return {"tables": tables}
+
+    @app.get("/api/table/{name}/spec")
+    def get_spec(name: str, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        return {"name": name, "spec": serialize_contract(table.spec())}
+
+    @app.get("/api/table/{name}/parts")
+    def get_parts(name: str, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        return {"parts": table.table_parts()}
+
+    @app.get("/api/table/{name}/segments")
+    def get_segments(name: str, request: Request,
+                     include_obsolete: bool = False) -> dict:
+        table = get_table(request.app.state.db, name)
+        return {
+            "segments": serialize_segments(
+                table.segments(include_obsolete=include_obsolete)
+            )
+        }
+
+    @app.post("/api/table/{name}/rows")
+    def post_rows(name: str, body: RowsBody, request: Request) -> dict:
+        db = request.app.state.db
+        table = get_table(db, name)
+        spec = table.spec()
+        comps = normalize_where(body.where)
+        col, direction, _applied = resolve_sort_col(table, spec, body.order_by)
+
+        # 复合 keyset：排序列后追加全部主键列做次级排序，消除同值并列丢行。
+        # 游标为 [各排序列值...]，条件展开为 OR 链：
+        #   (c1 > v1) OR (c1 == v1 AND c2 > v2) OR ...（desc 时比较方向反转）
+        pk_cols = list(spec.primary_key or []) if spec is not None else []
+        order_cols = [col] + [p for p in pk_cols if p != col]
+        word = "desc" if direction == "desc" else "asc"
+        applied = ", ".join(f"{c} {word}" for c in order_cols)
+
+        limit = max(1, min(int(body.limit), MAX_PAGE_LIMIT))
+        where_expr: Any = comps  # 无游标时沿用 dict 列表（AND 语义）
+        if body.cursor is not None:
+            if not isinstance(body.cursor, (list, tuple)):
+                raise _bad_request(
+                    "cursor 必须是数组",
+                    hint=f"游标为首页响应 next_cursor 原样回传的列表，长度应为 {len(order_cols)}",
+                )
+            vals = list(body.cursor)
+            if len(vals) != len(order_cols):
+                raise _bad_request(
+                    f"cursor 长度 {len(vals)} 与排序键 {len(order_cols)} 列不一致",
+                    hint=f"order_cols={order_cols}；请原样回传上一页 next_cursor",
+                )
+            strict_op = "<" if direction == "desc" else ">"
+            eq_op = "=="
+            expr: Any = None
+            prefix_eq: Any = None
+            for i, c in enumerate(order_cols):
+                branch: Any = Case(c, strict_op, vals[i])
+                if prefix_eq is not None:
+                    branch = prefix_eq * branch
+                expr = branch if expr is None else expr + branch
+                eq_i = Case(c, eq_op, vals[i])
+                prefix_eq = eq_i if prefix_eq is None else prefix_eq * eq_i
+            if comps:
+                user_chain: Any = Case(
+                    comps[0]["field"], comps[0]["op"], comps[0]["value"])
+                for d in comps[1:]:
+                    user_chain = user_chain * Case(d["field"], d["op"], d["value"])
+                expr = user_chain * expr
+            where_expr = expr
+
+        rows = table.select(
+            "*", where=where_expr, order_by=applied,
+            limit=limit + 1, to_dict=True,
+        )
+        next_cursor = None
+        if len(rows) > limit:
+            rows = rows[:limit]
+            next_cursor = [rows[-1].get(c) for c in order_cols]
+        columns = list(rows[0].keys()) if rows else table_columns(table, spec)
+        return {
+            "columns": columns,
+            "rows": rows,
+            "next_cursor": next_cursor,
+            "order_by": applied,
+        }
+
+    @app.post("/api/table/{name}/explain")
+    def post_explain(name: str, body: RowsBody, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        comps = normalize_where(body.where)
+        plan = table.explain_select("*", where=comps, order_by=body.order_by)
+        return {"plan": serialize_plan(plan)}
+
+    @app.post("/api/table/{name}/count")
+    def post_count(name: str, body: CountBody, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        comps = normalize_where(body.where)
+        if comps:
+            # 有筛选时 iosql 没有 SQL 级 count(where)，流式累计避免整表载入内存
+            total = 0
+            for batch in table.iter_select_batches(
+                "*", where=comps, to_dict=True, batch_size=EXPORT_BATCH_SIZE
+            ):
+                total += len(batch)
+            return {"count": total}
+        return {"count": table.count_rows()}
+
+    @app.post("/api/table/{name}/query")
+    def post_query(name: str, body: QueryBody, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        require_time_contract(table.spec())
+        comps = normalize_where(body.where)
+        fluent = table.query(
+            symbols=body.symbols,
+            start=body.start,
+            end=body.end,
+            date=body.date,
+            session=body.session,
+            columns=body.columns if body.columns is not None else "*",
+            where=comps,
+            order_by=body.order_by,
+            limit=max(1, min(int(body.limit), MAX_QUERY_LIMIT)),
+        )
+        rows = fluent.to_list()
+        truncated = len(rows) >= max(1, min(int(body.limit), MAX_QUERY_LIMIT))
+        columns = (
+            list(rows[0].keys()) if rows
+            else (list(body.columns) if isinstance(body.columns, list) else [])
+        )
+        return {"rows": rows, "columns": columns, "truncated": truncated}
+
+    @app.post("/api/table/{name}/latest")
+    def post_latest(name: str, body: LatestBody, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        require_time_contract(table.spec())
+        comps = normalize_where(body.where)
+        fluent = table.latest(
+            symbols=body.symbols,
+            as_of=body.as_of,
+            by=body.by,
+            columns=body.columns if body.columns is not None else "*",
+            where=comps,
+            session=body.session,
+        )
+        return {"rows": fluent.to_list()}
+
+    @app.get("/api/table/{name}/chart")
+    def get_chart(name: str, request: Request,
+                  col: str = Query(...),
+                  symbol: str = Query(""),
+                  start: Optional[str] = Query(None),
+                  end: Optional[str] = Query(None),
+                  buckets: int = Query(DEFAULT_CHART_BUCKETS),
+                  kind: str = Query("line")) -> dict:
+        return _chart_endpoint(name, request, col, symbol, start, end, buckets, kind)
+
+    @app.get("/api/table/{name}/export")
+    def get_export(name: str, request: Request,
+                   format: str = Query(...),
+                   where: Optional[str] = Query(None),
+                   order_by: Optional[str] = Query(None),
+                   limit: Optional[int] = Query(None)) -> StreamingResponse:
+        return _export_endpoint(name, request, format, where, order_by, limit)
+
+    @app.get("/api/table/{name}/layout_report")
+    def get_layout_report(name: str, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        return {"report": serialize_layout_report(table.layout_report())}
+
+    @app.post("/api/table/{name}/validate")
+    def post_validate(name: str, body: ValidateBody, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        validation = table.validate(deep=body.deep)
+        return {"validation": serialize_result(validation)}
+
+
+# ---------------------------------------------------------------- chart 实现
+
+
+def _detect_ohlc(columns: list[str]) -> Optional[tuple[str, str, str, str]]:
+    """检测 OHLC 列名集合：open/high/low/close 或 o/h/l/c 全存在才支持 candle。"""
+    lowered = {c.lower(): c for c in columns}
+    for group in (("open", "high", "low", "close"), ("o", "h", "l", "c")):
+        if all(g in lowered for g in group):
+            o, h, l, c = (lowered[g] for g in group)
+            return (o, h, l, c)
+    return None
+
+
+def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
+                    start: Optional[str], end: Optional[str],
+                    buckets: int, kind: str) -> dict:
+    if kind not in ("line", "candle"):
+        raise _bad_request(
+            f"非法图型 `{kind}`",
+            hint="kind 仅支持 line（折线）或 candle（K线，需表含 OHLC 列）",
+        )
+    db = request.app.state.db
+    table = get_table(db, name)
+    spec = table.spec()
+    columns = table_columns(table, spec)
+    if col not in columns:
+        raise _bad_request(
+            f"数值列 `{col}` 不存在",
+            hint=f"可用列: {', '.join(columns)}",
+        )
+
+    ohlc: Optional[tuple[str, str, str, str]] = None
+    if kind == "candle":
+        ohlc = _detect_ohlc(columns)
+        if ohlc is None:
+            # 契约行为（GOAL 冻结）：缺 OHLC 而 kind=candle 必须 422，
+            # 不做静默降级——前端需要明确的错误提示来切换图型
+            raise _bad_request(
+                "该表缺少 OHLC 列，无法绘制 K 线",
+                hint="candle 需要 open/high/low/close（或 o/h/l/c）四列齐全；"
+                     "请改用 kind=line",
+            )
+
+    x_col, _, _ = resolve_sort_col(table, spec, None)
+    # chart 的数值列（y 值）不允许文本；x 轴列允许数字或纯数字字符串
+    # （calendar 分区的 YYYYMMDD 日期字符串），其余文本在分桶前给出明确错误
+    x_is_text = False
+    if spec is not None and spec.columns:
+        col_type = str(spec.columns.get(col, "")).lower()
+        if any(t in col_type for t in ("text", "char", "blob")):
+            raise _bad_request(
+                f"数值列 `{col}` 是文本类型，无法绘图",
+                hint="chart 仅支持 integer/real 等数值列",
+            )
+        x_type = str(spec.columns.get(x_col, "")).lower()
+        x_is_text = any(t in x_type for t in ("text", "char", "blob"))
+
+    comps: list[dict[str, Any]] = []
+
+    sym_col = (spec.symbol_column if spec is not None else None) or "symbol"
+    if symbol:
+        symbols = [s.strip() for s in symbol.split(",") if s.strip()]
+        if len(symbols) == 1:
+            comps.append({"field": sym_col, "op": "==", "value": symbols[0]})
+        elif symbols:
+            comps.append({"field": sym_col, "op": "in", "value": symbols})
+
+    start_val = _parse_int_param(start, "start")
+    end_val = _parse_int_param(end, "end")
+    # 文本列与整数在 SQLite 比较时恒为 TEXT > INTEGER，整数条件会静默失效，
+    # 因此文本 x 列的边界值必须以字符串下发
+    if start_val is not None:
+        comps.append({
+            "field": x_col, "op": ">=",
+            "value": str(start_val) if x_is_text else start_val,
+        })
+    if end_val is not None:
+        comps.append({
+            "field": x_col, "op": "<=",
+            "value": str(end_val) if x_is_text else end_val,
+        })
+
+    n_buckets = max(1, min(int(buckets), MAX_CHART_BUCKETS))
+
+    # 两遍流式扫描：第一遍只读 x 列求范围（内存 O(1)），第二遍分桶聚合。
+    # first_is_str 兜底无契约表（spec.columns 缺失时 x_is_text 未判定）的文本 x 轴
+    x_min: Optional[Any] = None
+    x_max: Optional[Any] = None
+    scanned = 0
+    first_is_str: Optional[bool] = None
+    for batch in table.iter_select_batches(
+        [x_col], where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
+    ):
+        for row in batch:
+            value = row.get(x_col)
+            if value is None:
+                continue
+            scanned += 1
+            if scanned > MAX_CHART_SCAN_ROWS:
+                raise _bad_request(
+                    f"扫描行数超过上限 {MAX_CHART_SCAN_ROWS}",
+                    hint="请缩小时间窗（start/end）或增大分区粒度后再绘图",
+                )
+            is_str = isinstance(value, str)
+            if first_is_str is None:
+                first_is_str = is_str
+            elif is_str != first_is_str:
+                raise _bad_request(
+                    f"x 轴列 `{x_col}` 含混合类型数据",
+                    hint="同一列内文本与数值混存无法分桶，请先清洗该列",
+                )
+            if x_min is None or value < x_min:
+                x_min = value
+            if x_max is None or value > x_max:
+                x_max = value
+
+    result: dict[str, Any]
+    if scanned == 0 or x_min is None or x_max is None:
+        base: dict[str, Any] = {"kind": kind}
+        if kind == "line":
+            base.update({"x": [], "y": [], "col": col, "symbol": symbol or None})
+        else:
+            base.update({"x": [], "open": [], "high": [], "low": [], "close": []})
+        return base
+
+    # x 轴数值化：数字直接用；calendar 的 YYYYMMDD 等纯数字字符串转 int；
+    # 其他文本无法分桶，明确报错而非让减法运算 500。
+    # spec 缺失时以扫描期类型探测兜底（Oracle M4）
+    x_text_mode = x_is_text or bool(first_is_str)
+    if x_text_mode:
+        if not (isinstance(x_min, str) and x_min.strip().isdigit()
+                and isinstance(x_max, str) and x_max.strip().isdigit()):
+            raise _bad_request(
+                f"x 轴列 `{x_col}` 是非数字文本，无法分桶绘图",
+                hint="支持整数/浮点与 YYYYMMDD 等纯数字日期字符串；"
+                     "ISO 日期请改用 duration 毫秒时间戳分区表",
+            )
+        x_num_min: Any = int(x_min.strip())
+        x_num_max: Any = int(x_max.strip())
+    else:
+        x_num_min = x_min
+        x_num_max = x_max
+
+    def to_num(value: Any) -> Any:
+        if x_text_mode:
+            return int(str(value).strip())
+        return value
+
+    span = x_num_max - x_num_min
+    width = span // n_buckets + 1 if span >= 0 else 1
+
+    def bucket_index(xv: Any) -> int:
+        idx = int((to_num(xv) - x_num_min) // width)
+        return min(max(idx, 0), n_buckets - 1)
+
+    if kind == "line":
+        sums = [0.0] * n_buckets
+        counts = [0] * n_buckets
+        mids: list[Any] = []
+        ys: list[float] = []
+        try:
+            for batch in table.iter_select_batches(
+                "*", where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
+            ):
+                for row in batch:
+                    xv = row.get(x_col)
+                    yv = row.get(col)
+                    if xv is None:
+                        continue
+                    idx = bucket_index(xv)
+                    if yv is not None:
+                        sums[idx] += float(yv)
+                        counts[idx] += 1
+        except (TypeError, ValueError) as exc:
+            raise _bad_request(
+                f"列 `{col}` 含非数值数据，无法聚合",
+                hint="chart 仅支持数值列；请换一列或检查数据质量",
+            ) from exc
+        for i in range(n_buckets):
+            if counts[i]:
+                mids.append(x_num_min + i * width + width // 2)
+                ys.append(sums[i] / counts[i])
+        result = {
+            "kind": "line",
+            "x": mids,
+            "y": ys,
+            "col": col,
+            "symbol": symbol or None,
+        }
+    else:
+        assert ohlc is not None
+        o_col, h_col, l_col, c_col = ohlc
+        opens: list[Any] = [None] * n_buckets
+        closes: list[Any] = [None] * n_buckets
+        has_data = [False] * n_buckets
+        high_map: dict[int, float] = {}
+        low_map: dict[int, float] = {}
+        try:
+            for batch in table.iter_select_batches(
+                "*", where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
+            ):
+                for row in batch:
+                    xv = row.get(x_col)
+                    if xv is None:
+                        continue
+                    idx = bucket_index(xv)
+                    if not has_data[idx]:
+                        has_data[idx] = True
+                        opens[idx] = row.get(o_col)
+                    cv = row.get(c_col)
+                    if cv is not None:
+                        closes[idx] = cv
+                    hv = row.get(h_col)
+                    if hv is not None:
+                        high_map[idx] = max(high_map.get(idx, float(hv)), float(hv))
+                    lv = row.get(l_col)
+                    if lv is not None:
+                        low_map[idx] = min(low_map.get(idx, float(lv)), float(lv))
+        except (TypeError, ValueError) as exc:
+            raise _bad_request(
+                "OHLC 列含非数值数据，无法聚合",
+                hint="candle 要求 open/high/low/close 列均为数值类型；请检查数据质量",
+            ) from exc
+        mids = []
+        highs: list[float] = []
+        lows: list[float] = []
+        kept_opens: list[Any] = []
+        kept_closes: list[Any] = []
+        for i in range(n_buckets):
+            if not has_data[i]:
+                continue
+            mids.append(x_num_min + i * width + width // 2)
+            kept_opens.append(opens[i])
+            kept_closes.append(closes[i])
+            # high/low 缺失时以 close/open 兜底，保证输出恒为合法数值（JSON 不允许 NaN）
+            fallback_high = closes[i] if closes[i] is not None else opens[i]
+            fallback_low = opens[i] if opens[i] is not None else closes[i]
+            highs.append(high_map.get(i, float(fallback_high or 0.0)))
+            lows.append(low_map.get(i, float(fallback_low or 0.0)))
+        result = {
+            "kind": "candle",
+            "x": mids,
+            "open": kept_opens,
+            "high": highs,
+            "low": lows,
+            "close": kept_closes,
+        }
+    return result
+
+
+# ---------------------------------------------------------------- export 实现
+
+
+def _export_endpoint(name: str, request: Request, format: str,
+                     where: Optional[str], order_by: Optional[str],
+                     limit: Optional[int]) -> StreamingResponse:
+    if format not in ("csv", "jsonl"):
+        raise _bad_request(
+            f"非法导出格式 `{format}`",
+            hint="format 仅支持 csv 或 jsonl",
+        )
+    table = get_table(request.app.state.db, name)
+    if order_by:
+        # iter_select_batches 带 order_by 时引擎内部退化为全量物化排序，
+        # 大表会 OOM；导出语义本就无需稳定顺序，这里显式拒绝而非静默退化
+        raise _bad_request(
+            "export 暂不支持 order_by",
+            hint="导出按分区/segment 自然顺序流式产出以保证内存可控；"
+                 "如需有序结果请用 /rows 分页拉取",
+        )
+    spec = table.spec()
+    comps: Optional[list[dict[str, Any]]] = None
+    if where:
+        try:
+            parsed = json.loads(where)
+        except json.JSONDecodeError as exc:
+            raise _bad_request(
+                "where 参数不是合法 JSON",
+                hint="请对条件数组做 URL 编码后传入，"
+                     '示例: where=[{"field":"symbol","op":"==","value":"AAPL"}',
+            ) from exc
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+        comps = normalize_where(parsed)
+
+    media_types = {"csv": "text/csv", "jsonl": "application/x-ndjson"}
+    headers = {
+        "Content-Disposition": f'attachment; filename="{name}.{format}"',
+    }
+    batch_iter = table.iter_select_batches(
+        "*", where=comps, limit=limit,
+        to_dict=True, batch_size=EXPORT_BATCH_SIZE,
+    )
+    # 预取首个批次：字段级错误（未知列名等）在响应头发出的 200 之前暴露，
+    # 否则客户端只会拿到截断文件而看不到 {detail, hint}
+    first_batch = next(batch_iter, None)
+    csv_columns = table_columns(table, spec)
+    generator = _export_stream(batch_iter, first_batch, format, csv_columns)
+    return StreamingResponse(
+        generator,
+        media_type=media_types[format],
+        headers=headers,
+    )
+
+
+def _export_stream(batch_iter: Iterator[list[dict[str, Any]]],
+                   first_batch: Optional[list[dict[str, Any]]],
+                   format: str,
+                   csv_columns: list[str]) -> Iterator[str]:
+    """批处理流式产出文件内容。
+
+    csv 列集在流式开始前由契约/抽样预计算（evolve 扩列后契约 columns 是
+    schema 上确界），避免以首行为准静默丢弃后续批次的新增列。
+    """
+    batches: Iterator[list[dict[str, Any]]] = (
+        chain([first_batch], batch_iter) if first_batch is not None else batch_iter
+    )
+    header_written = False
+    for batch in batches:
+        buffer = StringIO()
+        if format == "csv":
+            writer = csv.writer(buffer, lineterminator="\n")
+            if not header_written and csv_columns:
+                writer.writerow(csv_columns)
+                header_written = True
+            for row in batch:
+                writer.writerow([row.get(c) for c in csv_columns])
+        else:
+            for row in batch:
+                buffer.write(json.dumps(row, ensure_ascii=False, default=str))
+                buffer.write("\n")
+        yield buffer.getvalue()
+
+
+# ---------------------------------------------------------------- 写端点（仅 write 模式注册）
+
+
+def _register_write_routes(app: FastAPI) -> None:
+    dependencies = [Depends(require_write_mode)]
+
+    @app.post("/api/table/{name}/write", dependencies=dependencies)
+    def post_write(name: str, body: WriteBody, request: Request) -> dict:
+        db = request.app.state.db
+        table = get_table(db, name)
+        if not isinstance(body.rows, list) or not body.rows:
+            raise _bad_request(
+                "rows 必须是非空列表",
+                hint='示例: {"rows": [{"symbol":"AAPL","ts":1735689600000,"price":187.4}]}',
+            )
+        if any(not isinstance(row, dict) for row in body.rows):
+            raise _bad_request(
+                "rows 中每个元素必须是对象",
+                hint='示例: {"rows": [{"symbol":"AAPL","ts":1735689600000,"price":187.4}]}',
+            )
+        if body.mode is not None and body.mode not in WRITE_MODES:
+            raise _bad_request(
+                f"非法写入模式 `{body.mode}`",
+                hint=f"mode 仅支持: {', '.join(WRITE_MODES)}；不传则使用表契约 conflict",
+            )
+        result = table.write(body.rows, mode=body.mode if body.mode else None)
+        invalidate_row_count(db.uri, name)
+        return {"result": serialize_result(result)}
+
+    @app.post("/api/table/{name}/delete", dependencies=dependencies)
+    def post_delete(name: str, body: DeleteBody, request: Request) -> dict:
+        db = request.app.state.db
+        table = get_table(db, name)
+        if not body.where:
+            raise AppError(
+                detail="where 必填",
+                hint="条件删除必须提供过滤条件；如需清空全表请使用 truncate 并输入表名确认",
+                status=422,
+            )
+        comps = normalize_where(body.where)
+        deleted = table.delete(comps)
+        invalidate_row_count(db.uri, name)
+        return {"deleted": deleted}
+
+    @app.post("/api/table/{name}/truncate", dependencies=dependencies)
+    def post_truncate(name: str, body: TruncateBody, request: Request) -> dict:
+        db = request.app.state.db
+        table = get_table(db, name)
+        if body.confirm != name:
+            raise _bad_request(
+                "确认文本不匹配",
+                hint=f"清空表不可恢复；请在 confirm 字段中输入表名 `{name}` 以确认",
+            )
+        result = table.truncate(confirm=True)
+        invalidate_row_count(db.uri, name)
+        return {"result": serialize_result(result)}
+
+    @app.post("/api/table/{name}/create_index", dependencies=dependencies)
+    def post_create_index(name: str, body: CreateIndexBody,
+                          request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        if body.order not in ("asc", "desc"):
+            raise _bad_request(
+                f"非法索引方向 `{body.order}`",
+                hint="order 仅支持 asc / desc",
+            )
+        table.create_index(body.column, order=body.order)
+        # iosql create_index 返回 None（探针确认），回显输入作为执行凭据
+        return {"result": {"column": body.column, "order": body.order}}
+
+    @app.post("/api/table/{name}/compact", dependencies=dependencies)
+    def post_compact(name: str, body: CompactBody, request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        result = table.compact(partition=body.partition, target_rows=body.target_rows)
+        return {"result": serialize_result(result)}
+
+    @app.post("/api/table/{name}/cleanup_obsolete", dependencies=dependencies)
+    def post_cleanup_obsolete(name: str, body: CleanupBody,
+                              request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        # 保留 iosql 自带语义：实删前默认 validate(deep=True)，失败抛 UnsafeOperation
+        result = table.cleanup_obsolete(
+            dry_run=body.dry_run, partition=body.partition
+        )
+        return {"result": serialize_result(result)}
+
+    @app.post("/api/table/{name}/repartition", dependencies=dependencies)
+    def post_repartition(name: str, body: RepartitionBody,
+                         request: Request) -> dict:
+        table = get_table(request.app.state.db, name)
+        target_uri = str(body.target_uri or "").strip()
+        if not target_uri:
+            raise _bad_request(
+                "target_uri 必填",
+                hint="重分区永远写入新库（源库不变），示例: sqlite://db/market-hourly.iosql",
+            )
+        try:
+            new_partition = parse_partition_spec(body.partition_str)
+        except PartitionSpecError as exc:
+            raise _bad_request(
+                f"非法 partition 表达式: {exc}",
+                hint=_PARTITION_HINT,
+            ) from exc
+        spec = table.spec()
+        if spec is None:
+            raise AppError(
+                detail="该表没有持久化契约，无法重分区",
+                hint="repartition_to 需要基于现有契约生成新布局",
+                status=409,
+            )
+        # 探针确认：with_partition 同时接受字符串与 PartitionSpec 对象，传解析后的对象
+        new_spec = spec.with_partition(partition=new_partition)
+        result = table.repartition_to(target_uri, spec=new_spec)
+        return {"result": serialize_result(result)}
+
+
+# ---------------------------------------------------------------- 工厂
+
+
+def _register_api_fallback(app: FastAPI) -> None:
+    """API 兜底路由：吞掉所有未匹配的 /api/* 请求，统一返回 404。
+
+    必须在全部 API 路由（含写路由）之后注册。没有它时，readonly 进程里
+    未注册的写路径会落到静态挂载上返回 405 Method Not Allowed——这既泄露
+    "该路径形态存在"的信息，也违反"写端点不存在（404）"的安全模型。
+    """
+
+    @app.api_route("/api/{rest:path}", methods=[
+        "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS",
+    ], include_in_schema=False)
+    def api_fallback(rest: str) -> JSONResponse:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": "端点不存在", "hint": "请对照设计文档第 7 节的 API 契约"},
+        )
+
+
+def create_app(db_uri: str, mode: str = "readonly") -> FastAPI:
+    """创建 iosql UI 的 FastAPI 应用。
+
+    - mode="readonly"（默认）：只注册读路由，写端点不存在（404）。
+    - mode="write"：额外注册写路由（均挂 require_write_mode 守卫）。
+    - Database 在 lifespan 启动时创建（进程单例），shutdown 时 close()；
+      TestClient 需用 ``with TestClient(app)`` 才能触发完整生命周期。
+    """
+    if mode not in MODES:
+        raise BadArgument(
+            f"非法 mode `{mode}`，仅支持: {', '.join(MODES)}"
+        )
+
+    app = FastAPI(title="iosql UI", lifespan=_lifespan)
+    app.state.db_uri = db_uri
+    app.state.mode = mode
+    app.state.db = None
+
+    _register_error_handlers(app)
+    _register_read_routes(app)
+    if mode == "write":
+        # 结构性隔离：readonly 进程里写路由从未注册，而非注册后被拒
+        _register_write_routes(app)
+    # 兜底 404 必须在所有 API 路由之后、静态挂载之前
+    _register_api_fallback(app)
+
+    static_dir = Path(__file__).parent / "static"
+    # API 路由之后挂载静态目录，SPA 入口兜底其余路径
+    app.mount(
+        "/",
+        StaticFiles(directory=str(static_dir), html=True, check_dir=False),
+        name="static",
+    )
+    return app

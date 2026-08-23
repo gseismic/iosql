@@ -8,10 +8,12 @@ import io
 import json
 import os
 import shutil
+import threading
 import time
+import webbrowser
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, NoReturn, Optional
 
 import typer
 
@@ -29,7 +31,7 @@ _ROW_FORMATS = {"json", "jsonl", "csv"}
 _WRITE_MODES = {"append", "ignore", "upsert", "replace"}
 
 
-def _fail(message: str, code: int = 1) -> None:
+def _fail(message: str, code: int = 1) -> NoReturn:
     typer.secho(message, fg=typer.colors.RED, err=True)
     raise typer.Exit(code)
 
@@ -1528,6 +1530,38 @@ def restore(
         shutil.rmtree(target_path)
     shutil.copytree(backup_path, target_path, dirs_exist_ok=False)
     _echo_json({"backup": str(backup_path), "target": str(target_path)})
+
+
+@app.command()
+def ui(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    write: bool = typer.Option(False, "--write", help="开启可修改模式（默认只读）"),
+    host: str = typer.Option("127.0.0.1", "--host", help="服务绑定地址"),
+    port: int = typer.Option(8686, "--port", help="服务端口"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="启动后不自动打开浏览器"),
+):
+    """启动本地 Web 管理台。"""
+    source_uri = _parse_uri(source)
+    source_path = _uri_to_path(source_uri)
+    if not source_path.exists():
+        raise typer.BadParameter(f"数据库不存在: {source_path}")
+
+    # 惰性导入：UI 依赖属于 [ui] extra，未安装时给出安装指引
+    try:
+        from iosql.ui import create_app
+        import uvicorn
+    except ImportError:
+        _fail('UI 依赖未安装，请先执行: pip install "iosql[ui]"')
+
+    mode = "write" if write else "readonly"
+    web_app = create_app(source_uri, mode=mode)
+    url = f"http://{host}:{port}"
+    mode_label = "WRITABLE" if write else "READ-ONLY"
+    typer.secho(f"iosql UI: {url} ({mode_label})", fg=typer.colors.GREEN)
+    if not no_browser:
+        # 延迟打开浏览器，等 uvicorn 完成监听
+        threading.Timer(1.0, webbrowser.open, args=(url,)).start()
+    uvicorn.run(web_app, host=host, port=port)
 
 
 @index_app.command("list")

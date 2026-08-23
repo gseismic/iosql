@@ -11,6 +11,7 @@
 - **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`write_buffer()` 缓冲批量写入。
 - **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
 - **时序语法糖**：`Database.timeseries()` 是 `table()` 的薄封装（duration/calendar 分区 + order_key + time），适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
+- **可视化管理台**：`iosql ui -s <db>` 启动本地 Web 管理台（默认只读，`--write` 开启维护），支持数据浏览、契约/分区/segment 透视、explain 裁剪可视化与时序快览图表。
 
 ## Partition 与 Segment 的关系
 
@@ -724,6 +725,44 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 `12_sqlite_postgresql_roundtrip.py` 未设置 `POSTGRES_DSN` 时只执行 dry-run；设置后会演示 `sqlite -> postgresql -> sqlite` 双向转换。
 
 低层 SQLite 工具示例位于 `examples/mysqlite/`，用于 `iosql.utils.mysqlite` 的 schema-on-write、批量写入、冲突处理和连接池清理。它们不是新的主 API 入口。
+
+## 可视化管理台（UI）
+
+iosql 自带一个本地 Web 管理台（只读浏览 + 受控维护），无需写代码即可查看表契约、分区布局、物理 segment 和数据样本。
+
+安装 UI 可选依赖：
+
+```bash
+python -m pip install -e ".[ui]"
+```
+
+启动（默认**只读模式**）：
+
+```bash
+iosql ui -s database/market.iosql
+# iosql UI: http://127.0.0.1:8686 (READ-ONLY)
+```
+
+开启可修改模式（写入与布局维护操作）：
+
+```bash
+iosql ui -s database/market.iosql --write
+```
+
+其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`（不自动打开浏览器）。
+
+功能分区：
+
+| 工作区 | 只读模式 | 可修改模式 | 说明 |
+| --- | :-: | :-: | --- |
+| Overview | ✅ | ✅ | 全库概览：表清单、行数、分区数、segment 数、partition 策略 |
+| Browse Data | ✅ | ✅ | 条件构造器筛选、keyset 翻页、排序、单元格详情、CSV/JSONL 导出 |
+| Structure | ✅ | ✅ | 表契约 / 逻辑分区 / 物理 segment 三层透视 |
+| Query | ✅ | ✅ | where 查询 + explain 裁剪可视化；时序表支持 start/end/date/session/latest 截面 |
+| Charts | ✅ | ✅ | 时序快览折线图（服务端降采样） |
+| Maintain | ❌ | ✅ | layout_report → compact → validate → cleanup_obsolete 步骤流；重分区 |
+
+安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需预览与手输表名确认。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
 
 ## 存储结构
 
