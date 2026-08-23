@@ -435,6 +435,34 @@ def test_cli_import_streams_jsonl_csv_and_keeps_json_compat(tmp_path, monkeypatc
     assert "batch-size 必须大于 0" in result.output
 
 
+def test_cli_import_ignore_mode_reports_rows_written_none(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+    jsonl_path = tmp_path / "dup.jsonl"
+    jsonl_path.write_text(
+        "\n".join([
+            json.dumps({"symbol": "AAPL", "ts": 1735689600000, "price": 999.0}),
+            json.dumps({"symbol": "NEW", "ts": 1736000000000, "price": 1.0}),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    result = _invoke(
+        "import",
+        "-s",
+        str(db_path),
+        "-t",
+        "ticks",
+        "-f",
+        str(jsonl_path),
+        "--mode",
+        "ignore",
+    )
+    assert result.exit_code == 0, result.output
+    summary = json.loads(result.output)
+    assert summary["rows_seen"] == 2
+    assert summary["rows_written"] is None
+
+
 class _FakeTargetTable:
     def __init__(self, table_name):
         self.table_name = table_name
@@ -611,6 +639,30 @@ def test_cli_backup_and_restore(tmp_path):
     result = _invoke("tables", "-s", str(restore_path))
     assert result.exit_code == 0
     assert "ticks" in result.output
+
+
+def test_cli_restore_replace_rejects_non_iosql_target(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+    backup_path = tmp_path / "backup.iosql"
+    result = _invoke("backup", "-s", str(db_path), "--target", str(backup_path))
+    assert result.exit_code == 0, result.output
+
+    target = tmp_path / "not_a_db"
+    target.mkdir()
+    (target / "random.txt").write_text("hello", encoding="utf-8")
+
+    result = _invoke(
+        "restore",
+        "--backup",
+        str(backup_path),
+        "--target",
+        str(target),
+        "--replace",
+        "--yes",
+    )
+    assert result.exit_code == 1
+    assert "不像 iosql 库" in result.output
+    assert (target / "random.txt").exists()
 
 
 def test_cli_repartition_default_behavior_and_flags(tmp_path):

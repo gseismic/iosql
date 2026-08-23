@@ -360,10 +360,14 @@ class Database(object):
             if exist_ok:
                 return self
             raise BadArgument("rename target is the current database")
-        if os.path.realpath(target_path).startswith(
-            os.path.realpath(source_path) + os.sep
-        ):
+        source_real = os.path.realpath(source_path)
+        target_real = os.path.realpath(target_path)
+        if target_real.startswith(source_real + os.sep):
             raise UnsafeOperation("rename target must not be inside the source database")
+        if source_real.startswith(target_real + os.sep):
+            raise UnsafeOperation(
+                "rename target must not contain the source database"
+            )
         if not os.path.isdir(source_path):
             raise BadArgument(f"database does not exist: {source_path}")
         if os.path.exists(target_path):

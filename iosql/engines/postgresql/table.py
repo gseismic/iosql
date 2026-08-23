@@ -4,6 +4,7 @@ import os
 import re
 import math
 import warnings
+import itertools
 from typing import Any, Dict, List, Optional
 import arrow
 import psycopg2
@@ -21,6 +22,9 @@ from ..sqlite.query_util import (
     build_or_cases_subquery,
     build_select_fields_sql,
 )
+
+
+_cursor_seq = itertools.count(1)
 
 
 class Table(BaseTable):
@@ -51,6 +55,15 @@ class Table(BaseTable):
         self._table_name = table_name
         self._uri_schema, self._uri_options = parse_db_schema(uri)
         self.verbose = verbose
+        if partition_mode not in (self.PARTITION_MODE_NATIVE, self.PARTITION_MODE_FILE):
+            raise BadArgument(f'invalid partition_mode: {partition_mode}')
+        if partition_mode == self.PARTITION_MODE_FILE:
+            raise BadArgument(
+                'PostgreSQL file partition mode is not supported: '
+                'file-per-partition writes to local SQLite files while reads '
+                'query only the PostgreSQL table, causing silent data loss. '
+                'Use native partitioning (default).'
+            )
         self.partition_mode = partition_mode
         self._partition = partition
         self._conn = None
@@ -706,37 +719,27 @@ class Table(BaseTable):
         if limit == 0:
             return
 
-        emitted = 0
-        offset = 0
-        while True:
-            current_limit = batch_size
-            if limit is not None:
-                remaining = limit - emitted
-                if remaining <= 0:
-                    break
-                current_limit = min(batch_size, remaining)
-
-            query, params = self._select_query(
-                fields,
-                where,
-                order_by=order_by,
-                limit=current_limit,
-                offset=offset,
-            )
-            conn = self.connect()
-            cursor = conn.cursor()
+        query, params = self._select_query(
+            fields,
+            where,
+            order_by=order_by,
+            limit=limit,
+        )
+        conn = self.connect()
+        cursor_name = f'iosql_iter_select_{next(_cursor_seq)}'
+        with conn.cursor(name=cursor_name, withhold=True) as cursor:
+            cursor.itersize = batch_size
             cursor.execute(query, params)
-            rows = cursor.fetchall()
-            if not rows:
-                break
-            if to_dict:
-                columns = [desc[0] for desc in cursor.description]
-                rows = [dict(zip(columns, row)) for row in rows]
-            yield rows
-            emitted += len(rows)
-            if len(rows) < current_limit:
-                break
-            offset += len(rows)
+            column_names = (
+                [desc[0] for desc in cursor.description] if to_dict else None
+            )
+            while True:
+                rows = cursor.fetchmany(batch_size)
+                if not rows:
+                    break
+                if to_dict:
+                    rows = [dict(zip(column_names, row)) for row in rows]
+                yield rows
 
     def count_rows(self):
         query, params = self._select_query("count(*)", None)
@@ -1024,12 +1027,22 @@ class Table(BaseTable):
         """Create an index on a column."""
         conn = self.connect()
         cursor = conn.cursor()
-        
-        order_str = 'DESC' if order.lower() == 'desc' else 'ASC'
+
+        order_value = str(order or 'asc').strip().lower()
+        if order_value not in ('asc', 'desc'):
+            raise BadArgument(f'invalid index order: {order}')
+        order_str = 'DESC' if order_value == 'desc' else 'ASC'
         index_name = f'{self._table_name}_{column}_idx'
-        
-        query = f'CREATE INDEX IF NOT EXISTS {index_name} ON {self._table_name} ({column} {order_str})'
-        
+
+        query = sql.SQL(
+            'CREATE INDEX IF NOT EXISTS {} ON {} ({} {})'
+        ).format(
+            sql.Identifier(index_name),
+            sql.Identifier(self._table_name),
+            sql.Identifier(column),
+            sql.SQL(order_str),
+        )
+
         cursor.execute(query)
         if self.verbose >= 1:
             logger.info(f'Created index {index_name}')

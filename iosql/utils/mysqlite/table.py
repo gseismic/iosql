@@ -68,7 +68,6 @@ class Table:
         # Type check will be handled by type hints
         self._database = database
         self._table_name = table_name
-        self.auto_commit = self.database.auto_commit
         self.verbose = self.database.verbose
         
         # Cache for frequently accessed properties
@@ -310,7 +309,7 @@ class Table:
         try:
             cursor.execute(sql)
             self._try_commit_on_connection(conn, commit)
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
             self._handle_error_on_connection(e, conn)
 
     def _execute_params_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
@@ -323,7 +322,7 @@ class Table:
         try:
             cursor.execute(sql, params or [])
             self._try_commit_on_connection(conn, commit)
-        except sqlite3.OperationalError as e:
+        except sqlite3.Error as e:
             self._handle_error_on_connection(e, conn)
 
     def _executemany_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
@@ -339,7 +338,7 @@ class Table:
         try:
             cursor.executemany(sql, list_values)
             self._try_commit_on_connection(conn, commit)
-        except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
+        except sqlite3.Error as e:
             self._handle_error_on_connection(e, conn)
 
     def execute(self, sql: str, commit: Optional[bool] = None) -> None:
@@ -350,7 +349,7 @@ class Table:
             try:
                 cursor.execute(sql)
                 self._try_commit_on_connection(conn, commit)
-            except sqlite3.OperationalError as e:
+            except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
 
     def execute_params(self, sql: str, params: Optional[List[Any]] = None,
@@ -371,7 +370,7 @@ class Table:
             try:
                 cursor.executemany(sql, list_values)
                 self._try_commit_on_connection(conn, commit)
-            except (sqlite3.OperationalError, sqlite3.ProgrammingError) as e:
+            except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
 
     def fetchall(self, sql: str, params: Optional[List[Any]] = None) -> List[Tuple]:
@@ -380,7 +379,7 @@ class Table:
             try:
                 cursor.execute(sql, params or [])
                 return cursor.fetchall()
-            except sqlite3.OperationalError as e:
+            except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
 
     def fetchone(self, sql: str, params: Optional[List[Any]] = None) -> Optional[Tuple]:
@@ -389,7 +388,7 @@ class Table:
             try:
                 cursor.execute(sql, params or [])
                 return cursor.fetchone()
-            except sqlite3.OperationalError as e:
+            except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
     
     def _try_commit_on_connection(self, conn: sqlite3.Connection, commit: Optional[bool]) -> None:
@@ -644,14 +643,19 @@ class Table:
         """在指定连接上确保列存在"""
         for column_name, value in od_fields.items():
             try:
-                type_ = suggest_value_type(value) or 'text'
+                type_ = (
+                    value
+                    if value in ('integer', 'float', 'text', 'blob')
+                    else (suggest_value_type(value) or 'text')
+                )
                 sql = getsql_add_column(self._table_name, column_name, type_)
                 cursor.execute(sql)
                 self._invalidate_cache()
                 if self.verbose >= 1:
                     logger.info(f'{self._table_name}: Added column {column_name} {type_}')
-            except DuplicateColumn:
-                pass
+            except sqlite3.OperationalError as e:
+                if 'duplicate column' not in str(e):
+                    raise
 
     def insert_all(self, list_kv: List[Dict[str, Any]], replace: bool = False, 
                    ignore: bool = False, batch_size: int = 5000, commit: bool = True, 
@@ -724,7 +728,7 @@ class Table:
             try:
                 cursor.execute(sql, values)
                 self._try_commit_on_connection(conn, True)
-            except sqlite3.OperationalError as e:
+            except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
 
     def count(self, where: Optional[str] = None) -> int:
@@ -823,6 +827,10 @@ class Table:
     @property
     def database(self) -> "my_database.Database":
         return self._database
+
+    @property
+    def auto_commit(self) -> bool:
+        return self.database.auto_commit
 
     @property
     def table_name(self) -> str:

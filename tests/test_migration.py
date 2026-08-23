@@ -191,12 +191,28 @@ class FakeCursor:
         self.description = []
         self.results = []
         self.fetchone_result = None
+        self.itersize = None
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
 
     def fetchall(self):
         return list(self.results)
+
+    def fetchmany(self, size=None):
+        if size is None:
+            rows = list(self.results)
+            self.results = []
+            return rows
+        rows = self.results[:size]
+        self.results = self.results[size:]
+        return rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        return False
 
     def fetchone(self):
         return self.fetchone_result
@@ -208,7 +224,7 @@ class FakeConnection:
         self.autocommit = False
         self.cursor_obj = FakeCursor()
 
-    def cursor(self):
+    def cursor(self, name=None, withhold=False, **kwargs):
         return self.cursor_obj
 
     def close(self):
@@ -364,8 +380,9 @@ def test_postgresql_select_iter_batches_and_count_are_parameterized(monkeypatch)
     assert len(batches) == 1
     batch_sql, batch_params = fake_conn.cursor_obj.executed[-1]
     assert 'WHERE ("ts" >= %s)' in batch_sql
-    assert "LIMIT %s OFFSET %s" in batch_sql
-    assert batch_params == [1000, 2, 0]
+    assert "LIMIT %s" in batch_sql
+    assert "OFFSET" not in batch_sql
+    assert batch_params == [1000, 2]
 
     assert table.count_rows() == 2
     count_sql, count_params = fake_conn.cursor_obj.executed[-1]
@@ -410,10 +427,10 @@ def test_postgresql_database_migrate_to_sqlite_batches_rows(tmp_path, monkeypatc
     assert result.verified is True
     assert result.source_rows == 3
     assert result.target_rows == 3
-    assert [params for _, params in fake_conn.cursor_obj.executed if params] == [
-        [2, 0],
-        [2, 2],
-    ]
+    assert not any(
+        'OFFSET' in str(query).upper()
+        for query, _ in fake_conn.cursor_obj.executed
+    )
 
     with Database(target_uri) as target:
         ticks = target.table("ticks")

@@ -304,6 +304,8 @@ class Table(BaseTable):
         if path is None or not db:
             raise InvalidUriSchema()
 
+        self._table_name = self._validate_table_name(self._table_name)
+
         self.db_path = os.path.join(path, db)
         self.db_meta_path = os.path.join(self.db_path, _DB_META_FILE)
 
@@ -341,7 +343,7 @@ class Table(BaseTable):
 
     def rename(self, new_name, exist_ok=False, overwrite=False):
         """重命名 SQLite 逻辑表目录并刷新表内 manifest。"""
-        new_name = self._validate_rename_table_name(new_name)
+        new_name = self._validate_table_name(new_name)
         old_name = self._table_name
         if new_name == old_name:
             if exist_ok:
@@ -375,7 +377,7 @@ class Table(BaseTable):
         self._partition = self._load_partition()
         return self
 
-    def _validate_rename_table_name(self, name):
+    def _validate_table_name(self, name):
         value = str(name or '').strip()
         if not value:
             raise BadArgument('table name must not be empty')
@@ -2300,7 +2302,11 @@ class Table(BaseTable):
             stats=stats,
             sealed=sealed,
             generation=segment.generation,
-            state='sealed' if sealed else 'active',
+            state=(
+                segment.state
+                if segment.state == 'obsolete'
+                else ('sealed' if sealed else 'active')
+            ),
             created_at=segment.created_at,
         )
         self._upsert_segment_info(info)
@@ -3400,32 +3406,33 @@ class Table(BaseTable):
         segment_kwargs.pop("table_contract", None)
         segment_kwargs.pop("table_spec", None)
 
-        for part_key, part_data in partitioned_data.items():
-            if use_segment:
-                self._do_insert_segmented(
-                    part_key,
-                    ts_col,
-                    part_data,
-                    pk,
-                    partition=part_obj,
-                    replace=replace,
-                    ignore=ignore,
-                    commit=commit,
-                    table_spec=segment_spec,
-                    **segment_kwargs,
-                )
-            else:
-                self._do_insert_part(
-                    part_key,
-                    ts_col,
-                    part_data,
-                    pk,
-                    partition=part_obj,
-                    replace=replace,
-                    ignore=ignore,
-                    commit=commit,
-                    **kwargs,
-                )
+        with self._compact_lock:
+            for part_key, part_data in partitioned_data.items():
+                if use_segment:
+                    self._do_insert_segmented(
+                        part_key,
+                        ts_col,
+                        part_data,
+                        pk,
+                        partition=part_obj,
+                        replace=replace,
+                        ignore=ignore,
+                        commit=commit,
+                        table_spec=segment_spec,
+                        **segment_kwargs,
+                    )
+                else:
+                    self._do_insert_part(
+                        part_key,
+                        ts_col,
+                        part_data,
+                        pk,
+                        partition=part_obj,
+                        replace=replace,
+                        ignore=ignore,
+                        commit=commit,
+                        **kwargs,
+                    )
         _t2 = time.time()
         logger.debug(f"Insert Time: {_t2 - _t1}")
         keys = list(partitioned_data)

@@ -199,7 +199,16 @@ class DatabaseConnectionPool:
                 self._checked_out -= 1
             should_close = self._closed
 
-        if should_close or not self._is_connection_alive(conn):
+        if should_close:
+            self._close_connection(conn)
+            return
+
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+
+        if not self._is_connection_alive(conn):
             self._close_connection(conn)
             return
 

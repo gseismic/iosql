@@ -82,6 +82,10 @@ def _backup_path(source_path: Path) -> Path:
     return source_path.with_name(f"{source_path.name}.backup_{ts}")
 
 
+def _is_iosql_like_database(path: Path) -> bool:
+    return (path / "meta.sqlite3").is_file()
+
+
 def _rmtree_robust(path: Path) -> None:
     """递归删除目录树，处理 FUSE 文件系统的 .fuse_hidden 残留文件。
 
@@ -1236,7 +1240,10 @@ def import_data(
             batch = _coerce_import_batch(batch, table_spec)
             rows_seen += len(batch)
             result = t.write(batch, mode=write_mode)
-            rows_written += result.rows_seen
+            if result.rows_written is None:
+                rows_written = None
+            elif rows_written is not None:
+                rows_written += result.rows_written
     finally:
         db.close()
     _echo_json({
@@ -1481,13 +1488,34 @@ def repartition(
 
     backup_path = None
     if source_replaced:
-        if not no_backup:
+        if no_backup:
+            moved_old_path = source_path.with_name(
+                f"{source_path.name}.repartition_old_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            os.replace(source_path, moved_old_path)
+            try:
+                os.replace(final_target_path, source_path)
+            except Exception:
+                os.replace(moved_old_path, source_path)
+                raise
+            _rmtree_robust(moved_old_path)
+        else:
             backup_path = Path(backup) if backup else _backup_path(source_path)
             if backup_path.exists():
                 _fail(f"备份目标已存在: {backup_path}")
-            shutil.copytree(source_path, backup_path, dirs_exist_ok=False)
-        _rmtree_robust(source_path)
-        shutil.move(str(final_target_path), str(source_path))
+            try:
+                os.replace(source_path, backup_path)
+            except OSError as e:
+                if e.errno == errno.EXDEV:
+                    _fail(
+                        f"--backup 与源库不在同一文件系统，原子备份不支持跨盘: {backup_path}"
+                    )
+                raise
+            try:
+                os.replace(final_target_path, source_path)
+            except Exception:
+                os.replace(backup_path, source_path)
+                raise
 
     _echo_json({
         "result": result.to_dict(),
@@ -1527,7 +1555,22 @@ def restore(
     if target_path.exists():
         if not replace or not yes:
             _fail("目标已存在，覆盖恢复必须同时提供 --replace --yes")
-        shutil.rmtree(target_path)
+        target_real = target_path.resolve()
+        if not target_real.is_dir():
+            _fail(f"覆盖目标不是目录，拒绝删除: {target_path}")
+        if target_real in (Path("/").resolve(), Path.home().resolve()):
+            _fail(f"拒绝覆盖特殊路径: {target_path}")
+        if not _is_iosql_like_database(target_real):
+            _fail(f"目标目录不像 iosql 库（缺少 meta.sqlite3），拒绝覆盖: {target_path}")
+        tmp_path = target_real.with_name(
+            f"{target_real.name}.restore_tmp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        )
+        os.replace(target_real, tmp_path)
+        try:
+            _rmtree_robust(tmp_path)
+        except Exception:
+            os.replace(tmp_path, target_real)
+            raise
     shutil.copytree(backup_path, target_path, dirs_exist_ok=False)
     _echo_json({"backup": str(backup_path), "target": str(target_path)})
 
