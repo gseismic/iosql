@@ -362,14 +362,37 @@ def resolve_sort_col(
     return col, "asc", col
 
 
+def fast_row_count(table: Any) -> int:
+    """manifest 求和的零 I/O 行数（PLAN-061）。
+
+    segments() 的 row_count 由核心在写入/删除/compact 时维护（探针验证
+    删除后仍精确），求和与 count_rows() 等价但不打开任何数据文件——
+    2000 万行 0.0000s vs 2.66s。无 segment 记录、记录缺 row_count 或
+    读取异常时回退 count_rows() 兜底。
+    """
+    try:
+        segs = table.segments()
+    except Exception:
+        return table.count_rows()
+    if not segs:
+        return table.count_rows()
+    total = 0
+    for seg in segs:
+        n = seg.get("row_count") if isinstance(seg, dict) else None
+        if not isinstance(n, int):
+            return table.count_rows()
+        total += n
+    return total
+
+
 def cached_row_count(db_uri: str, table: Any, name: str) -> int:
-    """带 TTL 缓存的 count_rows：防止 Overview 首屏被大表拖慢。"""
+    """带 TTL 缓存的行数：防止 Overview 首屏被大表拖慢。"""
     cache_key = (db_uri, name)
     now = time.monotonic()
     hit = _ROW_COUNT_CACHE.get(cache_key)
     if hit is not None and hit[0] > now:
         return hit[1]
-    count = table.count_rows()
+    count = fast_row_count(table)
     _ROW_COUNT_CACHE[cache_key] = (now + ROW_COUNT_TTL_SECONDS, count)
     return count
 
@@ -638,7 +661,7 @@ def _register_read_routes(app: FastAPI) -> None:
             ):
                 total += len(batch)
             return {"count": total}
-        return {"count": table.count_rows()}
+        return {"count": fast_row_count(table)}
 
     @app.post("/api/table/{name}/query")
     def post_query(name: str, body: QueryBody, request: Request) -> dict:

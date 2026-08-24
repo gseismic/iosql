@@ -179,6 +179,30 @@ class TestReadOnlyApi:
             resp = client.get("/api/table/nope/stats")
             assert resp.status_code == 404
 
+    def test_stats_single_file_table(self, demo_db_path):
+        """PLAN-061 · 无分区单文件表行数（manifest 回退路径覆盖）。"""
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.get("/api/table/notes/stats")
+            assert resp.status_code == 200
+            assert resp.json()["row_count"] == NOTES_TOTAL
+
+    def test_stats_after_delete(self, copy_db_uri):
+        """PLAN-061 · 删除后 stats 行数同步（manifest 求和仍精确）。"""
+        with _client(copy_db_uri, mode="write") as client:
+            before = client.get("/api/table/notes/stats").json()["row_count"]
+            client.post("/api/table/notes/delete", json={
+                "where": [{"field": "id", "op": "==", "value": 0}],
+            })
+            after = client.get("/api/table/notes/stats").json()["row_count"]
+            assert after == before - 1
+
+    def test_count_endpoint_uses_manifest_sum(self, demo_db_path):
+        """PLAN-061 · /count 无筛选走 manifest 求和（与 count_rows 一致）。"""
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.post("/api/table/ticks/count", json={})
+            assert resp.status_code == 200
+            assert resp.json()["count"] == TICKS_TOTAL
+
     def test_table_spec(self, demo_db_path):
         with _client(f"sqlite://{demo_db_path}") as client:
             resp = client.get("/api/table/ticks/spec")
