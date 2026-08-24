@@ -74,3 +74,5 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 ## 低层 mysqlite 示例
 
 `examples/mysqlite/` 保留少量 `iosql.utils.mysqlite` 示例，用于直接操作单个 SQLite 文件、schema-on-write、批量写入和连接池清理。新项目优先使用本目录上方的 `Database.table(...)` 主 API 示例。
+
+`examples/mysqlite-scenarios/` 按运维场景速查 mysqlite 完整能力面（增删改查、加列/删列、各类查询、表重命名与表信息、索引操作、在线备份），每个脚本独立可运行，详见该目录 README。
