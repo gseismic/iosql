@@ -207,12 +207,29 @@
   }
   IU.renderResultTable = renderResultTable;
 
-  /* ================= 单元格详情侧滑面板 ================= */
+  /* ================= 单元格详情侧滑面板 =================
+   * open(colName, value, opts)
+   * - opts.actions: [{label, onClick}] 额外动作按钮（如"以此值过滤"）
+   * - opts.note: 头部下方的备注行（如时间戳的可读时间） */
   var DetailPanel = {
-    open: function (colName, value) {
+    open: function (colName, value, opts) {
+      opts = opts || {};
       var pre = document.getElementById('detail-pre');
       document.getElementById('detail-colname').textContent = colName || '';
       pre.textContent = prettyValue(value);
+
+      var actionsSlot = document.getElementById('detail-actions');
+      IU.clear(actionsSlot);
+      (opts.actions || []).forEach(function (a) {
+        actionsSlot.append(h('button', {
+          class: 'btn sm ghost', onclick: a.onClick
+        }, a.label));
+      });
+
+      var noteEl = document.getElementById('detail-note');
+      noteEl.textContent = opts.note || '';
+      noteEl.style.display = opts.note ? '' : 'none';
+
       document.body.classList.add('detail-open');
       this._current = value;
     },
@@ -235,6 +252,14 @@
 
   document.getElementById('detail-close').addEventListener('click', function () { DetailPanel.close(); });
   document.getElementById('detail-mask').addEventListener('click', function () { DetailPanel.close(); });
+  // 标题承诺的 Esc 关闭；输入框内的 Esc（如过滤行清空本列）已 stopPropagation，
+  // 不会误关；确认弹窗打开时优先让弹窗响应，不穿透关闭面板
+  document.addEventListener('keydown', function (e) {
+    if (e.key !== 'Escape') return;
+    var modalRoot = document.getElementById('modal-root');
+    if (modalRoot && modalRoot.childElementCount) return;
+    DetailPanel.close();
+  });
   document.getElementById('detail-copy').addEventListener('click', function () {
     var text = document.getElementById('detail-pre').textContent;
     if (navigator.clipboard && navigator.clipboard.writeText) {

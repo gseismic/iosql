@@ -533,6 +533,179 @@ class TestKeysetPagination:
         }
 
 
+class TestNestedWhere:
+    """PLAN-059 · or/and 嵌套 where：修复前端 OR 序列化被 422 拒绝的坏损。"""
+
+    def test_or_group_union(self, demo_db_path):
+        """{"or":[…]} 两组 == 条件应返回并集（此前 422）。"""
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.post("/api/table/ticks/rows", json={
+                "where": [{"or": [
+                    {"field": "symbol", "op": "==", "value": "AAPL"},
+                    {"field": "symbol", "op": "==", "value": "MSFT"},
+                ]}],
+                "limit": 5000,
+            })
+        assert resp.status_code == 200
+        payload = resp.json()
+        symbols = {row["symbol"] for row in payload["rows"]}
+        assert symbols == {"AAPL", "MSFT"}
+        assert payload["next_cursor"] is None  # 两 symbol 全量命中
+
+    def test_flat_and_or_mix(self, demo_db_path):
+        """平铺普通条件与 or 分组混用：AND 连接 + 组内 OR。"""
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.post("/api/table/ticks/rows", json={
+                "where": [
+                    {"field": "price", "op": ">=", "value": 100.0},
+                    {"or": [
+                        {"field": "symbol", "op": "==", "value": "MSFT"},
+                        {"field": "volume", "op": ">", "value": 1005},
+                    ]},
+                ],
+                "limit": 5000,
+            })
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        assert rows
+        assert all(
+            (r["symbol"] == "MSFT" or r["volume"] > 1005) and r["price"] >= 100.0
+            for r in rows
+        )
+
+    def test_and_group_nested(self, demo_db_path):
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.post("/api/table/ticks/rows", json={
+                "where": [{"and": [
+                    {"field": "symbol", "op": "==", "value": "AAPL"},
+                    {"field": "ts", "op": ">=", "value": BASE_TS},
+                ]}],
+                "limit": 5000,
+            })
+        assert resp.status_code == 200
+        rows = resp.json()["rows"]
+        assert rows
+        assert all(r["symbol"] == "AAPL" and r["ts"] >= BASE_TS for r in rows)
+
+    def test_rows_cursor_with_or_where(self, demo_db_path):
+        """or 筛选与 keyset 游标组合：翻页不重不漏直至耗尽。"""
+        uri = f"sqlite://{demo_db_path}"
+        expected_symbols = {"AAPL", "MSFT"}
+        collected = []
+        cursor = None
+        pages = 0
+        with _client(uri) as client:
+            while True:
+                body = {
+                    "where": [{"or": [
+                        {"field": "symbol", "op": "==", "value": "AAPL"},
+                        {"field": "symbol", "op": "==", "value": "MSFT"},
+                    ]}],
+                    "limit": 7, "order_by": "ts",
+                }
+                if cursor is not None:
+                    body["cursor"] = cursor
+                resp = client.post("/api/table/ticks/rows", json=body)
+                assert resp.status_code == 200
+                payload = resp.json()
+                collected.extend(row["symbol"] for row in payload["rows"])
+                pages += 1
+                cursor = payload["next_cursor"]
+                if cursor is None:
+                    break
+                assert pages < 50
+
+        # ticks 全部行都属于 AAPL/MSFT → 命中数等于全表行数
+        assert len(collected) == TICKS_TOTAL
+        assert set(collected) == expected_symbols
+
+    def test_count_with_or_group(self, demo_db_path):
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.post("/api/table/ticks/count", json={
+                "where": [{"or": [
+                    {"field": "symbol", "op": "==", "value": "AAPL"},
+                    {"field": "symbol", "op": "==", "value": "MSFT"},
+                ]}],
+            })
+        assert resp.status_code == 200
+        assert resp.json()["count"] == TICKS_TOTAL
+
+    def test_query_latest_accept_or_group(self, demo_db_path):
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.post("/api/table/ticks/query", json={
+                "where": [{"or": [
+                    {"field": "symbol", "op": "==", "value": "AAPL"},
+                    {"field": "symbol", "op": "==", "value": "MSFT"},
+                ]}],
+                "limit": 10,
+            })
+            assert resp.status_code == 200
+            assert len(resp.json()["rows"]) == 10
+
+            resp = client.post("/api/table/ticks/latest", json={
+                "by": ["symbol"],
+                "columns": ["symbol", "ts"],
+                "where": [{"or": [
+                    {"field": "symbol", "op": "==", "value": "AAPL"},
+                    {"field": "symbol", "op": "==", "value": "MSFT"},
+                ]}],
+            })
+            assert resp.status_code == 200
+            assert len(resp.json()["rows"]) == 2
+
+    def test_invalid_nested_groups_rejected(self, demo_db_path):
+        cases = [
+            # or 内叶子缺 field
+            {"where": [{"or": [{"op": "==", "value": 1}]}]},
+            # or 与 and 同组
+            {"where": [{"or": [], "and": []}]},
+            # or 值不是数组
+            {"where": [{"or": {"field": "symbol", "op": "==", "value": "AAPL"}}]},
+            # 嵌套深层叶子非法 op
+            {"where": [{"or": [
+                {"and": [{"field": "ts", "op": "~", "value": 1}]},
+            ]}]},
+            # 非法 between 形态藏在嵌套里
+            {"where": [{"or": [
+                {"field": "ts", "op": "between", "value": [1]},
+            ]}]},
+        ]
+        with _client(f"sqlite://{demo_db_path}") as client:
+            for body in cases:
+                resp = client.post("/api/table/ticks/rows", json=body)
+                assert resp.status_code == 422, f"{body} 应 422，得到 {resp.status_code}"
+                assert "detail" in resp.json()
+
+    def test_delete_with_or_group(self, copy_db_uri):
+        with _client(copy_db_uri, mode="write") as client:
+            resp = client.post("/api/table/notes/delete", json={
+                "where": [{"or": [
+                    {"field": "id", "op": "==", "value": 0},
+                    {"field": "id", "op": "==", "value": 2},
+                ]}],
+            })
+            assert resp.status_code == 200
+            assert resp.json()["deleted"] == 2
+
+            remain = client.post("/api/table/notes/rows", json={"limit": 100})
+            assert [r["id"] for r in remain.json()["rows"]] == [1]
+
+    def test_export_with_or_group(self, demo_db_path):
+        import urllib.parse
+        where = [{"or": [
+            {"field": "symbol", "op": "==", "value": "AAPL"},
+            {"field": "symbol", "op": "==", "value": "MSFT"},
+        ]}]
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.get(
+                "/api/table/ticks/export?format=jsonl&where="
+                + urllib.parse.quote(json.dumps(where))
+            )
+        assert resp.status_code == 200
+        lines = [ln for ln in resp.text.strip().splitlines() if ln]
+        assert len(lines) == TICKS_TOTAL
+
+
 class TestCapabilityGating:
     """D5 · 能力门控：无 time 契约的表禁用 timeseries 快捷查询。"""
 

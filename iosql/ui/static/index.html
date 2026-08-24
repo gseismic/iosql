@@ -42,10 +42,14 @@
   <aside id="detail-panel" aria-label="单元格详情">
     <div class="detail-head">
       <span class="micro-label">单元格详情 · <span class="detail-colname" id="detail-colname"></span></span>
+      <span id="detail-actions" class="detail-actions"></span>
       <button class="btn sm ghost" id="detail-copy">复制值</button>
       <button class="icon-btn" id="detail-close" title="关闭 (Esc)">✕</button>
     </div>
-    <div class="detail-body"><pre id="detail-pre"></pre></div>
+    <div class="detail-body">
+      <div id="detail-note" class="detail-note mono" style="display:none"></div>
+      <pre id="detail-pre"></pre>
+    </div>
   </aside>
 
   <!-- 弹窗挂载点 / Toast 挂载点 -->

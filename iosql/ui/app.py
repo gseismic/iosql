@@ -19,6 +19,9 @@
 - ``db.table(未知表名)`` 返回 ghost 对象（spec=None/count=0/select=[]），
   因此存在性校验必须走 db.table_names()，不能依赖 table 方法自身报错。
 - ``with_partition(partition=...)`` 同时接受字符串与 parse_partition_spec 结果对象。
+- where 契约（PLAN-059）：除平铺 {field,op,value} 外，接受 {"or":[…]} /
+  {"and":[…]} 递归嵌套；build_case() 负责转为核心 Case/CaseExpression，
+  keyset 复合游标与用户 or 链通过 CaseExpression `*` 运算组合。
 """
 from __future__ import annotations
 
@@ -177,7 +180,11 @@ def _bad_request(detail: str, hint: str) -> AppError:
 
 
 def normalize_where(raw: Optional[list[dict[str, Any]]]) -> Optional[list[dict[str, Any]]]:
-    """where 归一化校验：list of {field, op, value}，非法即 422 带 hint。"""
+    """where 归一化校验：list of {field,op,value} 或 {"or"/"and":[…]} 嵌套。
+
+    叶子条件非法、嵌套结构非法均 422 带 hint；归一化输出保留嵌套结构，
+    由 _build_case 负责转成核心 Case/CaseExpression。
+    """
     if raw is None:
         return None
     if not isinstance(raw, list):
@@ -187,36 +194,100 @@ def normalize_where(raw: Optional[list[dict[str, Any]]]) -> Optional[list[dict[s
         )
     comps: list[dict[str, Any]] = []
     for item in raw:
-        if not isinstance(item, dict) or "field" not in item or "op" not in item:
-            raise _bad_request(
-                "where 条件必须包含 field 与 op",
-                '示例: {"field":"ts","op":">=","value":1735689600000}',
-            )
-        field = str(item["field"]).strip()
-        op = item["op"]
-        value = item.get("value")
-        if not field:
-            raise _bad_request("where 条件的 field 不能为空", hint="请填写列名")
-        if op not in ALLOWED_OPS:
-            raise _bad_request(
-                f"非法 where 运算符 `{op}`",
-                hint=f"合法 op: {', '.join(ALLOWED_OPS)}；"
-                     '示例: {"field":"symbol","op":"==","value":"AAPL"}',
-            )
-        if op == "between" and (
-            not isinstance(value, (list, tuple)) or len(value) != 2
-        ):
-            raise _bad_request(
-                "between 条件的 value 必须是二元列表 [min, max]",
-                hint='示例: {"field":"ts","op":"between","value":[start,end]}',
-            )
-        if op == "in" and not isinstance(value, list):
-            raise _bad_request(
-                "in 条件的 value 必须是非空列表",
-                hint='示例: {"field":"symbol","op":"in","value":["AAPL","MSFT"]}',
-            )
-        comps.append({"field": field, "op": op, "value": value})
+        if isinstance(item, dict) and ("or" in item or "and" in item) \
+                and "field" not in item:
+            comps.append(_normalize_group(item))
+        else:
+            comps.append(normalize_leaf(item))
     return comps or None
+
+
+def _normalize_group(item: dict[str, Any]) -> dict[str, Any]:
+    """递归校验 {"or":[…]} / {"and":[…]} 分组节点。"""
+    if "or" in item and "and" in item:
+        raise _bad_request(
+            "or 与 and 不能同时出现在同一分组",
+            hint='示例: {"or":[{"field":"symbol","op":"==","value":"AAPL"}, …]}',
+        )
+    key = "or" if "or" in item else "and"
+    children = item[key]
+    if not isinstance(children, list) or not children:
+        raise _bad_request(
+            f"`{key}` 分组的值必须是非空条件数组",
+            hint='示例: {"or":[{"field":"symbol","op":"==","value":"AAPL"},'
+                 '{"field":"symbol","op":"==","value":"MSFT"}]}',
+        )
+    kids = [
+        _normalize_group(child) if isinstance(child, dict)
+        and ("or" in child or "and" in child) and "field" not in child
+        else normalize_leaf(child)
+        for child in children
+    ]
+    return {key: kids}
+
+
+def normalize_leaf(item: Any) -> dict[str, Any]:
+    """单个叶子条件的校验与归一化（原 normalize_where 主体逻辑）。"""
+    if not isinstance(item, dict) or "field" not in item or "op" not in item:
+        raise _bad_request(
+            "where 条件必须包含 field 与 op",
+            '示例: {"field":"ts","op":">=","value":1735689600000}；'
+            'OR 条件请用 {"or":[条件,…]} 分组',
+        )
+    field = str(item["field"]).strip()
+    op = item["op"]
+    value = item.get("value")
+    if not field:
+        raise _bad_request("where 条件的 field 不能为空", hint="请填写列名")
+    if op not in ALLOWED_OPS:
+        raise _bad_request(
+            f"非法 where 运算符 `{op}`",
+            hint=f"合法 op: {', '.join(ALLOWED_OPS)}；"
+                 '示例: {"field":"symbol","op":"==","value":"AAPL"}',
+        )
+    if op == "between" and (
+        not isinstance(value, (list, tuple)) or len(value) != 2
+    ):
+        raise _bad_request(
+            "between 条件的 value 必须是二元列表 [min, max]",
+            hint='示例: {"field":"ts","op":"between","value":[start,end]}',
+        )
+    if op == "in" and not isinstance(value, list):
+        raise _bad_request(
+            "in 条件的 value 必须是非空列表",
+            hint='示例: {"field":"symbol","op":"in","value":["AAPL","MSFT"]}',
+        )
+    return {"field": field, "op": op, "value": value}
+
+
+def build_case(comps: Optional[list[dict[str, Any]]]) -> Any:
+    """把 normalize_where 输出转为核心 Case / CaseExpression（AND 平铺）。
+
+    嵌套 {"or":[…]} / {"and":[…]} 递归转换；None/空列表返回 None。
+    """
+    if not comps:
+        return None
+    expr: Any = None
+    for comp in comps:
+        node = _build_case_node(comp)
+        expr = node if expr is None else expr * node
+    return expr
+
+
+def _build_case_node(comp: dict[str, Any]) -> Any:
+    if "or" in comp:
+        expr: Any = None
+        for child in comp["or"]:
+            node = _build_case_node(child)
+            expr = node if expr is None else expr + node
+        return expr
+    if "and" in comp:
+        expr = None
+        for child in comp["and"]:
+            node = _build_case_node(child)
+            expr = node if expr is None else expr * node
+        return expr
+    return Case(comp["field"], comp["op"], comp["value"])
 
 
 def get_table(db: Any, name: str) -> Any:
@@ -481,7 +552,10 @@ def _register_read_routes(app: FastAPI) -> None:
         applied = ", ".join(f"{c} {word}" for c in order_cols)
 
         limit = max(1, min(int(body.limit), MAX_PAGE_LIMIT))
-        where_expr: Any = comps  # 无游标时沿用 dict 列表（AND 语义）
+        # 用户条件（含 or/and 嵌套）统一转 CaseExpression：
+        # 平铺 dict 列表虽可直传 select，但嵌套分组核心不识别
+        user_expr = build_case(comps)
+        where_expr: Any = user_expr
         if body.cursor is not None:
             if not isinstance(body.cursor, (list, tuple)):
                 raise _bad_request(
@@ -505,14 +579,11 @@ def _register_read_routes(app: FastAPI) -> None:
                 expr = branch if expr is None else expr + branch
                 eq_i = Case(c, eq_op, vals[i])
                 prefix_eq = eq_i if prefix_eq is None else prefix_eq * eq_i
-            if comps:
-                user_chain: Any = Case(
-                    comps[0]["field"], comps[0]["op"], comps[0]["value"])
-                for d in comps[1:]:
-                    user_chain = user_chain * Case(d["field"], d["op"], d["value"])
-                expr = user_chain * expr
+            if user_expr is not None:
+                # CaseExpression 的 `*` 已覆盖 Case×CaseExpression 组合，
+                # 用户条件（含 or 嵌套）与 keyset 游标链 AND 相乘
+                expr = user_expr * expr
             where_expr = expr
-
         rows = table.select(
             "*", where=where_expr, order_by=applied,
             limit=limit + 1, to_dict=True,
@@ -533,14 +604,15 @@ def _register_read_routes(app: FastAPI) -> None:
     def post_explain(name: str, body: RowsBody, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
         comps = normalize_where(body.where)
-        plan = table.explain_select("*", where=comps, order_by=body.order_by)
+        plan = table.explain_select("*", where=build_case(comps),
+                                    order_by=body.order_by)
         return {"plan": serialize_plan(plan)}
 
     @app.post("/api/table/{name}/count")
     def post_count(name: str, body: CountBody, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
-        comps = normalize_where(body.where)
-        if comps:
+        comps = build_case(normalize_where(body.where))
+        if comps is not None:
             # 有筛选时 iosql 没有 SQL 级 count(where)，流式累计避免整表载入内存
             total = 0
             for batch in table.iter_select_batches(
@@ -554,7 +626,7 @@ def _register_read_routes(app: FastAPI) -> None:
     def post_query(name: str, body: QueryBody, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
         require_time_contract(table.spec())
-        comps = normalize_where(body.where)
+        comps = build_case(normalize_where(body.where))
         fluent = table.query(
             symbols=body.symbols,
             start=body.start,
@@ -578,7 +650,7 @@ def _register_read_routes(app: FastAPI) -> None:
     def post_latest(name: str, body: LatestBody, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
         require_time_contract(table.spec())
-        comps = normalize_where(body.where)
+        comps = build_case(normalize_where(body.where))
         fluent = table.latest(
             symbols=body.symbols,
             as_of=body.as_of,
@@ -890,7 +962,7 @@ def _export_endpoint(name: str, request: Request, format: str,
                  "如需有序结果请用 /rows 分页拉取",
         )
     spec = table.spec()
-    comps: Optional[list[dict[str, Any]]] = None
+    comps: Any = None
     if where:
         try:
             parsed = json.loads(where)
@@ -902,7 +974,7 @@ def _export_endpoint(name: str, request: Request, format: str,
             ) from exc
         if isinstance(parsed, dict):
             parsed = [parsed]
-        comps = normalize_where(parsed)
+        comps = build_case(normalize_where(parsed))
 
     media_types = {"csv": "text/csv", "jsonl": "application/x-ndjson"}
     headers = {
@@ -992,7 +1064,7 @@ def _register_write_routes(app: FastAPI) -> None:
                 hint="条件删除必须提供过滤条件；如需清空全表请使用 truncate 并输入表名确认",
                 status=422,
             )
-        comps = normalize_where(body.where)
+        comps = build_case(normalize_where(body.where))
         deleted = table.delete(comps)
         invalidate_row_count(db.uri, name)
         return {"deleted": deleted}

@@ -186,7 +186,7 @@ iosql ui -s database/market.iosql --write   # 开启维护操作
 | 工作区 | 只读 | 可修改 | 说明 |
 |:--|:-:|:-:|---|
 | Overview | ✅ | ✅ | 全库概览：表清单、行数、分区数、segment 数、partition 策略 |
-| Browse Data | ✅ | ✅ | 条件构造器筛选、keyset 翻页、排序、单元格详情、CSV/JSONL 导出 |
+| Browse Data | ✅ | ✅ | 表头每列过滤行（裸词精确 / `>` 比较 / `a~b` 范围 / 逗号多值，防抖即输即查）+ 条件构造器（AND/OR，与表头条件叠加）+ keyset 翻页 + 列头排序 + 时序表默认最新优先 + 毫秒时间戳可读化（可开关）+ 单元格详情（可一键以此值过滤）+ CSV/JSONL 导出 |
 | Structure | ✅ | ✅ | 表契约 / 逻辑分区 / 物理 segment 三层透视 |
 | Query | ✅ | ✅ | where 查询 + explain 裁剪可视化；时序表支持 start/end/date/session/latest 截面 |
 | Charts | ✅ | ✅ | 时序快览折线图（服务端降采样） |
