@@ -2,6 +2,8 @@ from collections import OrderedDict
 from operator import itemgetter
 from typing import Dict, List, Tuple, Union, Optional, Any
 
+from .exception import DuplicateColumn, PrimaryKeyNotInColumn
+
 """
 columns = [
     {'name': 'name', 'dtype': 'text', 'index': False, 'unique': False, 'nullable': True}
@@ -192,12 +194,13 @@ def getsql_create_table(table_name: str, columns: List[Dict[str, Any]], pk: Unio
     sql_parts = [f'{create_keyword} {quoted_sql_text(table_name)} (']
 
     fields = [item['name'] for item in columns]
-    if len(fields) != len(set(fields)):
-        raise Exception('DuplicatedColumn')
+    duplicates = sorted({f for f in fields if fields.count(f) > 1})
+    if duplicates:
+        raise DuplicateColumn(f'columns 定义存在重复列: {duplicates}')
 
     if pk and not set(pk).issubset(set(fields)):
         extra_pk = set(pk) - set(fields)
-        raise Exception(f'PrimaryKeyNotInColumn: {extra_pk}')
+        raise PrimaryKeyNotInColumn(f'pk 不在 columns 中: {sorted(extra_pk)}')
 
     pk_set = set(pk)
     for item in columns:
@@ -271,28 +274,3 @@ def getsql_add_column(table_name: str, column_name: str, definition: str) -> str
         f'ALTER TABLE {quoted_sql_text(table_name)} '
         f'ADD {quoted_sql_text(column_name)} {definition};'
     )
-
-
-def getsql_query_all_index(table_name: str) -> str:
-    return (f"SELECT name FROM sqlite_master "
-            f"WHERE type == 'index' AND "
-            f"tbl_name == {sql_literal(table_name)}")
-
-
-def getsql_drop_index(index: str) -> str:
-    return f'drop index {quoted_sql_text(index)}'
-
-
-def getsql_drop_table(table_name: str) -> str:
-    return f'drop table if exists {quoted_sql_text(table_name)}'
-
-
-def getsql_dict_update(table_name: str, kv: Dict[str, Any], where: str) -> str:
-    kv_string = ','.join(
-        f'{quoted_sql_text(k)}={sql_literal(v)}'
-        for k, v in kv.items()
-    )
-    sql = f'update {quoted_sql_text(table_name)} set {kv_string}'
-    if where:
-        sql += f' where {where}'
-    return sql

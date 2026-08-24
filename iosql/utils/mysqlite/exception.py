@@ -17,5 +17,5 @@ class TableAlreadyExists(OperationalError):
     pass
 
 
-class UnKnownOperationalError(OperationalError):
+class PrimaryKeyNotInColumn(ValueError):
     pass

@@ -56,7 +56,7 @@ table.insert_all(
 | `replace` | 主键冲突时覆盖。 |
 | `ignore` | 主键冲突时跳过。 |
 | `batch_size` | 批量写入分批大小。 |
-| `commit` | 是否在批次结束后提交。 |
+| `commit` | 必须为 True（默认值）；传 `False` 会抛 `ValueError`，连接池模式下批量操作结束时会统一提交，不支持延迟提交。 |
 
 ## 查询和修改
 

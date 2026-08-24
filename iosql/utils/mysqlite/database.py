@@ -8,7 +8,6 @@ import atexit
 import weakref
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Union
-import sqlite3
 from contextlib import contextmanager
 from .connection_pool import (
     DatabaseConnectionPool,
@@ -128,23 +127,22 @@ class Database(object):
         else:
             self._pragma_dict['journal_mode'] = 'delete'
 
-    def _pragma_one(self, key: str, value: Optional[str] = None, ensure: bool = False) -> None:
+    def _pragma_one(self, key: str, value: Optional[str] = None) -> None:
         """设置单个PRAGMA值"""
         value = value or ''
         current_value = self._pragma_dict.get(key.lower(), '')
         if str(value).lower() != current_value.lower():
             self._pragma_dict[key.lower()] = str(value)
 
-    def pragma(self, key_or_dict: Union[str, Dict[str, Any]], value: Optional[str] = None, 
-               ensure: bool = False) -> None:
+    def pragma(self, key_or_dict: Union[str, Dict[str, Any]], value: Optional[str] = None) -> None:
         """设置PRAGMA值"""
         if isinstance(key_or_dict, dict):
             if value is not None:
                 raise ValueError("Cannot specify value when key_or_dict is a dictionary")
             for k, v in key_or_dict.items():
-                self._pragma_one(k, v, ensure=ensure)
+                self._pragma_one(k, v)
         else:
-            self._pragma_one(key_or_dict, value, ensure=ensure)
+            self._pragma_one(key_or_dict, value)
 
     def __enter__(self):
         """上下文管理器入口"""
@@ -224,7 +222,8 @@ class Database(object):
                     conn.commit()
             except sqlite3.Error as e:
                 logger.error(f"SQL execution failed: {sql}")
-                conn.rollback()
+                if not self.in_transaction():
+                    conn.rollback()
                 raise DatabaseError(f"SQL execution failed: {e}") from e
 
     def commit(self) -> None:
@@ -287,20 +286,6 @@ class Database(object):
         if self.verbose >= 2:
             logger.debug(f'已关闭数据库实例 {self.db_file}')
 
-    
-    # def force_close_all_connections(self) -> None:
-    #     """强制关闭所有数据库连接
-        
-    #     这个方法用于紧急情况下的资源清理，防止文件句柄泄露。
-    #     调用后连接池将不可用，需要重新创建Database实例。
-    #     """
-    #     if hasattr(self, '_pool'):
-    #         self._pool.force_close_all_connections()
-    #         if self.verbose >= 1:
-    #             logger.info(f'已数据库 {self.db_file} 的所有连接')
-        
-    #     # 从全局注册表中移除
-    #     _active_databases.discard(self)
     def force_close_all_connections(self) -> None:
         """强制关闭所有数据库连接（并标记实例为已关闭）"""
         if hasattr(self, '_pool'):
@@ -309,7 +294,7 @@ class Database(object):
             except Exception as e:
                 logger.warning(f'force_close_all_connections 出错: {e}')
             if self.verbose >= 1:
-                logger.info(f'已数据库 {self.db_file} 的所有连接')
+                logger.info(f'已关闭数据库 {self.db_file} 的所有连接')
 
         # 标记并移除
         self._closed = True
@@ -363,10 +348,6 @@ class Database(object):
     def cursor(self) -> sqlite3.Cursor:
         """获取数据库游标 - 不推荐在连接池模式下直接使用"""
         raise DatabaseError("在连接池模式下请使用 get_connection() 上下文管理器")
-
-    def __table_names(self) -> List[str]:
-        """获取所有表名（已弃用，请使用get_all_tables）"""
-        return self.get_all_tables()
 
     def get_all_tables(self) -> List[str]:
         """获取数据库中所有表名"""
@@ -491,15 +472,3 @@ class Database(object):
             self.execute(sql)
         except sqlite3.Error as e:
             raise DatabaseError(f"Failed to create index {index_name}: {e}") from e
-
-    def _ensure_pragma(self, key: str, value: Optional[str] = None) -> None:
-        """确保PRAGMA设置生效"""
-        if value:
-            self.execute(f'PRAGMA {key}={value};')
-        else:
-            self.execute(f'PRAGMA {key};')
-
-    def _ensure_all_pragma(self) -> None:
-        """确保所有PRAGMA设置生效"""
-        for key, value in self._pragma_dict.items():
-            self._ensure_pragma(key, value)

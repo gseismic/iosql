@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 from .sql import (
     getsql_create_table, 
     getsql_create_index, 
-    getsubsql_insert,
     getsqlarg_dict_insert,
     getsqlarg_dict_insertmany,
     getsql_add_column,
@@ -256,47 +255,38 @@ class Table:
             logger.info(f'Create Index on `{column}` {order}')
         self.execute(sql, commit=True)
 
-    def _handle_error(self, e: Exception) -> None:
-        str_e = str(e)
-        if 'no column named' in str_e:
-            match = _COLUMN_NAME_PATTERN.search(str_e)
-            if match:
-                raise NoSuchColumn(match.group(1))
-        elif 'no such table' in str_e:
-            match = _TABLE_NAME_PATTERN.search(str_e)
-            if match:
-                raise NoSuchTable(match.group(1))
-        elif 'already exists' in str_e:
-            match = _TABLE_EXISTS_PATTERN.search(str_e)
-            if match:
-                raise TableAlreadyExists(match.group(1))
-        elif 'duplicate column' in str_e:
-            match = _DUPLICATE_COLUMN_PATTERN.search(str_e)
-            if match:
-                raise DuplicateColumn(match.group(1))
-        else:
-            raise e
-
     def _handle_error_on_connection(self, e: Exception, conn: sqlite3.Connection) -> None:
-        """处理特定连接上的异常，包含回滚逻辑"""
-        conn.rollback()
+        """翻译 sqlite 错误为模块异常类型。
+
+        外层 db.transaction() 存在时连接是共享事务连接，
+        此处回滚会清空事务内先前未提交数据，故仅在非事务上下文回滚。
+        """
+        if not self.database.in_transaction():
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
         str_e = str(e)
         if 'no column named' in str_e:
             match = _COLUMN_NAME_PATTERN.search(str_e)
             if match:
                 raise NoSuchColumn(match.group(1))
+            raise e
         elif 'no such table' in str_e:
             match = _TABLE_NAME_PATTERN.search(str_e)
             if match:
                 raise NoSuchTable(match.group(1))
+            raise e
         elif 'already exists' in str_e:
             match = _TABLE_EXISTS_PATTERN.search(str_e)
             if match:
                 raise TableAlreadyExists(match.group(1))
+            raise e
         elif 'duplicate column' in str_e:
             match = _DUPLICATE_COLUMN_PATTERN.search(str_e)
             if match:
                 raise DuplicateColumn(match.group(1))
+            raise e
         else:
             raise e
 
@@ -409,13 +399,6 @@ class Table:
         elif commit:
             conn.commit()
 
-    def _update(self, kv: Dict[str, Any], where: Optional[str], commit: Optional[bool] = None) -> None:
-        kv_string = ','.join([f'{quoted_sql_text(k)}=?' for k in kv.keys()])
-        sql = f'UPDATE {quoted_sql_text(self._table_name)} SET {kv_string}'
-        if where:
-            sql += f' WHERE {where}'
-        self.execute_params(sql, list(kv.values()), commit=commit)
-
     def select_one(self, fields: Optional[Union[str, List[str]]], where: Optional[str] = None, 
                    order_by: Optional[str] = None, option: Optional[str] = None) -> Optional[Dict]:
         rv = self.select(fields, where, order_by=order_by, option=option, limit=1, to_dict=True)
@@ -457,7 +440,7 @@ class Table:
             sql += f' ORDER BY {order_by}'
         if option:
             sql += f' {option}'
-        if limit:
+        if limit is not None:
             sql += f' LIMIT {limit}'
 
         return self.query(sql, to_dict)
@@ -479,46 +462,6 @@ class Table:
             sql, commit, kv, ensure_table, ensure_column,
             params=values, **kwargs
         )
-
-    def _insert_one_batch(self, batch_data: List[Dict[str, Any]], 
-                          replace: bool = False, ignore: bool = False,
-                          commit: bool = True, ensure_table: bool = False, 
-                          ensure_column: bool = False, **kwargs) -> None:
-        if not batch_data:
-            return
-
-        default_values = self.default_values()
-        prepared = getarg_diclist_insertmany_known_fields(
-            batch_data,
-            default_values,
-        )
-        if prepared is None:
-            prepared = getarg_diclist_insertmany(batch_data, default_values)
-        od_fields, list_values = prepared
-        fields = list(od_fields.keys())
-        sql = getsqlarg_dict_insertmany(self._table_name, fields, replace=replace, ignore=ignore)
-        # list_values = [tuple(kv.values()) for kv in batch_data] 
-        try:
-            self.executemany(sql, list_values, commit=commit)
-        except NoSuchTable as e:
-            if ensure_table:
-                if self.verbose >= 1:
-                    logger.info(f'Table {self._table_name} Not Exist, try-to-create by Data')
-                # self.create_table_like(batch_data[0], **kwargs)
-                # Note 这里忽略了not_null等参数, 用了默认数值
-                # 用户能传的只有 columns(包含了not_null等信息), pk
-                columns = suggest_columns(od_fields)
-                self.create_table(columns, **kwargs)
-                self.executemany(sql, list_values, commit=commit)
-            else:
-                raise e
-        except NoSuchColumn as e:
-            if ensure_column:
-                self.ensure_columns(od_fields)
-                # self.ensure_columns_like(batch_data[0])
-                self.executemany(sql, list_values, commit=commit)
-            else:
-                 raise e
 
     def _insert_one_batch_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
                                        batch_data: List[Dict[str, Any]], 
@@ -661,6 +604,11 @@ class Table:
                    ignore: bool = False, batch_size: int = 5000, commit: bool = True, 
                    ensure_table: bool = False, ensure_column: bool = False, **kwargs) -> None:
         """批量插入数据，使用单个连接进行整个批量操作以提高性能"""
+        if commit is not True:
+            raise ValueError(
+                'insert_all(commit=...) 仅支持 True: '
+                '连接池模式下批量操作结束时会统一提交，无法支持延迟提交'
+            )
         # 要求keys一致: 但并不检验
         if not list_kv:
             return
@@ -701,20 +649,6 @@ class Table:
                     conn.rollback()
                 raise e
 
-
-    def _list_insertmany(self, list_values: List[Tuple], replace: bool = False, ignore: bool = False,
-                        batch_size: int = 50000, commit: bool = True) -> None:
-        '''要求字段完全匹配
-
-        使用不方便，废弃
-        '''
-        assert 0
-        if not list_values:
-            return
-        action = getsubsql_insert(replace=replace, ignore=ignore)
-        n_fields = len(self._fields)
-        sql = f"{action} {self._table_name} VALUES ({','.join(['?'] * n_fields)})"
-        self.executemany(sql, list_values, batch_size=batch_size, commit=commit)
 
     def delete(self, where: str) -> None:
         sql = f'DELETE FROM {quoted_sql_text(self._table_name)} WHERE {where}'
@@ -792,21 +726,6 @@ class Table:
     def commit(self, rollback_if_err: bool = True) -> None:
         # 在连接池模式下，commit应该在具体的连接上下文中进行
         raise NotImplementedError("在连接池模式下，请在具体的连接上下文中调用conn.commit()")
-
-    def _try_commit(self, commit: Optional[bool], conn: sqlite3.Connection = None) -> None:
-        if commit is None:
-            if self.auto_commit and conn:
-                try:
-                    conn.commit()
-                except Exception as e:
-                    logger.error(f'Error {str(e)}')
-                    conn.rollback()
-        elif commit and conn:
-            try:
-                conn.commit()
-            except Exception as e:
-                logger.error(f'Error {str(e)}')
-                conn.rollback()
 
     def close(self) -> None:
         # 在连接池模式下，不需要手动关闭cursor

@@ -415,3 +415,71 @@ class TestSchemaless:
         assert db['order_items'].count() == 3
         result = db['order_items'].select_one('*', where="order_id=1 AND product_id=100")
         assert result['quantity'] == 99
+
+
+class TestPlan057Fixes:
+    def test_transaction_preserves_rows_across_ensure_column_fallback(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['events'].insert({'id': 1, 'name': 'seed'}, pk='id', ensure_table=True)
+
+        with db.transaction():
+            db['events'].insert({'id': 2, 'name': 'in-txn'})
+            db['events'].insert(
+                {'id': 3, 'name': 'x', 'extra_col': 42},
+                ensure_column=True,
+            )
+
+        rows = db['events'].select_all('*', order_by='id')
+        assert [r['id'] for r in rows] == [1, 2, 3]
+
+    def test_execute_error_inside_transaction_does_not_wipe_shared_connection(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['kv'].insert({'k': 'a'}, pk='k', ensure_table=True)
+
+        with pytest.raises(DatabaseError):
+            with db.transaction():
+                db['kv'].insert({'k': 'b'})
+                db.execute('INSERT INTO no_such_table VALUES (1)')
+                db['kv'].insert({'k': 'c'})
+
+        assert db['kv'].count() == 1
+
+    def test_unparseable_error_message_is_reraised(self, tmp_path):
+        import sqlite3 as _sqlite3
+
+        from iosql.utils.mysqlite.table import Table
+
+        db = Database(str(tmp_path / 't.sqlite3'), auto_commit=True, verbose=0)
+        t = Table(db, table_name='t')
+        fake_conn = _sqlite3.connect(':memory:')
+        crafted = _sqlite3.OperationalError('table t has no column named "weird col"')
+
+        with pytest.raises(_sqlite3.OperationalError):
+            t._handle_error_on_connection(crafted, fake_conn)
+
+    def test_select_limit_zero_returns_no_rows(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+        db['t'].insert_all([{'i': i} for i in range(5)], pk='i', ensure_table=True)
+
+        assert db['t'].select('*', limit=0) == []
+        assert len(db['t'].select('*', limit=2)) == 2
+
+    def test_insert_all_rejects_deferred_commit(self):
+        db = Database(TEST_DB, auto_commit=True, verbose=0)
+
+        with pytest.raises(ValueError, match='commit'):
+            db['t'].insert_all([{'i': 1}], pk='i', ensure_table=True, commit=False)
+
+    def test_create_table_spec_errors_are_typed(self, tmp_path):
+        from iosql.utils.mysqlite.exception import PrimaryKeyNotInColumn
+        from iosql.utils.mysqlite.sql import getsql_create_table
+
+        columns = [
+            {'name': 'id', 'type': 'text'},
+            {'name': 'id', 'type': 'text'},
+        ]
+        with pytest.raises(DuplicateColumn):
+            getsql_create_table('demo', columns, pk=None)
+
+        with pytest.raises(PrimaryKeyNotInColumn):
+            getsql_create_table('demo', [{'name': 'id', 'type': 'text'}], pk=['missing'])
