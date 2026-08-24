@@ -25,6 +25,19 @@
 - 示例 05 种子数据主键重复触发 IntegrityError（改 S0-S2 × ts 0-99）
 - 移除一行误留死代码
 
+## Review 追加修正
+
+提交后自查发现示例 02 的删列验证输出自相矛盾：`DROP COLUMN` 实际成功，
+但 `column_info()` 命中 `_table_info_cache`，而原生 `table.execute()` 不触发
+`_invalidate_cache`，展示的是删列前的旧 schema。修正为确定性演示：
+
+1. DDL 前显式调用 `column_info()` 填充缓存
+2. 删列后打印"缓存视图"——仍含已删列，如实暴露 `execute` 不失效缓存的行为
+3. 最终以 `fetchall("PRAGMA table_info(events)")` 直查真实 schema 作对照
+
+该行为属 mysqlite 已知边界（原生 SQL 绕过 Table 缓存机制），示例选择如实
+教学而非修改库行为；如需库级修复应作为独立计划处理。
+
 ## 关联文档
 
 - 根 `examples/README.md` 低层 mysqlite 一节已补本目录入口
