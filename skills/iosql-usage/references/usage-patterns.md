@@ -310,7 +310,7 @@ latest = bars.latest(
 ).to_list()
 ```
 
-`by` 支持多列分组（`group_by=` 已废弃，请统一使用 `by=`）。不传 `by` 时默认按 `symbol_column`（默认 `"symbol"`）分组。
+`by` 支持多列分组（`group_by=` 已废弃，请统一使用 `by=`）。不传 `by` 时默认按 `symbol_column` 分组；`db.table()` 默认 `symbol_column=None`——未显式声明（或用 timeseries() 默认 `"symbol"`）时，`latest(symbols=...)` / `query(symbols=...)` 会抛带修复指引的 `BadArgument`。
 
 ## 写入模式
 

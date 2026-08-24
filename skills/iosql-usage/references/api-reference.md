@@ -9,6 +9,7 @@
 - [结果类型](#结果类型)
 - [查询类型](#查询类型)
 - [异常类型](#异常类型)
+- [可视化管理台](#可视化管理台)
 - [低层 mysqlite](#低层-mysqlite)
 
 ---
@@ -68,7 +69,7 @@ with Database("sqlite://db/test.iosql") as db:
 | `conflict` | `str` | 冲突策略：`"append"`/`"upsert"`/`"replace"`/`"ignore"` |
 | `schema_policy` | `str` | Schema 策略：`"evolve"`（自动加列） |
 | `time` | `str`/`TimeColumn` | 时间契约列；duration/calendar 分区未声明时自动反推 |
-| `symbol_column` | `str` | 标的列（默认 `"symbol"`） |
+| `symbol_column` | `str` | 标的列；默认 `None`——未声明时 `query(symbols=)` / `latest(symbols=)` 抛 `BadArgument`（timeseries() 默认 `"symbol"`） |
 | `session_column` | `str` | 交易日/session 列（期货夜盘等场景） |
 
 #### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None)`
@@ -168,12 +169,12 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | 方法 | 签名 |
 |------|------|
 | `query` | `(symbols=None, start=None, end=None, date=None, session=None, columns='*', where=None, order_by=None, limit=None) -> TableQuery` |
-| `select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=False, columns=None, **kwargs) -> list` |
-| `iter_select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=False, batch_size=10_000, columns=None) -> Iterator` |
-| `iter_select_batches` | `(fields='*', where=None, limit=None, order_by=None, to_dict=False, batch_size=10_000, columns=None) -> Iterator[list]` |
-| `select_all` | 已废弃：等价于 `select(fields, where, to_dict=True)`，触发 DeprecationWarning |
-| `explain_select` | `(fields='*', where=None, order_by=None, limit=None, columns=None) -> QueryPlan` |
-| `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery`（`group_by` 已废弃，改用 `by=`） |
+| `select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, columns=None, **kwargs) -> list`（默认返回 dict 行；`to_dict=False` 返回 tuple） |
+| `iter_select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, batch_size=10_000, columns=None) -> Iterator` |
+| `iter_select_batches` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, batch_size=10_000, columns=None) -> Iterator[list]` |
+| `select_all` | 已废弃：等价于 `select(fields, where, to_dict=True)`，触发 DeprecationWarning，永久保留 |
+| `explain_select` | `(fields='*', where=None, order_by=None, limit=None, columns=None, symbols=None, start=None, end=None, date=None, session=None) -> QueryPlan`（业务参数与 `query()` 对齐） |
+| `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery`（`group_by` 已废弃，改用 `by=`；未声明 symbol_column 且无 `by=` 时抛 `BadArgument`） |
 | `asof` | 同 `latest`（别名） |
 
 #### 诊断
@@ -187,11 +188,14 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `layout_report` | `() -> LayoutReport` | 分区诊断报告 |
 | `compact` | `(partition=None, target_rows=None) -> CompactResult` | 整理 row segment |
 | `cleanup_obsolete` | `(partition=None, dry_run=True, validate=True) -> CleanupResult` | 清理 obsolete segment 文件 |
-| `count_rows` | `(where=None) -> int` | 统计当前可见行数；PostgreSQL 支持 where |
+| `count_rows` | `() -> int` | 统计当前可见行数（无参，双引擎一致） |
 | `rename` | `(new_name, exist_ok=False, overwrite=False) -> Table` | 重命名当前逻辑表 |
 | `migrate_to` | `(target_uri, target_table=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> TableMigrationResult` | 迁移单表 |
 | `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |
+| `drop_index` | `(column)` | 删除所有分区上的列索引 |
+
+**并发语义**：写入路径（`write` / `write_buffer` / 迁移写目标）与 `compact()` 共用 `_compact_lock` 串行化——compact 与写互斥是预期吞吐代价，换取不会向 obsolete segment 复活插入。
 
 ---
 
@@ -257,11 +261,13 @@ for batch in table.query(start=start, end=end).iter_batches(batch_size=50_000):
 ```python
 from iosql import Partition
 
-# 工厂方法
+# 工厂方法（顶层唯一导出的分区入口）
 Partition.duration("ts", every="1day")
 Partition.calendar("date", every="1day", timezone="Asia/Shanghai")
 Partition.range("seq", every=10000)
 ```
+
+> 注意：`DurationPartition`/`CalendarPartition`/`RangePartition` 类**不在顶层导出**；确需直接引用时从内部模块导入，如 `from iosql.partition.duration import DurationPartition`。
 
 PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边界；
 `calendar(...)` 支持 `text` / `date` / `timestamp` 目标列。text 日期列应统一
@@ -419,7 +425,7 @@ CleanupResult(
 | `schema_policy` | `str` | `"evolve"` |
 | `order_key` | `str` | 排序键 |
 | `conflict` | `str` | 冲突策略 |
-| `symbol_column` | `str` | Symbol 列名（默认 `"symbol"`） |
+| `symbol_column` | `str`/`None` | Symbol 列名；默认 `None`（显式声明后 symbols 语义才可用） |
 | `session_column` | `str`/`None` | 交易日列名 |
 | `physical_layout` | `PhysicalLayout` | 物理布局 |
 
@@ -580,6 +586,36 @@ CleanupResult(
 
 ---
 
+## 可视化管理台
+
+依赖可选 extra（fastapi + uvicorn）：
+
+```bash
+python -m pip install -e ".[ui]"
+```
+
+CLI 入口：
+
+```bash
+iosql ui -s database/market.iosql [--write] [--host 127.0.0.1] [--port 8686] [--no-browser]
+```
+
+Python 入口（惰性导入，未装 fastapi 时抛带安装指引的 `ImportError`）：
+
+```python
+from iosql.ui import create_app
+app = create_app("sqlite://database/market.iosql", mode="readonly")  # 或 "write"
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `source` | 必填 | 数据库 URI 或本地路径 |
+| `mode` | `"readonly"` | `"readonly"` 不注册任何写路由；`"write"` 开启维护操作（危险操作需预览 + 手输表名确认） |
+
+工作区：Overview / Browse Data / Structure / Query / Charts（只读即可），Maintain 仅 write 模式。仅限本机 localhost 使用。
+
+---
+
 ## 低层 mysqlite
 
 ### `iosql.utils.mysqlite.Database`
@@ -599,8 +635,8 @@ table = db["table_name"]
 
 # CRUD
 table.insert(dict, pk=..., ensure_table=True, replace=False)
-table.insert_all(list_of_dicts, pk=..., batch_size=5000)
-table.select(fields, where=None, to_dict=True)
+table.insert_all(list_of_dicts, pk=..., batch_size=5000)  # commit=False 显式拒绝
+table.select(fields, where=None, to_dict=True)            # limit=0 按 SQL 语义返回 0 行
 table.select_all(fields, where=None)
 table.select_one(fields, where=None)
 table.query_all(sql)
@@ -619,6 +655,8 @@ with db.transaction():
 
 db.close()
 ```
+
+行为契约（PLAN-057 后）：错误路径统一先 `rollback()` 再转换异常（`transaction()` 内不重复回滚）；不可解析的 sqlite 错误消息重抛原始异常（保持 `except sqlite3.IntegrityError` 类匹配可用）；建表冲突抛类型化 `DuplicateColumn`，主键不在列中抛 `PrimaryKeyNotInColumn`。mysqlite 无内置 rename/drop_column/backup——用原生 SQL 或连接 API 完成（见 `examples/mysqlite-scenarios/`）。
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
