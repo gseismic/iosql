@@ -181,7 +181,7 @@ iosql ui -s database/market.iosql           # 默认只读模式, http://127.0.0
 iosql ui -s database/market.iosql --write   # 开启维护操作
 ```
 
-其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`。Python 侧入口是 `iosql.ui.create_app(source_uri, mode="readonly"|"write")`（惰性导入，未装依赖时抛带安装指引的 ImportError）。
+其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`。Python 侧入口是 `iosql.ui.create_app(source_uri, mode="readonly"|"write")`（惰性导入，未装依赖时抛带安装指引的 ImportError）。启动为**非阻塞渐进加载**（PLAN-060）：首屏只读 manifest 级元数据（毫秒级），行数/分区数/segment 数由前端逐表异步拉取填充，大库（HDD/冷缓存/网络盘上的大量 segment 文件）打开不再被全库统计阻塞。
 
 | 工作区 | 只读 | 可修改 | 说明 |
 |:--|:-:|:-:|---|

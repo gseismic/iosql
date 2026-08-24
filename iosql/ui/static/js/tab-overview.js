@@ -1,7 +1,8 @@
 /* =====================================================================
  * iosql UI · tab-overview.js
  * Overview：库级统计卡片行 + 表清单表格（名称/行数/分区数/segment 数/
- * partition 策略/时序徽标）。字段按 /api/tables 契约防御式读取。
+ * partition 策略/时序徽标）。统计字段来自渐进拉取（PLAN-060）：
+ * 未到达时显示占位并标注 data-stats-for，由 app.js 就地更新。
  * ===================================================================== */
 (function () {
   'use strict';
@@ -16,16 +17,21 @@
 
     render: function (root, ctx) {
       var tables = ctx.tables || [];
-      var totalRows = tables.reduce(function (sum, t) {
-        var n = Number(IU.pick(t, 'row_count', 'rows'));
-        return sum + (Number.isFinite(n) ? n : 0);
-      }, 0);
+      var stats = ctx.stats || {};
+      var sum = 0;
+      tables.forEach(function (t) {
+        var s = stats[String(IU.pick(t, 'name', 'table'))];
+        if (s && typeof s.row_count === 'number') sum += s.row_count;
+      });
 
       IU.clear(root);
       root.append(
         h('div', { class: 'stat-row' },
           statCard('表数量', IU.fmt.int(tables.length)),
-          statCard('总行数合计', tables.length ? IU.fmt.int(totalRows) : '—'),
+          statCard('总行数合计',
+            h('span', null,
+              h('span', { id: 'stat-total-rows' }, IU.fmt.int(sum)),
+              h('span', { id: 'stat-total-hint', class: 'faint', style: { fontSize: '11px', marginLeft: '6px' } }, ''))),
           statCard('当前模式', ctx.mode === 'write'
             ? IU.badge('WRITABLE', 'warn')
             : IU.badge('READ-ONLY', 'ok'))),
@@ -34,7 +40,7 @@
           h('div', { class: 'card-title' },
             h('span', { class: 'micro-label' }, '表清单'),
             h('span', { class: 'faint', style: { fontSize: '11px' } }, '点击行进入该表 Browse Data')),
-          buildTableEl(tables, ctx)));
+          buildTableEl(tables, stats)));
     }
   };
 
@@ -44,7 +50,7 @@
       h('div', { class: 'stat-value' }, value));
   }
 
-  function buildTableEl(tables, ctx) {
+  function buildTableEl(tables, stats) {
     var wrap = h('div', { class: 'table-wrap' });
     var table = h('table', { class: 'data-table' });
     var cols = [
@@ -70,9 +76,9 @@
       var hasTime = !!(IU.pick(t, 'has_time', 'is_timeseries', 'time'));
       var cells = [
         h('td', { style: { fontWeight: 600 } }, name),
-        numTd(IU.pick(t, 'row_count', 'rows')),
-        numTd(IU.pick(t, 'part_count', 'partition_count', 'parts_count')),
-        numTd(IU.pick(t, 'segment_count', 'segments_count')),
+        statsTd(name, 'rows', stats),
+        statsTd(name, 'parts', stats),
+        statsTd(name, 'segs', stats),
         h('td', null, String(IU.pick(t, 'partition_str', 'partition') !== undefined ? IU.pick(t, 'partition_str', 'partition') : '—')),
         h('td', null, hasTime ? IU.badge('时序', 'info') : h('span', { class: 'faint' }, '—'))
       ];
@@ -88,9 +94,17 @@
     wrap.append(table);
     return wrap;
 
-    function numTd(v) {
-      if (v === null || v === undefined) return h('td', { class: 'num' }, h('span', { class: 'null-cell' }, '∅'));
-      return h('td', { class: 'num' }, IU.fmt.int(v));
+    /* 统计单元格：stats 已到显示数值，未到显示占位并标注由 app.js 更新 */
+    function statsTd(n, kind, statsMap) {
+      var s = statsMap[n];
+      var key = { rows: 'row_count', parts: 'part_count', segs: 'segment_count' }[kind];
+      var v = s ? s[key] : undefined;
+      var text = typeof v === 'number' ? IU.fmt.int(v) : (s && s.error ? '—' : '…');
+      return h('td', {
+        class: 'num',
+        dataset: { statsFor: n, kind: kind },
+        title: typeof v === 'number' ? null : '统计中，稍后自动填充'
+      }, text);
     }
   }
 })();

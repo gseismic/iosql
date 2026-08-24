@@ -21,7 +21,8 @@
 
   var state = {
     db: null,          // GET /api/db 结果
-    tables: [],        // GET /api/tables 数组
+    tables: [],        // GET /api/tables 数组（轻量契约，无统计字段）
+    stats: {},         // 表名 → /stats 结果（渐进拉取，PLAN-060）
     mode: 'readonly',  // 'readonly' | 'write'
     table: null,       // 当前表名；null = 总览
     tab: 'overview',
@@ -42,6 +43,7 @@
       renderSidebar();
       renderTabbar();
       route();
+      pumpStats(); // 非阻塞：先出界面，行数/分区数异步逐表填充
     }).catch(function () {
       IU.clear(content);
       content.append(h('div', { class: 'boot-screen' },
@@ -49,6 +51,58 @@
         h('div', null, '无法连接后端 API（/api/db）。后端服务可能尚未就绪。'),
         h('button', { class: 'btn primary', onclick: boot }, '重试')));
     });
+  }
+
+  /* ---------------- 渐进统计（PLAN-060） ----------------
+   * 启动契约轻量化后，行数/分区数/segment 数由前端逐表拉取填充；
+   * 并发 4，避免大库上瞬间打满连接预算。 */
+  function pumpStats() {
+    var pending = [];
+    state.tables.forEach(function (t) {
+      var name = String(IU.pick(t, 'name', 'table'));
+      if (!state.stats[name]) pending.push(name);
+    });
+    var idx = 0;
+    function worker() {
+      if (idx >= pending.length) return;
+      var name = pending[idx++];
+      IU.api('/api/table/' + encodeURIComponent(name) + '/stats').then(
+        function (resp) {
+          state.stats[name] = resp || {};
+          refreshStatsViews();
+          worker();
+        },
+        function () {
+          state.stats[name] = { error: true };
+          refreshStatsViews();
+          worker();
+        });
+    }
+    for (var i = 0; i < 4 && i < pending.length; i++) worker();
+  }
+
+  /* stats 到达后就地更新所有标注单元格（侧栏 + Overview），不整页重渲染 */
+  function refreshStatsViews() {
+    document.querySelectorAll('[data-stats-for]').forEach(function (el) {
+      var s = state.stats[el.dataset.statsFor];
+      if (!s) return;
+      var key = { rows: 'row_count', parts: 'part_count', segs: 'segment_count' }[el.dataset.kind];
+      var v = s[key];
+      if (v === undefined) { el.textContent = '—'; return; }
+      el.textContent = IU.fmt.int(v) + (el.dataset.kind === 'rows' ? ' 行' : '');
+      el.removeAttribute('title'); // 清除"统计中"占位标记
+    });
+    var totalEl = document.getElementById('stat-total-rows');
+    if (totalEl) {
+      var sum = 0, done = 0;
+      state.tables.forEach(function (t) {
+        var s2 = state.stats[String(IU.pick(t, 'name', 'table'))];
+        if (s2 && typeof s2.row_count === 'number') { sum += s2.row_count; done++; }
+      });
+      totalEl.textContent = IU.fmt.int(sum);
+      var hint = document.getElementById('stat-total-hint');
+      if (hint) hint.textContent = done < state.tables.length ? '统计中…' : '';
+    }
   }
 
   /* ---------------- 顶栏 ---------------- */
@@ -90,16 +144,21 @@
       nav.append(h('div', { style: { padding: '8px 10px', color: 'var(--tx2)', fontSize: '12px' } }, '暂无表'));
     }
     state.tables.forEach(function (t) {
-      var name = String(IU.pick(t, 'name', 'table') || '(未知)');
-      var rows = IU.pick(t, 'row_count', 'rows');
+      var name = String(IU.pick(t, 'name', 'table'));
       var pstr = IU.pick(t, 'partition_str', 'partition');
+      var s = state.stats[name];
+      var rowsText = s && typeof s.row_count === 'number'
+        ? IU.fmt.int(s.row_count) + ' 行' : '…';
       nav.append(h('a', {
         class: 'side-item', href: '#/table/' + encodeURIComponent(name) + '/' + lastTableTab(),
         'data-nav': 'table:' + name
       },
         h('div', { class: 'side-name' }, h('span', { class: 'glyph' }, '▸'), name),
         h('div', { class: 'side-meta' },
-          h('span', { class: 'side-rows' }, rows !== undefined ? IU.fmt.int(rows) + ' 行' : ''),
+          h('span', {
+            class: 'side-rows', title: s ? null : '行数统计中…',
+            dataset: { statsFor: name, kind: 'rows' }
+          }, rowsText),
           pstr !== undefined ? h('span', { class: 'side-part', title: String(pstr) }, String(pstr)) : null)));
     });
   }
@@ -181,7 +240,10 @@
 
     // 总览：无需 spec
     if (state.tab === 'overview') {
-      safeRender(IU.tabs.overview, content, { mode: state.mode, tables: state.tables, table: null, spec: null });
+      safeRender(IU.tabs.overview, content, {
+        mode: state.mode, tables: state.tables, table: null, spec: null,
+        stats: state.stats
+      });
       return;
     }
 

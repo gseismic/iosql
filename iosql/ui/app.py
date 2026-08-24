@@ -487,21 +487,21 @@ def _register_read_routes(app: FastAPI) -> None:
         }
 
     @app.get("/api/tables")
-    def list_tables(request: Request) -> dict:
+    def list_tables(request: Request, with_stats: bool = False) -> dict:
+        """表清单。默认轻量（manifest 级，毫秒级返回，不碰物理文件）——
+        启动契约要求首屏不被全库统计阻塞（PLAN-060）。
+        with_stats=1 保留旧的阻塞式全量行为（脚本/测试兼容）。"""
         db = request.app.state.db
         db_uri = db.uri
+        names = db.table_names()
         tables = []
-        for name in db.table_names():
+        for name in names:
             table = get_table(db, name)
             spec = table.spec()
-            row_count = cached_row_count(db_uri, table, name)
             partition = spec.partition if spec is not None else None
             partition_data = serialize_partition(partition)
-            tables.append({
+            entry = {
                 "name": name,
-                "row_count": row_count,
-                "part_count": len(table.table_parts()),
-                "segment_count": len(table.segments()),
                 "partition_str": (
                     partition_data["str"] if partition_data else None
                 ),
@@ -512,8 +512,26 @@ def _register_read_routes(app: FastAPI) -> None:
                 ] if spec is not None else [],
                 "order_key": spec.order_key if spec is not None else None,
                 "pk": list(spec.primary_key) if spec is not None else [],
-            })
+            }
+            if with_stats:
+                entry["row_count"] = cached_row_count(db_uri, table, name)
+                entry["part_count"] = len(table.table_parts())
+                entry["segment_count"] = len(table.segments())
+            tables.append(entry)
         return {"tables": tables}
+
+    @app.get("/api/table/{name}/stats")
+    def get_stats(name: str, request: Request) -> dict:
+        """单表统计（行数带 TTL 缓存；parts/segments 为目录列举）。
+        前端启动后逐表渐进拉取，避免首屏阻塞（PLAN-060）。"""
+        db = request.app.state.db
+        table = get_table(db, name)
+        return {
+            "name": name,
+            "row_count": cached_row_count(db.uri, table, name),
+            "part_count": len(table.table_parts()),
+            "segment_count": len(table.segments()),
+        }
 
     @app.get("/api/table/{name}/spec")
     def get_spec(name: str, request: Request) -> dict:

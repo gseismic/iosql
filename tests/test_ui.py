@@ -126,7 +126,7 @@ class TestReadOnlyApi:
 
     def test_list_tables_summary(self, demo_db_path):
         with _client(f"sqlite://{demo_db_path}") as client:
-            resp = client.get("/api/tables")
+            resp = client.get("/api/tables?with_stats=1")
         assert resp.status_code == 200
         tables = {item["name"]: item for item in resp.json()["tables"]}
         assert set(tables) == {"ticks", "events", "notes"}
@@ -150,6 +150,34 @@ class TestReadOnlyApi:
 
         # 能力位：无分区表无 time 契约（驱动 D5 门控）
         assert tables["notes"]["has_time"] is False
+
+    def test_list_tables_light_default(self, demo_db_path):
+        """PLAN-060 · 默认轻量契约：不返回统计字段，首屏不被全库统计阻塞。"""
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.get("/api/tables")
+        assert resp.status_code == 200
+        tables = resp.json()["tables"]
+        assert {t["name"] for t in tables} == {"ticks", "events", "notes"}
+        for t in tables:
+            assert "row_count" not in t
+            assert "part_count" not in t
+            assert "segment_count" not in t
+            # manifest 级元数据仍然可用
+            assert "partition_str" in t and "has_time" in t and "pk" in t
+
+    def test_table_stats_endpoint(self, demo_db_path):
+        """PLAN-060 · 单表渐进统计端点。"""
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.get("/api/table/ticks/stats")
+            assert resp.status_code == 200
+            stats = resp.json()
+            assert stats["name"] == "ticks"
+            assert stats["row_count"] == TICKS_TOTAL
+            assert stats["part_count"] == 3
+            assert stats["segment_count"] > 1
+
+            resp = client.get("/api/table/nope/stats")
+            assert resp.status_code == 404
 
     def test_table_spec(self, demo_db_path):
         with _client(f"sqlite://{demo_db_path}") as client:
