@@ -1,30 +1,107 @@
 from __future__ import annotations
 
-import os
 import re
 import math
+import uuid
+import hashlib
 import warnings
 import itertools
-from typing import Any, Dict, List, Optional
+from contextlib import contextmanager
+from typing import Any, Dict, List
 import arrow
 import psycopg2
 from psycopg2 import sql
 
 from ...table import BaseTable, resolve_select_fields
-from ...partition import Partition, DurationPartition, CalendarPartition
+from ...partition import Partition, CalendarPartition
 from ...core.query import Where
-from ...exception import BadArgument, InvalidUriSchema
+from ...exception import BadArgument, SchemaConflict
 from ...utils.schema import parse_db_schema
 from ...logger import default_logger as logger
 from ...spec import TableContract, TableMigrationResult, WriteResult
 from ..sqlite.query_util import (
     _quote_sql_identifier,
     build_or_cases_subquery,
-    build_select_fields_sql,
 )
 
 
 _cursor_seq = itertools.count(1)
+
+# PostgreSQL 标识符字节上限；超长静默截断会导致索引/临时表撞名
+_IDENTIFIER_MAX_BYTES = 63
+# 单条 INSERT 语句最多绑定的参数量，超出则拆页（远低于 65535 上限）
+_INSERT_MAX_PARAMS = 60000
+
+# 契约列类型 -> PostgreSQL DDL 类型的封闭映射：
+# 不在表内的类型一律拒绝，避免把任意字符串（含多语句注入）拼进 DDL
+_PG_TYPE_MAP = {
+    'int': 'BIGINT',
+    'integer': 'BIGINT',
+    'bigint': 'BIGINT',
+    'float': 'DOUBLE PRECISION',
+    'real': 'DOUBLE PRECISION',
+    'double': 'DOUBLE PRECISION',
+    'double precision': 'DOUBLE PRECISION',
+    'text': 'TEXT',
+    'str': 'TEXT',
+    'string': 'TEXT',
+    'bool': 'BOOLEAN',
+    'boolean': 'BOOLEAN',
+    'date': 'DATE',
+    'timestamp': 'TIMESTAMP',
+    'datetime': 'TIMESTAMP',
+    'timestamp without time zone': 'TIMESTAMP',
+    'timestamptz': 'TIMESTAMPTZ',
+    'timestamp with time zone': 'TIMESTAMPTZ',
+    'json': 'JSONB',
+    'jsonb': 'JSONB',
+    'blob': 'BYTEA',
+    'bytes': 'BYTEA',
+    'bytea': 'BYTEA',
+}
+
+# 合法裸列名：字符串 fields 只接受标识符列表，杜绝 SQL 片段
+_FIELD_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_$]*$')
+# pg_get_expr(relpartbound) 形如 FOR VALUES FROM ('a') TO ('b')
+_PARTITION_BOUNDS_RE = re.compile(r'FROM \((.*)\) TO \((.*)\)', re.IGNORECASE)
+
+
+def _pg_identifier(name):
+    """带参数执行时的标识符引用：转义 % 避免 psycopg2 占位符插值误判。"""
+    return _quote_sql_identifier(name).replace('%', '%%')
+
+
+def _rewrite_placeholders(sql_text):
+    """把共享编译器的 `?` 占位符改写为 `%s`。
+
+    双引号标识符内部的 `?`/`%` 原样保留（`%` 需转义成 `%%`），
+    避免字段名含 `?`/`%` 时被全局替换破坏。
+    """
+    out = []
+    in_quote = False
+    for ch in str(sql_text):
+        if ch == '"':
+            in_quote = not in_quote
+            out.append(ch)
+        elif in_quote and ch == '%':
+            out.append('%%')
+        elif not in_quote and ch == '?':
+            out.append('%s')
+        else:
+            out.append(ch)
+    return ''.join(out)
+
+
+def _fit_identifier(name, suffix):
+    """把 `name + suffix` 限制在 PostgreSQL 63 字节内（前缀截断 + 后缀保留）。"""
+    raw = f'{name}{suffix}'
+    if len(raw.encode('utf-8')) <= _IDENTIFIER_MAX_BYTES:
+        return raw
+    budget = _IDENTIFIER_MAX_BYTES - len(suffix.encode('utf-8'))
+    if budget <= 0:
+        return suffix[:_IDENTIFIER_MAX_BYTES]
+    prefix = name.encode('utf-8')[:budget].decode('utf-8', errors='ignore')
+    return f'{prefix}{suffix}'
 
 
 class Table(BaseTable):
@@ -71,6 +148,11 @@ class Table(BaseTable):
         self._primary_key = []
         self._declared_column_types = {}
         self._table_created = False
+        # current_schema() 缓存，避免 public 硬编码
+        self._schema = None
+        # commit=False 写入会保持事务打开，后续写操作并入同一事务
+        self._in_explicit_tx = False
+        self._tx_previous_autocommit = True
         
         if self.verbose >= 1:
             logger.info(f'PostgreSQL Table {table_name} initialized with partition_mode={partition_mode}')
@@ -85,7 +167,69 @@ class Table(BaseTable):
     def close(self):
         """Close database connection."""
         if self._conn and not self._conn.closed:
+            if self._in_explicit_tx:
+                try:
+                    self._conn.rollback()
+                except Exception:
+                    pass
+                self._in_explicit_tx = False
             self._conn.close()
+
+    @contextmanager
+    def _transaction(self, commit=True):
+        """写事务：commit=True 成功提交/失败回滚；commit=False 保持事务打开。
+
+        保持事务打开时，调用方后续可用 commit=True 的写入或 delete 提交；
+        连接关闭时未提交事务自动回滚。
+        """
+        conn = self.connect()
+        if self._in_explicit_tx:
+            try:
+                yield conn
+            except BaseException:
+                conn.rollback()
+                self._in_explicit_tx = False
+                self._set_autocommit(conn, self._tx_previous_autocommit)
+                raise
+            if commit:
+                conn.commit()
+                self._in_explicit_tx = False
+                self._set_autocommit(conn, self._tx_previous_autocommit)
+            return
+
+        previous_autocommit = conn.autocommit
+        self._set_autocommit(conn, False)
+        self._in_explicit_tx = True
+        self._tx_previous_autocommit = previous_autocommit
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            self._in_explicit_tx = False
+            self._set_autocommit(conn, previous_autocommit)
+            raise
+        if commit:
+            conn.commit()
+            self._in_explicit_tx = False
+            self._set_autocommit(conn, previous_autocommit)
+
+    @staticmethod
+    def _set_autocommit(conn, value):
+        try:
+            conn.autocommit = value
+        except Exception:
+            # 事务仍应由调用方显式提交/回滚；连接属性设置失败不掩盖主流程
+            pass
+
+    def _schema_name(self):
+        """解析当前会话 search_path 的首个有效 schema，兜底 public。"""
+        if self._schema is None:
+            conn = self.connect()
+            cursor = conn.cursor()
+            cursor.execute('select current_schema()')
+            row = cursor.fetchone()
+            self._schema = (row[0] if row else None) or 'public'
+        return self._schema
 
     def rename(self, new_name, exist_ok=False, overwrite=False):
         """Rename the PostgreSQL table and matching native partition children."""
@@ -99,42 +243,69 @@ class Table(BaseTable):
             raise BadArgument('rename cannot use overwrite and exist_ok together')
 
         conn = self.connect()
-        cursor = conn.cursor()
-        if not self._relation_exists(old_name):
-            raise BadArgument(f'table does not exist: {old_name}')
-        if self._relation_exists(new_name):
-            if not overwrite:
-                raise BadArgument(f'table already exists: {new_name}')
-            cursor.execute(
-                sql.SQL('DROP TABLE {} CASCADE').format(sql.Identifier(new_name))
-            )
+        with self._transaction(True):
+            cursor = conn.cursor()
+            if not self._relation_exists(old_name):
+                raise BadArgument(f'table does not exist: {old_name}')
 
-        child_renames = self._native_partition_child_renames(old_name, new_name)
-        for _, target_child in child_renames:
-            if self._relation_exists(target_child):
-                if not overwrite:
-                    raise BadArgument(f'table already exists: {target_child}')
+            # 先完成全部可行性检查，再执行任何破坏性语句
+            child_renames = self._native_partition_child_renames(old_name, new_name)
+            target_parent_exists = self._relation_exists(new_name)
+            conflicting_children = [
+                target_child
+                for _, target_child in child_renames
+                if self._relation_exists(target_child)
+            ]
+            if not overwrite:
+                if target_parent_exists:
+                    raise BadArgument(f'table already exists: {new_name}')
+                if conflicting_children:
+                    raise BadArgument(
+                        f'table already exists: {conflicting_children[0]}'
+                    )
+
+            trash = None
+            if target_parent_exists:
+                # 目标改名到临时名而非直接 DROP；后续任一语句失败可整体回滚
+                trash = self._trash_name(new_name)
                 cursor.execute(
-                    sql.SQL('DROP TABLE {} CASCADE').format(sql.Identifier(target_child))
+                    sql.SQL('ALTER TABLE {} RENAME TO {}').format(
+                        sql.Identifier(new_name),
+                        sql.Identifier(trash),
+                    )
+                )
+            for target_child in conflicting_children:
+                cursor.execute(
+                    sql.SQL('DROP TABLE {} CASCADE').format(
+                        sql.Identifier(target_child)
+                    )
                 )
 
-        cursor.execute(
-            sql.SQL('ALTER TABLE {} RENAME TO {}').format(
-                sql.Identifier(old_name),
-                sql.Identifier(new_name),
-            )
-        )
-        for old_child, new_child in child_renames:
             cursor.execute(
                 sql.SQL('ALTER TABLE {} RENAME TO {}').format(
-                    sql.Identifier(old_child),
-                    sql.Identifier(new_child),
+                    sql.Identifier(old_name),
+                    sql.Identifier(new_name),
                 )
             )
+            for old_child, new_child in child_renames:
+                cursor.execute(
+                    sql.SQL('ALTER TABLE {} RENAME TO {}').format(
+                        sql.Identifier(old_child),
+                        sql.Identifier(new_child),
+                    )
+                )
+            if trash is not None:
+                cursor.execute(
+                    sql.SQL('DROP TABLE {} CASCADE').format(sql.Identifier(trash))
+                )
 
         self._table_name = new_name
         self._table_created = True
         return self
+
+    def _trash_name(self, name):
+        suffix = f'__iosql_old_{uuid.uuid4().hex[:8]}'
+        return _fit_identifier(name, suffix)
 
     def _validate_relation_name(self, name):
         value = str(name or '').strip()
@@ -157,9 +328,61 @@ class Table(BaseTable):
               and c.relkind in ('r', 'p')
             limit 1
             """,
-            ('public', name),
+            (self._schema_name(), name),
         )
         return cursor.fetchone() is not None
+
+    def _fetch_table_columns(self):
+        """读取已有物理表的列名集合（information_schema）。"""
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            select column_name
+            from information_schema.columns
+            where table_schema = %s
+              and table_name = %s
+            order by ordinal_position
+            """,
+            (self._schema_name(), self._table_name),
+        )
+        return {row[0] for row in cursor.fetchall()}
+
+    def _is_partitioned_table(self):
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            select 1
+            from pg_partitioned_table pt
+            join pg_class c on c.oid = pt.partrelid
+            join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = %s
+              and c.relname = %s
+            limit 1
+            """,
+            (self._schema_name(), self._table_name),
+        )
+        return cursor.fetchone() is not None
+
+    def _verify_existing_table(self, column_type, partition):
+        """已有表漂移检查：缺列/分区形态不符时抛 SchemaConflict。"""
+        existing = self._fetch_table_columns()
+        declared = list((column_type or {}).keys())
+        if existing:
+            missing = [col for col in declared if col not in existing]
+            if missing:
+                raise SchemaConflict(
+                    f'表 `{self._table_name}` 已存在但缺少契约列 {missing}；'
+                    '物理表与契约不一致。修复: 对齐 columns= 声明、'
+                    'DROP TABLE 后重建，或改用新的表名。'
+                )
+        if partition is not None and not self._is_partitioned_table():
+            raise SchemaConflict(
+                f'表 `{self._table_name}` 已存在但未启用 native 分区，'
+                '而契约声明了 partition。修复: DROP TABLE 后重建，'
+                '或去掉 partition 声明。'
+            )
 
     def _native_partition_child_renames(self, old_name, new_name):
         if self.partition_mode != self.PARTITION_MODE_NATIVE:
@@ -178,7 +401,7 @@ class Table(BaseTable):
               and parent.relname = %s
             order by child.relname
             """,
-            ('public', old_name),
+            (self._schema_name(), old_name),
         )
         renames = []
         for (child_name,) in cursor.fetchall():
@@ -222,14 +445,28 @@ class Table(BaseTable):
         if partition is None:
             partition = self._partition
         
-        self._declared_column_types.update(dict(column_type or {}))
+        column_type = dict(column_type or {})
+        self._declared_column_types.update(column_type)
         self._primary_key = list(pk or [])
+
+        # 先做封闭类型映射校验（未知类型一律拒绝，即使表已存在）
+        mapped_types = {
+            col_name: self._pg_column_type(col_type)
+            for col_name, col_type in column_type.items()
+        }
+
+        # 已有表：不再依赖 CREATE TABLE IF NOT EXISTS 静默跳过，先做漂移检查
+        if self._relation_exists(self._table_name):
+            self._verify_existing_table(column_type, partition)
+            self._table_created = True
+            return
+
         columns_def = []
-        for col_name, col_type in column_type.items():
+        for col_name, mapped_type in mapped_types.items():
             col_def = (
                 sql.Identifier(col_name)
                 + sql.SQL(' ')
-                + sql.SQL(self._pg_column_type(col_type))
+                + sql.SQL(mapped_type)
             )
             columns_def.append(col_def)
         if pk:
@@ -240,34 +477,22 @@ class Table(BaseTable):
             )
         
         if partition is not None:
-            if self.partition_mode == self.PARTITION_MODE_NATIVE:
-                self._create_native_partitioned_table(columns_def, pk, partition)
-            else:
-                self._create_file_partitioned_table(columns_def, pk, partition)
+            self._create_native_partitioned_table(columns_def, pk, partition)
         else:
             self._create_simple_table(columns_def, pk)
         self._table_created = True
 
     def _pg_column_type(self, col_type):
+        """封闭类型映射：未知类型直接拒绝，绝不透传用户字符串。"""
         value = str(col_type or 'text').strip().lower()
-        mapping = {
-            'int': 'BIGINT',
-            'integer': 'BIGINT',
-            'bigint': 'BIGINT',
-            'float': 'DOUBLE PRECISION',
-            'real': 'DOUBLE PRECISION',
-            'double': 'DOUBLE PRECISION',
-            'double precision': 'DOUBLE PRECISION',
-            'text': 'TEXT',
-            'str': 'TEXT',
-            'string': 'TEXT',
-            'bool': 'BOOLEAN',
-            'boolean': 'BOOLEAN',
-            'date': 'DATE',
-            'timestamp': 'TIMESTAMP',
-            'json': 'JSONB',
-        }
-        return mapping.get(value, value.upper())
+        mapped = _PG_TYPE_MAP.get(value)
+        if mapped is None:
+            allowed = ', '.join(sorted(set(_PG_TYPE_MAP)))
+            raise BadArgument(
+                f'不支持的 PostgreSQL 列类型 `{col_type}`；'
+                f'合法类型: {allowed}'
+            )
+        return mapped
     
     def _create_simple_table(self, columns_def: List, pk):
         """Create a simple non-partitioned table."""
@@ -299,11 +524,6 @@ class Table(BaseTable):
         cursor.execute(create_sql)
         if self.verbose >= 1:
             logger.info(f'Created partitioned table {self._table_name} by {partition_col}')
-    
-    def _create_file_partitioned_table(self, columns_def: List, pk, partition: Partition):
-        """Create file-per-partition table (uses foreign tables or regular tables per partition)."""
-        # For now, just create the main table - partitions will be created on-demand
-        self._create_simple_table(columns_def, pk)
     
     def insert(self, dic, pk=None, extra_data=None, partition=None,
                replace=False, ignore=False, commit=True, **kwargs):
@@ -383,6 +603,8 @@ class Table(BaseTable):
             partition = self._partition
         if pk is None:
             pk = self._primary_key
+        if isinstance(pk, str):
+            pk = [pk]
         
         # Add extra data if provided
         if extra_data:
@@ -396,33 +618,35 @@ class Table(BaseTable):
             self.create_table(column_types, pk=pk, partition=partition)
 
         partitioned_data = None
-        if partition is None:
-            # No partitioning - insert all into single table
-            self._insert_into_table(
-                data,
-                self._table_name,
-                pk=pk,
-                replace=replace,
-                ignore=ignore,
-            )
-        else:
-            # Partition data and insert into appropriate partitions
-            partitioned_data: Dict[Any, List] = {}
-            for row in data:
-                key = partition.get_key(row)
-                if key not in partitioned_data:
-                    partitioned_data[key] = []
-                partitioned_data[key].append(row)
-            
-            for part_key, part_rows in partitioned_data.items():
-                self._insert_partition(
-                    part_key,
-                    part_rows,
-                    partition,
+        # 整批写入放在一个显式事务中：失败不留半批脏数据
+        with self._transaction(commit):
+            if partition is None:
+                # No partitioning - insert all into single table
+                self._insert_into_table(
+                    data,
+                    self._table_name,
                     pk=pk,
                     replace=replace,
                     ignore=ignore,
                 )
+            else:
+                # Partition data and insert into appropriate partitions
+                partitioned_data: Dict[Any, List] = {}
+                for row in data:
+                    key = partition.get_key(row)
+                    if key not in partitioned_data:
+                        partitioned_data[key] = []
+                    partitioned_data[key].append(row)
+                
+                for part_key, part_rows in partitioned_data.items():
+                    self._insert_partition(
+                        part_key,
+                        part_rows,
+                        partition,
+                        pk=pk,
+                        replace=replace,
+                        ignore=ignore,
+                    )
         return WriteResult(
             rows_seen=len(data),
             rows_written=None if ignore else len(data),
@@ -433,125 +657,143 @@ class Table(BaseTable):
             ),
         )
     
+    def _union_columns(self, data: List[Dict]):
+        """按首次出现顺序取整批行的列并集；缺列在参数里补 None。
+
+        避免旧实现按 data[0] 取列造成的静默丢列/KeyError。
+        """
+        columns = []
+        seen = set()
+        for row in data:
+            if not isinstance(row, dict):
+                raise BadArgument(
+                    'insert_all: 每行必须是 dict，'
+                    f'得到 {type(row).__name__}: {row!r}'
+                )
+            for key in row.keys():
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(key)
+        if not columns:
+            raise BadArgument('insert_all: 数据行不能是空 dict')
+        return columns
+
     def _insert_into_table(self, data: List[Dict], table_name: str, pk=None,
                            replace=False, ignore=False):
-        """Insert data into a specific table."""
+        """Insert data into a specific table (multi-row VALUES 分页批量)。"""
         if not data:
             return
-        
+
+        if replace and not pk:
+            raise BadArgument('PostgreSQL replace/upsert requires primary key')
+
         conn = self.connect()
         cursor = conn.cursor()
-        
-        columns = list(data[0].keys())
-        col_identifiers = [sql.Identifier(col) for col in columns]
-        
-        if replace:
-            if not pk:
-                raise BadArgument('PostgreSQL replace/upsert requires primary key')
-            # Use ON CONFLICT DO UPDATE
-            for row in data:
-                placeholders = [sql.Placeholder(col) for col in columns]
-                insert_sql = sql.SQL('INSERT INTO {} ({}) VALUES ({})').format(
-                    sql.Identifier(table_name),
-                    sql.SQL(', ').join(col_identifiers),
-                    sql.SQL(', ').join(placeholders)
-                )
+
+        columns = self._union_columns(data)
+        col_identifiers = ', '.join(_pg_identifier(col) for col in columns)
+        param_rows = [
+            [row.get(col) for col in columns]
+            for row in data
+        ]
+        page_size = max(1, _INSERT_MAX_PARAMS // max(1, len(columns)))
+
+        for start in range(0, len(param_rows), page_size):
+            page = param_rows[start:start + page_size]
+            values_sql = ', '.join(
+                '(' + ', '.join(['%s'] * len(columns)) + ')'
+                for _ in page
+            )
+            insert_sql = (
+                f'INSERT INTO {_pg_identifier(table_name)} '
+                f'({col_identifiers}) VALUES {values_sql}'
+            )
+            if replace:
                 update_parts = [
-                    sql.Identifier(col) + sql.SQL(' = EXCLUDED.') + sql.Identifier(col)
+                    f'{_pg_identifier(col)} = EXCLUDED.{_pg_identifier(col)}'
                     for col in columns
                     if col not in pk
                 ]
+                conflict_cols = ', '.join(_pg_identifier(col) for col in pk)
                 if update_parts:
-                    insert_sql += sql.SQL(' ON CONFLICT ({}) DO UPDATE SET {}').format(
-                        sql.SQL(', ').join(sql.Identifier(col) for col in pk),
-                        sql.SQL(', ').join(update_parts),
+                    insert_sql += (
+                        f' ON CONFLICT ({conflict_cols}) DO UPDATE SET '
+                        + ', '.join(update_parts)
                     )
                 else:
-                    insert_sql += sql.SQL(' ON CONFLICT ({}) DO NOTHING').format(
-                        sql.SQL(', ').join(sql.Identifier(col) for col in pk)
-                    )
-                
-                cursor.execute(insert_sql, row)
-        elif ignore:
-            # Use ON CONFLICT DO NOTHING
-            for row in data:
-                placeholders = [sql.Placeholder(col) for col in columns]
-                insert_sql = sql.SQL(
-                    'INSERT INTO {} ({}) VALUES ({}) ON CONFLICT DO NOTHING'
-                ).format(
-                    sql.Identifier(table_name),
-                    sql.SQL(', ').join(col_identifiers),
-                    sql.SQL(', ').join(placeholders)
-                )
-                cursor.execute(insert_sql, row)
-        else:
-            # Regular INSERT
-            for row in data:
-                placeholders = [sql.Placeholder(col) for col in columns]
-                insert_sql = sql.SQL('INSERT INTO {} ({}) VALUES ({})').format(
-                    sql.Identifier(table_name),
-                    sql.SQL(', ').join(col_identifiers),
-                    sql.SQL(', ').join(placeholders)
-                )
-                cursor.execute(insert_sql, row)
+                    insert_sql += f' ON CONFLICT ({conflict_cols}) DO NOTHING'
+            elif ignore:
+                insert_sql += ' ON CONFLICT DO NOTHING'
+
+            flat_params = [value for row in page for value in row]
+            cursor.execute(insert_sql, flat_params)
     
     def _insert_partition(self, part_key, data: List[Dict], partition: Partition,
                          pk=None,
                          replace=False, ignore=False):
-        """Insert data into a specific partition."""
-        if self.partition_mode == self.PARTITION_MODE_NATIVE:
-            self._insert_into_native_partition(
-                part_key,
-                data,
-                partition,
-                pk=pk,
-                replace=replace,
-                ignore=ignore,
-            )
-        else:
-            self._insert_into_file_partition(
-                part_key,
-                data,
-                partition,
-                replace=replace,
-                ignore=ignore,
-            )
+        """Insert data into a specific native partition."""
+        self._insert_into_native_partition(
+            part_key,
+            data,
+            partition,
+            pk=pk,
+            replace=replace,
+            ignore=ignore,
+        )
     
     def _insert_into_native_partition(self, part_key, data: List[Dict], partition: Partition,
                                     pk=None,
                                     replace=False, ignore=False):
         """Insert into a native PostgreSQL partition.
-        
-        Creates the partition if it doesn't exist.
+
+        分区不存在则创建；同名分区已存在时校验边界，边界不一致立即报错，
+        不再静默跳过（边界重叠/漂移会被显式暴露）。
         """
         conn = self.connect()
         cursor = conn.cursor()
         
-        # Create partition if not exists
         partition_name = self._partition_table_name(part_key)
         start_bound, end_bound = self._partition_bounds(
             partition,
             part_key,
             rows=data,
         )
-        
-        create_part_sql = sql.SQL(
-            'CREATE TABLE IF NOT EXISTS {} PARTITION OF {} '
-            'FOR VALUES FROM ({}) TO ({})'
-        ).format(
-            sql.Identifier(partition_name),
-            sql.Identifier(self._table_name),
-            sql.Placeholder(),
-            sql.Placeholder()
-        )
-        
-        try:
-            cursor.execute(create_part_sql, (start_bound, end_bound))
-            if self.verbose >= 2:
-                logger.info(f'Created partition {partition_name}')
-        except psycopg2.errors.DuplicateTable:
+        existing_bound = self._existing_partition_bounds(partition_name)
+        if existing_bound is not None:
+            if not self._partition_bounds_equal(existing_bound, start_bound, end_bound):
+                raise BadArgument(
+                    f'分区 `{partition_name}` 已存在但边界与期望不一致: '
+                    f'{existing_bound!r}，期望 FROM ({start_bound!r}) TO ({end_bound!r})。'
+                    '修复: 重建该分区，或修正分区键/契约中的时间列与粒度。'
+                )
             if self.verbose >= 2:
                 logger.info(f'Partition {partition_name} already exists')
+        else:
+            create_part_sql = sql.SQL(
+                'CREATE TABLE {} PARTITION OF {} '
+                'FOR VALUES FROM ({}) TO ({})'
+            ).format(
+                sql.Identifier(partition_name),
+                sql.Identifier(self._table_name),
+                sql.Placeholder(),
+                sql.Placeholder()
+            )
+            try:
+                cursor.execute(create_part_sql, (start_bound, end_bound))
+                if self.verbose >= 2:
+                    logger.info(f'Created partition {partition_name}')
+            except (
+                psycopg2.errors.DuplicateTable,
+                psycopg2.errors.UniqueViolation,
+            ) as exc:
+                raise BadArgument(
+                    f'分区 `{partition_name}` 并发创建冲突，请重试'
+                ) from exc
+            except psycopg2.errors.InvalidObjectDefinition as exc:
+                raise BadArgument(
+                    f'分区 `{partition_name}` 与现有分区边界冲突: {exc}；'
+                    '修复: 清理重叠分区（含 DEFAULT 分区）或调整分区粒度'
+                ) from exc
         
         # Insert through the parent so PostgreSQL routes and enforces parent constraints.
         self._insert_into_table(
@@ -561,6 +803,51 @@ class Table(BaseTable):
             replace=replace,
             ignore=ignore,
         )
+
+    def _existing_partition_bounds(self, partition_name):
+        """读取同名子分区的 pg_get_expr(relpartbound)；不存在返回 None。"""
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            select pg_get_expr(c.relpartbound, c.oid)
+            from pg_class c
+            join pg_namespace n on n.oid = c.relnamespace
+            where n.nspname = %s
+              and c.relname = %s
+              and c.relkind = 'r'
+            limit 1
+            """,
+            (self._schema_name(), partition_name),
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    def _partition_bounds_equal(self, existing_expr, start_bound, end_bound):
+        match = _PARTITION_BOUNDS_RE.search(str(existing_expr or ''))
+        if not match:
+            return False
+        return (
+            self._bound_value_equal(match.group(1), start_bound)
+            and self._bound_value_equal(match.group(2), end_bound)
+        )
+
+    @staticmethod
+    def _bound_value_equal(raw_value, expected):
+        text = str(raw_value or '').strip()
+        text = re.sub(r'::[A-Za-z_][A-Za-z0-9_ ]*$', '', text).strip()
+        if text.startswith("'") and text.endswith("'"):
+            text = text[1:-1].replace("''", "'")
+        if str(expected) == text:
+            return True
+        try:
+            return float(text) == float(expected)
+        except (TypeError, ValueError):
+            pass
+        try:
+            return arrow.get(text) == arrow.get(expected)
+        except Exception:
+            return False
 
     def _partition_bounds(self, partition: Partition, part_key, rows=None):
         if isinstance(partition, CalendarPartition):
@@ -581,16 +868,17 @@ class Table(BaseTable):
         if normalized in ['date']:
             return start.format('YYYY-MM-DD'), end.format('YYYY-MM-DD')
 
-        if normalized in [
-            'timestamp',
-            'datetime',
-            'timestamp without time zone',
-            'timestamp with time zone',
-            'timestamptz',
-        ]:
+        if normalized in ['timestamp', 'datetime', 'timestamp without time zone']:
             return (
                 start.format('YYYY-MM-DD HH:mm:ss'),
                 end.format('YYYY-MM-DD HH:mm:ss'),
+            )
+
+        if normalized in ['timestamp with time zone', 'timestamptz']:
+            # 显式带 UTC 偏移，边界不依赖会话 TimeZone 解释
+            return (
+                start.to('UTC').format('YYYY-MM-DD HH:mm:ssZZ'),
+                end.to('UTC').format('YYYY-MM-DD HH:mm:ssZZ'),
             )
 
         return self._calendar_text_bounds(partition, start, end, rows)
@@ -616,9 +904,11 @@ class Table(BaseTable):
         elif unit in ['week', 'day']:
             fmt = 'YYYY-MM-DD'
         elif unit == 'hour':
-            fmt = f'YYYY-MM-DD{separator}HH:00:00'
+            # 粗粒度前缀作为边界：省略秒/分的文本值（'09'、'09:30'）也落在
+            # [lower, upper) 内，不会被补全的 ':00:00' 越界排除
+            fmt = f'YYYY-MM-DD{separator}HH'
         else:
-            fmt = f'YYYY-MM-DD{separator}HH:mm:00'
+            fmt = f'YYYY-MM-DD{separator}HH:mm'
         return start.format(fmt), end.format(fmt)
 
     def _calendar_sample_value(self, partition, rows):
@@ -636,38 +926,6 @@ class Table(BaseTable):
             suffix = f'p_{suffix}'
         return f'{self._table_name}_p_{suffix}'
     
-    def _insert_into_file_partition(self, part_key, data: List[Dict], partition: Partition,
-                                   replace=False, ignore=False):
-        """Insert into a file-per-partition (stores as local SQLite file).
-        
-        This is useful for syncing data between PostgreSQL and SQLite.
-        """
-        # For file-per-partition, we delegate to SQLite
-        from ...utils.mysqlite import Database as MySQLiteDB
-        
-        # Create a SQLite file for this partition
-        partition_file = self._get_partition_file_path(part_key)
-        os.makedirs(os.path.dirname(partition_file), exist_ok=True)
-        
-        db = MySQLiteDB(partition_file, auto_commit=True)
-        try:
-            # Ensure table exists
-            if len(data) > 0:
-                columns = list(data[0].keys())
-                col_defs = [{'name': col, 'type': 'TEXT'} for col in columns]  # Simplified - could infer types
-                
-                db[self._table_name].create_table(col_defs)
-                db[self._table_name].insert_all(data, replace=replace, ignore=ignore)
-        finally:
-            db.close()
-    
-    def _get_partition_file_path(self, part_key) -> str:
-        """Get the file path for a file-per-partition."""
-        # For PostgreSQL file-per-partition, we store in a subdirectory
-        base_dir = os.path.expanduser('~/.iosql/postgresql')
-        db_name = self._uri_options.get('db', 'default')
-        return os.path.join(base_dir, db_name, self._table_name, f'{part_key}.sqlite3')
-    
     def select_all(self, fields='*', where=None, limit=None, **kwargs):
         warnings.warn(
             "select_all() 已废弃：等价于 select(fields, where, to_dict=True)，"
@@ -680,6 +938,7 @@ class Table(BaseTable):
     def select(self, fields='*', where=None, limit=None, order_by=None,
                to_dict=True, columns=None, **kwargs):
         """Query data with where conditions."""
+        self._reject_unknown_kwargs('select', kwargs)
         fields = resolve_select_fields(fields, columns, 'select')
         query, params = self._select_query(
             fields,
@@ -698,6 +957,7 @@ class Table(BaseTable):
 
     def iter_select(self, fields='*', where=None, limit=None, order_by=None,
                     to_dict=True, batch_size=10_000, columns=None, **kwargs):
+        self._reject_unknown_kwargs('iter_select', kwargs)
         fields = resolve_select_fields(fields, columns, 'iter_select')
         for batch in self.iter_select_batches(
             fields,
@@ -706,13 +966,13 @@ class Table(BaseTable):
             order_by=order_by,
             to_dict=to_dict,
             batch_size=batch_size,
-            **kwargs,
         ):
             for row in batch:
                 yield row
 
     def iter_select_batches(self, fields='*', where=None, limit=None, order_by=None,
                             to_dict=True, batch_size=10_000, columns=None, **kwargs):
+        self._reject_unknown_kwargs('iter_select_batches', kwargs)
         fields = resolve_select_fields(fields, columns, 'iter_select_batches')
         batch_size = self._normalize_batch_size(batch_size)
         limit = self._normalize_limit(limit)
@@ -726,32 +986,57 @@ class Table(BaseTable):
             limit=limit,
         )
         conn = self.connect()
-        cursor_name = f'iosql_iter_select_{next(_cursor_seq)}'
-        with conn.cursor(name=cursor_name, withhold=True) as cursor:
-            cursor.itersize = batch_size
-            cursor.execute(query, params)
-            column_names = (
-                [desc[0] for desc in cursor.description] if to_dict else None
-            )
-            while True:
-                rows = cursor.fetchmany(batch_size)
-                if not rows:
-                    break
-                if to_dict:
-                    rows = [dict(zip(column_names, row)) for row in rows]
-                yield rows
+
+        def _iterate():
+            # 非 WITH HOLD 游标：服务端边取边发，避免服务端物化全量结果
+            cursor_name = f'iosql_iter_select_{next(_cursor_seq)}'
+            with conn.cursor(name=cursor_name) as cursor:
+                cursor.itersize = batch_size
+                cursor.execute(query, params)
+                column_names = (
+                    [desc[0] for desc in cursor.description] if to_dict else None
+                )
+                while True:
+                    rows = cursor.fetchmany(batch_size)
+                    if not rows:
+                        break
+                    if to_dict:
+                        rows = [dict(zip(column_names, row)) for row in rows]
+                    yield rows
+
+        if self._in_explicit_tx:
+            # 复用调用方未提交事务，不擅自结束
+            yield from _iterate()
+            return
+
+        previous_autocommit = conn.autocommit
+        self._set_autocommit(conn, False)
+        try:
+            yield from _iterate()
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            self._set_autocommit(conn, previous_autocommit)
 
     def count_rows(self):
-        query, params = self._select_query("count(*)", None)
+        query = f'SELECT count(*) FROM {_pg_identifier(self._table_name)}'
         conn = self.connect()
         cursor = conn.cursor()
-        cursor.execute(query, params)
+        cursor.execute(query, [])
         if hasattr(cursor, "fetchone"):
             row = cursor.fetchone()
         else:
             rows = cursor.fetchall()
             row = rows[0] if rows else None
         return int(row[0]) if row else 0
+
+    def _reject_unknown_kwargs(self, func_name, kwargs):
+        if kwargs:
+            names = ', '.join(sorted(kwargs))
+            raise BadArgument(f'{func_name}() 收到未知参数: {names}')
 
     def iter_rows(self, batch_size=10_000):
         yield from self.iter_select_batches(
@@ -865,11 +1150,10 @@ class Table(BaseTable):
             raise BadArgument('verify only supports row-count')
         return value
 
-    def _select_query(self, fields, where=None, order_by=None,
-                      limit=None, offset=None):
+    def _select_query(self, fields, where=None, order_by=None, limit=None):
         column_types = self._column_types()
-        field_sql = build_select_fields_sql(fields)
-        query = f'SELECT {field_sql} FROM {_quote_sql_identifier(self._table_name)}'
+        field_sql = self._select_fields_sql(fields)
+        query = f'SELECT {field_sql} FROM {_pg_identifier(self._table_name)}'
         params = []
 
         where_sql, where_params = self._where_sql(where, column_types)
@@ -885,20 +1169,46 @@ class Table(BaseTable):
         if normalized_limit is not None:
             query += ' LIMIT %s'
             params.append(normalized_limit)
-        if offset is not None:
-            offset = int(offset)
-            if offset < 0:
-                raise BadArgument('offset must be non-negative')
-            query += ' OFFSET %s'
-            params.append(offset)
         return query, params
+
+    def _select_fields_sql(self, fields):
+        """fields 只接受 `*` 或标识符列表；字符串含 SQL 语法直接拒绝。"""
+        if fields is None:
+            return '*'
+        if isinstance(fields, (tuple, list)):
+            names = [str(field).strip() for field in fields]
+            if not names or any(not name for name in names):
+                raise BadArgument('select field is empty')
+            if names == ['*']:
+                return '*'
+            return ', '.join(_pg_identifier(name) for name in names)
+        if isinstance(fields, str):
+            text = fields.strip().strip(',')
+            if not text:
+                raise BadArgument('select fields must not be empty')
+            if text == '*':
+                return '*'
+            names = []
+            for part in text.split(','):
+                name = part.strip()
+                if len(name) >= 2 and name[0] == '"' and name[-1] == '"':
+                    # 允许显式双引号列名，与共享 fields 编译器保持一致
+                    name = name[1:-1].replace('""', '"').strip()
+                if not _FIELD_IDENTIFIER_RE.fullmatch(name or ''):
+                    raise BadArgument(
+                        f'非法 select fields `{fields}`：'
+                        '只允许列名或逗号分隔列名列表'
+                    )
+                names.append(name)
+            return ', '.join(_pg_identifier(name) for name in names)
+        raise BadArgument('BadFieldType')
 
     def _where_sql(self, where, column_types):
         where_obj = Where(where)
         if not where_obj.or_and_cases:
             return '', []
         query = build_or_cases_subquery(where_obj.or_and_cases, column_types)
-        return query.sql.replace('?', '%s'), list(query.params)
+        return _rewrite_placeholders(query.sql), list(query.params)
 
     def _column_types(self):
         if self._contract and self._contract.columns:
@@ -914,7 +1224,7 @@ class Table(BaseTable):
               and table_name = %s
             order by ordinal_position
             """,
-            ('public', self._table_name),
+            (self._schema_name(), self._table_name),
         )
         return {row[0]: row[1] for row in cursor.fetchall()}
 
@@ -974,18 +1284,38 @@ class Table(BaseTable):
         for field, direction in specs:
             if column_types and field not in column_types:
                 raise BadArgument(f'Unknown order_by field `{field}`')
+            # 与 SQLite 对齐：ASC NULLS FIRST / DESC NULLS LAST
+            nulls = 'FIRST' if direction == 'asc' else 'LAST'
             parts.append(
-                f'{_quote_sql_identifier(field)} {direction.upper()}'
+                f'{_pg_identifier(field)} {direction.upper()} NULLS {nulls}'
             )
         return ', '.join(parts)
     
-    def upsert_all(self, kv_list, pk, where=None, partition=None, commit=True, **kwargs):
-        """Upsert (insert or update) multiple rows."""
+    def upsert_all(self, kv_list, pk, partition=None, commit=True, *,
+                   where=None, **kwargs):
+        """Upsert (insert or update) multiple rows.
+
+        `where` 为历史遗留关键字参数，已废弃并忽略：upsert 以 pk 为身份
+        标识，与 SQLite 一致地在全表范围合并既有行。
+        """
+        if where is not None:
+            warnings.warn(
+                'upsert_all(where=...) 已废弃并被忽略：upsert 以 pk 为身份标识，'
+                '不再按 where 过滤既有行',
+                DeprecationWarning,
+                stacklevel=2,
+            )
         if isinstance(kv_list, dict):
             kv_list = [kv_list]
+        elif not isinstance(kv_list, (list, tuple, set)):
+            raise BadArgument(
+                'upsert_all: `list/tuple/set/dict` required for `kv_list`'
+            )
+        if not kv_list:
+            return
         
-        # Select existing data
-        existing = self.select_all('*', where=where) if where else []
+        # Select existing data (全表按 pk 合并，不做 where 过滤)
+        existing = self.select('*', where=None, to_dict=True)
         
         # Build map by pk
         existing_map = {tuple([item[k] for k in pk]): item for item in existing}
@@ -999,29 +1329,49 @@ class Table(BaseTable):
         
         # Insert updated data
         self.insert_all(list(existing_map.values()), pk=pk, replace=True, 
-                      partition=partition, **kwargs)
+                      partition=partition, commit=commit, **kwargs)
     
     def delete(self, where):
         """Delete rows matching conditions.
 
         where 与 select 同源：dict/list/Case/文本四种形式统一经 Where
-        参数化编译，不做原始 SQL 拼接；None 等价 delete_all。
+        参数化编译，不做原始 SQL 拼接。
+        where=None 为显式全表删除（DeprecationWarning），请改用 delete_all()；
+        []/{}/""/0/False 等 falsy 非 None 值抛 BadArgument，绝不退化为全表删除。
+        返回删除行数（cursor.rowcount），与 SQLite 对齐。
         """
+        if where is None:
+            warnings.warn(
+                'delete(None) 已废弃：等价于全表删除，请显式调用 delete_all()',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            return self.delete_all()
+
+        where_sql, params = self._where_sql(where, self._column_types())
+        if not where_sql:
+            raise BadArgument(
+                'delete: where 不能为空（[]/{}/""）；'
+                '删除全表请显式调用 delete_all()'
+            )
+
         conn = self.connect()
         cursor = conn.cursor()
-
-        query = sql.SQL('DELETE FROM {}').format(sql.Identifier(self._table_name))
-        params = []
-        if where:
-            where_sql, params = self._where_sql(where, self._column_types())
-            if where_sql:
-                query += sql.SQL(' WHERE ') + sql.SQL(where_sql)
-
+        query = sql.SQL('DELETE FROM {} WHERE {}').format(
+            sql.Identifier(self._table_name),
+            sql.SQL(where_sql),
+        )
         cursor.execute(query, params)
+        return cursor.rowcount
     
     def delete_all(self):
-        """Delete all rows."""
-        self.delete(where=None)
+        """Delete all rows (explicit full-table delete)."""
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(
+            sql.SQL('DELETE FROM {}').format(sql.Identifier(self._table_name))
+        )
+        return cursor.rowcount
     
     def create_index(self, column, order='asc', exist_ok=True):
         """Create an index on a column."""
@@ -1032,39 +1382,50 @@ class Table(BaseTable):
         if order_value not in ('asc', 'desc'):
             raise BadArgument(f'invalid index order: {order}')
         order_str = 'DESC' if order_value == 'desc' else 'ASC'
-        index_name = f'{self._table_name}_{column}_idx'
-
-        query = sql.SQL(
+        index_name = self._index_name(column)
+        create_tpl = (
             'CREATE INDEX IF NOT EXISTS {} ON {} ({} {})'
-        ).format(
+            if exist_ok else 'CREATE INDEX {} ON {} ({} {})'
+        )
+        create_sql = sql.SQL(create_tpl).format(
             sql.Identifier(index_name),
             sql.Identifier(self._table_name),
             sql.Identifier(column),
             sql.SQL(order_str),
         )
 
-        cursor.execute(query)
+        cursor.execute(create_sql)
         if self.verbose >= 1:
             logger.info(f'Created index {index_name}')
+
+    def _index_name(self, column):
+        raw = f'{self._table_name}_{column}_idx'
+        if len(raw.encode('utf-8')) <= _IDENTIFIER_MAX_BYTES:
+            return raw
+        # PG 标识符 63 字节静默截断会撞名，超长时截断并追加哈希后缀
+        suffix = f'_{hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]}_idx'
+        return _fit_identifier(f'{self._table_name}_{column}', suffix)
 
     def drop_index(self, column):
         raise NotImplementedError("drop_index not implemented for postgresql engine")
     
     def suggest_column_types(self, data, column_type, n_suggest_check=None):
-        """Suggest column types based on data."""
-        # Simplified implementation
+        """Suggest column types based on data (按整批行列并集推断)。"""
         suggested = {}
-        for key, value in data[0].items():
-            if column_type and key in column_type:
-                suggested[key] = column_type[key]
-            elif isinstance(value, int):
-                suggested[key] = 'BIGINT'
-            elif isinstance(value, float):
-                suggested[key] = 'DOUBLE PRECISION'
-            elif isinstance(value, str):
-                suggested[key] = 'TEXT'
-            else:
-                suggested[key] = 'TEXT'
+        for row in data:
+            for key, value in row.items():
+                if key in suggested:
+                    continue
+                if column_type and key in column_type:
+                    suggested[key] = column_type[key]
+                elif isinstance(value, bool):
+                    suggested[key] = 'BOOLEAN'
+                elif isinstance(value, int):
+                    suggested[key] = 'BIGINT'
+                elif isinstance(value, float):
+                    suggested[key] = 'DOUBLE PRECISION'
+                else:
+                    suggested[key] = 'TEXT'
         return suggested
     
     @property
@@ -1089,28 +1450,30 @@ class Table(BaseTable):
         return self._partition
     
     def table_parts(self) -> List:
-        """Get list of partition keys for this table."""
-        if self.partition_mode == self.PARTITION_MODE_NATIVE:
-            return self._get_native_partitions()
-        else:
-            return self._get_file_partitions()
+        """Get sorted child partition relation names.
+
+        表不存在或无分区时返回空列表（与 SQLite 空表行为一致），不抛异常。
+        """
+        return self._get_native_partitions()
     
     def _get_native_partitions(self) -> List[str]:
-        """Get list of native PostgreSQL partitions."""
+        """Get list of native PostgreSQL partitions (按名字排序)。"""
         conn = self.connect()
         cursor = conn.cursor()
-        
-        query = """
-            SELECT inhrelid::regclass::text 
-            FROM pg_inherits 
-            WHERE inhparent = %s::regclass
-        """
-        cursor.execute(query, (self._table_name,))
-        return [row[0] for row in cursor.fetchall()]
-    
-    def _get_file_partitions(self) -> List[str]:
-        """Get list of file-per-partition files."""
-        partition_dir = os.path.dirname(self._get_partition_file_path(''))
-        if not os.path.exists(partition_dir):
-            return []
-        return [f.replace('.sqlite3', '') for f in os.listdir(partition_dir) if f.endswith('.sqlite3')]
+        # to_regclass 解析带引号的关系名：不存在返回 NULL 而非报错
+        relation = (
+            f'{_quote_sql_identifier(self._schema_name())}.'
+            f'{_quote_sql_identifier(self._table_name)}'
+        )
+        cursor.execute(
+            """
+            select child.relname
+            from pg_inherits i
+            join pg_class parent on parent.oid = i.inhparent
+            join pg_class child on child.oid = i.inhrelid
+            where parent.oid = to_regclass(%s)
+            order by child.relname
+            """,
+            (relation,),
+        )
+        return sorted(row[0] for row in cursor.fetchall())

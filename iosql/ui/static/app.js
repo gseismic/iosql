@@ -147,8 +147,11 @@
       var name = String(IU.pick(t, 'name', 'table'));
       var pstr = IU.pick(t, 'partition_str', 'partition');
       var s = state.stats[name];
-      var rowsText = s && typeof s.row_count === 'number'
-        ? IU.fmt.int(s.row_count) + ' 行' : '…';
+      // 占位一致性（与 Overview 对齐）：统计失败显示 —，未到达显示 …，成功显示行数
+      var rowsText = s && s.error
+        ? '—'
+        : (s && typeof s.row_count === 'number'
+          ? IU.fmt.int(s.row_count) + ' 行' : '…');
       nav.append(h('a', {
         class: 'side-item', href: '#/table/' + encodeURIComponent(name) + '/' + lastTableTab(),
         'data-nav': 'table:' + name
@@ -156,7 +159,8 @@
         h('div', { class: 'side-name' }, h('span', { class: 'glyph' }, '▸'), name),
         h('div', { class: 'side-meta' },
           h('span', {
-            class: 'side-rows', title: s ? null : '行数统计中…',
+            class: 'side-rows',
+            title: s ? (s.error ? '统计失败' : null) : '行数统计中…',
             dataset: { statsFor: name, kind: 'rows' }
           }, rowsText),
           pstr !== undefined ? h('span', { class: 'side-part', title: String(pstr) }, String(pstr)) : null)));

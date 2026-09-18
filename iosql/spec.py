@@ -1,3 +1,4 @@
+import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -44,21 +45,33 @@ def _duration_to_ms(value: Any) -> int:
     return parse_interval_ms(value)
 
 
-def _to_int_every(value: Any) -> int:
+def _to_int_every(value: Any, label: str = "range partition width") -> int:
+    if isinstance(value, bool):
+        raise PartitionSpecError(f"{label} must be an integer, got bool `{value}`")
     if isinstance(value, int):
-        return value
-    try:
-        return int(str(value).strip())
-    except (ValueError, TypeError) as e:
-        raise PartitionSpecError(
-            f"range partition every must be an integer, got `{value}`"
-        ) from e
+        number = value
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise PartitionSpecError(
+                f"{label} must be an integer, got `{value}`"
+            )
+        number = int(value)
+    else:
+        try:
+            number = int(str(value).strip())
+        except (ValueError, TypeError) as e:
+            raise PartitionSpecError(
+                f"{label} must be an integer, got `{value}`"
+            ) from e
+    if number <= 0:
+        raise PartitionSpecError(f"{label} must be positive, got `{value}`")
+    return number
 
 
 def _calendar_fmt(every: Any) -> str:
     try:
         return CalendarPartition.format_for_every(every)
-    except ValueError as e:
+    except (ValueError, PartitionSpecError) as e:
         raise PartitionSpecError(f"Unsupported calendar partition `{every}`") from e
 
 
@@ -145,6 +158,12 @@ def _validate_partition_token(name: str, label: str) -> str:
         raise PartitionSpecError(f"partition {label} must not be empty")
     if any(char in value for char in ["(", ")", ",", "="]):
         raise PartitionSpecError(f"Bad partition {label} `{name}`")
+    if any(char in value for char in ["'", '"', "\\"]):
+        # 含引号/反斜杠的列名无法在 partition 表达式里安全往返，直接拒绝
+        raise PartitionSpecError(
+            f"partition {label} `{name}` 不能包含引号或反斜杠；"
+            "修复: 改用普通列名"
+        )
     return value
 
 
@@ -217,6 +236,11 @@ def _parse_partition_expr(text: str) -> "PartitionSpec":
 
 
 def _format_duration_every(every: Any) -> str:
+    if isinstance(every, bool):
+        every = str(every)
+    elif isinstance(every, float) and math.isfinite(every) and every.is_integer():
+        # 整数值 float 归一为 int，保证输出可被 parse_interval_ms 回读
+        every = int(every)
     if isinstance(every, int):
         alias = _DURATION_MS_TO_ALIAS.get(every)
         if alias:
@@ -246,8 +270,14 @@ def _format_duration_every(every: Any) -> str:
 
 def _format_partition_value(value: Any) -> str:
     text = str(value)
+    if any(char in text for char in ["'", '"', "\\"]):
+        # 当前转义规则无法保证 format→parse 往返，拒绝而不是输出坏表达式
+        raise PartitionSpecError(
+            f"partition 值 `{text}` 含引号或反斜杠，无法安全格式化；"
+            "修复: 改用不含引号的列名/时区"
+        )
     if any(char in text for char in [",", "(", ")", "=", " "]):
-        return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+        return "'" + text + "'"
     return text
 
 
@@ -310,7 +340,9 @@ class TimeColumn:
         if value is None:
             return None
         if self.unit == "date":
-            return arrow.get(value).format("YYYY-MM-DD")
+            # date 语义必须先按契约时区换算，否则 UTC 晚间的值在
+            # Asia/Shanghai 下会被归一成前一天
+            return arrow.get(value).to(self.timezone).format("YYYY-MM-DD")
         if isinstance(value, (int, float)):
             return value
 
@@ -338,8 +370,15 @@ class TimeColumn:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "TimeColumn":
+        if not isinstance(data, dict):
+            raise BadArgument(f"Bad time column spec `{data}`")
+        name = data.get("name")
+        if not name:
+            raise BadArgument(
+                f"time column spec 缺少 name: {data!r}；修复: 补全 time 列定义"
+            )
         return cls(
-            name=data["name"],
+            name=name,
             unit=data.get("unit", "ms"),
             timezone=data.get("timezone", "UTC"),
         )
@@ -352,17 +391,41 @@ class PhysicalLayout:
     max_rows_per_file: int = 500_000
 
     def __post_init__(self):
-        self.target_rows_per_file = int(self.target_rows_per_file)
-        self.min_rows_per_file = int(self.min_rows_per_file)
-        self.max_rows_per_file = int(self.max_rows_per_file)
-        if self.min_rows_per_file <= 0:
-            raise BadArgument("min_rows_per_file must be positive")
-        if self.target_rows_per_file <= 0:
-            raise BadArgument("target_rows_per_file must be positive")
+        self.target_rows_per_file = self._positive_rows(
+            self.target_rows_per_file, "target_rows_per_file"
+        )
+        self.min_rows_per_file = self._positive_rows(
+            self.min_rows_per_file, "min_rows_per_file"
+        )
+        self.max_rows_per_file = self._positive_rows(
+            self.max_rows_per_file, "max_rows_per_file"
+        )
         if self.max_rows_per_file < self.target_rows_per_file:
             raise BadArgument("max_rows_per_file must be >= target_rows_per_file")
         if self.target_rows_per_file < self.min_rows_per_file:
             raise BadArgument("target_rows_per_file must be >= min_rows_per_file")
+
+    @staticmethod
+    def _positive_rows(value: Any, label: str) -> int:
+        """显式校验行数配置；None/非法类型给出 BadArgument 而不是 TypeError。"""
+        if isinstance(value, bool):
+            raise BadArgument(f"{label} must be a positive integer, got bool `{value}`")
+        if isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                raise BadArgument(
+                    f"{label} must be an integer, got `{value}`"
+                )
+            value = int(value)
+        elif not isinstance(value, int):
+            try:
+                value = int(str(value).strip())
+            except (ValueError, TypeError) as e:
+                raise BadArgument(
+                    f"{label} must be a positive integer, got `{value}`"
+                ) from e
+        if value <= 0:
+            raise BadArgument(f"{label} must be positive, got `{value}`")
+        return value
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -394,9 +457,21 @@ class Segment:
         self.kind = str(self.kind or "rows").lower()
         if self.kind != "rows":
             raise BadArgument(f"Unsupported segment kind `{self.kind}`")
-        self.max_rows = int(self.max_rows)
-        self.target_rows = int(self.target_rows or self.max_rows)
-        self.min_rows = int(self.min_rows or min(self.target_rows, self.max_rows))
+        self.max_rows = self._positive_rows(self.max_rows, "segment max_rows")
+        # target/min 显式传入时必须校验；None 才回落默认值，
+        # 避免 target_rows=0 被 `or` 静默替换成 max_rows
+        if self.target_rows is None:
+            self.target_rows = self.max_rows
+        else:
+            self.target_rows = self._positive_rows(
+                self.target_rows, "segment target_rows"
+            )
+        if self.min_rows is None:
+            self.min_rows = min(self.target_rows, self.max_rows)
+        else:
+            self.min_rows = self._positive_rows(
+                self.min_rows, "segment min_rows"
+            )
         if self.stats_columns is not None:
             if isinstance(self.stats_columns, str):
                 self.stats_columns = [self.stats_columns]
@@ -405,16 +480,29 @@ class Segment:
             ))
             if any(not column for column in self.stats_columns):
                 raise BadArgument("segment stats_columns must not contain empty names")
-        if self.max_rows <= 0:
-            raise BadArgument("segment max_rows must be positive")
-        if self.target_rows <= 0:
-            raise BadArgument("segment target_rows must be positive")
-        if self.min_rows <= 0:
-            raise BadArgument("segment min_rows must be positive")
         if self.target_rows > self.max_rows:
             raise BadArgument("segment target_rows must be <= max_rows")
         if self.min_rows > self.target_rows:
             raise BadArgument("segment min_rows must be <= target_rows")
+
+    @staticmethod
+    def _positive_rows(value: Any, label: str) -> int:
+        if isinstance(value, bool):
+            raise BadArgument(f"{label} must be a positive integer, got bool `{value}`")
+        if isinstance(value, float):
+            if not math.isfinite(value) or not value.is_integer():
+                raise BadArgument(f"{label} must be an integer, got `{value}`")
+            value = int(value)
+        elif not isinstance(value, int):
+            try:
+                value = int(str(value).strip())
+            except (ValueError, TypeError) as e:
+                raise BadArgument(
+                    f"{label} must be a positive integer, got `{value}`"
+                ) from e
+        if value <= 0:
+            raise BadArgument(f"{label} must be positive, got `{value}`")
+        return value
 
     @classmethod
     def rows(cls, max_rows: int = 500_000, target_rows: Optional[int] = None,
@@ -471,13 +559,39 @@ class PartitionSpec:
     fmt: Optional[str] = None
 
     def __post_init__(self):
-        self.column = str(self.column)
+        self.column = str(self.column or "").strip()
+        if not self.column:
+            raise PartitionSpecError("partition column must not be empty")
+        _validate_partition_token(self.column, "column")
         self.kind = str(self.kind or "duration").lower()
+        if self.kind not in _PARTITION_KINDS:
+            raise PartitionSpecError(
+                f"Unsupported partition kind `{self.kind}`；可选: "
+                f"{', '.join(sorted(_PARTITION_KINDS))}"
+            )
         self.time_unit = _normalize_time_unit(self.time_unit)
         if self.timezone is not None:
             self.timezone = str(self.timezone)
         if self.fmt is not None:
             self.fmt = str(self.fmt)
+            if self.kind == "calendar" and self.fmt not in CalendarPartition.FMT_SHIFT_MAP:
+                raise PartitionSpecError(
+                    f"不支持的 calendar fmt `{self.fmt}`；可选: "
+                    f"{', '.join(CalendarPartition.FMT_SHIFT_MAP)}。"
+                    "修复: 更新 manifest 中的 fmt，或删除该表 partition 元数据后重建"
+                )
+        # every 按 kind 统一在构造期校验，避免 KeyError/ValueError 泄漏到调用方
+        if self.kind == "range":
+            self.every = _to_int_every(self.every)
+        elif self.kind == "calendar":
+            if self.every is not None:
+                _calendar_fmt(self.every)
+            elif self.fmt is None:
+                raise PartitionSpecError(
+                    "calendar partition requires `every` or `fmt`"
+                )
+        else:
+            _duration_to_ms(self.every)
 
     def with_time(self, time: Optional[TimeColumn]) -> "PartitionSpec":
         if time is None:
@@ -544,8 +658,18 @@ class PartitionSpec:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PartitionSpec":
+        if not isinstance(data, dict):
+            raise PartitionSpecError(
+                f"Bad partition spec `{data}`；修复: 检查 manifest partition 字段"
+            )
+        column = data.get("column")
+        if not column:
+            raise PartitionSpecError(
+                f"partition spec 缺少 column: {data!r}；"
+                "修复: 补全 partition.column 或删除 partition 元数据后重建"
+            )
         return cls(
-            column=data["column"],
+            column=column,
             every=data.get("every", "1day"),
             kind=data.get("kind", "duration"),
             time_unit=data.get("time_unit"),
@@ -559,28 +683,56 @@ class PartitionSpec:
             return None
         partition_type = meta.get("type")
         if partition_type == "duration":
+            interval_ms = meta.get("interval_ms")
+            ts_col = meta.get("ts_col")
+            if interval_ms is None or not ts_col:
+                raise PartitionSpecError(
+                    f"duration partition meta 缺少 interval_ms/ts_col: {meta!r}；"
+                    "修复: 更新 manifest 中的 partition 元数据，"
+                    "或删除 partition 后按原契约重建该表"
+                )
             return cls(
-                column=meta["ts_col"],
-                every=meta["interval_ms"],
+                column=ts_col,
+                every=interval_ms,
                 kind="duration",
                 time_unit="ms",
             )
         if partition_type == "range":
+            width = meta.get("width")
+            ts_col = meta.get("ts_col")
+            if width is None or not ts_col:
+                raise PartitionSpecError(
+                    f"range partition meta 缺少 width/ts_col: {meta!r}；"
+                    "修复: 更新 manifest 中的 partition 元数据，"
+                    "或删除 partition 后按原契约重建该表"
+                )
             return cls(
-                column=meta["ts_col"],
-                every=meta["width"],
+                column=ts_col,
+                every=width,
                 kind="range",
             )
         if partition_type == "calendar":
+            fmt = meta.get("fmt")
+            ts_col = meta.get("ts_col")
+            if not fmt or not ts_col:
+                raise PartitionSpecError(
+                    f"calendar partition meta 缺少 fmt/ts_col: {meta!r}；"
+                    "修复: 更新 manifest 中的 partition 元数据，"
+                    "或删除 partition 后按原契约重建该表"
+                )
             return cls(
-                column=meta["ts_col"],
-                every=meta.get("every") or _calendar_every_from_fmt(meta.get("fmt")) or "1day",
+                column=ts_col,
+                every=meta.get("every") or _calendar_every_from_fmt(fmt) or "1day",
                 kind="calendar",
                 time_unit="date",
                 timezone=meta.get("tz", "UTC"),
-                fmt=meta.get("fmt"),
+                fmt=fmt,
             )
-        return None
+        raise PartitionSpecError(
+            f"Unknown partition type `{partition_type}`；"
+            "修复: 更新 manifest 中的 partition.type，"
+            "或删除 partition 后按原契约重建该表"
+        )
 
 
 @dataclass

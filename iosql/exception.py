@@ -18,7 +18,12 @@ class MissingTimeColumn(IosqlError):
     pass
 
 
-class PartitionSpecError(IosqlError):
+class PartitionSpecError(BadArgument):
+    """分区/表契约参数错误。
+
+    归入 BadArgument 族，保证调用方用 BadArgument 也能统一捕获，
+    同时保留更精确的类型供分区层单独处理。
+    """
     pass
 
 

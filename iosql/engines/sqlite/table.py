@@ -12,7 +12,7 @@ import warnings
 
 # from itertools import chain
 from collections import OrderedDict
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 import arrow
 
@@ -70,6 +70,8 @@ from .const import (
 from .query_util import (
     build_delete_query,
     build_select_cases_query,
+    build_select_count_query,
+    build_select_exists_query,
     build_select_or_cases_query,
 )
 
@@ -262,8 +264,12 @@ class Table(BaseTable):
         self._db_parts = OrderedDict()
         self._db_parts_status = OrderedDict()
         self._db_parts_leases = {}
+        # 记录当前线程持有的租约数量：close() 在同一线程内持有租约时直接报错，
+        # 避免等待自己释放而永久自旋
+        self._db_parts_lease_threads = {}
         self._db_parts_condition = threading.Condition(threading.RLock())
         self._db_parts_closing = False
+        self._db_parts_closed = False
         self._compact_lock = threading.RLock()
         # schema 演进锁：只串行化 NoSuchTable/NoSuchColumn 冷路径，
         # 防止并发加列时基于过时 meta 快照互相覆盖；稳态插入不经过这些分支
@@ -316,9 +322,16 @@ class Table(BaseTable):
 
         self._table_meta_db = self.get_table_meta_db()
         self._meta_db = self.get_meta_db()
+        with self._db_parts_condition:
+            self._db_parts_closed = False
 
     def close(self):
         with self._db_parts_condition:
+            if self._db_parts_lease_threads.get(threading.get_ident(), 0):
+                raise UnsafeOperation(
+                    'close() 不能在持有分区连接租约的线程内调用；'
+                    '请先退出 _part_db/查询上下文再关闭表'
+                )
             while self._db_parts_closing:
                 self._db_parts_condition.wait(timeout=0.1)
             self._db_parts_closing = True
@@ -328,6 +341,7 @@ class Table(BaseTable):
             self._db_parts.clear()
             self._db_parts_status.clear()
             self._db_parts_leases.clear()
+            self._db_parts_lease_threads.clear()
         try:
             if self._table_meta_db and not self._table_meta_db.is_closed():
                 self._table_meta_db.close()
@@ -339,6 +353,7 @@ class Table(BaseTable):
         finally:
             with self._db_parts_condition:
                 self._db_parts_closing = False
+                self._db_parts_closed = True
                 self._db_parts_condition.notify_all()
 
     def rename(self, new_name, exist_ok=False, overwrite=False):
@@ -436,15 +451,29 @@ class Table(BaseTable):
             value: Partition object (DurationPartition, CalendarPartition) or None
 
         Raises:
-            Exception: If partition type changes after table has data
+            TableSpecConflict: 已有数据且分区配置与持久化配置不兼容时
         """
-        self._partition = value
-
         meta = self.get_table_meta()
+        current_meta = None
+        if meta is not None and meta.get("partition"):
+            current_partition = Partition.from_meta(meta["partition"])
+            current_meta = current_partition.to_meta() if current_partition else None
+        new_meta = value.to_meta() if value else None
+        if (
+            meta is not None
+            and current_meta != new_meta
+            and self.table_parts()
+        ):
+            raise TableSpecConflict(
+                f'PartitionCanNotChange: current={current_meta} new={new_meta}；'
+                '修复: 用 repartition_to() 迁移到新表，或确认表为空后再设置分区'
+            )
+
+        self._partition = value
         if meta is None:
             return
 
-        meta["partition"] = value.to_meta() if value else None
+        meta["partition"] = new_meta
         self._overwrite_table_meta(meta)
 
     def use_contract(self, contract):
@@ -461,9 +490,29 @@ class Table(BaseTable):
 
     def spec(self):
         stored_spec = TableContract.from_table_meta(self.get_table_meta())
-        if stored_spec:
+        if stored_spec is None:
+            return self._declared_spec
+        if self._declared_spec is None:
             return stored_spec
-        return self._declared_spec
+        # 已有表：声明侧只覆盖随实例生效的行为字段（pk/分区/段/列已校验兼容），
+        # 动态演进出的列等 schema 信息以存量为准，保证 spec() 始终是最新快照
+        return self._merge_contract_bindings(stored_spec, self._declared_spec)
+
+    def _merge_contract_bindings(self, stored_spec, declared_spec):
+        data = stored_spec.to_dict()
+        data['conflict'] = declared_spec.conflict
+        data['schema_policy'] = declared_spec.schema_policy
+        for field in ('order_key', 'symbol_column', 'session_column'):
+            value = getattr(declared_spec, field)
+            if value is not None:
+                data[field] = value
+        if declared_spec.time is not None:
+            data['time'] = declared_spec.time.to_dict()
+        data['force_partition'] = declared_spec.force_partition
+        columns = dict(stored_spec.columns or {})
+        columns.update(declared_spec.columns or {})
+        data['columns'] = columns
+        return TableContract.from_dict(data)
 
     def _ensure_spec_compatible(self, current_spec, new_spec):
         if list(current_spec.primary_key) != list(new_spec.primary_key):
@@ -602,6 +651,7 @@ class Table(BaseTable):
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
         rows = self._add_extra_data(data, extra_data)
+        self._ensure_pk_present(rows, pk)
 
         partitions_touched = self.do_insert_all(
             rows,
@@ -633,6 +683,21 @@ class Table(BaseTable):
         if partition is None:
             return [None]
         return sorted({partition.get_key(row) for row in rows})
+
+    def _ensure_pk_present(self, rows, pk):
+        """主键列缺失必须显式报错：静默会让 single integer pk 走 rowid 自增。"""
+        if not pk:
+            return
+        pk_fields = [pk] if isinstance(pk, str) else list(pk)
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict):
+                continue
+            missing = [field for field in pk_fields if field not in row]
+            if missing:
+                raise BadArgument(
+                    f'row[{index}] 缺少主键字段 {missing}；'
+                    '修复: 每一行都补齐主键列的值（主键不允许省略）'
+                )
 
     def write(self, rows, mode=None, commit=True, **kwargs):
         if isinstance(rows, dict):
@@ -813,11 +878,24 @@ class Table(BaseTable):
             deep=bool(deep),
             include_obsolete=bool(include_obsolete),
         )
-        for ref in self._physical_part_refs(include_obsolete=include_obsolete):
+        # 一次取全量 refs：校验用可见部分，孤儿扫描必须带 obsolete
+        all_refs = self._physical_part_refs(include_obsolete=True)
+        if include_obsolete:
+            refs = all_refs
+        else:
+            refs = [ref for ref in all_refs if ref.state != 'obsolete']
+        for ref in refs:
             result.checked_segments += 1
             self._validate_segment_ref(ref, result)
             if deep:
                 self._validate_segment_ref_deep(ref, result)
+        # 反向扫描孤儿文件：manifest 不引用但磁盘存在的 segment（旧报告 S-M8）
+        for path in self._orphan_segment_files(all_refs):
+            result.add_warning(
+                'orphan_segment_file',
+                'segment file is not referenced by manifest',
+                path=path,
+            )
         return result
 
     def cleanup_obsolete(self, partition=None, dry_run=True, validate=True):
@@ -867,56 +945,61 @@ class Table(BaseTable):
                     f'{first.code}: {first.message}'
                 )
 
-        deleted_refs = []
-        for ref in refs:
-            if not self._is_safe_part_path(ref.path):
-                result.skipped.append({
-                    'part_key': ref.part_key,
-                    'path': ref.path,
-                    'reason': 'unsafe_path',
-                })
-                continue
-            if not self._close_part_db_if_idle(ref.path):
-                result.skipped.append({
-                    'part_key': ref.part_key,
-                    'path': ref.path,
-                    'reason': 'active_lease',
-                })
-                continue
-
-            files = self._segment_cleanup_files(ref)
-            if not files:
-                deleted_refs.append(ref)
-                continue
-
-            deleted_all = True
-            bytes_deleted = 0
-            files_deleted = 0
-            for path in files:
-                try:
-                    size = self._file_size(path)
-                    os.remove(path)
-                    bytes_deleted += size
-                    files_deleted += 1
-                except FileNotFoundError:
-                    continue
-                except OSError as exc:
-                    deleted_all = False
+        # 与 compact/write 互斥：文件删除 + manifest 清理不能与重建 segment 交错
+        with self._compact_lock:
+            deleted_refs = []
+            for ref in refs:
+                if not self._is_safe_part_path(ref.path):
                     result.skipped.append({
                         'part_key': ref.part_key,
-                        'path': path,
-                        'reason': f'delete_failed: {exc}',
+                        'path': ref.path,
+                        'reason': 'unsafe_path',
                     })
-                    break
-            result.bytes_deleted += bytes_deleted
-            result.files_deleted += files_deleted
-            if deleted_all:
-                deleted_refs.append(ref)
+                    continue
+                if not self._close_part_db_if_idle(ref.path):
+                    result.skipped.append({
+                        'part_key': ref.part_key,
+                        'path': ref.path,
+                        'reason': 'active_lease',
+                    })
+                    continue
 
-        result.manifest_rows_deleted = self._delete_segment_manifest_rows(deleted_refs)
+                files = self._segment_cleanup_files(ref)
+                if not files:
+                    deleted_refs.append(ref)
+                    continue
+
+                deleted_all = True
+                bytes_deleted = 0
+                files_deleted = 0
+                for path in files:
+                    try:
+                        size = self._file_size(path)
+                        os.remove(path)
+                        bytes_deleted += size
+                        files_deleted += 1
+                    except FileNotFoundError:
+                        continue
+                    except OSError as exc:
+                        deleted_all = False
+                        result.skipped.append({
+                            'part_key': ref.part_key,
+                            'path': path,
+                            'reason': f'delete_failed: {exc}',
+                        })
+                        break
+                result.bytes_deleted += bytes_deleted
+                result.files_deleted += files_deleted
+                if deleted_all:
+                    deleted_refs.append(ref)
+
+            result.manifest_rows_deleted = self._delete_segment_manifest_rows(
+                deleted_refs
+            )
         return result
 
-    def iter_rows(self, batch_size=10_000):
+    def iter_batches(self, batch_size=10_000):
+        """按批流式读取全表全部行（batch 为主形态）。"""
         if isinstance(batch_size, bool):
             raise BadArgument('batch_size must be a positive integer')
         batch_size = int(batch_size)
@@ -924,6 +1007,7 @@ class Table(BaseTable):
             raise BadArgument('batch_size must be a positive integer')
 
         for ref in self._physical_part_refs():
+            self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
             offset = 0
             while True:
@@ -947,9 +1031,16 @@ class Table(BaseTable):
                     break
                 offset += len(batch)
 
+    def iter_rows(self, batch_size=10_000):
+        """逐行流式读取全表（iter_batches 的逐行语法糖，与 README 语义一致）。"""
+        for batch in self.iter_batches(batch_size=batch_size):
+            for row in batch:
+                yield row
+
     def count_rows(self):
         total = 0
         for ref in self._physical_part_refs():
+            self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
             with self._part_db(part_dbfile, auto_commit=False) as db:
                 try:
@@ -998,7 +1089,7 @@ class Table(BaseTable):
         source_rows = self.count_rows() if verify == 'row-count' else None
         rows_copied = 0
         batches = 0
-        for batch in self.iter_rows(batch_size=batch_size):
+        for batch in self.iter_batches(batch_size=batch_size):
             if not batch:
                 continue
             target_table.write(batch, mode=mode)
@@ -1098,6 +1189,7 @@ class Table(BaseTable):
 
         rows = []
         for ref in refs:
+            self._ensure_ref_file_present(ref)
             rows.extend(
                 self._rows_from_part_dbfile(self._get_part_dbfile(ref.part_key))
             )
@@ -1206,7 +1298,12 @@ class Table(BaseTable):
             part_key = self._segment_part_key(logical_part, next_segment_id)
             path = self._get_part_dbfile(part_key)
             if os.path.exists(path):
-                raise UnsafeOperation(f'compact target segment already exists: {path}')
+                if self._manifest_references_part_key(part_key):
+                    raise UnsafeOperation(
+                        f'compact target segment already exists: {path}'
+                    )
+                # 目标名被历史孤儿文件占用：先安全清理再复用（旧报告 S-M8 修复路径）
+                self._remove_orphan_part_file(path)
             segment = SegmentInfo(
                 logical_part=logical_part,
                 segment_id=next_segment_id,
@@ -1271,7 +1368,7 @@ class Table(BaseTable):
                 f'invalid segment state: {ref.state}',
                 **self._segment_issue_context(ref),
             )
-        if not ref.part_key:
+        if ref.part_key is None or ref.part_key == '':
             result.add_error(
                 'missing_part_key',
                 'segment part_key is empty',
@@ -1428,7 +1525,9 @@ class Table(BaseTable):
 
     def _sqlite_integrity_check(self, path):
         try:
-            with sqlite3.connect(path) as conn:
+            # 显式关闭连接：contextlib.closing 避免 with sqlite3.connect 只提交不关闭
+            # 导致的 FD 泄漏（旧报告 S-M1 / 本轮 S1-4）
+            with closing(sqlite3.connect(path)) as conn:
                 rows = conn.execute('PRAGMA integrity_check;').fetchall()
         except sqlite3.Error as exc:
             return [str(exc)]
@@ -1436,7 +1535,7 @@ class Table(BaseTable):
 
     def _data_table_exists(self, path):
         try:
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 row = conn.execute(
                     (
                         "select name from sqlite_master "
@@ -1455,7 +1554,7 @@ class Table(BaseTable):
         field = self._quote_identifier(column)
         table_name = self._quote_identifier(_PART_DATA_TABLE_NAME)
         try:
-            with sqlite3.connect(path) as conn:
+            with closing(sqlite3.connect(path)) as conn:
                 conn.row_factory = sqlite3.Row
                 row = conn.execute(
                     (
@@ -1488,6 +1587,56 @@ class Table(BaseTable):
         base = os.path.realpath(self.table_part_path)
         real = os.path.realpath(path)
         return real.startswith(base + os.sep)
+
+    def _ensure_ref_file_present(self, ref):
+        """读路径前置校验：manifest 引用但文件缺失时立即报错，不隐式建空文件。"""
+        path = ref.path or self._get_part_dbfile(ref.part_key)
+        if os.path.isfile(path):
+            return
+        raise UnsafeOperation(
+            f'分区数据文件缺失: {path}（manifest 仍引用 part_key={ref.part_key}）；'
+            '修复: 运行 validate(deep=True) 检查完整性，'
+            '或用 cleanup_obsolete(dry_run=False) 处理 obsolete 引用后从备份恢复'
+        )
+
+    def _manifest_references_part_key(self, part_key):
+        key = self._part_token(part_key)
+        return any(
+            self._segment_lookup_key(info) == key
+            for info in self._segment_infos(include_obsolete=True)
+        )
+
+    def _orphan_segment_files(self, refs=None):
+        """扫描 data 目录中不被 manifest 引用的 segment 文件（含 -wal/-shm）。"""
+        if not os.path.isdir(self.table_part_path):
+            return []
+        if refs is None:
+            refs = self._physical_part_refs(include_obsolete=True)
+        referenced = {os.path.realpath(ref.path) for ref in refs}
+        orphans = []
+        for name in sorted(os.listdir(self.table_part_path)):
+            if not name.endswith('.sqlite3'):
+                continue
+            path = os.path.join(self.table_part_path, name)
+            if os.path.realpath(path) in referenced:
+                continue
+            orphans.append(path)
+        return orphans
+
+    def _remove_orphan_part_file(self, path):
+        """安全清理孤儿 segment 文件；被租约占用时拒绝删除。"""
+        if not self._is_safe_part_path(path):
+            raise UnsafeOperation(f'unsafe orphan file path: {path}')
+        if not self._close_part_db_if_idle(path):
+            raise UnsafeOperation(
+                f'orphan segment file is in use: {path}；'
+                '请稍后重试或先关闭并发查询'
+            )
+        for candidate in [path, f'{path}-wal', f'{path}-shm']:
+            try:
+                os.remove(candidate)
+            except FileNotFoundError:
+                continue
 
     def _close_part_db_if_idle(self, part_dbfile):
         db_to_close = None
@@ -1759,13 +1908,27 @@ class Table(BaseTable):
             )
         return table_spec.session_column
 
+    def _build_where(self, where):
+        """Where 构造统一包装：非法条件统一转 BadArgument，避免裸 KeyError/TypeError。"""
+        try:
+            return Where(where)
+        except BadArgument:
+            raise
+        except (KeyError, TypeError, ValueError) as e:
+            raise BadArgument(
+                f'无法解析 where 条件: {where!r}；'
+                '合法形式: dict/Case/CaseExpression/文本/列表，'
+                'dict 需包含 field/op/value'
+                '（示例: {"field": "ts", "op": ">=", "value": 0}）'
+            ) from e
+
     def _combine_query_where(self, where, generated):
         if not generated:
             return where
         if where is None:
             return generated
         if isinstance(where, str):
-            parsed = Where(where).or_and_cases or []
+            parsed = self._build_where(where).or_and_cases or []
             if not parsed:
                 return generated
             return [list(cases) + generated for cases in parsed]
@@ -1801,7 +1964,7 @@ class Table(BaseTable):
                 limit=query_spec.limit,
             )
 
-        w = Where(compiled_where)
+        w = self._build_where(compiled_where)
         scanned = set()
         scanned_ref_keys = set()
         candidate_ref_keys = set()
@@ -1903,7 +2066,15 @@ class Table(BaseTable):
         Returns:
             Full path to the partition file
         """
-        return os.path.join(self.table_part_path, f"{part_key}.sqlite3")
+        path = os.path.join(self.table_part_path, f"{part_key}.sqlite3")
+        # P0-3 纵深防御：即使分区 key 生成侧被绕过（fmt 注入/损坏 manifest），
+        # 也不允许分区文件写出 data 目录
+        if not self._is_safe_part_path(path):
+            raise UnsafeOperation(
+                f'unsafe partition file path: {path}；'
+                '分区键包含路径分隔符或越出表数据目录，已拒绝访问'
+            )
+        return path
 
     def _quote_identifier(self, value):
         return '"' + str(value).replace('"', '""') + '"'
@@ -2330,9 +2501,8 @@ class Table(BaseTable):
 
         column_types = self._column_types_for_pk_lookup(table_spec)
         cases = self._pk_cases(row, pk)
-        query = build_select_cases_query(
+        query = build_select_exists_query(
             _PART_DATA_TABLE_NAME,
-            '1',
             cases,
             column_types,
         )
@@ -2612,6 +2782,24 @@ class Table(BaseTable):
         )
         return self.select(fields, where, limit=limit, to_dict=True, **kwargs)
 
+    # select 家族不接受业务过滤参数：这些参数会被静默忽略，用户极易误用。
+    # 业务语义统一走 query()/explain_select() 编译。
+    _BUSINESS_SELECT_KWARGS = ('symbols', 'start', 'end', 'date', 'session')
+
+    def _reject_unknown_select_kwargs(self, kwargs, func_name):
+        provided = [
+            name for name in self._BUSINESS_SELECT_KWARGS if name in kwargs
+        ]
+        if provided:
+            raise BadArgument(
+                f'{func_name} 不支持业务参数 {provided}（会被静默忽略）；'
+                '修复: 改用 query(...) 或 explain_select(...)，'
+                '它们支持 symbols/start/end/date/session'
+            )
+        if kwargs:
+            names = ', '.join(sorted(kwargs))
+            raise BadArgument(f'{func_name}() 收到未知参数: {names}')
+
     def iter_select(
         self,
         fields='*',
@@ -2624,6 +2812,7 @@ class Table(BaseTable):
         **kwargs,
     ):
         fields = resolve_select_fields(fields, columns, 'iter_select')
+        self._reject_unknown_select_kwargs(kwargs, 'iter_select')
         for batch in self.iter_select_batches(
             fields,
             where,
@@ -2648,6 +2837,7 @@ class Table(BaseTable):
         **kwargs,
     ):
         fields = resolve_select_fields(fields, columns, 'iter_select_batches')
+        self._reject_unknown_select_kwargs(kwargs, 'iter_select_batches')
         batch_size = self._normalize_batch_size(batch_size)
         limit = self._normalize_limit(limit)
         if limit == 0:
@@ -2672,7 +2862,7 @@ class Table(BaseTable):
         column_types = {
             key: item["type"] for key, item in meta["column_info"].items()
         }
-        w = Where(where)
+        w = self._build_where(where)
         fetch_fields, project_fields = self._select_fields_with_order(
             fields,
             None,
@@ -2690,7 +2880,9 @@ class Table(BaseTable):
             if not rows:
                 continue
             if project_fields is not None:
-                rows = self._project_fields(rows, project_fields)
+                rows = self._project_fields(
+                    rows, project_fields, to_dict=to_dict
+                )
             if to_dict:
                 rows = [dict(item) for item in rows]
 
@@ -2716,6 +2908,7 @@ class Table(BaseTable):
         默认返回 dict 行（与 PG 引擎一致）；to_dict=False 返回 sqlite3.Row 元组。
         """
         fields = resolve_select_fields(fields, columns, 'select')
+        self._reject_unknown_select_kwargs(kwargs, 'select')
         # step1. 找到各part记录到的字段最大最小数值, 排除不需要查询的part
         # step2. 查找各个And([case..])的数据
         #       处理where以后, [And([case..])]之间不应有包含关系，否则可以直接去掉被包含的
@@ -2732,18 +2925,36 @@ class Table(BaseTable):
             # No such table
             return []
 
-        w = Where(where)
+        w = self._build_where(where)
         limit = self._normalize_limit(limit)
         fetch_fields, project_fields = self._select_fields_with_order(
             fields,
             order_by,
             column_types,
         )
+        if limit == 0:
+            return []
+
+        # ORDER BY + LIMIT 下推：每 segment SQL 先取 top-N，再在 Python 归并，
+        # 避免全表物化（UI /rows 大表分页依赖此路径），结果与不下推一致
+        pushdown = bool(order_by) and limit is not None
+        order_by_sql = (
+            self._order_by_sql(order_by, fetch_fields, column_types)
+            if pushdown
+            else None
+        )
+        select_kwargs = (
+            {'order_by_sql': order_by_sql, 'limit': limit}
+            if pushdown
+            else {}
+        )
 
         full_data = []
         if not w.or_and_cases:
             # select all
-            data = self._select_and_cases(fetch_fields, None, column_types)
+            data = self._select_and_cases(
+                fetch_fields, None, column_types, **select_kwargs
+            )
             # full_data.append(data)
             if data:
                 full_data.extend(data)
@@ -2752,13 +2963,16 @@ class Table(BaseTable):
                 fetch_fields,
                 w.or_and_cases,
                 column_types,
+                **select_kwargs,
             )
             if data:
                 full_data.extend(data)
         else:
             for cases in w.or_and_cases:
                 # 一个基本查询单元
-                data = self._select_and_cases(fetch_fields, cases, column_types)
+                data = self._select_and_cases(
+                    fetch_fields, cases, column_types, **select_kwargs
+                )
                 # full_data.append((cases, data))
                 # full_data.append(data)
                 if data:
@@ -2768,14 +2982,21 @@ class Table(BaseTable):
         if limit is not None:
             full_data = full_data[:limit]
         if project_fields is not None:
-            full_data = self._project_fields(full_data, project_fields)
-        if to_dict:
+            full_data = self._project_fields(
+                full_data, project_fields, to_dict=to_dict
+            )
+        elif to_dict:
             full_data = [dict(item) for item in full_data]
         return full_data
 
     def _normalize_limit(self, limit):
         if limit is None:
             return None
+        if isinstance(limit, bool):
+            raise BadArgument(
+                f'limit 不接受布尔值 {limit}；'
+                '修复: 传非负整数，如需无条件限制请传 None'
+            )
         limit = int(limit)
         if limit < 0:
             raise BadArgument('limit must be non-negative')
@@ -2828,9 +3049,15 @@ class Table(BaseTable):
             plain_fields.append(field)
         return plain_fields
 
-    def _project_fields(self, rows, fields):
+    def _project_fields(self, rows, fields, to_dict=False):
+        # 冻结契约：to_dict=False + 投影必须返回 tuple/Row，而不是 dict
+        if to_dict:
+            return [
+                {field: row[field] for field in fields}
+                for row in rows
+            ]
         return [
-            {field: row[field] for field in fields}
+            tuple(row[field] for field in fields)
             for row in rows
         ]
 
@@ -2867,6 +3094,29 @@ class Table(BaseTable):
                 raise BadArgument('order_by field is empty')
             specs.append((field, direction == 'desc'))
         return specs
+
+    def _order_by_sql(self, order_by, fetch_fields, column_types):
+        """把 order_by 编译为参数化安全的 SQL 片段（标识符加引号，方向白名单）。"""
+        specs = self._parse_order_by(order_by)
+        fetch_set = (
+            set(fetch_fields)
+            if isinstance(fetch_fields, (list, tuple))
+            else None
+        )
+        parts = []
+        for field, reverse in specs:
+            if fetch_set is not None and field not in fetch_set:
+                raise BadArgument(
+                    f'order_by field `{field}` must be included in selected fields'
+                )
+            if column_types and field not in column_types:
+                raise BadArgument(
+                    f'order_by field `{field}` 不是表字段；'
+                    '修复: 使用契约中声明的列名'
+                )
+            direction = 'desc' if reverse else 'asc'
+            parts.append(f'{self._quote_identifier(field)} {direction}')
+        return ', '.join(parts)
 
     def _apply_order_by(self, rows, order_by):
         specs = self._parse_order_by(order_by)
@@ -3044,21 +3294,26 @@ class Table(BaseTable):
             ]
         return need_parts
 
-    def _select_and_cases(self, fields, cases, column_types):
+    def _select_and_cases(self, fields, cases, column_types,
+                          order_by_sql=None, limit=None):
         """获得And[Case..] 的查询结果
         And[Case..] 为一个基本查询单元
+        order_by_sql/limit 提供时用于 ORDER BY + LIMIT 下推（每 segment 取 top-N）
         """
         # table field必须的，涉及到查询是否需要加 "
         # 分成独立文件是为了同步数据方便，也导致数据容易被盗
         need_refs = self._get_select_part_refs(cases)
         data = []
         for ref in need_refs:
+            self._ensure_ref_file_present(ref)
             part_table_name = _PART_DATA_TABLE_NAME
             query = build_select_cases_query(
                 part_table_name,
                 fields,
                 cases,
                 column_types,
+                order_by_sql=order_by_sql,
+                limit=limit,
             )
             part_dbfile = self._get_part_dbfile(ref.part_key)
 
@@ -3082,6 +3337,7 @@ class Table(BaseTable):
             where_obj,
             column_types,
         ):
+            self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
             logger.debug(
                 f"{part_dbfile}: {ref.part_key}: "
@@ -3153,7 +3409,8 @@ class Table(BaseTable):
                 break
             offset += len(rows)
 
-    def _select_or_cases(self, fields, or_cases, column_types):
+    def _select_or_cases(self, fields, or_cases, column_types,
+                         order_by_sql=None, limit=None):
         refs_by_key = OrderedDict()
         for cases in or_cases:
             for ref in self._get_select_part_refs(cases):
@@ -3161,11 +3418,14 @@ class Table(BaseTable):
 
         data = []
         for ref in refs_by_key.values():
+            self._ensure_ref_file_present(ref)
             query = build_select_or_cases_query(
                 _PART_DATA_TABLE_NAME,
                 fields,
                 or_cases,
                 column_types,
+                order_by_sql=order_by_sql,
+                limit=limit,
             )
             part_dbfile = self._get_part_dbfile(ref.part_key)
             logger.debug(
@@ -3184,19 +3444,26 @@ class Table(BaseTable):
         return data
 
     def create_index(self, column, order="asc", exist_ok=True):
-        for ref in self._physical_part_refs():
-            part_dbfile = self._get_part_dbfile(ref.part_key)
-            with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                part_db[_PART_DATA_TABLE_NAME].create_index(
-                    column, order, exist_ok=exist_ok
-                )
+        order_value = str(order or 'asc').strip().lower()
+        if order_value not in ('asc', 'desc'):
+            raise BadArgument(
+                f'invalid index order: {order}；合法值: asc/desc'
+            )
+        with self._compact_lock:
+            for ref in self._physical_part_refs():
+                part_dbfile = self._get_part_dbfile(ref.part_key)
+                with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                    part_db[_PART_DATA_TABLE_NAME].create_index(
+                        column, order_value, exist_ok=exist_ok
+                    )
 
     def drop_index(self, column):
         dropped = 0
-        for ref in self._physical_part_refs():
-            part_dbfile = self._get_part_dbfile(ref.part_key)
-            with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
+        with self._compact_lock:
+            for ref in self._physical_part_refs():
+                part_dbfile = self._get_part_dbfile(ref.part_key)
+                with self._part_db(part_dbfile, auto_commit=True) as part_db:
+                    dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
         return dropped
 
     def upsert_all(
@@ -3233,6 +3500,8 @@ class Table(BaseTable):
 
         if not kv_list:
             return
+
+        self._ensure_pk_present(kv_list, pk)
 
         # Step 1: SELECT all existing rows (no WHERE - pk is the identity)
         data = self.select("*", where=None, to_dict=True)
@@ -3278,11 +3547,12 @@ class Table(BaseTable):
         """
         if where is None:
             warnings.warn(
-                'delete(None) is deprecated; use truncate(confirm=True)',
+                'delete(None) is deprecated; use delete_all() or '
+                'truncate(confirm=True)',
                 DeprecationWarning,
                 stacklevel=2,
             )
-            return self._delete_all_count()
+            return self.delete_all()
 
         meta = self.get_table_meta()
         if not meta:
@@ -3290,20 +3560,28 @@ class Table(BaseTable):
 
         column_types = {key: item["type"] for key, item in meta["column_info"].items()}
 
-        w = Where(where)
+        w = self._build_where(where)
 
-        total_deleted = 0
-        for cases in w.or_and_cases:
-            deleted = self._delete_and_cases(cases, column_types)
-            total_deleted += deleted
+        # 与 compact/write 共用 _compact_lock：防止 compact 读取旧 segment 后
+        # delete 已删行被重建的新 segment“复活”（P0-2）
+        with self._compact_lock:
+            total_deleted = 0
+            for cases in w.or_and_cases:
+                deleted = self._delete_and_cases(cases, column_types)
+                total_deleted += deleted
 
         return total_deleted
+
+    def delete_all(self):
+        """显式清空全表（不要求 confirm；危险操作请优先用 truncate(confirm=True)）。"""
+        return self._delete_all_count()
 
     def truncate(self, confirm=False):
         if not confirm:
             raise UnsafeOperation('truncate requires confirm=True')
-        partitions = list(self.table_parts())
-        self._delete_all_count()
+        with self._compact_lock:
+            partitions = list(self.table_parts())
+            self._delete_all_count()
         return WriteResult(partitions_touched=partitions)
 
     def _delete_all_count(self):
@@ -3311,7 +3589,8 @@ class Table(BaseTable):
         if not meta:
             return 0
         column_types = {key: item["type"] for key, item in meta["column_info"].items()}
-        return self._delete_and_cases(None, column_types)
+        with self._compact_lock:
+            return self._delete_and_cases(None, column_types)
 
     def _delete_and_cases(self, cases, column_types):
         """Delete rows matching And[Case..] from all relevant partitions."""
@@ -3320,40 +3599,45 @@ class Table(BaseTable):
         spec = self.spec()
         layout = spec.physical_layout if spec else PhysicalLayout()
 
-        for ref in need_refs:
-            part_dbfile = self._get_part_dbfile(ref.part_key)
-            with self._part_db(part_dbfile, auto_commit=True) as db:
-                part_table = db[_PART_DATA_TABLE_NAME]
+        with self._compact_lock:
+            for ref in need_refs:
+                self._ensure_ref_file_present(ref)
+                part_dbfile = self._get_part_dbfile(ref.part_key)
+                with self._part_db(part_dbfile, auto_commit=True) as db:
+                    part_table = db[_PART_DATA_TABLE_NAME]
 
-                select_query = build_select_cases_query(
-                    _PART_DATA_TABLE_NAME, "COUNT(*)", cases, column_types
-                )
-                count_before = part_table.query(
-                    select_query.sql,
-                    params=select_query.params,
-                )
-                count = dict(count_before[0])["COUNT(*)"] if count_before else 0
-
-                if count > 0:
-                    delete_query = build_delete_query(
+                    select_query = build_select_count_query(
                         _PART_DATA_TABLE_NAME, cases, column_types
                     )
-                    logger.debug(
-                        f"{part_dbfile}: DELETE: {delete_query.sql}; "
-                        f"params={delete_query.params}"
+                    count_before = part_table.query(
+                        select_query.sql,
+                        params=select_query.params,
                     )
-                    db[_PART_DATA_TABLE_NAME].execute_params(
-                        delete_query.sql,
-                        delete_query.params,
+                    count = dict(count_before[0])["COUNT(*)"] if count_before else 0
+
+                    if count > 0:
+                        delete_query = build_delete_query(
+                            _PART_DATA_TABLE_NAME, cases, column_types
+                        )
+                        logger.debug(
+                            f"{part_dbfile}: DELETE: {delete_query.sql}; "
+                            f"params={delete_query.params}"
+                        )
+                        # 显式 commit=True：不能依赖共享 auto_commit（并发读会把它翻成
+                        # False，连接归还时 rollback 导致删除丢失，P0-1）
+                        db[_PART_DATA_TABLE_NAME].execute_params(
+                            delete_query.sql,
+                            delete_query.params,
+                            commit=True,
+                        )
+                        total_deleted += count
+                if count > 0 and ref.segment_id >= 0:
+                    self._refresh_segment_info(
+                        ref.logical_part,
+                        ref.segment_id,
+                        ref.part_key,
+                        layout,
                     )
-                    total_deleted += count
-            if count > 0 and ref.segment_id >= 0:
-                self._refresh_segment_info(
-                    ref.logical_part,
-                    ref.segment_id,
-                    ref.part_key,
-                    layout,
-                )
 
         return total_deleted
 
@@ -3711,9 +3995,6 @@ class Table(BaseTable):
         except NoSuchTable:
             return None
 
-    def _table_columns(self):
-        pass
-
     def table_names(self):
         if not os.path.isdir(self.db_path):
             return []
@@ -3740,7 +4021,11 @@ class Table(BaseTable):
             "updated_at": updated_at,
         }
         self.table_meta_db[_TABLE_META_TABLE_NAME].insert(
-            info, pk=["table_name"], replace=True, ensure_table=True
+            info,
+            pk=["table_name"],
+            replace=True,
+            ensure_table=True,
+            commit=True,
         )
         # decoupled
         # self.meta_db[_DB_META_TABLE_NAME].insert(
@@ -3796,7 +4081,11 @@ class Table(BaseTable):
         }
         _tblname = _TABLE_PART_COLUMN_RANGE_TABLE_NAME
         self.table_meta_db[_tblname].insert(
-            info, pk=["table_name", "part", "column"], ensure_table=True, replace=True
+            info,
+            pk=["table_name", "part", "column"],
+            ensure_table=True,
+            replace=True,
+            commit=True,
         )
 
     def get_part_column_ranges(self, table_name=None):
@@ -3826,6 +4115,7 @@ class Table(BaseTable):
     def _part_rows(self, part):
         rows = []
         for ref in self._physical_part_refs([part]):
+            self._ensure_ref_file_present(ref)
             rows.extend(self._rows_from_part_dbfile(self._get_part_dbfile(ref.part_key)))
         return rows
 
@@ -4039,10 +4329,20 @@ class Table(BaseTable):
     @contextmanager
     def _part_db(self, part_dbfile, auto_commit=True):
         db = self._acquire_part_db(part_dbfile, auto_commit)
+        thread_id = threading.get_ident()
+        with self._db_parts_condition:
+            self._db_parts_lease_threads[thread_id] = (
+                self._db_parts_lease_threads.get(thread_id, 0) + 1
+            )
         try:
             yield db
         finally:
             with self._db_parts_condition:
+                thread_leases = self._db_parts_lease_threads.get(thread_id, 0)
+                if thread_leases <= 1:
+                    self._db_parts_lease_threads.pop(thread_id, None)
+                else:
+                    self._db_parts_lease_threads[thread_id] = thread_leases - 1
                 leases = self._db_parts_leases.get(part_dbfile, 0)
                 if leases <= 1:
                     self._db_parts_leases[part_dbfile] = 0
@@ -4056,6 +4356,11 @@ class Table(BaseTable):
             with self._db_parts_condition:
                 while self._db_parts_closing:
                     self._db_parts_condition.wait(timeout=0.1)
+                if self._db_parts_closed:
+                    raise UnsafeOperation(
+                        'table 已关闭，不能再获取分区连接；'
+                        '修复: 重新通过 Database.table() 打开表'
+                    )
                 db = self._db_parts.get(part_dbfile)
                 if db is not None and not db.is_closed():
                     db.auto_commit = auto_commit

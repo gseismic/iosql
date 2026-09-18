@@ -216,12 +216,16 @@
         items.map(function (it) {
           return h('button', { onclick: function () { wrap.classList.remove('open'); it.onClick(); } }, it.label);
         })));
-    document.addEventListener('click', function (e) {
-      if (!wrap.contains(e.target)) wrap.classList.remove('open');
-    });
     return wrap;
   }
   IU.menu = menu;
+
+  /* 点击菜单外部收起：全局只挂一次委托监听，避免每次 menu() 累积监听器 */
+  document.addEventListener('click', function (e) {
+    document.querySelectorAll('.menu.open').forEach(function (m) {
+      if (!m.contains(e.target)) m.classList.remove('open');
+    });
+  });
 
   /* ---------- 徽章 ---------- */
   function badge(text, kind) { return h('span', { class: 'badge ' + (kind || 'gray') }, text); }
@@ -238,6 +242,17 @@
     return undefined;
   }
   IU.pick = pick;
+
+  /* 解包包裹式响应：后端读写端点返回 {report}/{validation}/{result}，
+   * 前端统一取内层对象；键不存在或为 null 时原样返回响应 */
+  function unwrap(resp, key) {
+    if (resp && typeof resp === 'object' &&
+        resp[key] !== undefined && resp[key] !== null) {
+      return resp[key];
+    }
+    return resp;
+  }
+  IU.unwrap = unwrap;
 
   /* 把响应统一成数组：容忍裸数组 / {rows:[]} / {items:[]} / {data:[]} 等形态 */
   function toArray(resp) {

@@ -72,6 +72,12 @@ with Database("sqlite://db/test.iosql") as db:
 | `symbol_column` | `str` | 标的列；默认 `None`——未声明时 `query(symbols=)` / `latest(symbols=)` 抛 `BadArgument`（timeseries() 默认 `"symbol"`） |
 | `session_column` | `str` | 交易日/session 列（期货夜盘等场景） |
 
+已有表上再次传 `spec=`（或快捷参数）时，声明的绑定字段
+（`order_key`/`symbol_column`/`session_column`/`conflict`/`schema_policy`）会通过
+`TableSpecConflict` 校验并写回持久化契约：存量仍为默认值或未声明时可被覆盖，
+否则报 `TableSpecConflict`（含修复提示）。`force_partition=True` 在快捷参数路径
+生效（走 `spec=` 时请同时显式传同名参数），会跳过分区冲突检查并把新分区契约落盘。
+
 #### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None)`
 
 时序语法糖：`table()` 的薄封装，duration 场景等价于 `db.table(..., partition=Partition.duration(time, every=partition_every), order_key=time, time=time)`。calendar 场景传 `partition=Partition.calendar(...)`。
@@ -89,6 +95,10 @@ PostgreSQL 后端只返回用户逻辑表，不返回 native partition 子表。
 重命名当前 SQLite 目录库。`new_uri_or_name` 可以是完整 `sqlite://...`
 URI，也可以是当前库父目录下的新目录名；重命名成功后当前 `Database`
 实例的 `uri` 会刷新到新路径，已缓存的表对象也会重新绑定到新目录。
+
+源目录与覆盖目标都必须通过 iosql 身份校验（存在表级 `<table>/meta.sqlite3`）；
+根目录、家目录、符号链接目标一律拒绝。覆盖时先把目标改名为临时目录再替换，
+失败自动回滚（跨文件系统 `EXDEV` 会包装为 `BadArgument` 并保留原数据）。
 
 PostgreSQL database 重命名不通过 iosql 执行。目标已存在时默认抛出
 `BadArgument`；需要覆盖时传 `overwrite=True`。
@@ -130,8 +140,12 @@ result = source.migrate_to(
 - `["ticks", "daily"]`：迁移指定表，目标表同名。
 - `{"ticks": "pg_ticks"}`：源表到目标表映射。
 
-`dry_run=True` 只统计源表行数和估算批次数，不连接目标库。`verify="row-count"`
-会在迁移后比较源/目标行数，结果写入 `source_rows`、`target_rows` 和 `verified`。
+`dry_run=True` 只统计源表行数和估算批次数，不连接目标库；`mode`/`tables`/目标 URI
+会在 `dry_run` 阶段一并校验，且不会为不存在的表创建目录或 `meta.sqlite3`。
+SQLite 源迁移到 SQLite 目标时，目标不能与源库相同或位于源库目录内（`BadArgument`）。
+`tables` 支持 `None`（全库）、表名列表/字符串、或 `{源表: 目标表}` 映射；空列表、
+未知源表或非法类型抛 `BadArgument`。`verify="row-count"` 会在迁移后比较源/目标
+行数，结果写入 `source_rows`、`target_rows` 和 `verified`。
 
 `to_postgresql(target_uri, ...)` 是只接受 `postgresql://` 目标的语义别名。
 PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要先
@@ -150,8 +164,9 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `write` | `(rows, mode=None, commit=True, **kwargs) -> WriteResult` |
 | `write_buffer` | `(mode=None, max_rows=10_000, **write_kwargs) -> BufferedWriter` |
 | `insert_all` | `(data, pk=None, extra_data=None, partition=None, replace=False, ignore=False, commit=True, **kwargs) -> WriteResult` |
-| `upsert_all` | `(kv_list, pk, partition=None, commit=True, **kwargs)` |
-| `delete` | `(where) -> int` |
+| `upsert_all` | SQLite `(kv_list, pk, partition=None, commit=True, **kwargs)`；PG `(kv_list, pk, partition=None, commit=True, *, where=None)`（`where` 已废弃并告警，按 pk 全表合并） |
+| `delete` | `(where) -> int`（返回删除行数；`where=None` 告警并转发 `delete_all()`；PG 侧 falsy 非 None 一律抛 `BadArgument`） |
+| `delete_all` | `() -> int`（显式清空全表；危险操作优先 `truncate(confirm=True)`） |
 | `truncate` | `(confirm=False) -> WriteResult` |
 
 **写入模式**：
@@ -172,6 +187,8 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, columns=None, **kwargs) -> list`（默认返回 dict 行；`to_dict=False` 返回 tuple） |
 | `iter_select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, batch_size=10_000, columns=None) -> Iterator` |
 | `iter_select_batches` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, batch_size=10_000, columns=None) -> Iterator[list]` |
+| `iter_rows` | `(batch_size=10_000) -> Iterator[row]`（流式读取全表，逐行；PG 同签名） |
+| `iter_batches` | `(batch_size=10_000) -> Iterator[list]`（SQLite；流式读取全表，按批；`iter_rows` 的批量版） |
 | `select_all` | 已废弃：等价于 `select(fields, where, to_dict=True)`，触发 DeprecationWarning，永久保留 |
 | `explain_select` | `(fields='*', where=None, order_by=None, limit=None, columns=None, symbols=None, start=None, end=None, date=None, session=None) -> QueryPlan`（业务参数与 `query()` 对齐） |
 | `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery`（`group_by` 已废弃，改用 `by=`；未声明 symbol_column 且无 `by=` 时抛 `BadArgument`） |
@@ -196,6 +213,16 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `drop_index` | `(column)` | 删除所有分区上的列索引 |
 
 **并发语义**：写入路径（`write` / `write_buffer` / 迁移写目标）与 `compact()` 共用 `_compact_lock` 串行化——compact 与写互斥是预期吞吐代价，换取不会向 obsolete segment 复活插入。
+
+**PostgreSQL 引擎差异**：
+
+- `delete(where)` 参数化执行并返回删除行数；`where=None` 触发 `DeprecationWarning` 并转发 `delete_all()`，`[]`/`{}`/`""`/`0`/`False` 等 falsy 非 None 值抛 `BadArgument`（不再退化为全表删除）。
+- 列类型走封闭白名单（`blob→BYTEA`、`datetime→TIMESTAMP` 等）；未知类型抛 `BadArgument`，不会把用户字符串拼进 DDL。已有物理表缺契约列、或声明分区但表未分区时抛 `SchemaConflict`。
+- 字符串 `fields` 只接受 `*` 或标识符列表；含 SQL 语法直接抛 `BadArgument`。`select()` / `iter_select()` / `iter_select_batches()` 拒绝未知 kwargs。
+- `insert_all` / `upsert_all` 按整批行列并集取值、缺列补 `NULL`，并按参数上限拆页；`commit=False` 会保持事务，后续提交写入或关闭时提交，失败整体回滚。
+- `order_by` 的 NULL 排序与 SQLite 一致：ASC → `NULLS FIRST`，DESC → `NULLS LAST`。
+- `upsert_all(..., where=...)` 的 `where` 为仅关键字参数且已废弃（忽略并告警）：upsert 以 pk 为身份在全表范围合并。
+- `calendar(...)` 的 `timestamptz` 边界带 UTC 偏移；`table_parts()` 返回排序后的子分区关系名。
 
 ---
 
@@ -228,6 +255,8 @@ for batch in table.query(start=start, end=end).iter_batches(batch_size=50_000):
 - 无全局 `order_by` 时按分区/segment 分页读取，适合大结果集。
 - 有 `order_by` 时为保证全局排序正确性，会复用 `select()` 的合并排序结果，再按批输出。
 - `limit` 会跨 batch 生效。
+- `select()` / `iter_select*()` 不接受 `symbols`/`start`/`end`/`date`/`session` 或任何未知 kwargs（抛 `BadArgument`，不静默忽略）；业务过滤请用 `query()` / `explain_select()`。
+- `select()` 同时给出全局 `order_by` 和 `limit` 时，`ORDER BY ... LIMIT` 会下推到每个 segment 再归并（结果不变、内存有界）；只排序不限行时仍需完整合并排序。
 
 ### `LatestQuery` 对象
 
@@ -282,11 +311,14 @@ PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边
 
 常用别名：`1min` `5min` `15min` `30min` `1hour` `4hour` `1day` `1week` `1month` `3month` `6month` `1year`
 
+`interval_ms` 接受正整数、整数值 float 与纯数字字符串，以及 `Nunit`（含 `Nmonth`=30 天、`Nyear`=365 天）；bool/非整数 float/非正值抛 `PartitionSpecError`（`BadArgument` 子类）。`format_partition_spec()` 的输出可被 `parse_interval_ms()` 回读（月/年按固定近似往返）。
+
 ### `CalendarPartition`
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `fmt` | `str` | 日期格式（`"YYYY"`/`"YYYYMM"`/`"YYYYMMDD"`/`"YYYYMMDDHH"`/`"YYYYMMDDHHmm"`） |
+| `fmt` | `str` | 日期格式，白名单：`"YYYY"`/`"YYYYMM"`/`"YYYYMMDD"`/`"YYYYMMDDHH"`/`"YYYYMMDDHHmm"`，其他值抛 `PartitionSpecError` |
+| `every` | `str`/`int` | 日历粒度（如 `"1week"`/`"4day"`），会真实参与分桶；缺省按 `fmt` 推断 |
 | `tz` | `str` | 时区（如 `"Asia/Shanghai"`） |
 | `ts_col` | `str` | 日期列名 |
 
@@ -294,8 +326,10 @@ PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `width` | `int` | 分区宽度 |
+| `width` | `int` | 分区宽度（正整数；`True`/小数/0 抛 `PartitionSpecError`） |
 | `column` | `str` | 数值列名 |
+
+range/duration 分区会把数值分区键向下取整归一为 `int`（`0.0` 与 `0` 是同一个分区键，等值查询可命中）。
 
 ---
 
@@ -335,7 +369,7 @@ Segment.rows(
 )
 ```
 
-约束：`max_rows >= target_rows >= min_rows > 0`
+约束：`max_rows >= target_rows >= min_rows > 0`。`max_rows` 必填且为正整数；`target_rows`/`min_rows` 只有 `None` 才回落默认值，显式传 `0`、bool 或非法类型抛 `BadArgument`（不会被静默替换）。`PhysicalLayout(target_rows_per_file=None)` 同样抛 `BadArgument`。
 
 `stats_columns=None` 默认统计全部列。显式列表可减少高频宽表的 min/max 维护成本；partition column、time、`order_key`、`session_column` 会自动补入必要统计列。
 
@@ -378,6 +412,8 @@ cleanup = table.cleanup_obsolete(dry_run=False)
 
 - `validate(deep=False)` 只做 manifest 级检查。
 - `validate(deep=True)` 会检查当前可见 segment 的文件存在性、SQLite `integrity_check`、`data` 表、`row_count`、time/session 范围和 manifest stats。
+- `validate()` 还会反向扫描 data 目录，把未被 manifest 引用的 segment 文件以 `orphan_segment_file` 警告列出（warnings 不影响 `ok`）。
+- manifest 引用的 segment 文件缺失时，读取/删除路径抛 `UnsafeOperation`（不会隐式创建空文件）；`compact()` 可安全清理占用目标文件名的孤儿文件后复用该名字。
 - `include_obsolete=True` 会把 obsolete segment 纳入校验；obsolete 的深度问题以 warning 记录，不影响默认查询。
 - `cleanup_obsolete()` 默认 dry-run，不删除文件。
 - `cleanup_obsolete(dry_run=False)` 删除前默认执行 `validate(deep=True)`；校验失败会抛出 `UnsafeOperation`。
@@ -577,7 +613,7 @@ CleanupResult(
 | `SchemaConflict` | Schema 冲突（同名列类型不一致） |
 | `MissingPrimaryKey` | 缺少主键 |
 | `MissingTimeColumn` | 缺少时间列 |
-| `PartitionSpecError` | 分区规格错误 |
+| `PartitionSpecError` | 分区规格错误（`BadArgument` 子类；损坏/旧 manifest 缺字段也走这里） |
 | `UnsafeOperation` | 不安全操作（如 truncate 未确认） |
 | `QueryFieldError` | 查询字段不存在 |
 | `ChunkVerificationError` | 数据块校验错误 |
@@ -642,6 +678,7 @@ table.select_one(fields, where=None)
 table.query_all(sql)
 table.update(new_values, where)
 table.delete(where)
+table.invalidate_cache()  # 外部 DDL 后手动失效列/默认值/主键缓存
 
 # 连接池
 db.get_connection_pool_status()
@@ -658,12 +695,23 @@ db.close()
 
 行为契约（PLAN-057 后）：错误路径统一先 `rollback()` 再转换异常（`transaction()` 内不重复回滚）；不可解析的 sqlite 错误消息重抛原始异常（保持 `except sqlite3.IntegrityError` 类匹配可用）；建表冲突抛类型化 `DuplicateColumn`，主键不在列中抛 `PrimaryKeyNotInColumn`。mysqlite 无内置 rename/drop_column/backup——用原生 SQL 或连接 API 完成（见 `examples/mysqlite-scenarios/`）。
 
+行为契约（PLAN-062 后）：
+
+- 连接池不支持 `Database(":memory:")` / `file::memory:`（抛 `BadArgument`；池内每个连接会各自打开独立内存库）。
+- 写入必须显式提交：`insert()`/`executemany()` 传 `commit=False` 抛 `ValueError`；`auto_commit=False` 时不在 `transaction()` 中的直写同样被拒绝，需要事务请用 `with db.transaction():`。
+- `insert_all` 按每行 key 集合分组：行中缺失的列从语句中省略，交由 SQLite 求值列 `DEFAULT`（`CURRENT_TIMESTAMP`、`(datetime('now'))` 等表达式默认值不再被当作字面量写盘）。
+- `wal=False` 在未显式给出 `journal_mode` 时生效；`timeout=` 同时派生默认 `busy_timeout`（毫秒，`pragma_dict` 显式值优先）。
+- 表结构缓存会在本模块 DDL（`create_table`/`add_column`/`drop_table` 等）后自动失效；通过 `db.execute()` 或外部连接执行 DDL 后需手动 `table.invalidate_cache()`。
+- `drop_all_index` / `drop_column_index` 跳过主键/唯一约束的 autoindex，并用 `PRAGMA index_info` 解析复合索引/表达式索引。
+- 连接池 `get_connection()` 同线程可重入；`fork()` 后子进程自动重建池状态；进程预算在全部池空闲时取声明上限的最大值（避免临时小池永久压缩全局预算）。
+- `suggest_value_type()` 识别 numpy 标量（`np.int64`/`np.float32`/`np.bool_` 等）并映射到 integer/float。
+
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `auto_commit` | `True` | 自动提交 |
+| `auto_commit` | `True` | 自动提交；为 `False` 时写入必须放在 `transaction()` 中或显式 `commit=True` |
 | `max_connections` | `10` | 最大连接数 |
-| `timeout` | `5.0` | 连接超时（秒） |
-| `wal` | `True` | 启用 WAL 模式 |
+| `timeout` | `5.0` | 连接超时（秒），同时派生默认 `busy_timeout` |
+| `wal` | `True` | 启用 WAL 模式（`pragma_dict` 显式给出 `journal_mode` 时以显式值为准） |
 
 ---
 

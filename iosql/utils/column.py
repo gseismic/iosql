@@ -1,5 +1,6 @@
 from collections import OrderedDict
 import datetime
+import numbers
 
 try:
     import numpy as np
@@ -31,12 +32,25 @@ if has_np:
             np.float16: "float",
             np.float32: "float",
             np.float64: "float",
+            np.bool_: "integer",
         }
     )
 
 
 def sqlite_type_of_value(v):
-    return sqlite_type_map.get(type(v), 'text')
+    # numpy 标量统一转成 Python 原生类型；未知数值类型走 numbers 兜底
+    if has_np and isinstance(v, np.generic):
+        v = v.item()
+    type_ = sqlite_type_map.get(type(v))
+    if type_ is not None:
+        return type_
+    if isinstance(v, bool):
+        return 'integer'
+    if isinstance(v, numbers.Integral):
+        return 'integer'
+    if isinstance(v, numbers.Real):
+        return 'float'
+    return 'text'
 
 
 def sqlite_types_of_data(data, n_check=None):
@@ -69,11 +83,13 @@ def suggest_column_types(data, column_type=None, n_check=None):
         if data_fields.issubset(column_type):
             return OrderedDict(column_type)
 
+    # 先保留全部声明列（即使本批数据未出现），再补充数据中推断出的新列；
+    # 旧实现走推断路径时会把「已声明但数据未出现」的列静默丢弃。
+    out_column_types.update(column_type)
+
     kvalue_types = sqlite_types_of_data(data, n_check)
     for column, type_by_data in kvalue_types.items():
-        if column in column_type:
-            out_column_types[column] = column_type[column]
-        else:
+        if column not in out_column_types:
             out_column_types[column] = type_by_data
 
     return out_column_types

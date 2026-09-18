@@ -34,39 +34,28 @@ def get_case_range(case):
 def unique_or_and_cases(list_cases: 'List[List[Case]]'):
     """
     Remove duplicate cases from a list of cases
+
+    Or[And[..]..] 化简：某个 And 组是另一个 And 组的 superset 时，
+    它在 OR 中被 subset 覆盖，可以删除；相同组只保留最早出现的一个。
+    与顺序无关（旧实现只检查更早的组，`[[A,B],[A]]` 会漏删）。
     """
-    # Or[And[..]..]
-    # 去除重复的
-    # And[..] 已经通过unique_and_cases 去重
-
-    # step1. Or 宏观去重
-    # 可以省略，因为通过后续的superset包含了
-    #out_and_cases = []
-    #and_cids = set()
-    #for cases in list_cases:
-    #    and_id = tuple(sorted([c.cid() for c in cases]))
-    #    if and_id not in out_and_cases:
-    #        out_and_cases.append(cases)
-    #        and_cids.add(and_id)
-
-    # step2. 如果And条件是 另一个And条件的 superset，则在OR运算中被自动满足
-    out_and_cases = list_cases
-    list_and_sets = []
-    for cases in out_and_cases:
-        list_and_sets.append(set([c.cid() for c in cases]))
+    out_and_cases = list(list_cases)
+    list_and_sets = [set([c.cid() for c in cases]) for cases in out_and_cases]
 
     to_del_index = set()
     n = len(out_and_cases)
-    for i in reversed(range(n)):
-        to_del = False
-        # 会导致凡是出现相同的都被删除
-        # for j in range(n)
-        for j in range(i):
-            if list_and_sets[i].issuperset(list_and_sets[j]):
-                to_del = True
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            if list_and_sets[i] == list_and_sets[j]:
+                # 完全相同的组：仅保留最先出现的下标
+                if i > j:
+                    to_del_index.add(i)
+                    break
+            elif list_and_sets[i].issuperset(list_and_sets[j]):
+                to_del_index.add(i)
                 break
-        if to_del:
-            to_del_index.add(i)
 
     final_out = []
     for i, cases in enumerate(out_and_cases):

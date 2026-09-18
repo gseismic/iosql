@@ -95,8 +95,8 @@
         IU.api(base + '/explain', {
           method: 'POST',
           body: { where: where || [], order_by: defaultOrder(spec), limit: limitNum() }
-        }).then(function (plan) {
-          IU.renderPlanPanel(planBox, plan);
+        }).then(function (resp) {
+          IU.renderPlanPanel(planBox, IU.unwrap(resp, 'plan'));
         }).catch(function () {
           IU.clear(planBox);
           planBox.append(h('div', { class: 'empty-state' }, '计划获取失败'));
@@ -105,13 +105,13 @@
     }
   };
 
-  /* 默认排序：time → order_key → pk[0] → 不传 */
+  /* 默认排序：time → order_key → primary_key[0] → 不传 */
   function defaultOrder(spec) {
     var t = spec.time;
     var timeCol = t && typeof t === 'object' ? IU.pick(t, 'column', 'col', 'field', 'name') : (typeof t === 'string' ? t : null);
     if (timeCol) return timeCol;
     if (spec.order_key) return spec.order_key;
-    if (Array.isArray(spec.pk) && spec.pk[0]) return spec.pk[0];
+    if (Array.isArray(spec.primary_key) && spec.primary_key[0]) return spec.primary_key[0];
     return '';
   }
 

@@ -1,9 +1,17 @@
 import os
 import shutil
+import threading
 import warnings
+from dataclasses import replace
 
 from .utils.schema import parse_db_schema
-from .exception import BadArgument, EngineNotExist, UnsafeOperation
+from .exception import (
+    BadArgument,
+    EngineNotExist,
+    SchemaConflict,
+    TableSpecConflict,
+    UnsafeOperation,
+)
 from .engines import sqlite
 from .partition import Partition
 from .spec import MigrationResult, Segment, TableContract, TimeColumn, PartitionSpec
@@ -11,6 +19,55 @@ from .spec import MigrationResult, Segment, TableContract, TimeColumn, Partition
 
 def _is_calendar_partition(partition):
     return getattr(partition, 'PARTITION_TYPE', None) == 'calendar'
+
+
+_RENAME_BACKUP_SUFFIX = '.__rename_tmp__'
+_MIGRATION_MODES = ['append', 'upsert', 'replace', 'ignore']
+_BINDING_DEFAULTS = {'conflict': 'append', 'schema_policy': 'evolve'}
+
+
+def _looks_like_iosql_database(path):
+    """目录是否像一个 iosql 目录库。
+
+    判定依据：任一表级 `<table>/meta.sqlite3`（真实库结构）；
+    空目录无内容可丢，视为可接管。不接受库级 meta.sqlite3 作为标记，
+    避免一个空文件即可伪造身份（review P0-4 的教训）。
+    """
+    if not os.path.isdir(path):
+        return False
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    if not entries:
+        return True
+    for name in entries:
+        table_dir = os.path.join(path, name)
+        if os.path.isdir(table_dir) and os.path.isfile(
+            os.path.join(table_dir, 'meta.sqlite3')
+        ):
+            return True
+    return False
+
+
+def _forbidden_rename_target_reason(path):
+    """返回 target 被禁止的原因（根/家目录/符号链接），否则 None。"""
+    real = os.path.realpath(path)
+    if real == os.path.realpath(os.sep):
+        return '根目录'
+    try:
+        home = os.path.realpath(os.path.expanduser('~'))
+    except (OSError, RuntimeError):
+        home = None
+    if home and real == home:
+        return '家目录'
+    if os.path.islink(path):
+        return '符号链接'
+    return None
+
+
+def _binding_fields():
+    return ('order_key', 'symbol_column', 'session_column', 'conflict', 'schema_policy')
 
 
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
@@ -69,6 +126,8 @@ class Database(object):
         self._uri = uri
         self._table_cls = Database.get_engine(uri)
         self._tables = {}
+        # 保护 _tables 的首次并发访问与缓存增删
+        self._tables_lock = threading.RLock()
         self.verbose = verbose
         uri_schema, _ = parse_db_schema(uri)
         self._uri_schema = uri_schema
@@ -108,7 +167,10 @@ class Database(object):
         return value
 
     def __getitem__(self, table_name):
-        if table_name not in self._tables:
+        with self._tables_lock:
+            table = self._tables.get(table_name)
+            if table is not None:
+                return table
             table_options = {
                 "table_name": table_name,
                 "verbose": self.verbose,
@@ -123,7 +185,7 @@ class Database(object):
                     table_options["pragma_dict"] = self._pragma_dict
             table = self._table_cls(self._uri, **table_options)
             self._tables[table_name] = table
-        return self._tables[table_name]
+            return table
 
     def table(
         self,
@@ -165,8 +227,16 @@ class Database(object):
 
         if spec is not None:
             contract = TableContract.ensure(spec)
-            contract.force_partition = force_partition
-            table.use_contract(contract)
+            overrides = {}
+            if conflict != 'append':
+                overrides['conflict'] = conflict
+            if schema_policy != 'evolve':
+                overrides['schema_policy'] = schema_policy
+            if overrides:
+                contract = replace(contract, **overrides)
+            if bool(contract.force_partition) != bool(force_partition):
+                contract = replace(contract, force_partition=force_partition)
+            self._bind_contract(table, contract, force_partition)
         elif any(value is not None for value in shortcut_values):
             normalized_pk = _normalize_pk(pk)
             normalized_primary_key = _normalize_pk(primary_key)
@@ -183,7 +253,7 @@ class Database(object):
                 contract_kwargs['symbol_column'] = symbol_column
             if session_column is not None:
                 contract_kwargs['session_column'] = session_column
-            table.use_contract(TableContract(
+            contract = TableContract(
                 primary_key=normalized_pk if normalized_pk is not None else normalized_primary_key,
                 columns=columns or {},
                 partition=partition,
@@ -191,9 +261,120 @@ class Database(object):
                 order_key=order_key,
                 conflict=conflict,
                 schema_policy=schema_policy,
+                force_partition=force_partition,
                 **contract_kwargs,
-            ))
+            )
+            self._bind_contract(table, contract, force_partition)
         return table
+
+    def _bind_contract(self, table, contract, force_partition):
+        """把声明契约绑定到（可能已存在的）表上。
+
+        引擎负责 pk/partition/segment/列类型 的核心兼容性校验；
+        这里补齐 order_key/symbol_column/session_column/conflict/schema_policy
+        的校验与落盘，避免 `spec=` 绑定被静默忽略。
+        """
+        stored = table.spec()
+        if stored is not None:
+            conflicts = []
+            for field_name in _binding_fields():
+                stored_value = getattr(stored, field_name)
+                declared_value = getattr(contract, field_name)
+                if stored_value == declared_value:
+                    continue
+                if field_name in ('conflict', 'schema_policy'):
+                    if stored_value == _BINDING_DEFAULTS[field_name]:
+                        # 存量仍是默认值，允许按声明覆盖（下方统一落盘）
+                        continue
+                elif stored_value is None:
+                    # 存量未声明该绑定，允许声明补全（下方统一落盘）
+                    continue
+                conflicts.append(
+                    f"{field_name}(当前={stored_value!r}, 声明={declared_value!r})"
+                )
+            if conflicts:
+                raise TableSpecConflict(
+                    "既有表契约与声明 spec 的绑定不一致: "
+                    + "; ".join(conflicts)
+                    + "。修复: 保持声明与既有契约一致；如需变更 "
+                    "symbol/session/order_key/conflict，请新建表后 repartition_to"
+                )
+
+        if force_partition and stored is not None:
+            # force_partition 显式允许分区契约变更：跳过引擎分区冲突检查，
+            # 直接绑定并落盘，保证 write()/query() 立即使用新契约
+            self._ensure_contract_core_compatible(stored, contract)
+            if hasattr(table, '_declared_spec'):
+                table._declared_spec = contract
+            if hasattr(table, '_contract'):
+                # PG 引擎的运行时契约字段
+                table._contract = contract
+            table._partition = contract.to_partition()
+        else:
+            table.use_contract(contract)
+
+        if stored is not None:
+            self._persist_declared_bindings(table, stored, contract, force_partition)
+
+    @staticmethod
+    def _ensure_contract_core_compatible(stored, contract):
+        """force_partition 直连路径仍需校验非分区核心字段，避免静默破坏数据。"""
+        if list(stored.primary_key) != list(contract.primary_key):
+            raise TableSpecConflict(
+                f'Primary key conflict: current={stored.primary_key} '
+                f'new={contract.primary_key}；修复: 保持 pk 一致，或新建目标表'
+            )
+        stored_segment = stored.segment.to_dict() if stored.segment else None
+        new_segment = contract.segment.to_dict() if contract.segment else None
+        if stored_segment != new_segment:
+            raise TableSpecConflict(
+                f'Segment conflict: current={stored_segment} new={new_segment}；'
+                "修复: 保持 segment 一致，或新建目标表"
+            )
+        stored_columns = {
+            key: str(value).lower()
+            for key, value in stored.columns.items()
+            if value is not None
+        }
+        new_columns = {
+            key: str(value).lower()
+            for key, value in contract.columns.items()
+            if value is not None
+        }
+        for column, type_ in new_columns.items():
+            if column in stored_columns and stored_columns[column] != type_:
+                raise SchemaConflict(
+                    f'Column `{column}` type conflict: '
+                    f'current={stored_columns[column]} new={type_}；'
+                    "修复: 转换数据类型，或重新声明契约 columns"
+                )
+
+    def _persist_declared_bindings(self, table, stored, contract, force_partition):
+        """把声明中存量缺失/默认的绑定字段与 force 分区契约写回 manifest。"""
+        if not (
+            hasattr(table, 'get_table_meta')
+            and hasattr(table, '_overwrite_table_meta')
+        ):
+            return
+        merged = dict(stored.to_dict())
+        changed = False
+        for field_name in _binding_fields():
+            if getattr(stored, field_name) != getattr(contract, field_name):
+                merged[field_name] = getattr(contract, field_name)
+                changed = True
+        if force_partition and contract.partition is not None:
+            merged['partition'] = contract.partition.to_dict()
+            merged['force_partition'] = True
+            changed = True
+        if not changed:
+            return
+        meta = table.get_table_meta()
+        if not meta:
+            return
+        meta['table_contract'] = merged
+        if force_partition and contract.partition is not None:
+            meta['partition'] = contract.partition.to_partition().to_meta()
+        table._overwrite_table_meta(meta)
 
     def timeseries(self, table_name, time, pk=None, primary_key=None,
                    columns=None, *, partition_every='1day', timezone='UTC',
@@ -260,10 +441,20 @@ class Database(object):
                     min_rows=min_rows_per_file or 300_000,
                 )
 
+        # time 支持 str / TimeColumn / dict；列名提取出来供分区与 order_key 使用，
+        # 之前直接把 TimeColumn 传进 order_key 会被 str() 污染成对象 repr
+        if isinstance(time, TimeColumn):
+            time_name = time.name
+        elif isinstance(time, dict):
+            time_name = time.get('name')
+            time = TimeColumn.from_dict(time)
+        else:
+            time_name = time
+
         if partition is None:
             if use_calendar:
                 partition = Partition.calendar(
-                    time,
+                    time_name,
                     every=partition_every,
                     timezone=timezone,
                 )
@@ -271,7 +462,7 @@ class Database(object):
                 # duration 分区按 UTC 对齐，无时区概念；
                 # 经 PartitionSpec 构造以支持 "1s"/"1day" 等字符串间隔
                 partition = PartitionSpec(
-                    column=time, every=partition_every, kind='duration',
+                    column=time_name, every=partition_every, kind='duration',
                 ).to_partition()
 
         if isinstance(time, str):
@@ -291,7 +482,7 @@ class Database(object):
             columns=columns,
             partition=partition,
             segment=segment,
-            order_key=order_key or time,
+            order_key=order_key or time_name,
             conflict=conflict,
             schema_policy=schema_policy,
             force_partition=force_partition,
@@ -370,6 +561,16 @@ class Database(object):
             )
         if not os.path.isdir(source_path):
             raise BadArgument(f"database does not exist: {source_path}")
+        if not _looks_like_iosql_database(source_path):
+            raise UnsafeOperation(
+                f"源目录不像 iosql 数据库（未找到 */meta.sqlite3）: {source_path}；"
+                "修复: 确认 uri 指向 iosql 库目录"
+            )
+        reason = _forbidden_rename_target_reason(target_path)
+        if reason:
+            raise UnsafeOperation(
+                f"rename target must not be a {reason}: {target_path}"
+            )
         if os.path.exists(target_path):
             if not overwrite:
                 raise BadArgument(f"rename target already exists: {target_path}")
@@ -377,13 +578,61 @@ class Database(object):
                 raise UnsafeOperation(
                     f"rename target exists and is not a directory: {target_path}"
                 )
-            shutil.rmtree(target_path)
+            if not _looks_like_iosql_database(target_path):
+                raise UnsafeOperation(
+                    f"rename target 不像 iosql 数据库（未找到 */meta.sqlite3）: "
+                    f"{target_path}；修复: 改用空目录或确认为 iosql 库"
+                )
 
-        cached_tables = list(self._tables.values())
-        for table in cached_tables:
-            table.close()
-        os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
-        os.replace(source_path, target_path)
+        with self._tables_lock:
+            cached_tables = list(self._tables.values())
+        backup_path = None
+        if os.path.exists(target_path):
+            backup_path = self._rename_backup_path(target_path)
+        try:
+            for table in cached_tables:
+                table.close()
+            os.makedirs(os.path.dirname(target_path) or ".", exist_ok=True)
+            if backup_path is not None:
+                # 先把目标改名到临时目录（可回滚），再整体挪入源库，
+                # 避免 rmtree 后失败导致目标数据不可恢复
+                os.replace(target_path, backup_path)
+            try:
+                os.replace(source_path, target_path)
+            except OSError:
+                if backup_path is not None and os.path.exists(backup_path):
+                    os.replace(backup_path, target_path)
+                raise
+        except OSError as e:
+            if (
+                backup_path is not None
+                and os.path.exists(backup_path)
+                and not os.path.exists(target_path)
+            ):
+                try:
+                    os.replace(backup_path, target_path)
+                except OSError:
+                    pass
+            for table in cached_tables:
+                try:
+                    table._rebind_uri(self._uri)
+                except Exception:
+                    pass
+            raise BadArgument(
+                f"重命名数据库失败: {e}；修复: 检查目标路径权限、"
+                "是否跨文件系统（EXDEV），或改用 shutil.move 后重新打开"
+            ) from e
+
+        if backup_path is not None and os.path.exists(backup_path):
+            try:
+                shutil.rmtree(backup_path)
+            except OSError as e:
+                warnings.warn(
+                    f"旧目标目录未能删除，残留在 {backup_path}: {e}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
         self._uri = _sqlite_uri_from_path(self._uri_schema, target_path)
         self._table_cls = Database.get_engine(self._uri)
         for table in cached_tables:
@@ -391,6 +640,15 @@ class Database(object):
             if hasattr(table, "_load_partition"):
                 table._partition = table._load_partition()
         return self
+
+    @staticmethod
+    def _rename_backup_path(target_path):
+        backup_path = target_path + _RENAME_BACKUP_SUFFIX
+        index = 0
+        while os.path.exists(backup_path):
+            index += 1
+            backup_path = f"{target_path}{_RENAME_BACKUP_SUFFIX}{index}"
+        return backup_path
 
     def _resolve_rename_database_target(self, new_uri_or_name):
         value = str(new_uri_or_name or "").strip()
@@ -408,7 +666,11 @@ class Database(object):
         return os.path.abspath(os.path.join(os.path.dirname(source_path), value))
 
     def rename_table(self, old_name, new_name, exist_ok=False, overwrite=False):
-        """重命名逻辑表并维护当前 Database 的表对象缓存。"""
+        """重命名逻辑表并维护当前 Database 的表对象缓存。
+
+        覆盖目标时先把目标目录改名到临时目录，失败时回滚，
+        避免引擎 rmtree 之后失败导致旧表对象保持 closed、数据不可恢复。
+        """
         old_name = str(old_name or "").strip()
         new_name = str(new_name or "").strip()
         if not old_name or not new_name:
@@ -422,21 +684,79 @@ class Database(object):
         if old_name not in self.table_names():
             raise BadArgument(f"table does not exist: {old_name}")
 
-        table = self[old_name]
-        cached_target = self._tables.get(new_name)
-        if cached_target is not None and cached_target is not table and overwrite:
-            cached_target.close()
-            self._tables.pop(new_name, None)
+        with self._tables_lock:
+            table = self[old_name]
+            cached_target = self._tables.get(new_name)
+            if cached_target is not None and cached_target is not table and overwrite:
+                cached_target.close()
+                self._tables.pop(new_name, None)
 
-        table.rename(new_name, exist_ok=exist_ok, overwrite=overwrite)
-        self._tables.pop(old_name, None)
-        self._tables[new_name] = table
+        # 不持 _tables_lock 执行目录移动：引擎 close() 会等待连接租约，
+        # 持锁等待可能与被租约阻塞在 __getitem__ 的线程互相死锁
+        db_path = (
+            _sqlite_path_from_uri(self._uri)
+            if self._uri_schema in ["sqlite", "sqlite3"]
+            else ""
+        )
+        source_path = os.path.join(db_path, old_name) if db_path else old_name
+        target_path = os.path.join(db_path, new_name) if db_path else new_name
+        backup_path = None
+        if (
+            self._uri_schema in ["sqlite", "sqlite3"]
+            and overwrite
+            and os.path.isdir(target_path)
+        ):
+            backup_path = self._rename_backup_path(target_path)
+            try:
+                os.replace(target_path, backup_path)
+            except OSError as e:
+                raise BadArgument(
+                    f"重命名表失败（无法移走目标目录）: {e}；"
+                    "修复: 检查目标目录权限后重试"
+                ) from e
+        try:
+            table.rename(new_name, exist_ok=exist_ok, overwrite=False)
+        except Exception as e:
+            # 回滚：目标目录移回；尽量重开源表对象，避免缓存里留下 closed 表
+            if (
+                backup_path is not None
+                and os.path.exists(backup_path)
+                and not os.path.exists(target_path)
+            ):
+                try:
+                    os.replace(backup_path, target_path)
+                except OSError:
+                    pass
+            with self._tables_lock:
+                self._tables.pop(old_name, None)
+                if not os.path.isdir(source_path) and os.path.isdir(target_path):
+                    # 移动已成功，只是后续 manifest/重连失败：挂到新名字下
+                    self._tables[new_name] = table
+                elif os.path.isdir(source_path):
+                    try:
+                        self[old_name]
+                    except Exception:
+                        pass
+            if isinstance(e, OSError):
+                raise BadArgument(
+                    f"重命名表失败: {e}；修复: 检查目录权限/跨设备限制后重试"
+                ) from e
+            raise
+        else:
+            if backup_path is not None and os.path.exists(backup_path):
+                shutil.rmtree(backup_path, ignore_errors=True)
+        with self._tables_lock:
+            self._tables.pop(old_name, None)
+            self._tables[new_name] = table
         return table
 
     def close(self):
-        for _, table in list(self._tables.items()):
+        # 先快照并清空缓存再关闭：避免持锁等待引擎连接租约释放
+        with self._tables_lock:
+            tables = list(self._tables.values())
+            self._tables.clear()
+        for table in tables:
             table.close()
-        self._tables.clear()
 
     def get_process_connection_budget_status(self):
         if self._uri_schema not in ["sqlite", "sqlite3"]:
@@ -450,12 +770,16 @@ class Database(object):
 
     def migrate_to(self, target_uri, tables=None, mode='append',
                    batch_size=10_000, verify=None, dry_run=False):
+        # 所有选项校验都先于任何落盘/建连，dry_run 只做估算不产生副作用
         verify = _normalize_migration_verify(verify)
+        mode = self._normalize_migration_mode(mode)
+        self._validate_migration_target(target_uri)
+        self._reject_migration_self_target(target_uri)
         table_mapping = self._migration_table_mapping(tables)
         if dry_run:
             results = []
             for source_name, target_name in table_mapping.items():
-                source_table = self.table(source_name)
+                source_table = self[source_name]
                 spec = source_table.spec()
                 if not spec:
                     raise BadArgument(
@@ -481,7 +805,7 @@ class Database(object):
         results = []
         try:
             for source_name, target_name in table_mapping.items():
-                source_table = self.table(source_name)
+                source_table = self[source_name]
                 spec = source_table.spec()
                 if not spec:
                     raise BadArgument(
@@ -508,6 +832,50 @@ class Database(object):
             dry_run=False,
         )
 
+    @staticmethod
+    def _normalize_migration_mode(mode):
+        value = str(mode or 'append').strip().lower()
+        if value not in _MIGRATION_MODES:
+            raise BadArgument(
+                f"Unsupported migration mode `{mode}`；"
+                f"可选: {', '.join(_MIGRATION_MODES)}"
+            )
+        return value
+
+    @staticmethod
+    def _validate_migration_target(target_uri):
+        if not target_uri:
+            raise BadArgument("migrate_to requires a target uri")
+        try:
+            schema, _ = parse_db_schema(target_uri)
+        except ValueError as e:
+            raise BadArgument(
+                f"Bad migration target uri `{target_uri}`: {e}"
+            ) from e
+        if schema not in ['sqlite', 'sqlite3', 'postgresql']:
+            raise BadArgument(
+                f"Unsupported migration target schema `{schema}`；"
+                "可选: sqlite/sqlite3/postgresql"
+            )
+
+    def _reject_migration_self_target(self, target_uri):
+        """拒绝把 SQLite 库迁移到自身或自身目录内（会静默翻倍/递归）。"""
+        if self._uri_schema not in ['sqlite', 'sqlite3']:
+            return
+        target_schema, _ = parse_db_schema(target_uri)
+        if target_schema not in ['sqlite', 'sqlite3']:
+            return
+        source_path = os.path.realpath(_sqlite_path_from_uri(self._uri))
+        target_path = os.path.realpath(_sqlite_path_from_uri(target_uri))
+        if target_path == source_path:
+            raise BadArgument(
+                "migrate_to target 不能与源库相同；修复: 指定一个新的目标路径"
+            )
+        if target_path.startswith(source_path + os.sep):
+            raise BadArgument(
+                "migrate_to target 不能位于源库目录内；修复: 指定源库之外的目标路径"
+            )
+
     def to_postgresql(self, target_uri, tables=None, mode='append',
                       batch_size=10_000, verify=None, dry_run=False):
         target_schema, _ = parse_db_schema(target_uri)
@@ -523,16 +891,37 @@ class Database(object):
         )
 
     def _migration_table_mapping(self, tables):
+        names = self.table_names()
         if tables is None:
-            names = self.table_names()
             if not names:
                 raise BadArgument('migrate_to found no source tables')
-            return {name: name for name in names}
-        if isinstance(tables, dict):
-            return dict(tables)
-        if isinstance(tables, str):
-            return {tables: tables}
-        return {name: name for name in list(tables)}
+            mapping = {name: name for name in names}
+        else:
+            if isinstance(tables, str):
+                mapping = {tables: tables}
+            elif isinstance(tables, dict):
+                mapping = dict(tables)
+            elif isinstance(tables, (list, tuple, set)):
+                mapping = {name: name for name in list(tables)}
+            else:
+                raise BadArgument(
+                    "tables must be a list/dict/str, got "
+                    f"`{type(tables).__name__}`"
+                )
+            if not mapping:
+                raise BadArgument("migrate_to requires at least one table")
+        known = set(names)
+        missing = [name for name in mapping if name not in known]
+        # 提前校验源表存在，dry_run 也不会为不存在的表创建目录/meta
+        if missing:
+            raise BadArgument(
+                "migrate_to source table(s) not found: "
+                + ", ".join(str(name) for name in missing)
+                + f"；修复: 先检查 db.table_names()（当前: "
+                + (", ".join(sorted(str(name) for name in known)) or "∅")
+                + "）"
+            )
+        return mapping
 
     def _new_migration_target(self, target_uri):
         return Database(target_uri)

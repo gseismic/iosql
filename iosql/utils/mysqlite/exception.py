@@ -19,3 +19,8 @@ class TableAlreadyExists(OperationalError):
 
 class PrimaryKeyNotInColumn(ValueError):
     pass
+
+
+class BadArgument(ValueError):
+    """参数非法（如连接池不支持 :memory:）。"""
+    pass

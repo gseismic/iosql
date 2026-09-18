@@ -26,8 +26,8 @@ from .sql import (
     suggest_value_type,
     suggest_data_columns,
     getsql_query_table, quoted_sql_text, sql_literal,
-    getarg_diclist_insertmany,
-    getarg_diclist_insertmany_known_fields,
+    group_rows_by_keys,
+    _union_fields_of_dictlist,
     suggest_columns
 )
 from .const import META_TABLE_NAME
@@ -38,7 +38,6 @@ _COLUMN_NAME_PATTERN = re.compile(r'no column named (\w+)')
 _TABLE_NAME_PATTERN = re.compile(r'no such table: (\w+)')
 _TABLE_EXISTS_PATTERN = re.compile(r'table (\w+) already exists')
 _DUPLICATE_COLUMN_PATTERN = re.compile(r'duplicate column name: (\w+)')
-_INDEX_COLUMN_PATTERN = re.compile(r'\((.*?)\)')
 
 """
 是否关闭cursor 几乎没有影响: 只是关闭后不能用于查询
@@ -79,6 +78,15 @@ class Table:
         self._table_info_cache = None
         self._default_values_cache = None
         self._pk_cache = None
+
+    def invalidate_cache(self) -> None:
+        """清除本对象缓存的表结构（列类型 / 默认值 / 主键）。
+
+        本模块的 DDL 封装（create_table/add_column/drop_table 等）会自动失效缓存；
+        如果通过 ``db.execute()`` 或外部连接直接执行了 DDL，
+        请在任何 ``column_info()/default_values()/pk()`` 之前手动调用本方法。
+        """
+        self._invalidate_cache()
     
     @contextmanager
     def _get_cursor(self):
@@ -146,6 +154,22 @@ class Table:
                                  exist_no_warn=exist_no_warn, **kwargs)
 
     def create_table(self, columns: List[Dict], pk: Optional[Union[str, List[str]]] = None, 
+                     exist_ok: bool = True, save_meta: bool = True, 
+                     table_comment: Optional[str] = None, exist_no_warn: bool = False,
+                     **kwargs) -> None:
+        """创建表并写入 meta 信息。
+
+        建表与 meta 写入在同一事务中完成：meta 写入失败会整体回滚，
+        不会留下「表已建但没有 meta」的半成品。
+        """
+        with self.database.transaction():
+            self._create_table_with_meta(
+                columns, pk=pk, exist_ok=exist_ok, save_meta=save_meta,
+                table_comment=table_comment, exist_no_warn=exist_no_warn,
+                **kwargs
+            )
+
+    def _create_table_with_meta(self, columns: List[Dict], pk: Optional[Union[str, List[str]]] = None, 
                      exist_ok: bool = True, save_meta: bool = True, 
                      table_comment: Optional[str] = None, exist_no_warn: bool = False,
                      **kwargs) -> None:
@@ -241,7 +265,8 @@ class Table:
     def ensure_columns_like(self, dic: Dict[str, Any]) -> None:
         for column_name, v in dic.items():
             try:
-                type_ = suggest_value_type(v)
+                # None 值推断不出类型，与批量路径保持一致回落到 text
+                type_ = suggest_value_type(v) or 'text'
                 self.add_column(column_name, type_)
                 if self.verbose >= 1:
                     logger.info(f'{self._table_name}: Added column {column_name} {type_}')
@@ -289,18 +314,6 @@ class Table:
             raise e
         else:
             raise e
-
-    def _execute_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection, 
-                              sql: str, commit: Optional[bool] = None) -> None:
-        """在指定连接上执行SQL语句"""
-        if self.verbose >= 2:
-            logger.info(f'SQL: {sql}')
-        
-        try:
-            cursor.execute(sql)
-            self._try_commit_on_connection(conn, commit)
-        except sqlite3.Error as e:
-            self._handle_error_on_connection(e, conn)
 
     def _execute_params_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
                                       sql: str, params: Optional[List[Any]] = None,
@@ -356,6 +369,8 @@ class Table:
         if not list_values:
             return
 
+        self._check_write_commit(commit)
+
         with self._get_cursor() as (cursor, conn):
             try:
                 cursor.executemany(sql, list_values)
@@ -381,6 +396,26 @@ class Table:
             except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
     
+    def _check_write_commit(self, commit: Optional[bool]) -> None:
+        """拒绝连接池模式下必然丢写的延迟提交用法。
+
+        连接归还时连接池会无条件 rollback，因此：
+        - 显式 ``commit=False`` 一律拒绝（与 insert_all 契约一致）；
+        - ``auto_commit=False`` 时不显式提交（commit=None）的写入会被丢弃。
+        """
+        if commit is False:
+            raise ValueError(
+                'commit=False 在连接池模式下会丢失写入：'
+                '请传 commit=True，事务提交请使用 database.transaction()'
+            )
+        if self.database.in_transaction():
+            return
+        if commit is None and not self.auto_commit:
+            raise ValueError(
+                'auto_commit=False 时写入必须显式传 commit=True '
+                '或放在 database.transaction() 上下文中，否则会被连接归还时的 rollback 丢弃'
+            )
+
     def _try_commit_on_connection(self, conn: sqlite3.Connection, commit: Optional[bool]) -> None:
         """在指定连接上尝试提交
         
@@ -396,6 +431,12 @@ class Table:
         if commit is None:
             if self.auto_commit:
                 conn.commit()
+            else:
+                # 防御：低层 execute/execute_params 绕过 _check_write_commit 时也不能静默丢写
+                raise ValueError(
+                    'auto_commit=False 时写入必须显式传 commit=True '
+                    '或放在 database.transaction() 上下文中'
+                )
         elif commit:
             conn.commit()
 
@@ -455,6 +496,7 @@ class Table:
                ensure_column: bool = False, **kwargs) -> None:
         if not kv:
             return
+        self._check_write_commit(commit)
         sql, values = getsqlarg_dict_insert(
             self._table_name, kv, replace=replace, ignore=ignore
         )
@@ -468,57 +510,51 @@ class Table:
                                        replace: bool = False, ignore: bool = False,
                                        ensure_table: bool = False, 
                                        ensure_column: bool = False, **kwargs) -> None:
-        """在指定连接上执行单批次插入"""
+        """在指定连接上执行单批次插入。
+
+        按行的 key 集合拆分为多条语句：行中缺失的列直接省略，
+        让 SQLite 自行求值列默认值（含 CURRENT_TIMESTAMP 等表达式），
+        避免把表达式默认值当成字面量写盘。
+        """
         if not batch_data:
             return
 
-        default_values = self.default_values(cursor=cursor)
-        prepared = getarg_diclist_insertmany_known_fields(
-            batch_data,
-            default_values,
-        )
-        if prepared is None:
-            prepared = getarg_diclist_insertmany(batch_data, default_values)
-        od_fields, list_values = prepared
-        fields = list(od_fields.keys())
-        sql = getsqlarg_dict_insertmany(self._table_name, fields, replace=replace, ignore=ignore)
-        
-        try:
-            self._executemany_on_connection(
-                cursor,
-                conn,
-                sql,
-                list_values,
-                commit=False,
+        # union 字段用于建表/加列（类型合并语义与旧路径一致）
+        union_fields = _union_fields_of_dictlist(batch_data)
+        statements = [
+            (
+                getsqlarg_dict_insertmany(
+                    self._table_name, fields, replace=replace, ignore=ignore
+                ),
+                values,
             )
+            for fields, values in group_rows_by_keys(batch_data)
+        ]
+
+        try:
+            self._executemany_statements_on_connection(cursor, conn, statements)
         except NoSuchTable as e:
             if ensure_table:
                 # Note 这里忽略了not_null等参数, 用了默认数值
                 # 用户能传的只有 columns(包含了not_null等信息), pk
-                columns = suggest_columns(od_fields)
+                columns = suggest_columns(union_fields)
                 self._create_table_on_connection(cursor, conn, columns, **kwargs)
-                self._executemany_on_connection(
-                    cursor,
-                    conn,
-                    sql,
-                    list_values,
-                    commit=False,
-                )
+                self._executemany_statements_on_connection(cursor, conn, statements)
             else:
                 raise e
         except NoSuchColumn as e:
             if ensure_column:
-                self._ensure_columns_on_connection(cursor, conn, od_fields)
-                # self.ensure_columns_like(batch_data[0])
-                self._executemany_on_connection(
-                    cursor,
-                    conn,
-                    sql,
-                    list_values,
-                    commit=False,
-                )
+                self._ensure_columns_on_connection(cursor, conn, union_fields)
+                self._executemany_statements_on_connection(cursor, conn, statements)
             else:
                  raise e
+
+    def _executemany_statements_on_connection(self, cursor: sqlite3.Cursor,
+                                              conn: sqlite3.Connection,
+                                              statements: List[Tuple[str, List[List[Any]]]]) -> None:
+        """按顺序执行 (sql, 参数列表) 语句组，由外层统一提交。"""
+        for sql, values in statements:
+            self._executemany_on_connection(cursor, conn, sql, values, commit=False)
 
 
     def _create_table_on_connection(self, cursor: sqlite3.Cursor, conn: sqlite3.Connection,
@@ -689,10 +725,28 @@ class Table:
             return [item['name'] for item in data]
         # return [dict(item) for item in data]
 
+    def _index_list(self) -> List[Dict]:
+        """PRAGMA index_list：含 origin（c=用户创建, u=唯一约束, pk=主键）。"""
+        rows = self.fetchall(f'PRAGMA index_list({quoted_sql_text(self._table_name)})')
+        return [dict(item) for item in rows]
+
+    def _index_info(self, index_name: str) -> List[Dict]:
+        """PRAGMA index_info：索引列列表；表达式索引的列名为 None。"""
+        rows = self.fetchall(f'PRAGMA index_info({quoted_sql_text(index_name)})')
+        return [dict(item) for item in rows]
+
+    def _is_user_index(self, item: Dict) -> bool:
+        if item.get('origin') not in (None, 'c'):
+            return False
+        return not str(item.get('name', '')).lower().startswith('sqlite_autoindex')
+
     def drop_all_index(self) -> None:
         # https://stackoverflow.com/questions/2121583/how-to-drop-all-indexes-of-a-sqlite-table
-        list_index = self.get_all_index()
-        for index in list_index:
+        # 只能删除用户创建的索引：主键/唯一约束的 autoindex 由 SQLite 管理，DROP 会报错
+        for item in self._index_list():
+            if not self._is_user_index(item):
+                continue
+            index = item['name']
             logger.info(f'drop index {index} ...')
             self.drop_index(index)
 
@@ -701,16 +755,17 @@ class Table:
         self.execute(sql, commit=True)
 
     def drop_column_index(self, column: str) -> int:
-        # index [{'type': 'index', 'name': 'data_name_index', 'tbl_name': 'data', 'rootpage': 5, 'sql': 'CREATE INDEX data_name_index on data (name asc)'}]
-        items = self.get_all_index(full_info=True)
-        to_del = set()
-        for item in items:
-            sql_text = item.get('sql') or ''
-            match = _INDEX_COLUMN_PATTERN.search(sql_text)
-            if match:
-                _column = match.group(1).split(' ')[0].strip('"')
-                if _column == column:
-                    to_del.add(item['name'])
+        to_del = []
+        for item in self._index_list():
+            if not self._is_user_index(item):
+                continue
+            # 用 PRAGMA index_info 解析真实索引列，兼容复合索引/表达式索引
+            index_columns = [
+                row['name'] for row in self._index_info(item['name'])
+                if row.get('name') is not None
+            ]
+            if column in index_columns:
+                to_del.append(item['name'])
 
         for index_name in to_del:
             if self.verbose >= 1:
@@ -722,6 +777,8 @@ class Table:
     def drop_table(self) -> None:
         sql = f'DROP TABLE IF EXISTS {quoted_sql_text(self._table_name)}'
         self.execute(sql, commit=True)
+        # 表已删除，必须失效缓存，避免 drop 后用旧 schema 重建表
+        self.invalidate_cache()
 
     def commit(self, rollback_if_err: bool = True) -> None:
         # 在连接池模式下，commit应该在具体的连接上下文中进行

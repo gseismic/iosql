@@ -97,6 +97,12 @@ table.repartition_to(source_uri)  # BadArgument: requires a different target uri
 
 # limit 不能为负数
 table.select("*", where=None, limit=-1)  # BadArgument: limit must be non-negative
+
+# select/iter_select* 不接受业务参数（会被静默忽略）
+table.select("*", symbols=["AAPL"])  # BadArgument: 改用 query()/explain_select()
+
+# 写入行缺主键字段（不会退回 rowid 自增）
+table.write([{"v": 1}])  # BadArgument: row[0] 缺少主键字段 [...]
 ```
 
 ### PartitionSpecError
@@ -109,22 +115,35 @@ table.select("*", where=None, limit=-1)  # BadArgument: limit must be non-negati
 # 不支持的时间单位
 TimeColumn("ts", unit="nanoseconds")  # PartitionSpecError
 
-# 不支持的日历分区粒度
-Partition.calendar("date", every="1week")  # PartitionSpecError
+# fmt 不在白名单（fmt 会拼进分区文件名，禁止任意格式）
+parse_partition_spec("calendar(date,every=1day,fmt=YYYY/MM/DD)")  # PartitionSpecError
 
 # 无效的分区时长
 Partition.duration("ts", every=-1)  # PartitionSpecError
+Partition.duration("ts", every=True)  # PartitionSpecError
 ```
+
+`PartitionSpecError` 是 `BadArgument` 子类。旧/损坏 manifest 缺少 partition 必需字段
+（`interval_ms`/`ts_col`/`width`/`fmt`）时也会抛带修复指引的 `PartitionSpecError`；
+按提示修复 manifest，或删除 partition 元数据后按原契约重建该表。
 
 ### UnsafeOperation
 
-**症状**：执行危险操作时未显式确认。
+**症状**：执行危险操作时未显式确认，或 manifest 引用的数据文件缺失。
 
 ```python
 table.truncate()  # UnsafeOperation: truncate requires confirm=True
 
 # 正确
 table.truncate(confirm=True)
+```
+
+manifest 引用的分区文件被外部删除后，读取/删除路径直接抛 `UnsafeOperation`
+（不会隐式重建空文件）：
+
+```text
+UnsafeOperation: 分区数据文件缺失: .../data/0.sqlite3（manifest 仍引用 part_key=0）；
+修复: 运行 validate(deep=True) 检查完整性，或用 cleanup_obsolete(dry_run=False) 处理 obsolete 引用后从备份恢复
 ```
 
 ## 查询错误
@@ -166,7 +185,9 @@ print("跳过 segment:", plan.segment_skip_reasons)
 
 **症状**：多分区查询延迟高，特别是带 `order_by` 和 `limit` 时。
 
-**原因**：多分区查询的 `order_by` 和 `limit` 在 Python 层合并排序，数据量大时性能受影响。
+**原因**：`select()` 在 `order_by` 与 `limit` 同时给出时会把 `ORDER BY ... LIMIT`
+下推到每个 segment 再归并（结果不变、内存有界）；但只排序不限行、或 `query()` /
+`iter_select_batches()` 的全局排序仍需完整合并排序，数据量大时性能受影响。
 
 **排查**：
 
@@ -332,6 +353,18 @@ iosql migrate -s sqlite://db/market.iosql \
 2. 对全量迁移使用空目标表或独立目标表名。
 3. 迁移窗口内暂停源库写入，再执行 `--verify row-count`。
 
+### PostgreSQL delete 行为与 SQLite 对齐
+
+**症状**：`table.delete([])` / `delete({})` / `delete("")` 报 `BadArgument`，或 `delete(None)` 发出 DeprecationWarning。
+
+**说明**：PG `delete` 不再把 falsy 非 None 的 where 当作全表删除；全表清空请显式调用 `delete_all()`。返回值与 SQLite 一致，为删除行数。
+
+### 不支持的 PostgreSQL 列类型
+
+**症状**：建表或绑定契约时报 `BadArgument: 不支持的 PostgreSQL 列类型 ...`。
+
+**说明**：PG 列类型走封闭白名单（`blob→BYTEA`、`datetime→TIMESTAMP` 等），未知类型不会透传进 DDL。按错误消息中的合法类型列表修正 `columns=`。
+
 ## 分区维护
 
 ### repartition_to 后原库未变化
@@ -373,6 +406,12 @@ print(result.rows_copied)  # 新库中的行数
 2. 如果是 `row_count_mismatch`、`time_min_mismatch`、`stats_min_mismatch` 等错误，说明当前可见 segment 的 manifest 与物理文件不一致，不应删除 obsolete 文件。
 3. 如果只是想预览可释放空间，使用默认 dry-run，不要传 `--yes`。
 4. 只有确认当前可见 segment 可被查询且校验问题已修复后，才重新执行清理。
+
+### validate 报 orphan_segment_file
+
+**症状**：`table.validate()` / `iosql validate` 的 `warnings` 出现 `orphan_segment_file`。
+
+**说明**：data 目录中存在未被 manifest 引用的 segment 文件（历史中断写入、手工改动 manifest 等）。孤儿是警告、不影响 `ok`，也不会被查询使用；`compact()` 在目标文件名被孤儿占用时会先安全清理再复用。可按 warning 中的路径人工确认后删除，或保留给 compact 复用。
 
 ### layout_report 的 recommendation 误解
 
@@ -426,6 +465,30 @@ if not db.is_connection_pool_healthy():
 
 1. 确认调用了 `ensure_column=True`。
 2. 对于时序表，列必须在 `TableSpec` 中声明，动态加列仅在 mysqlite 低层模块中支持。
+
+### 写入报 commit=False / auto_commit=False 错误
+
+**症状**：`insert()`/`executemany()` 传 `commit=False` 抛 `ValueError`；或 `Database(auto_commit=False)` 时不在事务里的写入被拒绝。
+
+**说明**：连接池归还连接时会 `rollback()`，延迟提交会丢写，因此直接拒绝。需要一次事务写多行时使用：
+
+```python
+with db.transaction():
+    db["t"].insert({...})
+db["t"].insert({...}, commit=True)
+```
+
+### Database(':memory:') 被拒绝
+
+**症状**：`BadArgument: 连接池不支持 :memory: 数据库`。
+
+**说明**：池中每个连接会各自打开独立内存库，数据互不可见。需要内存库时直接用 `sqlite3.connect(":memory:")`。
+
+### 外部 DDL 后缓存未更新
+
+**症状**：通过 `db.execute()` 或外部连接执行 DDL 后，`column_info()`/`default_values()`/`pk()` 仍返回旧结构。
+
+**排查**：调用 `table.invalidate_cache()` 手动失效缓存；使用本模块的 DDL 封装（`create_table`/`add_column`/`drop_table`）则自动失效。
 
 ### Too Many Open Files
 

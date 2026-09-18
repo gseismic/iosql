@@ -108,8 +108,12 @@ def copy_db_uri(demo_db_path: Path, tmp_path: Path) -> str:
 
 
 def _client(uri: str, mode: str = "readonly") -> TestClient:
-    """统一以上下文管理器使用，保证 shutdown 执行 db.close()。"""
-    return TestClient(create_app(uri, mode))
+    """统一以上下文管理器使用，保证 shutdown 执行 db.close()。
+
+    base_url 用 localhost：生产 app 挂了 TrustedHostMiddleware（只信任
+    本机回环 Host），TestClient 默认的 testserver 会被 400 拒绝。
+    """
+    return TestClient(create_app(uri, mode), base_url="http://localhost")
 
 
 class TestReadOnlyApi:
@@ -379,10 +383,10 @@ class TestReadOnlyApi:
         assert "hint" in payload
 
     def test_write_endpoints_absent_in_readonly(self, demo_db_path):
-        # 只读模式下写路由不注册：8 个写端点全部 404 而非 403
+        # 只读模式下写路由不注册：7 个写端点全部 404 而非 403
+        # （import_buffer 从未实现，PLAN-055 OUTCOME 已确认 v1 仅 7 个写端点）
         write_endpoints = [
             ("/api/table/ticks/write", {"rows": []}),
-            ("/api/table/ticks/import_buffer", {}),
             ("/api/table/ticks/delete", {}),
             ("/api/table/ticks/truncate", {"confirm": "ticks"}),
             ("/api/table/ticks/create_index", {"column": "ts"}),

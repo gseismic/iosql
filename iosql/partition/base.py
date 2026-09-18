@@ -1,5 +1,27 @@
+import math
 from abc import ABC, abstractmethod
 from typing import Any, Dict, Union
+
+from ..exception import PartitionSpecError
+
+
+def normalize_part_value(value: Any, label: str) -> int:
+    """把分区键数值归一为 int。
+
+    浮点值向下取整（0.0 → 0），拒绝 bool/非有限值/非数值，
+    避免 float 分区键生成 `0.0.sqlite3` 这类与等值查询不匹配的 token。
+    """
+    if isinstance(value, bool):
+        raise PartitionSpecError(f"{label} must be numeric, got bool `{value}`")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise PartitionSpecError(f"{label} must be finite, got `{value}`")
+        return int(math.floor(value))
+    raise PartitionSpecError(
+        f"{label} must be numeric, got `{type(value).__name__}`"
+    )
 
 
 class Partition(ABC):
@@ -30,7 +52,10 @@ class Partition(ABC):
         from .calendar import CalendarPartition
 
         fmt = cls._calendar_format(every)
-        return CalendarPartition(fmt=fmt, tz=timezone, ts_col=column)
+        # every 必须透传：否则日历分区静默退化为 fmt 默认粒度（1day）
+        return CalendarPartition(
+            fmt=fmt, tz=timezone, ts_col=column, every=every,
+        )
 
     @staticmethod
     def _calendar_format(every: Any) -> str:

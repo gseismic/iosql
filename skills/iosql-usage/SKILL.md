@@ -5,7 +5,7 @@ description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存�
 
 # iosql 使用指南
 
-> 版本对齐：iosql v0.3.x（PLAN-052~058 后的用户接口定稿版）。参数拼写与默认值已冻结（长期稳定），本文与该契约同步。
+> 版本对齐：iosql v0.3.x（PLAN-052~062 后的用户接口定稿版）。参数拼写与默认值已冻结（长期稳定），本文与该契约同步。
 
 ## 核心判断
 
@@ -95,18 +95,19 @@ for part_key, part_data in partitioned_data.items():
 | **入口** | `Database(uri)` | 创建/打开数据库，`sqlite://` 或 `postgresql://` URI |
 | | `Database.table(name, **opts)` | 创建/获取表（核心入口） |
 | | `Database.timeseries(name, time=..., pk=..., **opts)` | 时序语法糖：table() 的薄封装（废弃参数迁移见下） |
-| | `Database.rename(new_uri_or_name)` / `Database.rename_table(old, new)` / `table.rename(new)` | 重命名 SQLite 目录库或逻辑表；table 重命名会更新 manifest |
-| | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库 |
+| | `Database.rename(new_uri_or_name)` / `Database.rename_table(old, new)` / `table.rename(new)` | 重命名 SQLite 目录库或逻辑表；覆盖目标需 `overwrite`，会校验 iosql 身份并拒绝根/家目录/符号链接，失败可回滚 |
+| | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库；`dry_run` 也先校验 mode/tables/target 且无落盘副作用 |
 | **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
 | | `table.write_buffer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
 | | `table.insert_all(rows, ...)` | 低层写入（需明确传 pk/partition） |
 | | `table.upsert_all(kv_list, pk)` | 按主键合并写入（merge 字段） |
-| | `table.delete(where)` | 条件删除（传 None 已废弃，改用 truncate） |
+| | `table.delete(where)` | 条件删除，返回删除行数；`where=None` 触发 DeprecationWarning 并转发 `delete_all()`（PG 侧 falsy 非 None 一律抛 `BadArgument`） |
+| | `table.delete_all()` | 显式清空全表（Python 专用；危险操作优先 `truncate(confirm=True)`） |
 | | `table.truncate(confirm=True)` | 清空表（需显式确认） |
 | **查询** | `table.query(...).to_list()` / `.explain()` | 时序高层查询（timeseries 表；duration/calendar 分区的普通表也可用） |
 | | `table.query(...).iter_batches(batch_size=...)` | 时序查询批量迭代 |
-| | `table.select(fields="*", where=None, order_by, limit, to_dict=True, columns=)` | 底层条件查询（所有表）；fields/where 可省略，columns= 是 fields= 别名；**默认返回 dict 行**（`to_dict=False` 才返回 tuple） |
-| | `table.iter_select(...)` / `iter_select_batches(...)` | 底层流式查询（所有表，默认 to_dict=True） |
+| | `table.select(fields="*", where=None, order_by, limit, to_dict=True, columns=)` | 底层条件查询（所有表）；fields/where 可省略，columns= 是 fields= 别名；**默认返回 dict 行**（`to_dict=False` 才返回 tuple）；不接受 `symbols/start/end/date/session`（抛 BadArgument，业务过滤用 `query()`/`explain_select()`） |
+| | `table.iter_select(...)` / `iter_select_batches(...)` | 底层流式查询（所有表，默认 to_dict=True）；SQLite 另有 `iter_rows()`（逐行）与 `iter_batches()`（按批） |
 | | `table.select_all(fields, where)` | 已废弃：等价于 select(to_dict=True)，触发 DeprecationWarning，永久保留 |
 | | `table.explain_select(fields, where, order_by, limit, symbols=, start=, end=, date=, session=)` | 查询计划/分区裁剪分析；业务参数与 query() 对齐 |
 | | `table.latest(symbols, as_of, by, columns)` | 最新截面查询；要求契约声明 symbol_column（见反模式） |
@@ -114,7 +115,7 @@ for part_key, part_data in partitioned_data.items():
 | **诊断** | `table.spec()` | 获取当前表契约 |
 | | `table.segments(include_obsolete=False)` | 获取物理 segment 清单 |
 | | `table.table_parts()` | 获取逻辑分区列表 |
-| | `table.validate(deep=False, include_obsolete=False)` | 校验 manifest 与物理 segment 文件 |
+| | `table.validate(deep=False, include_obsolete=False)` | 校验 manifest 与物理 segment 文件，并报告孤儿 segment 文件（警告） |
 | | `table.layout_report()` | 分区诊断报告（行数、推荐） |
 | | `table.compact(partition=None, target_rows=None)` | 显式整理 row segment，旧 segment 标记 obsolete；与写入共用锁串行化 |
 | | `table.cleanup_obsolete(partition=None, dry_run=True, validate=True)` | 安全清理 compact 后的 obsolete 文件 |
@@ -141,7 +142,7 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 |------|------|------|
 | **发现** | `iosql tables -s DB` | 列出逻辑表 |
 | | `iosql ui -s DB [--write] [--host] [--port] [--no-browser]` | 启动本地 Web 管理台（默认只读，详见下节） |
-| | `iosql rename-database -s DB --target NEW_DB` | 重命名 SQLite 目录库；覆盖目标需 `--overwrite --yes` |
+| | `iosql rename-database -s DB --target NEW_DB` | 重命名 SQLite 目录库；覆盖目标需 `--overwrite --yes`，目标须为 iosql 库且非根/家目录/符号链接，失败可回滚 |
 | | `iosql rename-table -s DB -t OLD --new-table NEW` | 重命名逻辑表；覆盖目标需 `--overwrite --yes` |
 | | `iosql spec -s DB -t TABLE` | 输出表契约 JSON |
 | | `iosql layout -s DB -t TABLE` | 输出 `layout_report()` |
@@ -153,23 +154,25 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 | **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append --batch-size 50000` | 批处理读取并写入既有契约表 |
 | | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON --batch-size 50000` | 批处理导出查询结果 |
 | **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
-| | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation |
-| | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件 |
-| | `iosql migrate -s DB --target postgresql://... [--dry-run] [--verify row-count]` | 迁移 SQLite iosql 库到 PostgreSQL |
-| | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库 |
-| | `iosql backup -s DB --target BACKUP` | 目录级备份 |
-| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；覆盖目标需 `--replace --yes`，且目标必须是含 `meta.sqlite3` 的 iosql 目录库（拒绝根/家目录） |
-| | `iosql index list/check/create/drop ...` | 检查、创建或删除物理分区索引 |
+| | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation；`--partition` 会校验分区存在并列可用分区 |
+| | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件；`--partition` 同样校验（含仅存在于 obsolete 的分区） |
+| | `iosql migrate -s DB --target postgresql://... [--dry-run] [--verify row-count]` | 迁移 SQLite iosql 库到 PostgreSQL；拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表 |
+| | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库；`--dry-run` 也校验 interval/timezone 与目标父目录，目标不能等于/嵌套源库 |
+| | `iosql backup -s DB --target BACKUP` | 目录级备份；拒绝与源库互相包含的路径 |
+| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；覆盖目标需 `--replace --yes`，目标必须是真实 iosql 库（表级 `<表>/meta.sqlite3` 且为有效 SQLite 文件），拒绝伪造 meta、根/家目录、符号链接及与备份重叠的路径；替换原子化、失败回滚 |
+| | `iosql index list/check/create/drop ...` | 检查、创建或删除物理分区索引；`index create` 校验列存在，`index check` 未通过退出码 2 |
 
 ### CLI 安全规则
 
-- `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。
+- `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。`--dry-run` 也会先解析 interval/timezone 并校验目标父目录，且拒绝目标等于源库/位于源库内部。
 - 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。替换过程原子化：备份用 `os.replace` 改名（近零成本），跨文件系统传 `--backup` 会明确拒绝（EXDEV，源库原封不动），失败自动回滚。
-- `restore` 覆盖已有目标时必须使用 `--replace --yes`。
-- `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验。
-- `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取，CSV 会按契约列类型做基础转换。
-- `query` 适合排查和小规模输出到终端；`export` 使用 `--batch-size` 批处理写文件，适合无全局排序的大结果集导出。
+- `restore --replace --yes` 只允许覆盖真实 iosql 库（表级 `<表>/meta.sqlite3` 且为有效 SQLite 文件）；伪造 meta 的普通目录、根/家目录、符号链接、以及与备份互相包含的路径全部拒绝。替换先把备份复制到临时目录，再原子换入，失败保留原目标。
+- `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表（否则迁移前直接报错）。
+- `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验；`--partition` 拼写错误会报错并列出可用分区（compact 同理）。
+- `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取并支持 UTF-8 BOM，坏 JSONL 行/CSV 字段数不匹配会报行号；中途失败输出 `rows_seen`/`rows_written`/`batches_committed` JSON 汇总，以退出码 1 结束。
+- `query` 适合排查和小规模输出到终端；`export` 使用 `--batch-size` 批处理写文件，适合无全局排序的大结果集导出；`export` 先写临时文件再原子替换输出，失败保留旧文件。JSON 中 bytes 列统一 base64。
 - 复杂 where 优先传 JSON 或 `@file`，例如 `--where '{"field":"symbol","op":"==","value":"AAPL"}'`。
+- 所有命令失败统一输出红色单行错误（不裸 traceback）；退出码：`0` 成功、`1` 业务失败、`2` 校验未通过（validate/index check/doctor）、`130` 用户中断。
 
 ## 可视化管理台（iosql ui）
 
@@ -181,7 +184,7 @@ iosql ui -s database/market.iosql           # 默认只读模式, http://127.0.0
 iosql ui -s database/market.iosql --write   # 开启维护操作
 ```
 
-其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`。Python 侧入口是 `iosql.ui.create_app(source_uri, mode="readonly"|"write")`（惰性导入，未装依赖时抛带安装指引的 ImportError）。启动为**非阻塞渐进加载**（PLAN-060）：首屏只读 manifest 级元数据（毫秒级），行数/分区数/segment 数由前端逐表异步拉取填充，大库（HDD/冷缓存/网络盘上的大量 segment 文件）打开不再被全库统计阻塞。行数统计走 manifest 求和零 I/O 路径（PLAN-061，2000 万行 8ms），数据行按 keyset 分页按需读取。
+其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`；绑定非 loopback `--host` 时会打印暴露警告，服务端只信任 `localhost`/`127.0.0.1`/`[::1]` 的 Host 头。Python 侧入口是 `iosql.ui.create_app(source_uri, mode="readonly"|"write")`（惰性导入，未装依赖时抛带安装指引的 ImportError）。启动为**非阻塞渐进加载**（PLAN-060）：首屏只读 manifest 级元数据（毫秒级），行数/分区数/segment 数由前端逐表异步拉取填充，大库（HDD/冷缓存/网络盘上的大量 segment 文件）打开不再被全库统计阻塞。无筛选行数统计走 manifest 求和零 I/O 路径（PLAN-061，2000 万行 8ms）；带筛选计数为流式扫描，超过 5,000,000 行扫描预算返回 422 提示缩小范围。数据行按 keyset 分页按需读取，排序列含 NULL 时返回 422 并禁用该列排序（避免静默漏行）。Browse Data 导出为流式下载，文件名兼容非 ASCII（RFC 5987），CSV 自动转义公式注入前缀，空结果也输出表头。
 
 | 工作区 | 只读 | 可修改 | 说明 |
 |:--|:-:|:-:|---|
@@ -195,7 +198,8 @@ iosql ui -s database/market.iosql --write   # 开启维护操作
 安全模型：
 
 - 只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝）。
-- 可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需预览 + 手输表名确认。
+- 可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认；重分区没有 dry-run 预览，确认后直接写入新库。
+- 服务端只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`），绑定非 loopback `--host` 时 CLI 打印暴露警告。
 - 定位是本机 localhost 工具，**不要暴露到公网**；排查 UI 问题时优先怀疑模式没开对（只读看不到 Maintain）。
 
 ## 工作流
@@ -276,6 +280,8 @@ with table.write_buffer(max_rows=10_000) as buf:
 # mode="ignore"：重复主键跳过
 # mode="upsert"/"replace"：覆盖写；当前不支持 Segment.rows 表
 ```
+
+每行必须包含完整主键字段；缺失主键列会立即抛 `BadArgument`，不会退回 SQLite rowid 自增。
 
 大批量写入建议：
 
@@ -436,22 +442,23 @@ with Database("sqlite://db/test.iosql") as db:
 - **导出面收缩**：`from iosql import ...` 只导出工厂 `Partition.*` 和结果类型；`DurationPartition`/`CalendarPartition`/`RangePartition` 需从 `iosql.partition.duration` 等内部模块导入（顶层导入会 ImportError）。
 - **symbol_column 显式化**：`db.table()` 默认 `symbol_column=None`；未声明时 `query(symbols=)`/`latest(symbols=)` 抛带修复指引的 `BadArgument`。需要 symbol 语义就显式声明 `symbol_column="symbol"`（timeseries() 保持默认 `"symbol"`）。`latest(by=...)` 显式分组不受影响。
 - `select()` 双引擎统一默认 `to_dict=True` 返回 dict 行；依赖 tuple 行为的旧代码必须显式 `to_dict=False`。
-- 间隔词汇统一由 `iosql.partition.duration.parse_interval_ms()` 解析：`Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')` 行为一致，支持别名 + 任意 `Nunit`。
+- 间隔词汇统一由 `iosql.partition.duration.parse_interval_ms()` 解析：`Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')` 行为一致，支持别名 + 任意 `Nunit`，以及 `Nmonth`（按 30 天）/`Nyear`（按 365 天）近似；bool 等非法值抛 `PartitionSpecError`（`BadArgument` 子类）。
 - 代码结构按层理解：`iosql.core.query` 是通用查询 AST/where 解析；`iosql.engines.sqlite` / `iosql.engines.postgresql` 是引擎实现；旧 `iosql.query` / `iosql.sqlite` / `iosql.postgresql` 包已删除。
 - `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数和可选 `stats_columns`，合理配置以控制文件大小及统计开销。
-- `compact()` 只整理当前可见 row segment，生成新的 sealed generation，并把旧 segment 标记为 `obsolete`；默认查询和 `segments()` 不扫描 obsolete；需要释放旧文件时先 `validate(deep=True)`，再用 `cleanup_obsolete(dry_run=False)`。
+- `compact()` 只整理当前可见 row segment，生成新的 sealed generation，并把旧 segment 标记为 `obsolete`；默认查询和 `segments()` 不扫描 obsolete；需要释放旧文件时先 `validate(deep=True)`，再用 `cleanup_obsolete(dry_run=False)`。manifest 引用文件缺失时读取直接抛 `UnsafeOperation`（不隐式重建），`validate()` 会以 `orphan_segment_file` 警告列出孤儿文件，compact 可安全复用被孤儿占用的目标文件名。
 - **单 writer 保证强化**：写入路径与 `compact()` 共用 `_compact_lock` 串行化，消除 compact 后向旧 segment 插入的复活竞态；compact 与写互斥是预期吞吐代价。多线程读取可按需提高 `max_connections_per_file`。
-- 大结果集读取优先用 `iter_select_batches()` / `query(...).iter_batches()` 或 CLI `export --batch-size`；带全局 `order_by` 的跨 segment 查询仍可能需要 Python 层合并排序。
+- 大结果集读取优先用 `iter_select_batches()` / `iter_batches()` / `query(...).iter_batches()` 或 CLI `export --batch-size`；`select()` 的 `order_by`+`limit` 会按 segment 下推后归并（内存有界），只排序不限行时仍可能需要 Python 层合并排序。
 - 大文件导入优先用 `iosql import --batch-size` 读取 JSONL/CSV；JSON 数组兼容但不适合数 GB 文件。CLI import 输出的 `rows_written` 在 ignore 模式下如实输出 null（不冒充 rows_seen）。
 - `repartition_to()` 写入新库，不要假设它会原地修改源库。
-- SQLite 到 PostgreSQL 迁移优先用 `Database.migrate_to()` / `to_postgresql()`；迁移按 `batch_size` 逐批读取 SQLite 物理文件，适合海量 K 线，不会一次性载入全库。生产迁移建议先 `dry_run=True` 预览，再用 `verify="row-count"` 校验源/目标行数。
+- SQLite 到 PostgreSQL 迁移优先用 `Database.migrate_to()` / `to_postgresql()`；迁移按 `batch_size` 逐批读取 SQLite 物理文件，适合海量 K 线，不会一次性载入全库。生产迁移建议先 `dry_run=True` 预览，再用 `verify="row-count"` 校验源/目标行数。`migrate_to(dry_run=True)` 会先校验 `mode`/`tables`/目标 URI 且无落盘副作用；SQLite 源迁 SQLite 目标时目标不能等于/嵌套源库；CLI `migrate` 同样拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。PG 流式导出使用命名游标（单语句快照），无序翻页不会跳行/重复。
 - PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边界；`calendar(...)` 支持 `text` / `date` / `timestamp` 目标列，text 日期列不要混用 ISO 与 compact 格式。
+- PostgreSQL 引擎差异：`delete` 返回删除行数，falsy 非 None 的 `where` 抛 `BadArgument`，`delete(None)` 警告并转发 `delete_all()`；列类型走封闭白名单（`blob→BYTEA`、`datetime→TIMESTAMP`，未知类型抛 `BadArgument`）；字符串 `fields` 只接受列名；批量写入按整批行列并集补 NULL；`commit=False` 会保持事务，失败整体回滚；NULL 排序与 SQLite 一致（ASC NULLS FIRST / DESC NULLS LAST）；select 未知 kwargs 抛 `BadArgument`；`upsert_all(where=...)` 仅关键字传入且已废弃；已有物理表与契约漂移抛 `SchemaConflict`。
 - 测试必须覆盖写入结果、查询结果和必要的 `explain()` 裁剪信息。
 - 修改核心行为时，至少跑相关 sqlite 契约测试、partition 测试和 mysqlite 测试。
 - `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
-- 异常体系统一使用 `IosqlError` 子类（`BadArgument`、`TableSpecConflict`、`SchemaConflict` 等）；`IosqlBadArgument` 已移除，统一用 `BadArgument`。
-- mysqlite 定位是"SQL 完备工具"（第三方库心智）：`insert_all(commit=False)` 显式拒绝（延迟提交与连接池归还语义冲突）；`select(limit=0)` 按 SQL 语义返回 0 行；错误路径统一回滚并转换异常；建表冲突抛类型化 `DuplicateColumn`/`PrimaryKeyNotInColumn`。mysqlite 无内置 rename/drop_column/backup——用原生 SQL 或连接 API 完成（见 `examples/mysqlite-scenarios/`）。
+- 异常体系统一使用 `IosqlError` 子类（`BadArgument`、`TableSpecConflict`、`SchemaConflict` 等）；`PartitionSpecError` 继承 `BadArgument`，损坏/旧 manifest 缺字段也走该异常族；`IosqlBadArgument` 已移除，统一用 `BadArgument`。
+- mysqlite 定位是"SQL 完备工具"（第三方库心智）：`insert_all(commit=False)` 显式拒绝（延迟提交与连接池归还语义冲突）；`insert()/executemany(commit=False)` 与 `auto_commit=False` 下的直写同样拒绝，需要事务用 `db.transaction()`；`select(limit=0)` 按 SQL 语义返回 0 行；错误路径统一回滚并转换异常；建表冲突抛类型化 `DuplicateColumn`/`PrimaryKeyNotInColumn`；`Database(':memory:')` 被拒绝（池内连接各自独立），`insert_all` 缺列交由 SQLite 求值表达式默认值，`wal=False`/`timeout` 真实生效，DDL 后缓存自动失效（外部 DDL 需手动 `table.invalidate_cache()`）。mysqlite 无内置 rename/drop_column/backup——用原生 SQL 或连接 API 完成（见 `examples/mysqlite-scenarios/`）。
 
 ## 反模式（避免）
 
@@ -459,9 +466,11 @@ with Database("sqlite://db/test.iosql") as db:
 - ❌ `from iosql import DurationPartition` → 顶层已不导出分区类，用 `Partition.duration(...)` 工厂或 `iosql.partition.duration` 内部路径
 - ❌ 对已存在表重复声明不同契约 → 用 `db.table("name")` 获取引用而非重新声明
 - ❌ 在写入前未声明 `pk` → `write()` 必须有主键
+- ❌ 写入行缺主键字段 → 会抛 `BadArgument`（不会退回 rowid 自增），每行必须补齐主键
+- ❌ 给 `select()` / `iter_select*()` 传 `symbols`/`start`/`end`/`date`/`session` → 抛 BadArgument；业务过滤用 `query()` / `explain_select()`
 - ❌ 未声明 `symbol_column` 的普通表调用 `query(symbols=)`/`latest(symbols=)` → 报 BadArgument；先 `symbol_column="symbol"` 显式声明或改用 `by=`/`where=`
 - ❌ 依赖旧版 `select()` 默认返回 tuple → 现默认 dict 行，需要 tuple 显式 `to_dict=False`
-- ❌ 用 `delete(None)` → 已废弃，改用 `truncate(confirm=True)`
+- ❌ 用 `delete(None)` → 已废弃，改用 `delete_all()` 或 `truncate(confirm=True)`
 - ❌ 假设 `repartition_to()` 会修改原库 → 它只写新库
 - ❌ 拼接原始 SQL 做 where → 用 dict/list/`Case`/文本表达式
 - ❌ 忽略 `WriteResult` 返回值 → 检查 `rows_seen` vs `rows_written`
@@ -469,6 +478,7 @@ with Database("sqlite://db/test.iosql") as db:
 - ❌ 忽略测试数据隔离 → 每个测试用独立 `tmp_path`
 - ❌ 用 `insert_all()` 替代 `write()` → `insert_all` 是低层 API，不自动使用表契约
 - ❌ mysqlite `insert_all(commit=False)` → 已显式拒绝；需要事务用 `db.transaction()`
+- ❌ mysqlite `Database(':memory:')` → 连接池不支持，直接用 `sqlite3.connect(':memory:')`
 
 ## 引用资料
 

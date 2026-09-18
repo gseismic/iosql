@@ -675,7 +675,9 @@ class TestLargeData:
             db['kline'].insert_all(data, pk=['timestamp', 'symbol'])
             if (batch + 1) % 5 == 0:
                 print(f'  Batch {batch + 1}/{num_batches} done ({len(data)} rows)')
-                db['kline'].close()
+                # close 后引擎不再允许重开分区连接（PLAN-062），
+                # 这里通过 Database.close() 显式重建表对象，同时验证重开路径
+                db.close()
 
         insert_end = time.time()
         print(f'Insert completed in {insert_end - insert_start:.2f}s')

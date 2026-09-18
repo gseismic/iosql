@@ -74,14 +74,14 @@ class Database(object):
         初始化数据库实例
         
         Args:
-            db_file: 数据库文件路径
-            auto_commit: 自动提交事务
+            db_file: 数据库文件路径；不支持 ':memory:'（池内多连接会各自得到独立内存库）
+            auto_commit: 自动提交事务；为 False 时写入必须放在 transaction() 上下文或显式 commit=True
             verbose: 详细级别 (0=静默, 1=信息, 2=调试)
-            pragma_dict: 自定义PRAGMA设置
-            wal: 启用WAL模式
+            pragma_dict: 自定义PRAGMA设置；未显式给出的 journal_mode/busy_timeout 分别由 wal/timeout 派生
+            wal: 启用WAL模式（pragma_dict 显式给出 journal_mode 时以 pragma_dict 为准）
             max_connections: 最大连接数
             max_process_connections: 进程内所有 mysqlite 池共享的最大连接数
-            timeout: 连接超时时间（秒）
+            timeout: 连接超时时间（秒），同时用作默认 busy_timeout
             **kwargs: 其他连接参数
         """
         self.db_file = Path(db_file)
@@ -98,6 +98,13 @@ class Database(object):
             if pragma_dict is not None
             else copy.deepcopy(_DEFAULT_PRAGMA)
         )
+        # busy_timeout 与 timeout 对齐：sqlite3.connect(timeout=) 会被 PRAGMA 覆盖，
+        # 调用方未显式指定 busy_timeout 时用 timeout 派生（毫秒），保证两处语义一致。
+        if pragma_dict is None or 'busy_timeout' not in pragma_dict:
+            self._pragma_dict['busy_timeout'] = str(max(0, int(float(timeout) * 1000)))
+        # 未显式指定 journal_mode 时，wal 参数必须真实生效
+        if pragma_dict is None or not pragma_dict.get('journal_mode'):
+            self._pragma_dict['journal_mode'] = 'wal' if wal else 'delete'
         self._local = threading.local()
         
         # 添加连接池
@@ -111,28 +118,32 @@ class Database(object):
 
         # closed flag
         self._closed = False
-        
-        # 如果请求则启用WAL模式
-        if wal:
-            self.enable_wal()
-        
+
         # 注册到全局数据库实例注册表，用于程序退出时的自动清理
         _register_cleanup()
         _active_databases.add(self)
 
     def enable_wal(self, enable: bool = True) -> None:
-        """启用或禁用WAL模式"""
-        if enable:
-            self._pragma_dict['journal_mode'] = 'wal'
-        else:
-            self._pragma_dict['journal_mode'] = 'delete'
+        """启用或禁用WAL模式（同时应用到池中空闲连接）"""
+        mode = 'wal' if enable else 'delete'
+        self._pragma_dict['journal_mode'] = mode
+        self._apply_pragma_to_idle('journal_mode', mode)
+
+    def _apply_pragma_to_idle(self, key: str, value: Any) -> None:
+        """把 PRAGMA 应用到池中空闲连接；使用中的连接不受影响（下次新建时生效）。"""
+        if str(value) == '':
+            return
+        if getattr(self, '_pool', None) is not None:
+            self._pool.apply_pragma_to_idle(key, value)
 
     def _pragma_one(self, key: str, value: Optional[str] = None) -> None:
-        """设置单个PRAGMA值"""
-        value = value or ''
-        current_value = self._pragma_dict.get(key.lower(), '')
+        """设置单个PRAGMA值（value=0 等 falsy 值同样生效）"""
+        value = '' if value is None else value
+        key = key.lower()
+        current_value = str(self._pragma_dict.get(key, ''))
         if str(value).lower() != current_value.lower():
-            self._pragma_dict[key.lower()] = str(value)
+            self._pragma_dict[key] = str(value)
+            self._apply_pragma_to_idle(key, value)
 
     def pragma(self, key_or_dict: Union[str, Dict[str, Any]], value: Optional[str] = None) -> None:
         """设置PRAGMA值"""
@@ -210,8 +221,17 @@ class Database(object):
     
 
     def execute(self, sql: str) -> None:
-        """执行SQL语句，包含适当的错误处理"""
+        """执行SQL语句，包含适当的错误处理。
+
+        auto_commit=False 时不能在 transaction() 之外执行语句：连接归还时的
+        rollback 会让写入静默丢失，因此这里直接拒绝。
+        """
         self._ensure_open()
+        if not self.auto_commit and not self.in_transaction():
+            raise DatabaseError(
+                'auto_commit=False 时 execute() 无法提交：'
+                '请改用 db.transaction() 上下文执行写入'
+            )
         if self.verbose >= 2:
             logger.debug(f'{self.db_file}: 执行: {sql}')
 
@@ -416,8 +436,12 @@ class Database(object):
                 if self.verbose >= 1:
                     logger.info(f'删除表: {sql}')
                 self.execute(sql)
-            except sqlite3.Error as e:
+            except DatabaseError as e:
                 raise DatabaseError(f"Failed to drop table {tbl}: {e}") from e
+            # 已缓存的 Table 对象必须失效，否则用旧 schema 重建会复活已删列/默认值
+            cached_table = self._tables.get(tbl)
+            if cached_table is not None:
+                cached_table.invalidate_cache()
 
     def drop_index(self, index_or_indices: Union[str, List[str], tuple]) -> None:
         """删除一个或多个索引"""
@@ -435,7 +459,7 @@ class Database(object):
                 if self.verbose >= 1:
                     logger.info(f'删除索引: {sql}')
                 self.execute(sql)
-            except sqlite3.Error as e:
+            except DatabaseError as e:
                 raise DatabaseError(f"Failed to drop index {index}: {e}") from e
 
     def drop_all_indices(self, exclude_autoindex: bool = True) -> None:
@@ -470,5 +494,5 @@ class Database(object):
         
         try:
             self.execute(sql)
-        except sqlite3.Error as e:
+        except DatabaseError as e:
             raise DatabaseError(f"Failed to create index {index_name}: {e}") from e

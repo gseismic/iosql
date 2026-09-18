@@ -143,10 +143,24 @@ class Case(object):
         return CaseExpression('or', self, other)
 
     def __eq__(self, other):
+        if not isinstance(other, Case):
+            return NotImplemented
         return self.cid() == other.cid()
+
+    def __hash__(self):
+        # 与 __eq__ 保持一致；Where 文档示例把 Case 放进 set 使用
+        return hash(self.cid())
 
     @classmethod
     def from_dict(cls, dic):
+        if not isinstance(dic, dict):
+            raise BadArgument(f'Case 需要 dict，得到 {type(dic).__name__}: {dic}')
+        missing = [key for key in ('field', 'op', 'value') if key not in dic]
+        if missing:
+            raise BadArgument(
+                f'Case dict 缺少键 {missing}，得到 {dic}；'
+                '示例: {"field": "ts", "op": "between", "value": [1, 10]}'
+            )
         return Case(dic['field'], dic['op'], dic['value'])
 
     @classmethod

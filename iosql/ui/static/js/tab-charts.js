@@ -15,6 +15,7 @@
 
   var st = null;
   var chart = null; // uPlot 实例（单例，重绘前销毁）
+  var resizeHandler = null; // resize 监听引用：重渲染前移除，避免监听器累积
 
   function ensureState(ctx) {
     if (st && st.table === ctx.table) return st;
@@ -108,6 +109,9 @@
       var chartBox = h('div', { class: 'chart-box' });
       root.append(chartBox);
 
+      // 先清理上一次渲染留下的 resize 监听，再挂新的（防止反复切换 Tab 累积）
+      if (resizeHandler) { window.removeEventListener('resize', resizeHandler); }
+      resizeHandler = onResize;
       window.addEventListener('resize', onResize);
 
       function onResize() {
@@ -115,6 +119,7 @@
           chart.setSize({ width: Math.max(chartBox.clientWidth - 24, 320), height: 360 });
         } else {
           window.removeEventListener('resize', onResize);
+          if (resizeHandler === onResize) resizeHandler = null;
         }
       }
 

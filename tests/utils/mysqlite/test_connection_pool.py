@@ -216,26 +216,28 @@ class TestConnectionPool:
             'open_process_connections'
         ] == baseline
 
-    def test_process_budget_uses_smallest_active_limit(self, tmp_path):
+    def test_idle_small_pool_does_not_compress_process_budget(self, tmp_path):
         large_pool = DatabaseConnectionPool(
             str(tmp_path / 'large.sqlite3'),
             max_connections=4,
             max_process_connections=8,
         )
-        small_pool = DatabaseConnectionPool(
-            str(tmp_path / 'small.sqlite3'),
-            max_connections=1,
-            max_process_connections=2,
-        )
         try:
-            status = get_process_connection_budget_status()
-            assert status['max_process_connections'] == 2
-        finally:
-            small_pool.force_close_all_connections()
+            baseline = get_process_connection_budget_status()['max_process_connections']
+            assert baseline >= 8
 
-        try:
-            status = get_process_connection_budget_status()
-            assert status['max_process_connections'] == 8
+            small_pool = DatabaseConnectionPool(
+                str(tmp_path / 'small.sqlite3'),
+                max_connections=1,
+                max_process_connections=2,
+            )
+            try:
+                # 保守的小池不能压缩整个进程的预算（旧 min() 语义会压缩）
+                status = get_process_connection_budget_status()
+                assert status['max_process_connections'] >= 8
+                assert status['max_process_connections'] == baseline
+            finally:
+                small_pool.force_close_all_connections()
         finally:
             large_pool.force_close_all_connections()
 

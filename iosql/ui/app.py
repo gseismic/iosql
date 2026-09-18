@@ -27,18 +27,21 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
 from io import StringIO
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Optional
+from typing import Any, AsyncIterator, Iterator, Optional, Union
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from iosql import Case
 from iosql.exception import (
@@ -65,6 +68,8 @@ from .serializers import (
 
 # ---------------------------------------------------------------- 常量
 
+logger = logging.getLogger(__name__)
+
 MODES = ("readonly", "write")
 
 # where 条件合法 op 白名单（与 iosql Case 归一化入口一致）
@@ -72,9 +77,18 @@ ALLOWED_OPS = ("==", "!=", ">", ">=", "<", "<=", "between", "in")
 
 WRITE_MODES = ("append", "upsert", "replace", "ignore")
 
-# rows 端点单页上限：防止 limit=10^9 拖垮进程（keyset 分页本身每页很小）
+# rows 端点单页响应上限：只约束返回行数，防止 limit=10^9 撑爆响应体。
+# 内存真正的大头是核心查询的全量物化排序（U1-5），由核心侧
+# ORDER BY + LIMIT 下推解决，本上限不是内存保护。
 MAX_PAGE_LIMIT = 5000
 MAX_QUERY_LIMIT = 50_000
+
+# 过滤统计（/count 带 where）的扫描行软预算：超出返回 422 提示缩小筛选；
+# 无筛选统计走 manifest 求和，不受此限制。
+MAX_COUNT_SCAN_ROWS = 5_000_000
+
+# 大表告警阈值：未过滤首页仅记录服务端日志，不改变响应契约
+BIG_TABLE_WARN_ROWS = 1_000_000
 
 # chart 流式扫描行数上限：超出直接 422，提示缩小时间窗
 MAX_CHART_SCAN_ROWS = 500_000
@@ -101,6 +115,12 @@ _PARTITION_HINT = (
 # ---------------------------------------------------------------- 请求体模型
 
 
+class _StrictBody(BaseModel):
+    """写请求体基类：未知字段一律 422，避免 dry_run 之类的字段被静默吞掉。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
 class RowsBody(BaseModel):
     """POST /rows 与 /explain 共用请求体。"""
 
@@ -116,8 +136,8 @@ class CountBody(BaseModel):
 
 class QueryBody(BaseModel):
     symbols: Optional[Any] = None
-    start: Optional[Any] = None
-    end: Optional[Any] = None
+    start: Optional[int] = None
+    end: Optional[int] = None
     date: Optional[str] = None
     session: Optional[str] = None
     columns: Optional[Any] = None
@@ -139,35 +159,37 @@ class ValidateBody(BaseModel):
     deep: bool = False
 
 
-class WriteBody(BaseModel):
+class WriteBody(_StrictBody):
     rows: list[dict[str, Any]]
     mode: Optional[str] = None
 
 
-class DeleteBody(BaseModel):
+class DeleteBody(_StrictBody):
     where: Optional[list[dict[str, Any]]] = None
 
 
-class TruncateBody(BaseModel):
+class TruncateBody(_StrictBody):
     confirm: str = ""
 
 
-class CreateIndexBody(BaseModel):
+class CreateIndexBody(_StrictBody):
     column: str
     order: str = "asc"
 
 
-class CompactBody(BaseModel):
-    partition: Optional[Any] = None
+class CompactBody(_StrictBody):
+    # 分区键为字符串（calendar/duration token）或数值（range）；dict 等非法
+    # 形态由 pydantic 直接 422，绝不允许静默成功
+    partition: Optional[Union[str, int, float]] = None
     target_rows: Optional[int] = None
 
 
-class CleanupBody(BaseModel):
+class CleanupBody(_StrictBody):
     dry_run: bool = True
-    partition: Optional[Any] = None
+    partition: Optional[Union[str, int, float]] = None
 
 
-class RepartitionBody(BaseModel):
+class RepartitionBody(_StrictBody):
     target_uri: str
     partition_str: str
 
@@ -226,6 +248,15 @@ def _normalize_group(item: dict[str, Any]) -> dict[str, Any]:
     return {key: kids}
 
 
+# 标量值白名单：where 的 between/in 元素只允许标量，防止 dict/None
+# 直达 SQL 参数绑定引发底层 500
+_SCALAR_TYPES = (int, float, str, bool)
+
+
+def _is_scalar(value: Any) -> bool:
+    return isinstance(value, _SCALAR_TYPES)
+
+
 def normalize_leaf(item: Any) -> dict[str, Any]:
     """单个叶子条件的校验与归一化（原 normalize_where 主体逻辑）。"""
     if not isinstance(item, dict) or "field" not in item or "op" not in item:
@@ -252,11 +283,17 @@ def normalize_leaf(item: Any) -> dict[str, Any]:
             "between 条件的 value 必须是二元列表 [min, max]",
             hint='示例: {"field":"ts","op":"between","value":[start,end]}',
         )
-    if op == "in" and not isinstance(value, list):
-        raise _bad_request(
-            "in 条件的 value 必须是非空列表",
-            hint='示例: {"field":"symbol","op":"in","value":["AAPL","MSFT"]}',
-        )
+    if op in ("between", "in"):
+        if op == "in" and (not isinstance(value, list) or not value):
+            raise _bad_request(
+                "in 条件的 value 必须是非空列表",
+                hint='示例: {"field":"symbol","op":"in","value":["AAPL","MSFT"]}',
+            )
+        if not all(_is_scalar(v) for v in value):
+            raise _bad_request(
+                f"{op} 条件的元素必须是标量（int/float/str）",
+                hint='示例: {"field":"symbol","op":"in","value":["AAPL","MSFT"]}',
+            )
     return {"field": field, "op": op, "value": value}
 
 
@@ -472,10 +509,12 @@ def _register_error_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(Exception)
     async def handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
-        # 兜底防线：未预期异常也保持 {detail,hint} 形状，不让堆栈直泄给前端
+        # 兜底防线：未预期异常保持 {detail,hint} 形状，细节只进服务端日志，
+        # 不把裸异常文本（可能含路径/数据）回传给前端
+        logger.exception("未处理异常: %s %s", request.method, request.url.path)
         return JSONResponse(
             status_code=500,
-            content={"detail": f"内部错误: {exc}", "hint": "请查看服务端日志定位问题"},
+            content={"detail": "内部错误", "hint": "请查看服务端日志定位问题"},
         )
 
 
@@ -596,6 +635,36 @@ def _register_read_routes(app: FastAPI) -> None:
         # 用户条件（含 or/and 嵌套）统一转 CaseExpression：
         # 平铺 dict 列表虽可直传 select，但嵌套分组核心不识别
         user_expr = build_case(comps)
+
+        # 大表未过滤首页：只告警不改契约（真正的慢点是核心全量物化排序，
+        # 由核心侧 ORDER BY+LIMIT 下推解决；这里用 manifest 求和无 I/O）
+        if body.cursor is None and user_expr is None:
+            try:
+                big_rows = fast_row_count(table)
+            except Exception:
+                big_rows = 0
+            if big_rows > BIG_TABLE_WARN_ROWS:
+                logger.warning(
+                    "大表未过滤分页 table=%s rows=%s limit=%s："
+                    "首页排序依赖核心 ORDER BY+LIMIT 下推",
+                    name, big_rows, limit,
+                )
+
+        # NULL 排序列探测（U1-1）：keyset 游标无法表达 IS NULL（Case 拒绝
+        # None，SQL 比较对 NULL 恒为 NULL），排序列一旦含 NULL，ASC 的
+        # NULL 段与 DESC 的 NULL 尾段都不可达/半截。首页即 422 明确拒绝，
+        # 保证不出现"看起来翻完了其实漏行"的静默部分分页。
+        if body.cursor is None:
+            probe = table.select(
+                [col], where=user_expr, order_by=col, limit=1, to_dict=True,
+            )
+            if probe and probe[0].get(col) is None:
+                raise _bad_request(
+                    f"排序列 `{col}` 含 NULL，keyset 分页无法安全遍历",
+                    hint="请改用不含 NULL 的列排序（如主键/时间列），"
+                         "或先在 where 中对排序列加比较条件（如 >=）过滤 NULL 行",
+                )
+
         where_expr: Any = user_expr
         if body.cursor is not None:
             if not isinstance(body.cursor, (list, tuple)):
@@ -608,6 +677,11 @@ def _register_read_routes(app: FastAPI) -> None:
                 raise _bad_request(
                     f"cursor 长度 {len(vals)} 与排序键 {len(order_cols)} 列不一致",
                     hint=f"order_cols={order_cols}；请原样回传上一页 next_cursor",
+                )
+            if any(v is None for v in vals):
+                raise _bad_request(
+                    "cursor 含 NULL，keyset 分页无法继续",
+                    hint=f"排序键 {order_cols} 的游标值不能为 NULL；请更换排序列或过滤 NULL 行",
                 )
             strict_op = "<" if direction == "desc" else ">"
             eq_op = "=="
@@ -654,12 +728,18 @@ def _register_read_routes(app: FastAPI) -> None:
         table = get_table(request.app.state.db, name)
         comps = build_case(normalize_where(body.where))
         if comps is not None:
-            # 有筛选时 iosql 没有 SQL 级 count(where)，流式累计避免整表载入内存
+            # 有筛选时 iosql 没有 SQL 级 count(where)，流式累计避免整表载入内存；
+            # 扫描行数超软预算时明确 422，请用户缩小筛选范围
             total = 0
             for batch in table.iter_select_batches(
                 "*", where=comps, to_dict=True, batch_size=EXPORT_BATCH_SIZE
             ):
                 total += len(batch)
+                if total > MAX_COUNT_SCAN_ROWS:
+                    raise _bad_request(
+                        f"筛选统计扫描行数超过预算 {MAX_COUNT_SCAN_ROWS}",
+                        hint="请缩小筛选范围后重试；无筛选统计走 manifest 求和不受此限制",
+                    )
             return {"count": total}
         return {"count": fast_row_count(table)}
 
@@ -668,6 +748,8 @@ def _register_read_routes(app: FastAPI) -> None:
         table = get_table(request.app.state.db, name)
         require_time_contract(table.spec())
         comps = build_case(normalize_where(body.where))
+        effective_limit = max(1, min(int(body.limit), MAX_QUERY_LIMIT))
+        # 多取一行判断是否被截断，避免"恰好取满 limit"的假阳性
         fluent = table.query(
             symbols=body.symbols,
             start=body.start,
@@ -677,10 +759,12 @@ def _register_read_routes(app: FastAPI) -> None:
             columns=body.columns if body.columns is not None else "*",
             where=comps,
             order_by=body.order_by,
-            limit=max(1, min(int(body.limit), MAX_QUERY_LIMIT)),
+            limit=effective_limit + 1,
         )
         rows = fluent.to_list()
-        truncated = len(rows) >= max(1, min(int(body.limit), MAX_QUERY_LIMIT))
+        truncated = len(rows) > effective_limit
+        if truncated:
+            rows = rows[:effective_limit]
         columns = (
             list(rows[0].keys()) if rows
             else (list(body.columns) if isinstance(body.columns, list) else [])
@@ -690,7 +774,16 @@ def _register_read_routes(app: FastAPI) -> None:
     @app.post("/api/table/{name}/latest")
     def post_latest(name: str, body: LatestBody, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
-        require_time_contract(table.spec())
+        spec = table.spec()
+        require_time_contract(spec)
+        if body.columns:
+            known = table_columns(table, spec)
+            unknown = [c for c in body.columns if c not in known]
+            if unknown:
+                raise _bad_request(
+                    f"columns 含不存在的列: {', '.join(unknown)}",
+                    hint=f"可用列: {', '.join(known)}",
+                )
         comps = build_case(normalize_where(body.where))
         fluent = table.latest(
             symbols=body.symbols,
@@ -985,6 +1078,35 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
 # ---------------------------------------------------------------- export 实现
 
 
+def _content_disposition(name: str, fmt: str) -> str:
+    """构造 Content-Disposition：ASCII 降级名 + RFC 5987 UTF-8 文件名。
+
+    表名可来自用户数据（可能含中文/引号/换行）；直接拼 header 会抛
+    latin-1 编码错或注入畸形 header，这里统一降级与转义。
+    """
+    filename = f"{name}.{fmt}"
+    ascii_name = filename.encode("ascii", "replace").decode("ascii")
+    ascii_name = "".join(
+        ch if 32 <= ord(ch) < 127 and ch not in '\\"' else "_"
+        for ch in ascii_name
+    )
+    return (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(filename, safe='')}"
+    )
+
+
+# CSV 公式注入危险前缀（Excel/LibreOffice 会把它们当公式执行）
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _csv_safe(value: Any) -> Any:
+    """CSV 公式注入防护：危险前缀的文本前加单引号，强制按文本解析。"""
+    if isinstance(value, str) and value[:1] in _CSV_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
 def _export_endpoint(name: str, request: Request, format: str,
                      where: Optional[str], order_by: Optional[str],
                      limit: Optional[int]) -> StreamingResponse:
@@ -1019,7 +1141,7 @@ def _export_endpoint(name: str, request: Request, format: str,
 
     media_types = {"csv": "text/csv", "jsonl": "application/x-ndjson"}
     headers = {
-        "Content-Disposition": f'attachment; filename="{name}.{format}"',
+        "Content-Disposition": _content_disposition(name, format),
     }
     batch_iter = table.iter_select_batches(
         "*", where=comps, limit=limit,
@@ -1058,11 +1180,16 @@ def _export_stream(batch_iter: Iterator[list[dict[str, Any]]],
                 writer.writerow(csv_columns)
                 header_written = True
             for row in batch:
-                writer.writerow([row.get(c) for c in csv_columns])
+                writer.writerow([_csv_safe(row.get(c)) for c in csv_columns])
         else:
             for row in batch:
                 buffer.write(json.dumps(row, ensure_ascii=False, default=str))
                 buffer.write("\n")
+        yield buffer.getvalue()
+    # 空结果集也必须输出表头（零批次时此前无表头，导出文件不可直接用）
+    if format == "csv" and not header_written and csv_columns:
+        buffer = StringIO()
+        csv.writer(buffer, lineterminator="\n").writerow(csv_columns)
         yield buffer.getvalue()
 
 
@@ -1185,6 +1312,32 @@ def _register_write_routes(app: FastAPI) -> None:
 # ---------------------------------------------------------------- 工厂
 
 
+class _IPv6HostNormalizer:
+    """把 ``[::1]:port`` 形式的 Host 归一为 ``localhost:port``。
+
+    Starlette 的 TrustedHostMiddleware 以 ``host.split(":")[0]`` 解析
+    Host，IPv6 字面量会得到 ``"["``，导致 ``[::1]`` 无法命中白名单。
+    本中间件只做这一处归一，校验仍交给 TrustedHostMiddleware。
+    """
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") in ("http", "websocket"):
+            new_headers = []
+            changed = False
+            for key, value in scope.get("headers") or []:
+                if key == b"host" and value.startswith(b"[::1]"):
+                    rest = value[len(b"[::1]"):]
+                    value = b"localhost" + rest
+                    changed = True
+                new_headers.append((key, value))
+            if changed:
+                scope = dict(scope, headers=new_headers)
+        await self.app(scope, receive, send)
+
+
 def _register_api_fallback(app: FastAPI) -> None:
     """API 兜底路由：吞掉所有未匹配的 /api/* 请求，统一返回 404。
 
@@ -1220,6 +1373,15 @@ def create_app(db_uri: str, mode: str = "readonly") -> FastAPI:
     app.state.db_uri = db_uri
     app.state.mode = mode
     app.state.db = None
+
+    # Host 头安全（DNS rebinding 纵深防御）：默认只信任本机回环地址；
+    # 不加 CORS（同源部署，无需跨域放行）。CLI --host 绑定非回环地址时
+    # 应由 CLI 打印警告（见 cli.py:1732 附近，本任务不修改 CLI）。
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "::1"],
+    )
+    app.add_middleware(_IPv6HostNormalizer)
 
     _register_error_handlers(app)
     _register_read_routes(app)

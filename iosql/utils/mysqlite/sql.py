@@ -1,8 +1,15 @@
+import numbers
 from collections import OrderedDict
 from operator import itemgetter
 from typing import Dict, List, Tuple, Union, Optional, Any
 
 from .exception import DuplicateColumn, PrimaryKeyNotInColumn
+
+try:
+    import numpy as np
+    _has_np = True
+except ImportError:  # pragma: no cover - numpy 可选依赖
+    _has_np = False
 
 """
 columns = [
@@ -23,6 +30,9 @@ def quoted_sql_text(s: str) -> str:
 def sql_literal(value: Any) -> str:
     if value is None:
         return 'NULL'
+    # bytes 必须走 blob 字面量，直接 str(bytes) 会得到 b'...' 字面量
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return "X'" + bytes(value).hex() + "'"
     if isinstance(value, bool):
         return '1' if value else '0'
     if isinstance(value, (int, float)):
@@ -123,17 +133,40 @@ def getarg_diclist_insertmany_known_fields(
     return fields, list_values
 
 
+def group_rows_by_keys(data: List[Dict[str, Any]]) -> List[Tuple[List[str], List[List[Any]]]]:
+    """按每行的 key 集合分组，返回 [(字段列表, 参数列表), ...]。
+
+    行中缺失的列不再由 Python 侧回填 DEFAULT，而是直接从语句中省略，
+    交由 SQLite 求值列默认值（含 CURRENT_TIMESTAMP / (datetime('now')) 等表达式）。
+    这样既能修复表达式默认值被当成字面量写盘的问题，也保持字面量默认值语义。
+    """
+    groups: 'OrderedDict[frozenset, Tuple[List[str], List[List[Any]]]]' = OrderedDict()
+    for item in data:
+        key = frozenset(item.keys())
+        group = groups.get(key)
+        if group is None:
+            fields = list(item.keys())
+            group = (fields, [])
+            groups[key] = group
+        group[1].append([item[field] for field in group[0]])
+    return list(groups.values())
+
+
 def suggest_value_type(v: Any) -> str:
     if v is None:
         return None
-    if isinstance(v, float):
-        return 'float'
-    elif isinstance(v, (int, bool)):
+    # numpy 标量统一转换为其 Python 原生类型再判定
+    if _has_np and isinstance(v, np.generic):
+        v = v.item()
+    if isinstance(v, bool):
         return 'integer'
-    elif isinstance(v, bytes):
+    if isinstance(v, numbers.Integral):
+        return 'integer'
+    if isinstance(v, numbers.Real):
+        return 'float'
+    if isinstance(v, (bytes, bytearray, memoryview)):
         return 'blob'
-    else:
-        return 'text'
+    return 'text'
 
 
 def suggest_columns(field_types: Dict[str, str], **kwargs) -> List[Dict[str, Any]]:
@@ -187,6 +220,8 @@ def getsql_create_table(table_name: str, columns: List[Dict[str, Any]], pk: Unio
         'comment': '姓名'
     }]
     '''
+    if not columns:
+        raise ValueError('getsql_create_table: columns 不能为空')
     pk = pk or []
     pk = pk if isinstance(pk, (list, tuple)) else [pk]
     
@@ -239,7 +274,8 @@ def getsql_create_index(table_name: str, column: str, order: str = 'ASC', if_not
 
 
 def getsubsql_insert(ignore: bool, replace: bool) -> str:
-    assert not (ignore and replace)
+    if ignore and replace:
+        raise ValueError('ignore 与 replace 不能同时为 True')
     if replace:
         return 'replace into'
     elif ignore:

@@ -3,6 +3,7 @@ from functools import lru_cache
 from typing import Any, Dict
 import arrow
 from .base import Partition
+from ..exception import PartitionSpecError
 
 
 class CalendarPartition(Partition):
@@ -76,6 +77,14 @@ class CalendarPartition(Partition):
             ts_col: Column name containing timestamp/datetime
             every: Calendar interval, e.g. '1day', '1week', '4day'
         """
+        # fmt 白名单收口：任意字符串会经 format() 生成分区 key 并拼进文件名，
+        # 非白名单值（如 ../../../pwn、YYYY/MM/DD）可能造成路径穿越或多级目录。
+        if fmt not in self.FMT_SHIFT_MAP:
+            raise PartitionSpecError(
+                f"不支持的 calendar fmt `{fmt}`；可选: "
+                f"{', '.join(self.FMT_SHIFT_MAP)}。"
+                "修复: 更新 manifest 中的 fmt，或删除该表 partition 元数据后重建"
+            )
         self.fmt = fmt
         self.tz = tz
         self.TS_COL = ts_col
@@ -92,13 +101,17 @@ class CalendarPartition(Partition):
         text = str(every or '1day').strip().lower()
         match = re.fullmatch(r'(?:(\d+)\s*)?([a-z]+)', text)
         if not match:
-            raise ValueError(f'Unsupported calendar partition interval: {every}')
+            raise PartitionSpecError(
+                f'Unsupported calendar partition interval: {every}'
+            )
         count = int(match.group(1) or '1')
         if count <= 0:
-            raise ValueError('calendar partition interval must be positive')
+            raise PartitionSpecError('calendar partition interval must be positive')
         unit = cls.UNIT_ALIASES.get(match.group(2))
         if unit is None:
-            raise ValueError(f'Unsupported calendar partition interval: {every}')
+            raise PartitionSpecError(
+                f'Unsupported calendar partition interval: {every}'
+            )
         return count, unit
 
     @classmethod
@@ -234,7 +247,17 @@ class CalendarPartition(Partition):
             
         Returns:
             CalendarPartition instance
+
+        Raises:
+            PartitionSpecError: manifest 缺少必要字段或 fmt 不在白名单内
         """
+        missing = [key for key in ('fmt', 'tz', 'ts_col') if not meta.get(key)]
+        if missing:
+            raise PartitionSpecError(
+                f"calendar partition meta 缺少字段 {missing} (meta={meta!r})；"
+                "修复: 更新 manifest 中的 partition 元数据，"
+                "或删除 partition 后按原契约重建该表"
+            )
         return cls(
             fmt=meta['fmt'],
             tz=meta['tz'],

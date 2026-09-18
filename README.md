@@ -148,7 +148,7 @@ iosql rename-database -s database/market.iosql --target market-renamed.iosql
 iosql rename-table -s database/market.iosql -t ticks --new-table ticks_2026
 ```
 
-SQLite table 重命名会移动表目录并更新表内 manifest；database 重命名会移动整个目录库并刷新当前 `Database` 实例 URI。覆盖已有目标时需要显式传 `overwrite=True`；CLI 对应 `--overwrite --yes`。
+SQLite table 重命名会移动表目录并更新表内 manifest；database 重命名会移动整个目录库并刷新当前 `Database` 实例 URI。覆盖已有目标时需要显式传 `overwrite=True`；CLI 对应 `--overwrite --yes`。`Database.rename(overwrite=True)` 会校验源/目标都是 iosql 目录库，拒绝根目录、家目录和符号链接目标，并以“先改名到临时目录、再替换”的方式保证失败可回滚。
 
 ### 创建或打开表
 
@@ -179,6 +179,8 @@ db.table("items", pk=["id"], partition="range(id,width=100000)")
 字符串 partition 统一示范 `timezone=`（与对象 API 一致）；`tz=` 保留为兼容别名，解析结果相同。
 
 时序数据优先使用 `duration(...)` 或 `calendar(...)`。`range(...)` 主要用于 id、offset、版本号等非时间数值字段；历史库中基于 `partition_key` 的 `range(...)` 可以作为兼容迁移方案。
+
+`calendar(...)` 的 `every` 会真实参与分桶（如 `4day`/`1week`）；`fmt` 仅接受 `YYYY`/`YYYYMM`/`YYYYMMDD`/`YYYYMMDDHH`/`YYYYMMDDHHmm`，其他值抛 `PartitionSpecError`。duration 间隔支持别名、任意 `Nunit` 以及 `Nmonth`（按 30 天）/`Nyear`（按 365 天）。range/duration 分区键会把整数值浮点输入向下取整归一为整数（写入 `0.0` 的分区键为 `0`，用 `value=0` 可查询命中）。
 
 等价对象 API：
 
@@ -223,6 +225,8 @@ with table.write_buffer(max_rows=10_000) as buffer:
 ```
 
 `insert_all()` 是低层基础入口（布尔标志 `replace=`/`ignore=`，两者互斥），供进阶场景使用；日常写入统一使用 `write()`。
+
+每行必须包含契约声明的全部主键字段；行缺失主键列会立即抛 `BadArgument`，不会退回 SQLite rowid 自增。
 
 ### 大批量写入性能
 
@@ -391,6 +395,8 @@ segments = table.segments()
 
 `select(fields, where)` 的两个位置参数均可省略：`select()` 即全表扫描；`columns=` 是 `fields=` 的别名（与 `query(columns=)` 对齐），两者同传冲突报错。返回值语义：`select()` 急切求值并返回完整列表（默认行元组，`to_dict=True` 返回 dict 行）；`query()` 返回惰性 fluent 对象（`.to_list()` / `.iter_batches()` / `.explain()`）。`select_all()` 已废弃，等价于 `select(to_dict=True)`。
 
+`select()` / `iter_select()` / `iter_select_batches()` 只接受底层参数（`fields`、`where`、`order_by`、`limit`、`columns`、`batch_size`）；传入 `symbols`/`start`/`end`/`date`/`session` 或其他未知参数会抛 `BadArgument` 而不是被静默忽略，业务过滤请改用 `query()` / `explain_select()`。
+
 dict 条件的合法 op（别名自动归一化，非法 op 在构造时即抛带修复指引的 `BadArgument`）：
 
 | 用户 op | 含义 | 内部别名 |
@@ -417,6 +423,8 @@ all_segments = table.segments(include_obsolete=True)
 ```
 
 `compact()` 成功后会把旧 segment 标记为 `obsolete`，默认查询、`segments()`、`layout_report()` 和 `repartition_to()` 都只使用新 segment。`compact()` 本身不会物理删除旧 SQLite 文件；append-only 表中如果已经存在跨 segment 重复主键，compact 会把重复主键分到不同新 segment，保持现有查询结果不变。
+
+manifest 引用的 segment 文件缺失时，读取路径直接抛 `UnsafeOperation`，不会隐式重建空文件。`validate()` 会反向扫描 data 目录并报告未被 manifest 引用的孤儿 segment 文件（`orphan_segment_file` 警告，不计入错误）；`compact()` 遇到目标文件名被历史孤儿文件占用时，会先安全清理孤儿再复用。
 
 需要释放 compact 后的旧文件时，先执行深度校验，再清理 obsolete segment。`cleanup_obsolete()` 默认 dry-run，只预览候选文件和可释放字节；真正删除必须显式传 `dry_run=False`。删除前默认会校验当前可见 segment 的 SQLite integrity、row_count 和 manifest stats，校验失败会拒绝删除旧文件：
 
@@ -478,7 +486,7 @@ snapshot = ticks.latest(
 
 ### 流式查询和导出
 
-大结果集优先使用批量迭代接口，避免 `select()` / `to_list()` 一次性持有全部行。`iter_batches()` 是主形态；`iter_select()` / `iter_rows()` 是它的逐行语法糖，逐条处理时更顺手：
+大结果集优先使用批量迭代接口，避免 `select()` / `to_list()` 一次性持有全部行。`iter_batches()` / `iter_select_batches()` 是主形态；`iter_rows()` / `iter_select()` 是它的逐行语法糖，逐条处理时更顺手：
 
 ```python
 for batch in ticks.query(start=start, end=end).iter_batches(batch_size=50_000):
@@ -503,7 +511,7 @@ iosql export \
   --batch-size 50000
 ```
 
-无全局 `order_by` 时，查询按分区/segment 分批读取。跨多个 segment 使用全局 `order_by` 时，为保证排序正确性，仍会在 Python 层合并排序后再按批输出。
+无全局 `order_by` 时，查询按分区/segment 分批读取。`select()` 在全局 `order_by` 与 `limit` 同时提供时，会把 `ORDER BY ... LIMIT` 下推到每个 segment，再在 Python 层归并取前 `limit` 行（结果不变、内存有界）；只带全局 `order_by` 的流式输出仍会先合并排序再按批给出。
 
 CLI `import` 会批处理读取 JSONL/CSV 并写入既有契约表，适合 vendor 历史文件和离线回补包：
 
@@ -518,6 +526,8 @@ iosql import \
 ```
 
 CSV 导入会按表契约中的 `columns` 对 integer/float/bool 做基础类型转换；JSON 对象或对象数组仍兼容，但超大文件推荐使用 JSONL 或 CSV。
+
+`iosql export` 先写临时文件、成功后再原子替换 `--output`，查询或写入失败时旧输出保持不变；`iosql import` 支持 UTF-8 BOM，JSONL 坏行与 CSV 字段数不匹配会报具体行号，中途失败会输出含 `rows_seen`/`rows_written`/`batches_committed` 的 JSON 汇总并以退出码 1 结束。JSON 输出中 bytes 列统一为 base64。
 
 ### 日历分区
 
@@ -645,6 +655,8 @@ iosql migrate \
 
 也可以先执行 `iosql migrate ... --dry-run` 查看表、源行数和批次数估算。
 
+`iosql migrate` 拒绝目标与源库相同或位于源库内部；`--verify row-count` 会在迁移前检查目标库是否已存在同名表，已存在则直接报错（请改用空目标表或去掉该校验）。Python 侧 `migrate_to(dry_run=True)` 同样先校验 `mode`/`tables`/目标 URI，且不会为不存在的表创建目录或 `meta.sqlite3`。
+
 CLI 重分区推荐使用 `--partition`：
 
 ```bash
@@ -749,7 +761,7 @@ iosql ui -s database/market.iosql
 iosql ui -s database/market.iosql --write
 ```
 
-其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`（不自动打开浏览器）。
+其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`（不自动打开浏览器）。绑定非 loopback 的 `--host` 时会打印暴露警告；服务端只信任 `localhost`/`127.0.0.1`/`[::1]` 的 Host 头。
 
 功能分区：
 
@@ -762,7 +774,7 @@ iosql ui -s database/market.iosql --write
 | Charts | ✅ | ✅ | 时序快览折线图（服务端降采样） |
 | Maintain | ❌ | ✅ | layout_report → compact → validate → cleanup_obsolete 步骤流；重分区 |
 
-安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需预览与手输表名确认。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
+安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝），并只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认（重分区无 dry-run 预览，确认后直接写入新库）。Browse 的 keyset 分页在排序列含 NULL 时返回 422 并禁用该列排序，避免静默漏行。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
 
 ## 存储结构
 
@@ -785,7 +797,7 @@ database/
 
 - 核心 `Database.table(...)` 不需要 `time` 字段；分区字段由 `Partition.*(...)` 指定。duration/calendar 分区在未显式声明 time 时会自动反推 time 契约（`range` 分区不反推），因此普通分区表也可直接使用 `query(start/end/date)`、`latest()`、`asof()`。
 - `timeseries()` 是 `table()` 的薄语法糖；`partition_kind` / `time_unit` / `*_rows_per_file` 已废弃，迁移写法见"创建或打开表"一节的对照表。
-- 多分区查询支持全局 `order_by` 和 `limit`，但带全局排序时结果会在 Python 层合并排序；大结果集无排序导出优先使用 `iter_select_batches()` 或 CLI `export --batch-size`。
+- 多分区查询支持全局 `order_by` 和 `limit`；`select()` 在两者同传时会把排序与 limit 下推到各 segment 后再归并（内存有界），只排序不限行时结果仍会在 Python 层合并排序。大结果集无排序导出优先使用 `iter_select_batches()` / `iter_batches()` 或 CLI `export --batch-size`。
 - 大文件导入优先使用 JSONL/CSV 和 `iosql import --batch-size`；JSON 数组格式保持兼容但不推荐用于数 GB 文件。
 - 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment，可用 `compact()` 显式整理为新的 sealed generation，再用 `validate(deep=True)` / `cleanup_obsolete()` 释放旧文件。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
@@ -814,7 +826,7 @@ database/
 | 条件查询 | `select` / `iter_select` / `iter_select_batches` | `select` / `iter_select` / `iter_select_batches` |
 | 时序查询 | `query` / `latest` / `asof` | 不支持 |
 | 查询计划 | `explain_select` | 不支持 |
-| 诊断维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` / `truncate` / `delete` / `count_rows` | `delete` / `count_rows` |
+| 诊断维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` / `truncate` / `delete` / `delete_all` / `count_rows` | `delete` / `delete_all` / `count_rows` |
 | 迁移 | `migrate_to` / `to_postgresql` | `migrate_to`（作为源写回 SQLite） |
 
 PostgreSQL 引擎定位是**迁移目标 + 基础查询**，时序便捷查询（`query/latest/asof`）仅在 SQLite 侧提供；需要完整业务接口时以 SQLite 目录库为主存储，PG 作为迁移/备份目标。

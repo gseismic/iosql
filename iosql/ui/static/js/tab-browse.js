@@ -18,6 +18,8 @@
   var LS_PAGE_SIZE = 'iosql_ui_page_size';
   var LS_TS_READABLE = 'iosql_ui_ts_readable';
   var DEBOUNCE_MS = 300;
+  /* 大表提示阈值：与后端 BIG_TABLE_WARN_ROWS 对齐 */
+  var BIG_ROWS_HINT = 1000000;
   /* 时间列名启发式：精确名或后缀；仅整型且毫秒量级才格式化 */
   var TS_NAME_RE = /^(ts|time|timestamp|datetime)$|(_ts|_time|_at)$/i;
 
@@ -63,7 +65,9 @@
       appliedOrderBy: '',
       pageSize: loadPageSize(),
       tsReadable: loadTsReadable(),
-      countCache: {},     // whereJSON → 行数（进程内缓存）
+      countCache: {},     // whereJSON → 行数（进程内缓存，-1 = 统计失败/超预算）
+      countHint: {},      // whereJSON → 失败提示
+      badCols: {},        // 排序列 → 服务端 NULL 拒绝提示（禁用该列排序）
       lastSig: '',        // 最近一次成功渲染的条件签名
       shell: null         // 表格骨架（thead 两行 + tbody），数据更新只换 tbody
     };
@@ -97,7 +101,7 @@
     var timeCol = t && typeof t === 'object'
       ? IU.pick(t, 'column', 'col', 'field', 'name')
       : (typeof t === 'string' ? t : null);
-    var pk = spec && Array.isArray(spec.pk) ? spec.pk : null;
+    var pk = spec && Array.isArray(spec.primary_key) ? spec.primary_key : null;
     var cand = [timeCol, spec && spec.order_key, pk && pk[0], columns[0]];
     var col = columns[0] || '';
     for (var i = 0; i < cand.length; i++) {
@@ -284,16 +288,21 @@
         if (s.pos === 0) return;
         var where = currentWhere();
         if (where === undefined) return;
+        s.pos--; // 回到上一页（chain[s.pos] 即上一页游标；首页为 null）
         fetchPage(where);
       }
 
+      /* 请求序号：快速切表/翻页时丢弃过期响应，防止旧数据覆盖新页 */
+      var pageSeq = 0;
       function fetchPage(where) {
+        var seq = ++pageSeq;
         renderBodyLoading();
         var body = { where: where || [], order_by: orderByStr(s), limit: s.pageSize };
         var cursor = s.chain[s.pos];
         if (cursor !== null && cursor !== undefined) body.cursor = cursor;
 
         IU.api(base + '/rows', { method: 'POST', body: body }).then(function (resp) {
+          if (seq !== pageSeq) return; // 过期响应：丢弃
           var norm = IU.normalizeRows(resp);
           s.nextCursor = IU.pick(resp || {}, 'next_cursor', 'nextCursor') || null;
           s.appliedOrderBy = String(IU.pick(resp || {}, 'order_by', 'orderBy') || body.order_by);
@@ -303,10 +312,25 @@
           renderBody(norm);
           renderPager();
           fetchCount(where);
-        }).catch(function () {
-          renderBodyError();
+        }).catch(function (err) {
+          if (seq !== pageSeq) return;
+          handlePageError(err);
           renderPager();
         });
+      }
+
+      /* 分页失败处理：排序列含 NULL（服务端 422）时禁用该列排序并在表体提示 */
+      function handlePageError(err) {
+        var msg = (err && (err.hint || err.message)) || '';
+        if (err && err.status === 422 && msg.indexOf('NULL') >= 0) {
+          s.badCols[s.sortCol] = msg;
+          s.shell = null; // 重建骨架以给该列打上禁用态
+          renderBodyError('排序列 `' + s.sortCol + '` 含 NULL，keyset 分页不可用：' + msg
+            + ' 请点击其他列排序后重试。');
+          IU.toast('该排序列含 NULL，已禁用；请更换排序列', 'warn');
+          return;
+        }
+        renderBodyError();
       }
 
       /* 动态列兜底：行里出现契约外列时补进列头（触发骨架重建） */
@@ -318,7 +342,7 @@
         });
       }
 
-      /* 总行数异步统计：按 where 签名缓存 */
+      /* 总行数异步统计：按 where 签名缓存；服务端扫描预算超限时显示提示 */
       var countSeq = 0;
       function fetchCount(where) {
         var sig = JSON.stringify(where || []);
@@ -328,18 +352,34 @@
           var n = IU.pick(resp || {}, 'count', 'total', 'rows');
           if (n !== undefined) s.countCache[sig] = Number(n);
           if (seq === countSeq) renderInfo(sig);
-        }).catch(function () { /* toast 已由 api() 弹出 */ });
+        }).catch(function (err) {
+          if (seq !== countSeq) return;
+          s.countCache[sig] = -1; // 失败/超预算占位：不显示错误数字
+          s.countHint[sig] = (err && (err.hint || err.message)) || '统计失败';
+          renderInfo(sig);
+        });
       }
 
       function renderInfo(sig) {
         IU.clear(infoBar);
         var n = s.countCache[sig];
+        var failed = n === -1;
+        // 大表未过滤首页提示（服务端排序尚未下推时全量物化排序可能很慢）
+        var bigUnfiltered = !failed && typeof n === 'number' &&
+          n > BIG_ROWS_HINT && String(sig) === '[]';
         infoBar.append(
           h('span', null, '总行数：',
             n === undefined
               ? h('span', { class: 'spinner', style: { width: '11px', height: '11px' } })
-              : h('b', { class: 'mono' }, IU.fmt.int(n)),
-            h('span', { class: 'faint' }, n === undefined ? ' 统计中…' : ''),
+              : failed
+                ? h('b', { class: 'mono' }, '—')
+                : h('b', { class: 'mono' }, IU.fmt.int(n)),
+            h('span', { class: 'faint' }, n === undefined
+              ? ' 统计中…'
+              : (failed ? ' ' + (s.countHint[sig] || '统计失败') : '')),
+            bigUnfiltered
+              ? h('span', { class: 'faint' }, ' · 大表未过滤：首页排序可能较慢，建议加表头过滤')
+              : null,
             activeFilterHint()));
       }
 
@@ -374,12 +414,20 @@
 
       function buildTitleTh(c) {
         var sorted = s.sortCol === c;
+        var bad = s.badCols[c];
         return h('th', {
           class: 'sortable' + (sorted ? ' sorted' : '') +
+            (bad ? ' sort-bad' : '') +
             (isFilteredCol(c) ? ' filtered' : '') +
             (IU.isNumericCol(c, s.colTypes) ? ' num' : ''),
-          title: '点击按 ' + c + ' 排序（重置到第一页）',
+          title: bad
+            ? ('该列含 NULL，无法分页排序：' + bad)
+            : '点击按 ' + c + ' 排序（重置到第一页）',
           onclick: function () {
+            if (bad) {
+              IU.toast('该列含 NULL，keyset 分页不可用；请更换排序列', 'warn', bad);
+              return;
+            }
             if (s.sortCol === c) s.sortDir = s.sortDir === 'asc' ? 'desc' : 'asc';
             else { s.sortCol = c; s.sortDir = 'asc'; }
             s.shell = null; // 重建骨架以刷新列头排序箭头（过滤输入由 st.filters 恢复）
@@ -534,12 +582,12 @@
             h('span', { class: 'spinner' }), ' 加载中…')));
       }
 
-      function renderBodyError() {
+      function renderBodyError(msg) {
         var shell = ensureShell();
         IU.clear(shell.tbody);
         shell.tbody.append(h('tr', null,
           h('td', { class: 'loading-cell', colspan: String(Math.max(s.columns.length, 1)) },
-            '加载失败，请重试（错误详情见右下角提示）')));
+            msg || '加载失败，请重试（错误详情见右下角提示）')));
       }
 
       function renderPager() {

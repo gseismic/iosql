@@ -62,7 +62,7 @@ iosql 是面向金融时序数据的分区式 SQLite 存储库，当前交互手
   - `layout_report` 可视化：分区行数分布图 + 官方 recommendation 直接展示。
   - segment 清单：文件 key、行数、min/max stats、active/sealed/obsolete 状态、可回收字节。
   - 维护操作台（**需可写模式**）：compact 预览 → 执行；cleanup_obsolete 先 dry-run 显示 bytes_reclaimable，确认后才真删。
-  - repartition 确认弹窗（目标 URI + 新分区串 + "源库不变"声明）后执行；服务端无原生 dry-run，估算预览列为增强项。
+  - repartition 确认弹窗（目标 URI + 新分区串 + "源库不变"声明，需手输表名）后执行；服务端无原生 dry-run，不做假预览（估算预览列为增强项）。
 - 模式需求：**必须可修改模式**，且每步有预览-确认节奏。
 
 ### P4 iosql 库开发者 —— "裁剪到底生效没有"
@@ -124,7 +124,7 @@ DB Browser 的信息架构是平级 Tab：Database Structure / Browse Data / Edi
 - 后端：FastAPI + uvicorn（`[project.optional-dependencies] ui = ["fastapi>=0.110", "uvicorn>=0.29"]`）
 - 前端：单 HTML 入口 + vanilla JS 模块 + uPlot（vendored 于 `iosql/ui/static/vendor/`）
 - 服务形态：uvicorn 起 127.0.0.1 随机/指定端口，自动开浏览器（`--no-browser` 可关）
-- 安全边界：默认绑定 loopback；只读模式下服务层不注册任何写端点（404 而非 403，彻底消除误调用面）
+- 安全边界：默认绑定 loopback；只读模式下服务层不注册任何写端点（404 而非 403，彻底消除误调用面）；服务端用 TrustedHost 只信任 `localhost`/`127.0.0.1`/`[::1]` 的 Host 头（DNS rebinding 纵深防御），CLI 绑定非 loopback `--host` 时打印暴露警告。
 
 ---
 
@@ -165,7 +165,6 @@ DB Browser 的信息架构是平级 Tab：Database Structure / Browse Data / Edi
 | UI 功能 | iosql API | 防呆措施 |
 | --- | --- | --- |
 | 追加写入行 | `table.write(rows)` | JSONL 粘贴框 + 逐行校验预览 |
-| 缓冲批量导入 | `table.write_buffer(max_rows)` | 文件选择 + batch-size 参数 + WriteResult 对账展示 |
 | 条件删除 | `table.delete(where)` | 必填 where + 先 `count` 预览命中行数 + 输入表名确认 |
 | 清空表 | `table.truncate(confirm=True)` | 二次弹窗 + 手输表名 |
 | 建索引 | `table.create_index(column)` | 显示涉及分区数 |
@@ -241,7 +240,7 @@ DB Browser 的信息架构是平级 Tab：Database Structure / Browse Data / Edi
 ### Tab 6 · Maintain（诊断维护台，仅 `--write` 可见可操作）
 
 - 步骤流 UI（引导正确顺序）：layout_report → compact → validate(deep) → cleanup_obsolete(dry-run → 确认删除)。
-- repartition 面板：新 partition 串输入（带 duration/calendar/range 语法提示）+ target URI + 执行按钮（confirm 弹窗声明"写入新库，源库不变"；无服务端 dry-run）。
+- repartition 面板：新 partition 串输入（带 duration/calendar/range 语法提示）+ target URI + 执行按钮（按钮为「执行重分区（写入新库）」；confirm 弹窗声明"写入新库，源库不变"并需手输表名确认；无服务端 dry-run，不提供假预览）。
 - 所有执行类按钮：确认弹窗内回显将执行的 iosql 语义说明（如"将在新库 X 创建 hourly 布局，源库不变"）。
 
 ---
@@ -251,9 +250,10 @@ DB Browser 的信息架构是平级 Tab：Database Structure / Browse Data / Edi
 > 分页关键约束（代码调研确认）：`table.select()` **没有 offset 参数**，只有 `where + order_by + limit`。
 > 因此 Browse Data 采用 **keyset 分页**：游标为复合键 `[排序列值, 主键值...]`，
 > 条件展开为 `(c1>v1) OR (c1==v1 AND c2>v2)` 的 OR 链——排序列有并列值
-> （多 symbol 同 tick）时不会跳行。正确性由 keyset 保证；注意当前引擎对
-> 带 order_by 的查询在 Python 层合并排序，深翻页成本随剩余行数增长，
-> 大表建议配合时间窗筛选使用。
+> （多 symbol 同 tick）时不会跳行。正确性由 keyset 保证。排序列一旦含 NULL，
+> keyset 无法表达 IS NULL（首页探测即返回 422 并提示更换排序列），前端禁用该列
+> 排序，避免"看起来翻完了其实漏行"。核心侧 `select(order_by, limit)` 已把
+> `ORDER BY ... LIMIT` 下推到每个 segment 再归并，深翻页内存与全量物化解耦。
 
 ```
 GET  /api/db                          # uri、模式、表汇总（懒加载统计）
@@ -263,7 +263,7 @@ GET  /api/table/{name}/parts          # 逻辑分区
 GET  /api/table/{name}/segments?include_obsolete=
 POST /api/table/{name}/rows           # body: {where[], order_by, limit, cursor?} → 行 + next_cursor
 POST /api/table/{name}/explain        # body: 同上 → QueryPlan
-POST /api/table/{name}/count          # body: {where?} → 全表行数或筛选计数(流式累计)
+POST /api/table/{name}/count          # body: {where?} → 无 where 走 manifest 求和；带筛选流式累计，超 5,000,000 行扫描预算 422
 POST /api/table/{name}/query          # timeseries 快捷(start/end/date/session/symbols)
 POST /api/table/{name}/latest         # as_of/by/columns/symbols（仅 spec.time 存在时可用）
 GET  /api/table/{name}/chart          # ?col=&symbol=&start=&end=&buckets= → 服务端降采样序列
@@ -273,18 +273,18 @@ POST /api/table/{name}/validate       # {deep}
 
 # ---- 以下仅在 --write 模式注册 ----
 POST /api/table/{name}/write          # {rows:[...]}
-POST /api/table/{name}/import_buffer  # multipart 文件 + batch_size
 POST /api/table/{name}/delete         # {where} （where 必填）
 POST /api/table/{name}/truncate       # {}（body 需 confirm:name）
 POST /api/table/{name}/create_index   # {column}
 POST /api/table/{name}/compact        # {partition?, target_rows?}
 POST /api/table/{name}/cleanup_obsolete # {dry_run, partition?}
-POST /api/table/{name}/repartition    # {target_uri, partition_str}（无服务端 dry-run，前端确认弹窗替代）
+POST /api/table/{name}/repartition    # {target_uri, partition_str}（无服务端 dry-run；前端手输表名确认后直接写入）
 ```
 
 约定：
 
 - 错误统一 `{detail: str, hint?: str}`；写操作响应附 iosql 原生结果对象（WriteResult/CleanupResult 等 `to_dict()`）。
+- 写请求体模型 `extra="forbid"`：未知字段（如已移除的 `dry_run`）一律 422，不会被静默吞掉。
 - **能力门控**：`spec().time` 存在的表才启用 Query Tab 的 start/end/date/session/latest/asof 区块与 Charts 的 candlestick；普通表只保留 where 构造器查询。前端从 `/api/tables` 摘要读取能力位。
 - 后端取表引用必须用裸 `db.table(name)`（禁止重传契约参数，避免 TableSpecConflict）。
 - Database 实例为进程单例（uvicorn workers=1），FastAPI shutdown 时 `db.close()`。

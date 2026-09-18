@@ -1,23 +1,44 @@
+import math
 from typing import Any, Dict, Union
-from .base import Partition
+from .base import Partition, normalize_part_value
 from ..exception import PartitionSpecError
 
 
 def parse_interval_ms(value: Any) -> int:
     """把分区周期统一解析为毫秒，支持别名与任意 `Nunit` 形式。
 
+    接受 int、整数值 float 与纯数字字符串；拒绝 bool/非整数 float/非正值。
+    month/year 为固定近似：1month = 30day，1year = 365day，与
+    `_format_duration_every` 的反推口径一致，保证 format→parse 往返稳定。
+
     与 `PartitionSpec`/`timeseries(partition_every=...)` 的解析口径一致，
     保证 `Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')`
     行为等价（PLAN-054 N2 统一间隔词汇表）。
     """
+    if isinstance(value, bool):
+        raise PartitionSpecError(
+            f"partition duration must be a positive integer, got bool `{value}`"
+        )
     if isinstance(value, int):
         if value <= 0:
             raise PartitionSpecError("partition duration must be positive")
         return value
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer() or value <= 0:
+            raise PartitionSpecError(
+                "partition duration must be an integer number of milliseconds, "
+                f"got `{value}`"
+            )
+        return int(value)
 
     text = str(value).strip().lower()
     if text in DurationPartition.INTERVAL_ALIASES:
         return DurationPartition.INTERVAL_ALIASES[text]
+    if text.isdigit():
+        count = int(text)
+        if count <= 0:
+            raise PartitionSpecError("partition duration must be positive")
+        return count
 
     units = [
         ("milliseconds", 1),
@@ -45,6 +66,11 @@ def parse_interval_ms(value: Any) -> int:
         ("weeks", 604_800_000),
         ("week", 604_800_000),
         ("w", 604_800_000),
+        # 月/年按固定近似换算（30d/365d），与 _format_duration_every 的分母一致
+        ("months", 2_592_000_000),
+        ("month", 2_592_000_000),
+        ("years", 31_536_000_000),
+        ("year", 31_536_000_000),
     ]
     for suffix, scale in sorted(units, key=lambda item: len(item[0]), reverse=True):
         if text.endswith(suffix):
@@ -136,7 +162,9 @@ class DurationPartition(Partition):
         Returns:
             Integer partition key aligned to interval boundary
         """
-        ts = row[self.TS_COL]
+        ts = normalize_part_value(
+            row[self.TS_COL], f"duration partition field `{self.TS_COL}`"
+        )
         return (ts // self.interval_ms) * self.interval_ms
     
     def get_range(self, key: int) -> tuple[int, int]:  # type: ignore[override]
@@ -178,7 +206,17 @@ class DurationPartition(Partition):
             
         Returns:
             DurationPartition instance
+
+        Raises:
+            PartitionSpecError: manifest 缺少必要字段或 interval_ms 非法
         """
+        missing = [key for key in ('interval_ms', 'ts_col') if meta.get(key) is None]
+        if missing:
+            raise PartitionSpecError(
+                f"duration partition meta 缺少字段 {missing} (meta={meta!r})；"
+                "修复: 更新 manifest 中的 partition 元数据，"
+                "或删除 partition 后按原契约重建该表"
+            )
         return cls(
             interval_ms=meta['interval_ms'],
             ts_col=meta['ts_col'],

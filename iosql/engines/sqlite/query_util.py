@@ -1,7 +1,13 @@
+import re
 from dataclasses import dataclass
 from typing import Any, List, Sequence
 
 from ...exception import BadArgument
+
+
+# 纯列名白名单：字符串 fields 只允许列名列表，表达式一律拒绝，
+# 防止把 SQL 语法原样拼进 SELECT（old S-M5 / P1-1）
+_SQL_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_$]*$')
 
 
 def _quote_sql_identifier(name):
@@ -51,6 +57,26 @@ def _select_identifier_field_sql(field):
     return _quote_sql_identifier(text)
 
 
+def _select_string_field_sql(item, original):
+    """字符串 fields 的单个片段：只接受列名（可带双引号），统一加引号。"""
+    text = item.strip()
+    if not text:
+        raise BadArgument(f'select fields `{original}` 含空列名')
+    if text == '*':
+        return text
+    if len(text) >= 2 and text[0] == '"' and text[-1] == '"':
+        inner = text[1:-1].replace('""', '"').strip()
+        if not inner:
+            raise BadArgument(f'select fields `{original}` 含空列名')
+        return _quote_sql_identifier(inner)
+    if not _SQL_IDENTIFIER_RE.match(text):
+        raise BadArgument(
+            f'select fields `{original}` 不是纯列名列表（不允许 SQL 语法）；'
+            '修复: 用逗号分隔的列名，表达式/聚合请改用 query()/explain_select()'
+        )
+    return _quote_sql_identifier(text)
+
+
 def build_select_fields_sql(fields):
     if fields is None:
         return '*'
@@ -60,7 +86,16 @@ def build_select_fields_sql(fields):
         text = fields.strip(' ').strip(',')
         if not text:
             raise BadArgument('select fields must not be empty')
-        return text
+        items = text.split(',')
+        if len(items) == 1 and items[0].strip() == '*':
+            return '*'
+        if any(item.strip() == '*' for item in items):
+            raise BadArgument(
+                f'select fields `{fields}` 中通配符 `*` 必须单独使用'
+            )
+        return ','.join(
+            _select_string_field_sql(item, fields) for item in items
+        )
     raise BadArgument('BadFieldType')
 
 
@@ -130,38 +165,71 @@ def build_or_cases_subquery(or_cases: Sequence[Sequence], column_types):
     sqls = []
     params = []
     for cases in or_cases:
+        if not cases:
+            # 空 AND 组恒真；OR 中只要有一组恒真，整体恒真。
+            # 与 select 路径“空条件=全集”保持一致，禁止静默丢弃该组
+            return SqlQuery('', [])
         item = build_and_cases_subquery(cases, column_types)
-        if item.sql:
-            sqls.append(f'({item.sql})')
-            params.extend(item.params)
+        sqls.append(f'({item.sql})')
+        params.extend(item.params)
     if not sqls:
         return SqlQuery('', [])
     return SqlQuery(' or '.join(sqls), params)
 
 
-def build_select_cases_query(part_table_name, fields, cases, column_types):
-    field_str = build_select_fields_sql(fields)
-    sql = f'select {field_str} from {part_table_name} '
+def _build_select_with_where(part_table_name, field_sql, where,
+                             order_by_sql=None, limit=None):
+    sql = f'select {field_sql} from {part_table_name} '
+    if where.sql:
+        sql += f' where {where.sql}'
+    if order_by_sql:
+        sql += f' order by {order_by_sql}'
+    params = list(where.params)
+    if limit is not None:
+        sql += ' limit ?'
+        params.append(int(limit))
+    return SqlQuery(sql + ';', params)
+
+
+def build_select_cases_query(part_table_name, fields, cases, column_types,
+                             order_by_sql=None, limit=None):
     where = build_and_cases_subquery(cases, column_types)
-    if where.sql:
-        sql += f' where {where.sql}'
-    return SqlQuery(sql + ';', where.params)
+    return _build_select_with_where(
+        part_table_name,
+        build_select_fields_sql(fields),
+        where,
+        order_by_sql=order_by_sql,
+        limit=limit,
+    )
 
 
-def build_select_or_cases_query(part_table_name, fields, or_cases, column_types):
-    field_str = build_select_fields_sql(fields)
-    sql = f'select {field_str} from {part_table_name} '
+def build_select_or_cases_query(part_table_name, fields, or_cases, column_types,
+                                order_by_sql=None, limit=None):
     where = build_or_cases_subquery(or_cases, column_types)
-    if where.sql:
-        sql += f' where {where.sql}'
-    return SqlQuery(sql + ';', where.params)
+    return _build_select_with_where(
+        part_table_name,
+        build_select_fields_sql(fields),
+        where,
+        order_by_sql=order_by_sql,
+        limit=limit,
+    )
 
 
-def build_select_cases_sql(part_table_name, fields, cases, column_types):
-    query = build_select_cases_query(part_table_name, fields, cases, column_types)
-    if query.params:
-        raise BadArgument('build_select_cases_sql cannot inline parameterized values')
-    return query.sql
+def build_select_count_query(part_table_name, cases, column_types):
+    """内部计数查询：字段为固定的 COUNT(*)，不经过用户 fields 白名单。"""
+    where = build_and_cases_subquery(cases, column_types)
+    return _build_select_with_where(part_table_name, 'COUNT(*)', where)
+
+
+def build_select_exists_query(part_table_name, cases, column_types):
+    """内部存在性查询：字段为固定字面量 1，限制 1 行。"""
+    where = build_and_cases_subquery(cases, column_types)
+    return _build_select_with_where(
+        part_table_name,
+        '1',
+        where,
+        limit=1,
+    )
 
 
 def build_delete_query(part_table_name, cases, column_types):
@@ -171,10 +239,3 @@ def build_delete_query(part_table_name, cases, column_types):
     if where.sql:
         sql += f' where {where.sql}'
     return SqlQuery(sql + ';', where.params)
-
-
-def build_delete_sql(part_table_name, cases, column_types):
-    query = build_delete_query(part_table_name, cases, column_types)
-    if query.params:
-        raise BadArgument('build_delete_sql cannot inline parameterized values')
-    return query.sql

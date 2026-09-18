@@ -292,6 +292,8 @@ table.data-table { border-collapse: separate; border-spacing: 0; width: 100%; fo
 .data-table th.sortable { cursor: pointer; }
 .data-table th.sortable:hover { color: var(--acc); }
 .data-table th.sorted { color: var(--acc); }
+/* 排序列含 NULL 被服务端拒绝（keyset 分页不可用）时的禁用态 */
+.data-table th.sort-bad { cursor: not-allowed; color: var(--err, #ff6b6b); text-decoration: line-through; }
 .data-table td {
   padding: 5px 10px; border-bottom: 1px solid rgba(35, 43, 59, .55);
   font-family: var(--font-mono); font-size: 12px;

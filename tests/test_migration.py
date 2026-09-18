@@ -223,26 +223,55 @@ class FakeConnection:
         self.closed = False
         self.autocommit = False
         self.cursor_obj = FakeCursor()
+        self.commit_count = 0
+        self.rollback_count = 0
 
     def cursor(self, name=None, withhold=False, **kwargs):
         return self.cursor_obj
 
+    def commit(self):
+        self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
+
     def close(self):
         self.closed = True
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, exc_tb):
+        self.close()
+        return False
+
 
 class FakePagingCursor(FakeCursor):
-    def __init__(self, rows, columns):
+    # 目录/元数据查询关键字：这些查询返回空结果，不走数据分页模拟
+    _CATALOG_MARKERS = (
+        'pg_class',
+        'pg_inherits',
+        'information_schema',
+        'current_schema',
+        'pg_partitioned_table',
+    )
+
+    def __init__(self, rows, columns, catalog_names=()):
         super().__init__()
         self._rows = list(rows)
+        self.catalog_names = list(catalog_names)
         self.description = [(column,) for column in columns]
 
     def execute(self, query, params=None):
         super().execute(query, params)
-        text = str(query).lower()
+        text = str(query).strip().lower()
         if text.startswith('select count(*)'):
             self.fetchone_result = (len(self._rows),)
             self.results = []
+            return
+        if any(marker in text for marker in self._CATALOG_MARKERS):
+            self.results = [(name,) for name in self.catalog_names]
+            self.fetchone_result = None
             return
         if text.startswith('select'):
             limit = len(self._rows)
@@ -260,9 +289,9 @@ class FakePagingCursor(FakeCursor):
 
 
 class FakePagingConnection(FakeConnection):
-    def __init__(self, rows, columns):
+    def __init__(self, rows, columns, catalog_names=()):
         super().__init__()
-        self.cursor_obj = FakePagingCursor(rows, columns)
+        self.cursor_obj = FakePagingCursor(rows, columns, catalog_names)
 
 
 class FakeContextCursor(FakeCursor):
@@ -343,7 +372,6 @@ def test_postgresql_select_iter_batches_and_count_are_parameterized(monkeypatch)
         ("AAPL", 1000, 1.0),
         ("MSFT", 2000, 2.0),
     ]
-    fake_conn.cursor_obj.fetchone_result = (2,)
     monkeypatch.setattr(
         pg_table_module.psycopg2,
         "connect",
@@ -358,6 +386,8 @@ def test_postgresql_select_iter_batches_and_count_are_parameterized(monkeypatch)
     )
     db = Database("postgresql://user:pass@localhost:5432/market")
     table = db.table("ticks", spec=spec)
+    # 表创建完成后才注入 count 的 fetchone 结果，避免 relation/drift 探测误读
+    fake_conn.cursor_obj.fetchone_result = (2,)
 
     rows = table.select(
         ["symbol", "ts", "price"],
@@ -398,7 +428,9 @@ def test_postgresql_database_migrate_to_sqlite_batches_rows(tmp_path, monkeypatc
         ("MSFT", 1735689601000, 420.3),
         ("AAPL", 1735776000000, 189.1),
     ]
-    fake_conn = FakePagingConnection(rows, ["symbol", "ts", "price"])
+    fake_conn = FakePagingConnection(
+        rows, ["symbol", "ts", "price"], catalog_names=["pg_ticks"]
+    )
     monkeypatch.setattr(
         pg_table_module.psycopg2,
         "connect",

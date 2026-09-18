@@ -359,6 +359,7 @@ def test_cli_import_streams_jsonl_csv_and_keeps_json_compat(tmp_path, monkeypatc
     assert summary == {
         "rows_seen": 3,
         "rows_written": 3,
+        "batches_committed": 2,
         "mode": "append",
         "batch_size": 2,
     }
@@ -944,7 +945,7 @@ def test_cli_doctor_recommends_partition_expr_for_range(tmp_path):
     db.close()
 
     result = _invoke("doctor", "-s", str(db_path), "-t", "items")
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 2, result.output
     assert "partition: range(id,width=1)" in result.output
     assert "suggestions:" in result.output
     assert "--partition 'range(id,width=500000)' --replace-source --yes" in result.output
@@ -993,7 +994,7 @@ def test_cli_doctor_prefers_time_partition_for_range_time_table(tmp_path):
 
     result = _invoke("doctor", "-s", str(db_path), "-t", "daily_bars")
 
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 2, result.output
     assert "partition: range(partition_key,width=1)" in result.output
     assert "suggestions:" in result.output
     assert "1. 推荐: 按时间列 date 使用 5day" in result.output
@@ -1049,7 +1050,7 @@ def test_cli_doctor_duration_time_range_table_uses_day_baseline(tmp_path):
 
     result = _invoke("doctor", "-s", str(db_path), "-t", "ticks")
 
-    assert result.exit_code == 1, result.output
+    assert result.exit_code == 2, result.output
     assert "1. 推荐: 按时间列 ts 使用 5day" in result.output
     assert "--partition 'duration(ts,every=5day)'" in result.output
     assert "duration(ts,every=5ms)" not in result.output

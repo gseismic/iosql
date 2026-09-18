@@ -63,7 +63,8 @@ iosql rename-table -s db/market.iosql -t ticks --new-table ticks_2026
 ```
 
 覆盖已有目标需要显式确认：Python 传 `overwrite=True`；CLI 传
-`--overwrite --yes`。
+`--overwrite --yes`。`Database.rename` 会校验源/目标身份并拒绝根目录、家目录、
+符号链接目标与互相包含的路径，覆盖失败可回滚。
 
 ## 毫秒时序表：原始 Table 版
 
@@ -319,6 +320,7 @@ latest = bars.latest(
 - `mode="ignore"`：同主键已有行时跳过。
 - `mode="upsert"`：同主键覆盖旧行，当前不支持 `Segment.rows` 表。
 - `mode="replace"`：显式 replace，同主键覆盖旧行，当前不支持 `Segment.rows` 表。
+- 每行必须包含完整主键字段；缺失主键列会抛 `BadArgument`，不会退回 SQLite rowid 自增。
 
 ```python
 result = table.write(data)
@@ -348,13 +350,20 @@ table.upsert_all([
 ## delete 和 truncate
 
 ```python
-# 条件删除
+# 条件删除（返回删除行数）
 deleted = ticks.delete(where={"field": "symbol", "op": "==", "value": "DELISTED"})
 print(f"删除了 {deleted} 行")
+
+# 显式清空全表（Python 专用；delete(None) 已废弃并转发到这里）
+ticks.delete_all()
 
 # 清空表（需显式确认）
 ticks.truncate(confirm=True)
 ```
+
+`delete` 的 `where` 必须是合法条件：`{}`/`0`/`False` 等非法值抛 `BadArgument`
+（PG 侧连 `[]`/`0`/`False` 都拒绝，防止误判为全表删除）。全表清空请显式用
+`delete_all()` 或 `truncate(confirm=True)`。
 
 ## create_index
 
@@ -429,7 +438,7 @@ iosql export \
   --batch-size 50000
 ```
 
-带全局 `order_by` 的跨 segment 查询为了保证排序正确性，仍需要 Python 层合并排序后再按批输出。
+带全局 `order_by` 的跨 segment 查询为了保证排序正确性，仍需要 Python 层合并排序后再按批输出；`select()` 在 `order_by` 与 `limit` 同时给出时会把 `ORDER BY ... LIMIT` 下推到每个 segment 再归并（结果不变、内存有界）。`select()` / `iter_select*()` 不接受 `symbols/start/end/date/session` 等业务参数（抛 `BadArgument`），业务过滤请用 `query()` / `explain_select()`。
 
 CLI 导入会批处理读取 JSONL/CSV 并写入既有契约表：
 
@@ -686,6 +695,15 @@ PostgreSQL 模式当前覆盖契约建表、批量写入、基础 `select()` /
 优化仍以 SQLite 引擎更完整。`Database.table_names()` 返回逻辑表，不暴露 native
 partition 子表。
 
+PostgreSQL 与 SQLite 的行为差异：
+
+- `delete(where)` 返回删除行数；`where=None` 告警并转发 `delete_all()`，falsy 非 None 抛 `BadArgument`，不会静默全表删除。
+- 列类型只接受封闭白名单（`blob→BYTEA`、`datetime→TIMESTAMP`）；未知类型抛 `BadArgument`。已有表缺契约列或未分区但声明分区时抛 `SchemaConflict`。
+- 字符串 `fields` 只接受 `*` 或列名列表；含 SQL 语法抛 `BadArgument`；`select()` / `iter_select*()` 拒绝未知 kwargs。
+- 批量写入按整批行列并集补 `NULL`，并按参数上限拆页；`commit=False` 保持事务，失败整体回滚。
+- `order_by` 的 NULL 排序与 SQLite 一致（ASC → NULLS FIRST / DESC → NULLS LAST）。
+- `upsert_all(..., where=...)` 的 `where` 为仅关键字参数且已废弃（忽略并告警）。
+
 `duration(...)`、`range(...)` 和常见 `calendar(...)` 都可迁移到 PostgreSQL
 native range partition。calendar 目标列支持 `text` / `date` / `timestamp`；
 text 日期建议统一使用 ISO 日期（如 `2026-01-05`）或 compact 日期（如
@@ -714,11 +732,14 @@ db.close()
 
 - 需要动态建表时传 `ensure_table=True`。
 - 需要动态加列时传 `ensure_column=True`。
-- 批量写入优先 `insert_all()`。
+- 批量写入优先 `insert_all()`；行中缺列会省略该列，由 SQLite 求值列默认值（含 `CURRENT_TIMESTAMP` 等表达式）。
+- `insert()`/`executemany()` 传 `commit=False` 会被拒绝；`auto_commit=False` 时写入必须放在 `with db.transaction():` 中。
+- `Database(":memory:")` 不被连接池支持，内存库请直接用 `sqlite3.connect(":memory:")`。
 - 多线程或长期进程关注 `get_connection_pool_status()`、
   `get_process_connection_budget_status()`、`is_connection_pool_healthy()` 和
   `close()`。
 - 事务用 `with db.transaction():` 上下文管理器。
+- 通过外部连接执行 DDL 后，调用 `table.invalidate_cache()` 让列/默认值/主键缓存失效。
 
 ## 测试建议
 

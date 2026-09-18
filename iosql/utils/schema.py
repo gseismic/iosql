@@ -115,7 +115,8 @@ def parse_db_schema(uri: str) -> Tuple[str, Dict[str, Union[str, int, bool, None
         options.update({'host': host, 'port': port, 'db': int(db)})
         
     elif schema in ('sqlite', 'sqlite3'):
-        if detail == ':memory':
+        # 兼容 sqlite3://:memory:、sqlite3:///:memory:（标准形式）与 sqlite3://:memory
+        if detail.lstrip('/') in (':memory', ':memory:'):
             options['memory'] = True
         else:
             options['memory'] = False

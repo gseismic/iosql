@@ -82,10 +82,10 @@
       class: 'btn primary',
       onclick: function () {
         busy(btn, true);
-        IU.api(base + '/layout_report').then(function (report) {
+        IU.api(base + '/layout_report').then(function (resp) {
           busy(btn, false);
           box.classList.add('done');
-          renderReport(box, report);
+          renderReport(box, IU.unwrap(resp, 'report'));
         }).catch(function () {
           busy(btn, false);
           IU.clear(box);
@@ -142,10 +142,11 @@
           IU.api(base + '/compact', { method: 'POST', body: body }).then(function (resp) {
             busy(btn, false);
             IU.clear(box);
+            var r = IU.unwrap(resp, 'result') || {};
             box.append(pills([
-              { k: 'rows_read', v: IU.pick(resp || {}, 'rows_read', 'rowsSeen') },
-              { k: 'rows_written', v: IU.pick(resp || {}, 'rows_written', 'rows_written') },
-              { k: 'new_segments', v: IU.pick(resp || {}, 'new_segments', 'new_segments') }
+              { k: 'rows_read', v: IU.pick(r, 'rows_read', 'rowsSeen') },
+              { k: 'rows_written', v: IU.pick(r, 'rows_written', 'rows_written') },
+              { k: 'new_segments', v: IU.pick(r, 'new_segments', 'new_segments') }
             ]), rawDetails(resp));
             IU.toast('compact 完成', 'ok');
           }).catch(function () { busy(btn, false); });
@@ -173,10 +174,11 @@
         IU.api(base + '/validate', { method: 'POST', body: { deep: deepChk.checked } }).then(function (resp) {
           busy(btn, false);
           IU.clear(box);
-          var ok = !!(IU.pick(resp || {}, 'ok', 'valid', 'passed'));
+          var v = IU.unwrap(resp, 'validation') || {};
+          var ok = !!(IU.pick(v, 'ok', 'valid', 'passed'));
           box.append(
             h('div', null, ok ? IU.badge('校验通过 OK', 'ok') : IU.badge('校验失败 FAILED', 'err')),
-            buildErrors(resp));
+            buildErrors(v));
         }).catch(function () { busy(btn, false); });
       }
     }, '执行校验');
@@ -221,8 +223,8 @@
         busy(previewBtn, true);
         IU.api(base + '/cleanup_obsolete', { method: 'POST', body: cleanupBody(true) }).then(function (resp) {
           busy(previewBtn, false);
-          preview = resp;
-          renderPreview(resp);
+          preview = IU.unwrap(resp, 'result') || {};
+          renderPreview(preview);
         }).catch(function () { busy(previewBtn, false); });
       }
     }, '① 预览可回收空间');
@@ -269,9 +271,10 @@
           busy(deleteBtn, false);
           preview = null;
           IU.clear(box);
+          var r = IU.unwrap(resp, 'result') || {};
           box.append(pills([
-            { k: 'files_deleted', v: IU.pick(resp || {}, 'files_deleted', 'deleted_files') },
-            { k: 'bytes_deleted', v: fmtDeletedBytes(resp) }
+            { k: 'files_deleted', v: IU.pick(r, 'files_deleted', 'deleted_files') },
+            { k: 'bytes_deleted', v: fmtDeletedBytes(r) }
           ]), rawDetails(resp));
           IU.toast('obsolete 清理完成', 'ok');
         }).catch(function () { busy(deleteBtn, false); });
@@ -303,11 +306,10 @@
       autocomplete: 'off', spellcheck: 'false', style: { flex: '1 1 260px' }
     });
 
-    function bodyOf(dryRun) {
+    function bodyOf() {
       return {
         target_uri: targetUriIn.value.trim(),
-        partition_str: partitionStrIn.value.trim(),
-        dry_run: dryRun
+        partition_str: partitionStrIn.value.trim()
       };
     }
 
@@ -317,56 +319,46 @@
       return true;
     }
 
-    var dryBtn = h('button', {
-      class: 'btn',
-      onclick: function () {
-        if (!validInputs()) return;
-        busy(dryBtn, true);
-        IU.api(base + '/repartition', { method: 'POST', body: bodyOf(true) }).then(function (resp) {
-          busy(dryBtn, false);
-          renderPreview(resp);
-        }).catch(function () { busy(dryBtn, false); });
-      }
-    }, 'Dry-run 预览');
-
     var runBtn = h('button', {
       class: 'btn danger',
       onclick: function () {
         if (!validInputs()) return;
         IU.confirmModal({
-          title: '执行重分区？',
-          message: '将在新库「' + targetUriIn.value.trim() + '」按「' + partitionStrIn.value.trim() + '」创建新布局。',
-          note: '写入新库，源库不变。源表数据不会被修改或删除。',
-          confirmText: '执行重分区',
+          title: '执行重分区（写入新库）？',
+          message: '将在新库「' + targetUriIn.value.trim() + '」按「' + partitionStrIn.value.trim() + '」创建新布局并复制全部行。',
+          note: '服务端无预览/ dry-run：确认后立即写入新库。源库不变，源表数据不会被修改或删除。',
+          confirmText: '执行重分区（写入新库）',
           danger: true,
           typeName: ctx.table
         }).then(function (ok) {
           if (!ok) return;
           busy(runBtn, true);
-          IU.api(base + '/repartition', { method: 'POST', body: bodyOf(false) }).then(function (resp) {
+          IU.api(base + '/repartition', { method: 'POST', body: bodyOf() }).then(function (resp) {
             busy(runBtn, false);
-            renderPreview(resp);
+            renderResult(resp);
             IU.toast('重分区完成', 'ok');
           }).catch(function () { busy(runBtn, false); });
         });
       }
-    }, '执行重分区…');
+    }, '执行重分区（写入新库）');
 
-    function renderPreview(resp) {
+    function renderResult(resp) {
       IU.clear(box);
+      var r = IU.unwrap(resp, 'result') || {};
       box.append(pills([
-        { k: 'rows_copied', v: IU.pick(resp || {}, 'rows_copied', 'rowsCopied') },
-        { k: 'partitions_created', v: IU.pick(resp || {}, 'partitions_created', 'partitionsCreated') },
-        { k: 'batches', v: IU.pick(resp || {}, 'batches') }
+        { k: 'rows_copied', v: IU.pick(r, 'rows_copied', 'rowsCopied') },
+        { k: 'partitions_created', v: IU.pick(r, 'partitions_created', 'partitionsCreated') },
+        { k: 'target_uri', v: IU.pick(r, 'target_uri', 'targetUri') }
       ]), rawDetails(resp));
     }
 
     return stepCard(5, '重分区 · repartition',
-      '把表按新 partition 策略写入目标新库；先 Dry-run 预览行数与分区数。',
+      '把表按新 partition 策略写入目标新库并复制全部行（源库不变）。'
+      + '服务端没有 dry-run 预览，需手输表名确认后直接写入；本操作不可预览。',
       h('div', { class: 'inline-form' },
         h('label', { style: { flex: '1 1 320px' } }, 'target_uri', targetUriIn),
         h('label', { style: { flex: '1 1 260px' } }, 'partition_str', partitionStrIn),
-        dryBtn, runBtn),
+        runBtn),
       box);
   }
 

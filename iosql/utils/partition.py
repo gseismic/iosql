@@ -1,3 +1,10 @@
+"""遗留的 ClickHouse 风格分区工具（toYYYY*/TS*/KTS* 表达式）。
+
+DEPRECATED：当前核心分区实现是 `iosql.partition`（Calendar/Duration/Range），
+本模块只被 `tests/utils/test_utils.py` 引用，生产代码不再调用。
+保留仅为兼容旧调用方；新代码请勿依赖，后续版本可能移除。
+"""
+
 from collections import defaultdict
 from datetime import datetime
 import arrow
