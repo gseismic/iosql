@@ -52,7 +52,7 @@
 | --- | --- | --- |
 | N2 统一间隔词汇表 | ✅ 已实施 | `iosql/partition/duration.py` 新增模块函数 `parse_interval_ms()`（通用解析：别名 + 任意 `Nunit`）；`DurationPartition.__init__` 改用它；`iosql/spec.py` 的 `_duration_to_ms` 改为委托 `parse_interval_ms`（删除重复实现，spec.py 净减约 50 行）。效果：`Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')` 行为一致。注意 `parse_interval_ms` 从 `iosql.partition.duration` 导入，spec.py 已加对应 import（无循环导入）。 |
 | N9 修 Case.__repr__ | ✅ 已实施 | `iosql/core/query/case.py` `__repr__` 补右括号，字段加 `!r` 引号：`Case(field='sym', op='==', value={...})` |
-| N6 write_buffer 异常 warn | ✅ 已实施 | `iosql/engines/sqlite/table.py` `_BufferedWriter.__exit__`：异常且 buffer 非空时 `warnings.warn(..., RuntimeWarning)` 提示未 flush 行数 |
+| N6 buffered_writer 异常 warn | ✅ 已实施 | `iosql/engines/sqlite/table.py` `_BufferedWriter.__exit__`：异常且 buffer 非空时 `warnings.warn(..., RuntimeWarning)` 提示未 flush 行数 |
 | N4 select 默认 to_dict=True | ✅ 已实施 | `iosql/engines/sqlite/table.py` `select`/`iter_select`/`iter_select_batches` 默认 `to_dict=True`（与 PG 引擎一致）；`to_dict=False` 保留返回 sqlite3.Row 元组。**破坏性变更**：依赖默认 tuple 行的调用方需显式 `to_dict=False`。`select_all`（已废弃）保持 `to_dict=False` 签名不变但内部强制 True。 |
 | N5 PG count_rows 去参 | ✅ 已实施 | `iosql/engines/postgresql/table.py` `count_rows(where=None)` → `count_rows()`（无调用方传 where，内部全部无参调用） |
 | N1 构造器导出收缩 | ✅ 已实施 | `iosql/__init__.py` 不再导出 `DurationPartition`/`CalendarPartition`/`RangePartition`（从 `__all__` 和 import 移除）；仅保留工厂 `Partition.*`。**已同步修改 2 处测试导入**：`tests/engines/sqlite/test_classic_use.py` 改为 `from iosql.partition.duration import DurationPartition`；`tests/engines/sqlite/test_timeseries_contract.py` 改为 `from iosql.partition.calendar import CalendarPartition`。**注意**：若还有别处 `from iosql import DurationPartition` 会报 ImportError，全量回归时留意。 |
@@ -92,7 +92,7 @@
    - N3：`db.table(...)` 不传 symbol_column → `spec().symbol_column is None`；
      `latest(symbols=)` 无 symbol_column 时报 BadArgument。
    - N4：`select()` 默认 dict 行；`select(to_dict=False)` 返回 tuple。
-   - N6：write_buffer 块内异常发 RuntimeWarning。
+   - N6：buffered_writer 块内异常发 RuntimeWarning。
    - N8：`explain_select(symbols=..., start=..., end=...)` 与 `query(...).explain()` scanned_partitions 一致。
 5. **写结果文档**：`docs/dev/PLAN-054-user-api-finalize-OUTCOME.md`（按 AGENTS.md 规范，
    记录逐项变更、验证结果、已知限制）。

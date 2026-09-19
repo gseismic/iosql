@@ -162,7 +162,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | 方法 | 签名 |
 |------|------|
 | `write` | `(rows, mode=None, commit=True, **kwargs) -> WriteResult` |
-| `write_buffer` | `(mode=None, max_rows=10_000, **write_kwargs) -> BufferedWriter` |
+| `buffered_writer` | `(mode=None, max_rows=10_000, **write_kwargs) -> BufferedWriter` |
 | `insert_all` | `(data, pk=None, extra_data=None, partition=None, replace=False, ignore=False, commit=True, **kwargs) -> WriteResult` |
 | `upsert_all` | SQLite `(kv_list, pk, partition=None, commit=True, **kwargs)`；PG `(kv_list, pk, partition=None, commit=True, *, where=None)`（`where` 已废弃并告警，按 pk 全表合并） |
 | `delete` | `(where) -> int`（返回删除行数；`where=None` 告警并转发 `delete_all()`；PG 侧 falsy 非 None 一律抛 `BadArgument`） |
@@ -212,7 +212,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |
 | `drop_index` | `(column)` | 删除所有分区上的列索引 |
 
-**并发语义**：写入路径（`write` / `write_buffer` / 迁移写目标）与 `compact()` 共用 `_compact_lock` 串行化——compact 与写互斥是预期吞吐代价，换取不会向 obsolete segment 复活插入。
+**并发语义**：写入路径（`write` / `buffered_writer` / 迁移写目标）与 `compact()` 共用 `_compact_lock` 串行化——compact 与写互斥是预期吞吐代价，换取不会向 obsolete segment 复活插入。
 
 **PostgreSQL 引擎差异**：
 
@@ -272,7 +272,7 @@ for batch in table.query(start=start, end=end).iter_batches(batch_size=50_000):
 
 ### `BufferedWriter` 对象
 
-由 `table.write_buffer(...)` 返回。上下文管理器。
+由 `table.buffered_writer(...)` 返回。上下文管理器。
 
 | 方法 | 说明 |
 |------|------|

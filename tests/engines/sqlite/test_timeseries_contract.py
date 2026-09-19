@@ -1206,7 +1206,7 @@ def test_repartition_to_closes_target_database_on_write_error(tmp_path, monkeypa
     assert created[0]._tables == {}
 
 
-def test_write_buffer_flushes_by_row_threshold(tmp_path):
+def test_buffered_writer_flushes_by_row_threshold(tmp_path):
     db = Database(_uri(tmp_path))
     ticks = db.timeseries(
         "ticks",
@@ -1219,7 +1219,7 @@ def test_write_buffer_flushes_by_row_threshold(tmp_path):
         max_rows_per_file=20,
     )
 
-    with ticks.write_buffer(max_rows=2) as buffer:
+    with ticks.buffered_writer(max_rows=2) as buffer:
         buffer.append({"symbol": "AAPL", "ts": 1000, "price": 1.0})
         assert ticks.select("*", where=None, to_dict=True) == []
         buffer.append({"symbol": "MSFT", "ts": 2000, "price": 2.0})

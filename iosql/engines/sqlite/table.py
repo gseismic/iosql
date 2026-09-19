@@ -228,7 +228,7 @@ class _BufferedWriter:
             return
         if self._buffer:
             warnings.warn(
-                f"write_buffer 因异常未 flush {len(self._buffer)} 行缓冲数据",
+                f"buffered_writer 因异常未 flush {len(self._buffer)} 行缓冲数据",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -747,7 +747,7 @@ class Table(BaseTable):
             **kwargs,
         )
 
-    def write_buffer(self, mode=None, max_rows=10_000, **write_kwargs):
+    def buffered_writer(self, mode=None, max_rows=10_000, **write_kwargs):
         return _BufferedWriter(self, mode=mode, max_rows=max_rows, **write_kwargs)
 
     def _ensure_segment_conflict_supported(self, spec, mode):

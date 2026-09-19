@@ -7,7 +7,7 @@ partition 与 segment 四种组合的完整测试。
 3. 仅 segment：__all__ 逻辑分区 + 按行数滚动
 4. 两者都有：逻辑分区路由 + 按行数滚动（二级管理）
 5. 跨组合切换：从一种模式变更为另一种
-6. write() / write_buffer() / insert_all() API 一致性
+6. write() / buffered_writer() / insert_all() API 一致性
 7. spec() 持久化与回读
 8. explain_select 二级裁剪
 """
@@ -123,7 +123,7 @@ class TestNeitherPartitionNorSegment:
         ]
         db.close()
 
-    def test_write_buffer(self, tmp_path):
+    def test_buffered_writer(self, tmp_path):
         db = Database(_uri(tmp_path))
         table = db.table(
             "events",
@@ -131,7 +131,7 @@ class TestNeitherPartitionNorSegment:
             columns={"seq": "integer", "kind": "text"},
         )
 
-        with table.write_buffer(max_rows=2) as buf:
+        with table.buffered_writer(max_rows=2) as buf:
             for i in range(5):
                 buf.append({"seq": i, "kind": f"type_{i}"})
 
@@ -471,8 +471,8 @@ class TestSegmentOnly:
         assert "pruned_by_segment_stats" in str(plan["segment_skip_reasons"])
         db.close()
 
-    def test_write_buffer_with_segment(self, tmp_path):
-        """write_buffer 在 segment 模式下自动分批写入。"""
+    def test_buffered_writer_with_segment(self, tmp_path):
+        """buffered_writer 在 segment 模式下自动分批写入。"""
         db = Database(_uri(tmp_path))
         table = db.table(
             "logs",
@@ -482,7 +482,7 @@ class TestSegmentOnly:
             order_key="id",
         )
 
-        with table.write_buffer(max_rows=3) as buf:
+        with table.buffered_writer(max_rows=3) as buf:
             for i in range(12):
                 buf.append({"id": i, "msg": f"log_{i}"})
 
@@ -693,8 +693,8 @@ class TestBothPartitionAndSegment:
         assert len(segs) == 2  # 2 segments（原 segment sealed + 新 active segment）
         db.close()
 
-    def test_write_buffer_with_both(self, tmp_path):
-        """write_buffer 在完整模式下分批写入。"""
+    def test_buffered_writer_with_both(self, tmp_path):
+        """buffered_writer 在完整模式下分批写入。"""
         db = Database(_uri(tmp_path))
         table = db.table(
             "ticks",
@@ -706,7 +706,7 @@ class TestBothPartitionAndSegment:
         )
 
         base = 1735689600000
-        with table.write_buffer(max_rows=4) as buf:
+        with table.buffered_writer(max_rows=4) as buf:
             for i in range(10):
                 buf.append({
                     "id": i,

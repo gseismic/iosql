@@ -29,7 +29,7 @@ def run():
         )
 
         base_ts = 1735689600000
-        with ticks.write_buffer(max_rows=4) as buffer:
+        with ticks.buffered_writer(max_rows=4) as buffer:
             for hour in range(4):
                 for symbol in ["AAPL", "MSFT"]:
                     buffer.append({

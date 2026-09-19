@@ -2,7 +2,7 @@
 
 覆盖：多线程写同一表（不同/相同分区）、并发 evolve 加不同新列、
 读并发于演进、首次分区创建竞争、LRU 驱逐下的并发写入、
-latest 并发读、Case 归一化线程安全、独立 write_buffer。
+latest 并发读、Case 归一化线程安全、独立 buffered_writer。
 """
 
 import threading
@@ -318,7 +318,7 @@ def test_lru_eviction_under_concurrent_writes(tmp_path):
 
 
 # ---------------------------------------------------------------
-# latest/asof 并发只读 + 独立 write_buffer
+# latest/asof 并发只读 + 独立 buffered_writer
 # ---------------------------------------------------------------
 
 def test_latest_concurrent_reads_during_writes(tmp_path):
@@ -361,7 +361,7 @@ def test_latest_concurrent_reads_during_writes(tmp_path):
         _collect_errors(errors)
 
 
-def test_write_buffer_separate_threads(tmp_path):
+def test_buffered_writer_separate_threads(tmp_path):
     with Database(_uri(tmp_path)) as db:
         ticks = db.table(
             "ticks", pk=["symbol", "ts"],
@@ -374,7 +374,7 @@ def test_write_buffer_separate_threads(tmp_path):
         def buffered_writer(worker):
             try:
                 barrier.wait(timeout=15)
-                with ticks.write_buffer(max_rows=5) as buffer:
+                with ticks.buffered_writer(max_rows=5) as buffer:
                     for i in range(12):
                         buffer.append({
                             "symbol": f"W{worker}",

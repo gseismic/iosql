@@ -247,13 +247,13 @@ print("跳过:", plan.segment_skip_reasons)
 db.close()
 ```
 
-## 缓冲批量写入（write_buffer）
+## 缓冲批量写入（buffered_writer）
 
 适合大批量数据摄入，自动分批 flush：
 
 ```python
 base_ts = 1735689600000
-with ticks.write_buffer(max_rows=4) as buf:
+with ticks.buffered_writer(max_rows=4) as buf:
     for hour in range(100):
         for symbol in ["AAPL", "MSFT", "GOOGL"]:
             buf.append({

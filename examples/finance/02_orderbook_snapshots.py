@@ -38,7 +38,7 @@ def run():
         )
 
         base_ts = 1735689600000
-        with book.write_buffer(max_rows=8) as buffer:
+        with book.buffered_writer(max_rows=8) as buffer:
             for tick in range(3):
                 ts = base_ts + tick * 500
                 for side, sign in [("bid", -1), ("ask", 1)]:

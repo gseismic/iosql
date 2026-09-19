@@ -12,7 +12,7 @@
 | `01_quickstart_timeseries.py` | 入门 | 用 `Database.timeseries()` 快捷创建同等时序 helper，保留 `query(start/end)` 便利查询。 |
 | `02_calendar_events_table.py` | 入门 | 用 `Partition.calendar(...)` 保存日期字符串事件表，不需要核心 `time` 字段。 |
 | `02_calendar_events.py` | 入门 | 用 `Database.timeseries()` 快捷创建日期字符串和日历分区事件表。 |
-| `03_buffered_ingest_and_query_plan.py` | 进阶 | 使用 `write_buffer()` 批量写入，并通过 `explain_select()` 查看分区和 segment 裁剪。 |
+| `03_buffered_ingest_and_query_plan.py` | 进阶 | 使用 `buffered_writer()` 批量写入，并通过 `explain_select()` 查看分区和 segment 裁剪。 |
 | `04_layout_report_and_repartition.py` | 高级 | 使用 `layout_report()` 诊断分区行数，并用 `repartition_to()` 生成新布局。 |
 | `05_partition_segments_smoke.py` | 高级 | 验证逻辑分区 + 物理 row segment 的二级查询计划。 |
 | `06_row_segment_late_data.py` | 高级 | 仅按行数滚动 segment，展示晚到数据、`__all__` 逻辑分区和 stats pruning。 |

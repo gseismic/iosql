@@ -1,6 +1,6 @@
 ---
 name: iosql-usage
-description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, write_buffer, query, latest, asof, select, explain_select, segments, validate, cleanup_obsolete, layout_report, repartition_to, rename, rename_table, spec, table_parts, delete, truncate, create_index, drop_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, iosql ui 可视化管理台, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
+description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, buffered_writer, query, latest, asof, select, explain_select, segments, validate, cleanup_obsolete, layout_report, repartition_to, rename, rename_table, spec, table_parts, delete, truncate, create_index, drop_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, iosql ui 可视化管理台, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
 ---
 
 # iosql 使用指南
@@ -98,7 +98,7 @@ for part_key, part_data in partitioned_data.items():
 | | `Database.rename(new_uri_or_name)` / `Database.rename_table(old, new)` / `table.rename(new)` | 重命名 SQLite 目录库或逻辑表；覆盖目标需 `overwrite`，会校验 iosql 身份并拒绝根/家目录/符号链接，失败可回滚 |
 | | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库；`dry_run` 也先校验 mode/tables/target 且无落盘副作用 |
 | **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
-| | `table.write_buffer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
+| | `table.buffered_writer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
 | | `table.insert_all(rows, ...)` | 低层写入（需明确传 pk/partition） |
 | | `table.upsert_all(kv_list, pk)` | 按主键合并写入（merge 字段） |
 | | `table.delete(where)` | 条件删除，返回删除行数；`where=None` 触发 DeprecationWarning 并转发 `delete_all()`（PG 侧 falsy 非 None 一律抛 `BadArgument`） |
@@ -268,7 +268,7 @@ result = table.write([
 ])
 
 # 缓冲批量写入（推荐大量数据时使用）
-with table.write_buffer(max_rows=10_000) as buf:
+with table.buffered_writer(max_rows=10_000) as buf:
     for batch in data_source:
         buf.append(batch)
 # 退出上下文时自动 flush；块内抛异常且 buffer 非空时发 RuntimeWarning
@@ -474,7 +474,7 @@ with Database("sqlite://db/test.iosql") as db:
 - ❌ 假设 `repartition_to()` 会修改原库 → 它只写新库
 - ❌ 拼接原始 SQL 做 where → 用 dict/list/`Case`/文本表达式
 - ❌ 忽略 `WriteResult` 返回值 → 检查 `rows_seen` vs `rows_written`
-- ❌ 吞掉 write_buffer 异常退出时的 RuntimeWarning → 提示的是未 flush 行数，意味着数据未落库
+- ❌ 吞掉 buffered_writer 异常退出时的 RuntimeWarning → 提示的是未 flush 行数，意味着数据未落库
 - ❌ 忽略测试数据隔离 → 每个测试用独立 `tmp_path`
 - ❌ 用 `insert_all()` 替代 `write()` → `insert_all` 是低层 API，不自动使用表契约
 - ❌ mysqlite `insert_all(commit=False)` → 已显式拒绝；需要事务用 `db.transaction()`

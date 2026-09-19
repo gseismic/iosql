@@ -8,7 +8,7 @@
 - **任意可排序字段分区**：`Partition.range(...)`、`Partition.duration(...)`、`Partition.calendar(...)` 都是普通分区策略；duration/calendar 分区未声明 time 时会自动反推。
 - **物理 row segment**：同一 logical partition 可按行数自动拆成多个 SQLite 文件，也可以不配置 logical partition，仅用 `__all__` + row segment 控制文件大小。
 - **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
-- **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`write_buffer()` 缓冲批量写入。
+- **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`buffered_writer()` 缓冲批量写入。
 - **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
 - **时序语法糖**：`Database.timeseries()` 是 `table()` 的薄封装（duration/calendar 分区 + order_key + time），适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 - **可视化管理台**：`iosql ui -s <db>` 启动本地 Web 管理台（默认只读，`--write` 开启维护），支持数据浏览、契约/分区/segment 透视、explain 裁剪可视化与时序快览图表。
@@ -217,7 +217,7 @@ calendar（日期字符串）场景直接传 `partition=Partition.calendar(...)`
 table.write({"symbol": "AAPL", "ts": 1735689600000, "price": 187.4})
 table.write(rows, mode="ignore")   # append / ignore / upsert / replace
 
-with table.write_buffer(max_rows=10_000) as buffer:
+with table.buffered_writer(max_rows=10_000) as buffer:
     buffer.append([
         {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
         {"symbol": "MSFT", "ts": 1735689600000, "price": 420.3},
@@ -283,7 +283,7 @@ book = db.table(
     conflict="append",
 )
 
-with book.write_buffer(max_rows=100_000) as buffer:
+with book.buffered_writer(max_rows=100_000) as buffer:
     for rows in stream_batches:
         buffer.append(rows)
 ```
@@ -822,7 +822,7 @@ database/
 | 能力 | SQLite 引擎 | PostgreSQL 引擎 |
 | --- | --- | --- |
 | 建表/契约 | `db.table()` 完整 | 迁移绑定 `db.table(name, spec=...)` |
-| 写入 | `write` / `write_buffer` / `insert_all` / `upsert_all` | `write` / `insert_all` / `upsert_all` |
+| 写入 | `write` / `buffered_writer` / `insert_all` / `upsert_all` | `write` / `insert_all` / `upsert_all` |
 | 条件查询 | `select` / `iter_select` / `iter_select_batches` | `select` / `iter_select` / `iter_select_batches` |
 | 时序查询 | `query` / `latest` / `asof` | 不支持 |
 | 查询计划 | `explain_select` | 不支持 |
