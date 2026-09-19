@@ -1,506 +1,183 @@
----
-name: iosql-usage
-description: 使用 iosql 构建、审查或调试本地 SQLite 时序数据存储。Use when working with iosql APIs such as Database, table, TableSpec/TableContract, timeseries, Partition (duration/calendar/range), Segment, write, buffered_writer, query, latest, asof, select, explain_select, segments, validate, cleanup_obsolete, layout_report, repartition_to, rename, rename_table, spec, table_parts, delete, truncate, create_index, drop_index, Case, CaseExpression, Where, WriteResult, QueryPlan, LayoutReport, iosql CLI commands, iosql ui 可视化管理台, or iosql.utils.mysqlite; also use when designing financial time-series schemas, partition strategies, ingestion workflows, layout maintenance, CLI maintenance workflows, or tests for this repository.
----
+# Skill: iosql-usage
 
-# iosql 使用指南
+iosql：本地 SQLite（可迁 PostgreSQL）时序数据存储库。版本契约 v0.3.x，接口已定稿冻结（长期稳定），本文件与该契约同步。
 
-> 版本对齐：iosql v0.3.x（PLAN-052~062 后的用户接口定稿版）。参数拼写与默认值已冻结（长期稳定），本文与该契约同步。
-
-## 核心判断
-
-优先使用主 API：
+## 30 秒上手（80% 的场景就这一段）
 
 ```python
 from iosql import Database
-```
 
-只有在明确需要直接操作单个 SQLite 文件、schema-on-write、动态列或连接池细节时，才使用低层模块：
+with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前缀；with 自动 close
+    bars = db.timeseries(
+        "kline_1m",
+        time="ts",
+        pk=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "open": "float", "close": "float"},
+        partition_every="1day",                        # 按天自动分区
+    )
 
-```python
-from iosql.utils.mysqlite import Database
+    result = bars.write([{"symbol": "AAPL", "ts": 1735689600000, "open": 187.0, "close": 187.4}])
+    assert result.rows_written == result.rows_seen     # 检查写入结果
+
+    rows = bars.query(symbols="AAPL", start=1735689600000, end=1735776000000, order_by="ts").to_list()
+    plan = bars.query(symbols="AAPL", start=..., end=...).explain()   # 分区裁剪分析
+    snap = bars.latest(symbols=["AAPL"], as_of=1735776000000, by=["symbol"]).to_list()  # 最新截面
 ```
 
 ## 决策树：选对入口
 
 ```
-需要逻辑分区 + 物理 segment？
-├─ 是 → Database.table(..., pk=..., partition=..., segment=..., order_key=...)
-│      适用于：任意可排序字段分区（时间戳、序号、offset 等）
-│
-需要 timeseries 便利查询（start/end/date/latest/asof）？
-├─ 是 → Database.timeseries(...)
-│      适用于：K线、tick、orderbook、新闻等带时间的金融数据
-│
-只需要纯 row segment 滚动（按行数拆文件）？
-├─ 是 → Database.table(..., segment=Segment.rows(max_rows=N))
-│      适合日志、事件等不需要逻辑分区、只需控制文件大小的场景
-│
-需要直接操作单个 SQLite 文件？
-└─ 是 → iosql.utils.mysqlite.Database
-       适合：独立 SQLite 工具、schema-on-write 快速原型
+带时间戳/日期的数据（K线、tick、orderbook、财报、新闻）
+  → db.timeseries(name, time=..., pk=..., columns=..., partition_every="1day")
+
+任意可排序字段分区（毫秒 ts / 日期字符串 / 序号 offset）
+  → db.table(..., partition="duration(ts,every=1day)")
+     # 日期串用 "calendar(date,every=1day,timezone=Asia/Shanghai)"
+     # 非时间数值用 "range(id,width=100000)" 或 Partition.duration/calendar/range 工厂
+
+只按行数滚文件（日志类，无逻辑分区）
+  → db.table(..., segment=Segment.rows(max_rows=N), order_key=...)
+
+直接操作单个 SQLite 文件（非 iosql 目录库）
+  → iosql.utils.mysqlite.Database   # 低层工具，见 examples/mysqlite/
 ```
 
-## Partition 与 Segment 的关系
+分区推荐统一字符串表达（CLI/诊断/API 复用）；`Partition.duration(...)` 等对象形式等价兼容。
 
-`partition`（逻辑分区）和 `segment`（物理分段）是独立的两级机制，组合使用形成不同存储模式：
+## 参数怎么设：先估算数据量，再定分区
 
-```
-Partition（逻辑分区）           Segment（物理分段）
-按业务键路由到不同目录         在同一逻辑分区内按行数拆分 .sqlite3 文件
-e.g. ts=1735689600000          e.g. max_rows=500_000
-```
+### 第 1 步：估算数据量（动手前必做）
 
-### 四种组合及行为
+- **每个逻辑分区落 10~50 万行**是经验值：太小 → 大量小文件、打开/切换开销大；太大 → 单文件查询慢、裁剪粒度粗。
+- 每日行数先算出来：`标的数 × 每标的每天条数`（K线）或 `采样频率 × 86400/间隔秒`（tick）。
 
-| Partition | Segment | 行为 | 目录结构 |
-|:---------:|:-------:|------|---------|
-| ✅ | ✅ | 按分区键路由，每个分区内按行数自动滚动文件 | `partition_key.sqlite3` / `partition_key-1.sqlite3` |
-| ✅ | ❌ | 按分区键路由，每个分区仅一个文件（无限增长） | `partition_key.sqlite3` |
-| ❌ | ✅ | 全部数据写入 `__all__`，仅按行数滚动文件 | `__all__-0.sqlite3` / `__all__-1.sqlite3` |
-| ❌ | ❌ | 退化为单文件 SQLite | `table_name.sqlite3` |
+### 第 2 步：选分区类型并定粒度
 
-### 查询裁剪
+| 类型 | 分区键 | 粒度参数 | 适用 |
+|------|--------|---------|------|
+| `duration(ts, every=1day)` | 毫秒时间戳 | `every`：1hour / 1day / 1week / 1month | 行情、tick、orderbook |
+| `calendar(date, every=1day, timezone=...)` | 日期字符串 | `every`：1day / 7day / 1month + `timezone` | 交易日、财报、事件 |
+| `range(id, width=100000)` | 任意数值 | `width` = 每分区行数 | 序号、offset、版本号 |
 
-有 `segment` 时执行**二级裁剪**：
+粒度按每日行数定（以 duration 为例）：
 
-1. **一级**：按 `partition` 键跳过不相关的逻辑分区
-2. **二级**：通过 segment `stats`（每列 min/max）和 `session_min/session_max` 跳过不相关的物理文件
+- 每天 10~50 万行 → `every=1day`（日线、分钟线大多数情况）
+- 每天 > 50 万行（orderbook/tick）→ `every=1hour` 或按交易所/venue 加进 pk 前先看是否够裁剪
+- 每天 < 10 万行（低频事件）→ `every=1week` / `1month`，避免几千个小文件；日线历史回灌甚至 `every=1year`（20 年 = 20 个文件，而不是 5000 个）
+- `calendar` 的 `timezone` 决定日期边界，跨时区市场必须显式传
+- `range` 的 `width` 直接就是每分区行数，如 `width=100_000`
 
-`explain_select()` 返回的 `QueryPlan` 同时展示 `scanned_partitions` / `scanned_segments` 和对应的 `skip_reasons`。
+### 第 3 步：segment（单个 SQLite 文件大小）
 
-### 核心代码逻辑
+- `segment=Segment.rows(max_rows=…)` 控制分区内物理文件滚动；不设则单分区单文件无限增长。
+- 从 `max_rows=1_000_000` 开始测；宽表降到 20 万~50 万，窄表可提高。
+- `target_rows`/`min_rows` 是 compact 的目标/合并下限，一般不用动。
+- 高频宽表传 `stats_columns=["ts","sequence"]`，只对裁剪关键列维护 min/max（未统计列仍可查，但计划保守扫描）。
 
-```python
-# do_insert_all 中的关键决策
-part_obj    = partition or self._partition      # 有逻辑分区？
-use_segment = bool(spec and spec.segment)       # 有物理分段？
+### 其他参数
 
-if part_obj is None:
-    logical_part = DEFAULT_LOGICAL_PART if use_segment else None  # "__all__" or None
-else:
-    partitioned_data = {part_obj.get_key(row): [rows...]}         # 按分区键拆散
+- `pk`：唯一标识一行，时序一般 `["symbol", "ts"]`；写入每行必须带齐全部 pk 字段。
+- `columns`：声明类型（text/integer/float/blob），声明优先于推断，避免二次打开时 `SchemaConflict`。
+- `order_key`：segment 内排序键，时序传 `"ts"`（`timeseries()` 自动带）；写入顺序尽量与之一致。
+- `symbol_column`：需要 `symbols=`/`latest(symbols=)` 的普通表必须显式传（`timeseries()` 默认 `"symbol"`）。
+- `session_column`：期货夜盘等按交易日归属时传交易日列名。
+- 写入批次：先测 `50_000` 行/批（HDD 上至少数千行，不要逐条 `write()`）。
 
-for part_key, part_data in partitioned_data.items():
-    if use_segment:
-        _do_insert_segmented(...)   # segment 感知：检查行数、seal、滚动
-    else:
-        _do_insert_part(...)        # 直接写入对应 SQLite 文件
-```
+### 不确定时
 
-## API 速查表
+写入后跑 `table.layout_report()`，看 `report.recommendation`（行数倾斜、文件过多/过大会给建议）；调整分区用 `spec().with_partition(...)` + `repartition_to()` 迁新库。
 
-| 类别 | API | 说明 |
+## 场景导航（频率按真实示例反推）
+
+### 常用（高频）
+
+| 场景 | 最小做法 | 可运行示例 |
+|------|---------|-----------|
+| 建表 + 写 + 时间窗查 | 上面的 30 秒上手 | [examples/01_quickstart_timeseries.py](examples/01_quickstart_timeseries.py) |
+| 日期字符串数据（ISO/交易日） | `db.timeseries(..., partition=Partition.calendar("date", every="1day", timezone="Asia/Shanghai"))`，查询 `query(date="2026-01-06")` | [examples/02_calendar_events.py](examples/02_calendar_events.py) |
+| 大批量缓冲写入（万行级） | `with table.buffered_writer(max_rows=10_000) as buf: buf.append(batch)` | [examples/03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
+| 大表控制文件大小 | `segment=Segment.rows(max_rows=500_000, target_rows=200_000)` | [examples/finance/02_orderbook_snapshots.py](examples/finance/02_orderbook_snapshots.py) |
+| 金融最新截面 | `table.latest(symbols=[...], as_of=..., by=["symbol","timeframe"], columns=[...]).to_list()`；单条用 `.one()` | [examples/finance/01_kline_bars.py](examples/finance/01_kline_bars.py) |
+| 任意条件查询 | `table.select(where=..., order_by=..., limit=..., to_dict=True)`；where 用 dict/list/文本/`Case` | [examples/01_quickstart_table.py](examples/01_quickstart_table.py)、[references/usage-patterns.md](references/usage-patterns.md) #Where 条件构造 |
+| 查询裁剪诊断 | `table.explain_select(where=..., order_by=...)` 或 `query(...).explain()` | [examples/03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
+| 期货/夜盘交易日 session | 建表传 `session_column="trading_date"`，查询 `query(session="2026-01-06")` | [references/usage-patterns.md](references/usage-patterns.md) #交易日session |
+| 打开已有库继续写 | `db.table("name")` 不重新声明契约；`write(mode="ignore")` 跳过重复主键 | [examples/09_existing_database_append.py](examples/09_existing_database_append.py) |
+
+### 进阶（偶尔需要）
+
+| 场景 | 入口 | 可运行示例 |
+|------|------|-----------|
+| 事件/新闻/财报等低频表 | `db.timeseries(time=日期或ts, pk=..., segment=Segment.rows(target_rows=300_000))` | [examples/finance/03_financial_reports.py](examples/finance/03_financial_reports.py)、[04_news_announcements.py](examples/finance/04_news_announcements.py) |
+| 晚到数据 + 纯 row segment | `db.table(..., segment=Segment.rows(max_rows=N), order_key=...)`，晚到数据进新 active segment | [examples/06_row_segment_late_data.py](examples/06_row_segment_late_data.py) |
+| 布局诊断 + 重分区 | `layout_report()` → `spec().with_partition(...)` → `repartition_to(新库URI, spec=)`（只写新库） | [examples/04_layout_report_and_repartition.py](examples/04_layout_report_and_repartition.py) |
+| CLI 重分区 | `iosql repartition -s ... -t ... --partition 'duration(ts,every=1hour)' --target 新库` | [examples/07_partition_string_repartition_cli.py](examples/07_partition_string_repartition_cli.py) |
+| SQLite → PostgreSQL 迁移 | 先 `to_postgresql(..., dry_run=True)` 预览，再 `verify="row-count"` 正式迁移 | [examples/11_sqlite_to_postgresql_migration.py](examples/11_sqlite_to_postgresql_migration.py) |
+| SQLite ⇄ PostgreSQL 双向 | PG 侧重开逻辑表需 `db.table(名字, spec=同一份契约)` | [examples/12_sqlite_postgresql_roundtrip.py](examples/12_sqlite_postgresql_roundtrip.py) |
+| 逻辑分区 + 物理 segment 组合 | partition 与 segment 同时配置，explain 看两级裁剪 | [examples/05_partition_segments_smoke.py](examples/05_partition_segments_smoke.py) |
+| 已有库整体重分区 | 读 `spec()` 构造新 spec → `repartition_to(..., batch_size=50_000)` | [examples/10_existing_database_repartition.py](examples/10_existing_database_repartition.py) |
+
+### 高级（很少用，需要时按链接查）
+
+| 主题 | 链接 |
+|------|------|
+| CLI 全部命令 + 安全规则（doctor/compact/import/export/backup/restore/rename/migrate/index） | [references/cli.md](references/cli.md) |
+| 可视化管理台 `iosql ui` 工作区/安全模型 | [references/ui.md](references/ui.md) |
+| compact / cleanup_obsolete / validate / segments 维护流 | [references/usage-patterns.md](references/usage-patterns.md) #布局和重分区；错误对照 [references/troubleshooting.md](references/troubleshooting.md) #分区维护 |
+| 流式查询 iter_select_batches / iter_batches / 大结果导出 | [references/usage-patterns.md](references/usage-patterns.md) #流式查询和导出 |
+| upsert_all 字段级合并、delete/truncate、create_index/drop_index、rename | [references/usage-patterns.md](references/usage-patterns.md) |
+| where 全部运算符、Case/CaseExpression 组合 | [references/api-reference.md](references/api-reference.md) #Where 条件支持的运算符 |
+| mysqlite 单文件（schema-on-write/事务/加删列/索引/备份） | [examples/mysqlite/](examples/mysqlite/)、[examples/mysqlite-scenarios/](examples/mysqlite-scenarios/) |
+| 写入性能调优（批次/PRAGMA/FD 预算/HDD） | [references/write-performance.md](references/write-performance.md) |
+| 全部 API 签名、结果类型、异常、mysqlite 契约 | [references/api-reference.md](references/api-reference.md) |
+| 本仓库开发守则（接口冻结/PG 引擎差异/测试要求/反模式全表） | [references/design-contract.md](references/design-contract.md) |
+
+## 常用 API 速查
+
+| 类别 | API | 要点 |
 |------|-----|------|
-| **入口** | `Database(uri)` | 创建/打开数据库，`sqlite://` 或 `postgresql://` URI |
-| | `Database.table(name, **opts)` | 创建/获取表（核心入口） |
-| | `Database.timeseries(name, time=..., pk=..., **opts)` | 时序语法糖：table() 的薄封装（废弃参数迁移见下） |
-| | `Database.rename(new_uri_or_name)` / `Database.rename_table(old, new)` / `table.rename(new)` | 重命名 SQLite 目录库或逻辑表；覆盖目标需 `overwrite`，会校验 iosql 身份并拒绝根/家目录/符号链接，失败可回滚 |
-| | `Database.migrate_to(target_uri, tables=None, verify=None, dry_run=False)` / `to_postgresql(target_uri)` | 迁移 SQLite iosql 库到目标库；`dry_run` 也先校验 mode/tables/target 且无落盘副作用 |
-| **写入** | `table.write(rows, mode=None)` | 写入行；默认使用表契约 `conflict`，新表默认 append |
-| | `table.buffered_writer(mode=None, max_rows=...)` | 缓冲批量写入（上下文管理器） |
-| | `table.insert_all(rows, ...)` | 低层写入（需明确传 pk/partition） |
-| | `table.upsert_all(kv_list, pk)` | 按主键合并写入（merge 字段） |
-| | `table.delete(where)` | 条件删除，返回删除行数；`where=None` 触发 DeprecationWarning 并转发 `delete_all()`（PG 侧 falsy 非 None 一律抛 `BadArgument`） |
-| | `table.delete_all()` | 显式清空全表（Python 专用；危险操作优先 `truncate(confirm=True)`） |
-| | `table.truncate(confirm=True)` | 清空表（需显式确认） |
-| **查询** | `table.query(...).to_list()` / `.explain()` | 时序高层查询（timeseries 表；duration/calendar 分区的普通表也可用） |
-| | `table.query(...).iter_batches(batch_size=...)` | 时序查询批量迭代 |
-| | `table.select(fields="*", where=None, order_by, limit, to_dict=True, columns=)` | 底层条件查询（所有表）；fields/where 可省略，columns= 是 fields= 别名；**默认返回 dict 行**（`to_dict=False` 才返回 tuple）；不接受 `symbols/start/end/date/session`（抛 BadArgument，业务过滤用 `query()`/`explain_select()`） |
-| | `table.iter_select(...)` / `iter_select_batches(...)` | 底层流式查询（所有表，默认 to_dict=True）；SQLite 另有 `iter_rows()`（逐行）与 `iter_batches()`（按批） |
-| | `table.select_all(fields, where)` | 已废弃：等价于 select(to_dict=True)，触发 DeprecationWarning，永久保留 |
-| | `table.explain_select(fields, where, order_by, limit, symbols=, start=, end=, date=, session=)` | 查询计划/分区裁剪分析；业务参数与 query() 对齐 |
-| | `table.latest(symbols, as_of, by, columns)` | 最新截面查询；要求契约声明 symbol_column（见反模式） |
-| | `table.asof(...)` | latest 的别名 |
-| **诊断** | `table.spec()` | 获取当前表契约 |
-| | `table.segments(include_obsolete=False)` | 获取物理 segment 清单 |
-| | `table.table_parts()` | 获取逻辑分区列表 |
-| | `table.validate(deep=False, include_obsolete=False)` | 校验 manifest 与物理 segment 文件，并报告孤儿 segment 文件（警告） |
-| | `table.layout_report()` | 分区诊断报告（行数、推荐） |
-| | `table.compact(partition=None, target_rows=None)` | 显式整理 row segment，旧 segment 标记 obsolete；与写入共用锁串行化 |
-| | `table.cleanup_obsolete(partition=None, dry_run=True, validate=True)` | 安全清理 compact 后的 obsolete 文件 |
-| | `table.count_rows()` | 统计当前可见行数（无参，双引擎一致）；SQLite 按物理 segment 执行 `count(*)` |
-| | `table.migrate_to(target_uri, target_table=None, verify=None, dry_run=False)` | 迁移单表到目标库 |
-| | `table.repartition_to(target_uri, spec)` | 按新策略重分区到新库 |
-| **维护** | `table.create_index(column, order, exist_ok=True)` | 为所有分区创建索引 |
-| | `table.drop_index(column)` | 删除所有分区上的列索引 |
-| | `Database.table_names()` | 列出数据库中所有表 |
-| | `db.close()` | 关闭所有连接 |
-
-## CLI 速查表
-
-CLI 入口：
-
-```bash
-iosql --help
-python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
-```
-
-CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径或 `sqlite://...` / `sqlite3://...`。如果 source 输入 `postgresql://...` 等其他 URI，应直接拒绝，不要自动包装成 SQLite 路径。`iosql migrate --target` 例外，目标可传 `postgresql://...`。
-
-| 类别 | 命令 | 说明 |
-|------|------|------|
-| **发现** | `iosql tables -s DB` | 列出逻辑表 |
-| | `iosql ui -s DB [--write] [--host] [--port] [--no-browser]` | 启动本地 Web 管理台（默认只读，详见下节） |
-| | `iosql rename-database -s DB --target NEW_DB` | 重命名 SQLite 目录库；覆盖目标需 `--overwrite --yes`，目标须为 iosql 库且非根/家目录/符号链接，失败可回滚 |
-| | `iosql rename-table -s DB -t OLD --new-table NEW` | 重命名逻辑表；覆盖目标需 `--overwrite --yes` |
-| | `iosql spec -s DB -t TABLE` | 输出表契约 JSON |
-| | `iosql layout -s DB -t TABLE` | 输出 `layout_report()` |
-| | `iosql parts -s DB -t TABLE` | 输出逻辑分区 |
-| | `iosql segments -s DB -t TABLE` | 输出物理 segment |
-| | `iosql validate -s DB -t TABLE --deep` | 深度校验 manifest、SQLite 文件和 stats |
-| **查询** | `iosql explain -s DB -t TABLE --where JSON` | 输出 `explain_select()` 查询计划 |
-| | `iosql query -s DB -t TABLE --where JSON --format jsonl` | 查询小规模结果 |
-| **数据进出** | `iosql import -s DB -t TABLE -f rows.jsonl --mode append --batch-size 50000` | 批处理读取并写入既有契约表 |
-| | `iosql export -s DB -t TABLE -o rows.jsonl --where JSON --batch-size 50000` | 批处理导出查询结果 |
-| **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
-| | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation；`--partition` 会校验分区存在并列可用分区 |
-| | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件；`--partition` 同样校验（含仅存在于 obsolete 的分区） |
-| | `iosql migrate -s DB --target postgresql://... [--dry-run] [--verify row-count]` | 迁移 SQLite iosql 库到 PostgreSQL；拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表 |
-| | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库；`--dry-run` 也校验 interval/timezone 与目标父目录，目标不能等于/嵌套源库 |
-| | `iosql backup -s DB --target BACKUP` | 目录级备份；拒绝与源库互相包含的路径 |
-| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；覆盖目标需 `--replace --yes`，目标必须是真实 iosql 库（表级 `<表>/meta.sqlite3` 且为有效 SQLite 文件），拒绝伪造 meta、根/家目录、符号链接及与备份重叠的路径；替换原子化、失败回滚 |
-| | `iosql index list/check/create/drop ...` | 检查、创建或删除物理分区索引；`index create` 校验列存在，`index check` 未通过退出码 2 |
-
-### CLI 安全规则
-
-- `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。`--dry-run` 也会先解析 interval/timezone 并校验目标父目录，且拒绝目标等于源库/位于源库内部。
-- 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。替换过程原子化：备份用 `os.replace` 改名（近零成本），跨文件系统传 `--backup` 会明确拒绝（EXDEV，源库原封不动），失败自动回滚。
-- `restore --replace --yes` 只允许覆盖真实 iosql 库（表级 `<表>/meta.sqlite3` 且为有效 SQLite 文件）；伪造 meta 的普通目录、根/家目录、符号链接、以及与备份互相包含的路径全部拒绝。替换先把备份复制到临时目录，再原子换入，失败保留原目标。
-- `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表（否则迁移前直接报错）。
-- `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验；`--partition` 拼写错误会报错并列出可用分区（compact 同理）。
-- `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取并支持 UTF-8 BOM，坏 JSONL 行/CSV 字段数不匹配会报行号；中途失败输出 `rows_seen`/`rows_written`/`batches_committed` JSON 汇总，以退出码 1 结束。
-- `query` 适合排查和小规模输出到终端；`export` 使用 `--batch-size` 批处理写文件，适合无全局排序的大结果集导出；`export` 先写临时文件再原子替换输出，失败保留旧文件。JSON 中 bytes 列统一 base64。
-- 复杂 where 优先传 JSON 或 `@file`，例如 `--where '{"field":"symbol","op":"==","value":"AAPL"}'`。
-- 所有命令失败统一输出红色单行错误（不裸 traceback）；退出码：`0` 成功、`1` 业务失败、`2` 校验未通过（validate/index check/doctor）、`130` 用户中断。
-
-## 可视化管理台（iosql ui）
-
-本地 Web 管理台：只读浏览 + 受控维护，无需写代码即可查看表契约、分区布局、物理 segment 和数据样本。依赖属于可选 extra：
-
-```bash
-python -m pip install -e ".[ui]"   # fastapi + uvicorn
-iosql ui -s database/market.iosql           # 默认只读模式, http://127.0.0.1:8686
-iosql ui -s database/market.iosql --write   # 开启维护操作
-```
-
-其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`；绑定非 loopback `--host` 时会打印暴露警告，服务端只信任 `localhost`/`127.0.0.1`/`[::1]` 的 Host 头。Python 侧入口是 `iosql.ui.create_app(source_uri, mode="readonly"|"write")`（惰性导入，未装依赖时抛带安装指引的 ImportError）。启动为**非阻塞渐进加载**（PLAN-060）：首屏只读 manifest 级元数据（毫秒级），行数/分区数/segment 数由前端逐表异步拉取填充，大库（HDD/冷缓存/网络盘上的大量 segment 文件）打开不再被全库统计阻塞。无筛选行数统计走 manifest 求和零 I/O 路径（PLAN-061，2000 万行 8ms）；带筛选计数为流式扫描，超过 5,000,000 行扫描预算返回 422 提示缩小范围。数据行按 keyset 分页按需读取，排序列含 NULL 时返回 422 并禁用该列排序（避免静默漏行）。Browse Data 导出为流式下载，文件名兼容非 ASCII（RFC 5987），CSV 自动转义公式注入前缀，空结果也输出表头。
-
-| 工作区 | 只读 | 可修改 | 说明 |
-|:--|:-:|:-:|---|
-| Overview | ✅ | ✅ | 全库概览：表清单、行数、分区数、segment 数、partition 策略 |
-| Browse Data | ✅ | ✅ | 表头每列过滤行（裸词精确 / `>` 比较 / `a~b` 范围 / 逗号多值，防抖即输即查）+ 条件构造器（AND/OR，与表头条件叠加）+ keyset 翻页 + 列头排序 + 时序表默认最新优先 + 毫秒时间戳可读化（可开关）+ 单元格详情（可一键以此值过滤）+ CSV/JSONL 导出 |
-| Structure | ✅ | ✅ | 表契约 / 逻辑分区 / 物理 segment 三层透视 |
-| Query | ✅ | ✅ | where 查询 + explain 裁剪可视化；时序表支持 start/end/date/session/latest 截面 |
-| Charts | ✅ | ✅ | 时序快览折线图（服务端降采样） |
-| Maintain | ❌ | ✅ | layout_report → compact → validate → cleanup_obsolete 步骤流；重分区 |
-
-安全模型：
-
-- 只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝）。
-- 可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认；重分区没有 dry-run 预览，确认后直接写入新库。
-- 服务端只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`），绑定非 loopback `--host` 时 CLI 打印暴露警告。
-- 定位是本机 localhost 工具，**不要暴露到公网**；排查 UI 问题时优先怀疑模式没开对（只读看不到 Maintain）。
-
-## 工作流
-
-### 1. 明确数据模型
-
-确定时间列、主键、列类型、自然日还是交易日/session、预期单日或单分区数据量。
-
-### 2. 声明表契约
-
-两种入口等价：
-
-**显式版（推荐）**：
-```python
-from iosql import Database, Partition, Segment
-db = Database("sqlite://db/market.iosql")
-ticks = db.table(
-    "ticks",
-    pk=["symbol", "ts"],
-    columns={"symbol": "text", "ts": "integer", "price": "float"},
-    partition="duration(ts,every=1day)",
-    segment=Segment.rows(max_rows=500_000),
-    order_key="ts",
-)
-```
-
-`partition` 推荐使用统一字符串表达，便于 CLI、诊断输出和 Python API 复用：
-
-```python
-"duration(ts,every=1day)"
-"calendar(event_date,every=1day,timezone=Asia/Shanghai)"
-"calendar(date,every=4day,timezone=Asia/Shanghai)"
-"range(id,width=100000)"
-```
-
-时序表优先使用 `duration(...)` 或 `calendar(...)`。`range(...)` 主要用于 id、offset、版本号等非时间数值字段；历史库里的 `range(partition_key,...)` 可以作为兼容迁移方案。对象 API 仍然兼容：`Partition.duration(...)`、`Partition.calendar(...)`、`Partition.range(...)`。
-
-**快捷版（timeseries helper）**：
-```python
-ticks = db.timeseries(
-    "ticks",
-    time="ts",
-    pk=["symbol", "ts"],
-    columns={"symbol": "text", "ts": "integer", "price": "float"},
-    partition_every="1day",
-)
-```
-
-`timeseries()` 是 `table()` 的薄语法糖；calendar 场景传 `partition=Partition.calendar(...)`。废弃参数迁移：`partition_kind='calendar'` / `time_unit='date'` → `partition=Partition.calendar(...)`；`target/min/max_rows_per_file` → `segment=Segment.rows(...)`（触发 DeprecationWarning，行为等价）。
-
-### 3. 选择分区策略
-
-| 分区类型 | API | 适用场景 | 分区键格式 |
-|---------|-----|---------|-----------|
-| duration | `"duration(ts,every=1hour)"` | 毫秒时间戳 | 整数（对齐边界） |
-| calendar | `"calendar(date,every=1day,timezone=Asia/Shanghai)"`、`"calendar(date,every=4day,timezone=Asia/Shanghai)"` | 日期字符串 | `YYYYMMDD` 等 |
-| range | `"range(seq,width=10000)"` | 任意可排序数值 | 整数（对齐边界） |
-
-### 4. 写入
-
-```python
-# 单条/多条写入
-result = table.write([
-    {"symbol": "AAPL", "ts": 1735689600000, "price": 187.4},
-    {"symbol": "MSFT", "ts": 1735689600000, "price": 420.3},
-])
-
-# 缓冲批量写入（推荐大量数据时使用）
-with table.buffered_writer(max_rows=10_000) as buf:
-    for batch in data_source:
-        buf.append(batch)
-# 退出上下文时自动 flush；块内抛异常且 buffer 非空时发 RuntimeWarning
-# 提示未 flush 行数——不要吞掉这个警告，否则会静默丢数据
-
-# 写入模式
-# mode=None：使用表契约 conflict，新表默认 append
-# mode="append"：严格追加，重复主键通常由 SQLite 约束处理
-# mode="ignore"：重复主键跳过
-# mode="upsert"/"replace"：覆盖写；当前不支持 Segment.rows 表
-```
-
-每行必须包含完整主键字段；缺失主键列会立即抛 `BadArgument`，不会退回 SQLite rowid 自增。
-
-大批量写入建议：
-
-- 日线历史回灌从每批 `50_000` 行开始测，按年分区通常优于按日创建大量小文件。
-- orderbook/tick 使用 append-only，建议每批 `50_000` 至 `100_000` 行，并配置 `Segment.rows(max_rows=...)`。
-- 高频宽表可用 `Segment.rows(..., stats_columns=["ts", "sequence"])` 限制 min/max 统计开销；partition/time/order/session 字段会自动保留。
-- iosql 默认 SQLite 写入配置是 `WAL + synchronous=NORMAL`；更强断电保障可传 `Database(..., pragma_dict={"journal_mode": "wal", "synchronous": "full"})`。
-- 主 API 默认 `max_open_partitions=5`、`max_connections_per_file=1`、`max_process_connections=32`，分别限制单表分区缓存、单文件连接池和进程真实连接总数；不要依赖提高 `ulimit -n`，也不要直接修改私有字段。
-- 分区 LRU 使用租约保护并发访问；同一逻辑表仍建议单 writer，多线程读取可按需提高 `max_connections_per_file`，但总数受进程预算约束。
-- 长期进程必须使用上下文管理器或显式 `db.close()`；弱引用清理只负责避免遗弃对象被注册表永久保活。
-- 目标盘必须运行仓库 `benchmarks/benchmark_write.py`，不要用系统盘测试结果推断 ext4 HDD。
-- 批次和磁盘比较使用 `benchmarks/sweep_write.py`，可同时传多个 `--root` 并生成 JSON/Markdown 排名。
-- 多分区 FD 压力测试使用 `benchmarks/stress_open_files.py`，报告系统 FD 限制、进程 FD 峰值和分区连接峰值。
-- 详细选择和命令见 [write-performance.md](references/write-performance.md)。
-
-### 5. 查询
-
-**时序查询（timeseries 表）**：
-```python
-# 时间窗口查询
-rows = ticks.query(start=..., end=..., symbols="AAPL").to_list()
-
-# 查询计划（分区裁剪分析）
-plan = ticks.query(start=..., end=...).explain()
-print(plan.scanned_partitions, plan.skipped_partitions)
-```
-
-**底层条件查询（所有表）**：
-```python
-where = [
-    {"field": "symbol", "op": "in", "value": ["AAPL", "MSFT"]},
-    {"field": "ts", "op": "between", "value": [start, end]},
-]
-# select 默认 to_dict=True（双引擎一致），返回 dict 行；要 tuple 需显式 to_dict=False
-rows = ticks.select(where=where, order_by="ts", limit=100)
-plan = ticks.explain_select(
-    where=where, order_by="ts",
-    symbols=["AAPL"], start=start, end=end,   # 业务参数与 query() 对齐
-)
-
-# 大结果集批量读取
-for batch in ticks.iter_select_batches("*", where=where, batch_size=50_000):
-    process(batch)
-```
-
-**金融截面查询**：
-```python
-# 最新值（每个 symbol 截至 as_of 的最新行）
-latest = ticks.latest(
-    symbols=["AAPL", "MSFT"],
-    as_of=1735776000000,
-    by=["symbol", "timeframe"],
-    columns=["symbol", "timeframe", "ts", "price"],
-).to_list()
-
-# 单条获取
-row = ticks.latest(symbols="AAPL", as_of=ts).one()
-```
-
-### 6. 交易日 / Session
-
-期货夜盘、跨时区行情使用 `session_column`：
-
-```python
-futures = db.timeseries(
-    "futures_ticks",
-    time="ts",
-    pk=["symbol", "ts"],
-    columns={"symbol": "text", "ts": "integer", "trading_date": "text", "price": "float"},
-    session_column="trading_date",
-)
-rows = futures.query(session="2026-01-06", symbols="AU").to_list()
-```
-
-### 7. 布局诊断和重分区
-
-```python
-report = table.layout_report()
-print(report.total_rows, report.recommendation)
-
-result = table.compact()
-print(result.rows_read, result.rows_written, result.new_segments)
-validation = table.validate(deep=True)
-print(validation.ok, validation.errors)
-preview = table.cleanup_obsolete()
-print(preview.bytes_reclaimable)
-print(table.segments(include_obsolete=True))
-
-new_spec = table.spec().with_partition(partition="duration(ts,every=1hour)")
-result = table.repartition_to("sqlite://db/hourly.iosql", spec=new_spec)
-print(result.rows_copied, result.partitions_created)
-```
-
-### 8. SQLite 迁移到 PostgreSQL
-
-安装 PostgreSQL 可选依赖：
-
-```bash
-python -m pip install "iosql[postgresql]"
-```
-
-Python：
-
-```python
-source = Database("sqlite://db/market.iosql")
-result = source.to_postgresql(
-    "postgresql://user:pass@localhost:5432/market",
-    tables=["daily_bars", "kline_1m"],  # 不传则迁移全库
-    batch_size=50_000,
-    verify="row-count",                 # 可选：校验源/目标行数
-)
-print(result.rows_copied, result.batches, result.verified)
-source.close()
-```
-
-迁移前预览，不连接目标库：
-
-```python
-plan = source.to_postgresql(
-    "postgresql://user:pass@localhost:5432/market",
-    dry_run=True,
-    batch_size=50_000,
-)
-print(plan.source_rows, plan.batches)
-```
-
-CLI：
-
-```bash
-iosql migrate \
-  -s sqlite://db/market.iosql \
-  --target postgresql://user:pass@localhost:5432/market \
-  --table kline_1m:pg_kline_1m \
-  --batch-size 50000 \
-  --verify row-count
-```
-
-也可以用 `iosql migrate ... --dry-run` 输出表、源行数和批次数估算。
-
-### 9. 清理
-
-```python
-# 关闭（推荐）
-db.close()
-
-# 上下文管理器（自动关闭）
-with Database("sqlite://db/test.iosql") as db:
-    ...
-```
-
-## 设计偏好
-
-- **接口已定稿冻结（PLAN-054，长期稳定）**：不再改参数名、默认值、方法职责；新增能力只能以"新方法/新参数"叠加。参数词汇表唯一拼写：`pk` / `columns` / `every` / `timezone` / `between` / `mode`；别名永久保留：`primary_key` / `fields` / `partition_every` / `tz` / `between_and` / 契约侧 `conflict`。缩写只允许行业级 `pk`，其余参数一律全称。结果对象字段冻结，`to_dict()` 是唯一序列化入口，新字段只能追加。
-- **废弃参数只加不减**：`partition_kind`/`time_unit`/`*_rows_per_file`/`group_by`/`select_all` 的 DeprecationWarning 永久保留，不要计划移除，也不要在新代码里使用。
-- 让 `TableSpec/TableContract` 成为表契约来源，避免隐式依赖第一次写入推断出的结构。
-- 查询 API 优先表达业务条件：`symbols/start/end/date/session/where/order_by/limit`。
-- 复杂 where 优先使用受支持的 dict/list/`Case` 或文本 where，不要拼接原始 SQL。
-- **导出面收缩**：`from iosql import ...` 只导出工厂 `Partition.*` 和结果类型；`DurationPartition`/`CalendarPartition`/`RangePartition` 需从 `iosql.partition.duration` 等内部模块导入（顶层导入会 ImportError）。
-- **symbol_column 显式化**：`db.table()` 默认 `symbol_column=None`；未声明时 `query(symbols=)`/`latest(symbols=)` 抛带修复指引的 `BadArgument`。需要 symbol 语义就显式声明 `symbol_column="symbol"`（timeseries() 保持默认 `"symbol"`）。`latest(by=...)` 显式分组不受影响。
-- `select()` 双引擎统一默认 `to_dict=True` 返回 dict 行；依赖 tuple 行为的旧代码必须显式 `to_dict=False`。
-- 间隔词汇统一由 `iosql.partition.duration.parse_interval_ms()` 解析：`Partition.duration(every='1s')` 与 `timeseries(partition_every='1s')` 行为一致，支持别名 + 任意 `Nunit`，以及 `Nmonth`（按 30 天）/`Nyear`（按 365 天）近似；bool 等非法值抛 `PartitionSpecError`（`BadArgument` 子类）。
-- 代码结构按层理解：`iosql.core.query` 是通用查询 AST/where 解析；`iosql.engines.sqlite` / `iosql.engines.postgresql` 是引擎实现；旧 `iosql.query` / `iosql.sqlite` / `iosql.postgresql` 包已删除。
-- `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数和可选 `stats_columns`，合理配置以控制文件大小及统计开销。
-- `compact()` 只整理当前可见 row segment，生成新的 sealed generation，并把旧 segment 标记为 `obsolete`；默认查询和 `segments()` 不扫描 obsolete；需要释放旧文件时先 `validate(deep=True)`，再用 `cleanup_obsolete(dry_run=False)`。manifest 引用文件缺失时读取直接抛 `UnsafeOperation`（不隐式重建），`validate()` 会以 `orphan_segment_file` 警告列出孤儿文件，compact 可安全复用被孤儿占用的目标文件名。
-- **单 writer 保证强化**：写入路径与 `compact()` 共用 `_compact_lock` 串行化，消除 compact 后向旧 segment 插入的复活竞态；compact 与写互斥是预期吞吐代价。多线程读取可按需提高 `max_connections_per_file`。
-- 大结果集读取优先用 `iter_select_batches()` / `iter_batches()` / `query(...).iter_batches()` 或 CLI `export --batch-size`；`select()` 的 `order_by`+`limit` 会按 segment 下推后归并（内存有界），只排序不限行时仍可能需要 Python 层合并排序。
-- 大文件导入优先用 `iosql import --batch-size` 读取 JSONL/CSV；JSON 数组兼容但不适合数 GB 文件。CLI import 输出的 `rows_written` 在 ignore 模式下如实输出 null（不冒充 rows_seen）。
-- `repartition_to()` 写入新库，不要假设它会原地修改源库。
-- SQLite 到 PostgreSQL 迁移优先用 `Database.migrate_to()` / `to_postgresql()`；迁移按 `batch_size` 逐批读取 SQLite 物理文件，适合海量 K 线，不会一次性载入全库。生产迁移建议先 `dry_run=True` 预览，再用 `verify="row-count"` 校验源/目标行数。`migrate_to(dry_run=True)` 会先校验 `mode`/`tables`/目标 URI 且无落盘副作用；SQLite 源迁 SQLite 目标时目标不能等于/嵌套源库；CLI `migrate` 同样拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表。
-- PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。PG 流式导出使用命名游标（单语句快照），无序翻页不会跳行/重复。
-- PostgreSQL native partition 下，`duration(...)` / `range(...)` 使用数值边界；`calendar(...)` 支持 `text` / `date` / `timestamp` 目标列，text 日期列不要混用 ISO 与 compact 格式。
-- PostgreSQL 引擎差异：`delete` 返回删除行数，falsy 非 None 的 `where` 抛 `BadArgument`，`delete(None)` 警告并转发 `delete_all()`；列类型走封闭白名单（`blob→BYTEA`、`datetime→TIMESTAMP`，未知类型抛 `BadArgument`）；字符串 `fields` 只接受列名；批量写入按整批行列并集补 NULL；`commit=False` 会保持事务，失败整体回滚；NULL 排序与 SQLite 一致（ASC NULLS FIRST / DESC NULLS LAST）；select 未知 kwargs 抛 `BadArgument`；`upsert_all(where=...)` 仅关键字传入且已废弃；已有物理表与契约漂移抛 `SchemaConflict`。
-- 测试必须覆盖写入结果、查询结果和必要的 `explain()` 裁剪信息。
-- 修改核心行为时，至少跑相关 sqlite 契约测试、partition 测试和 mysqlite 测试。
-- `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
-- 异常体系统一使用 `IosqlError` 子类（`BadArgument`、`TableSpecConflict`、`SchemaConflict` 等）；`PartitionSpecError` 继承 `BadArgument`，损坏/旧 manifest 缺字段也走该异常族；`IosqlBadArgument` 已移除，统一用 `BadArgument`。
-- mysqlite 定位是"SQL 完备工具"（第三方库心智）：`insert_all(commit=False)` 显式拒绝（延迟提交与连接池归还语义冲突）；`insert()/executemany(commit=False)` 与 `auto_commit=False` 下的直写同样拒绝，需要事务用 `db.transaction()`；`select(limit=0)` 按 SQL 语义返回 0 行；错误路径统一回滚并转换异常；建表冲突抛类型化 `DuplicateColumn`/`PrimaryKeyNotInColumn`；`Database(':memory:')` 被拒绝（池内连接各自独立），`insert_all` 缺列交由 SQLite 求值表达式默认值，`wal=False`/`timeout` 真实生效，DDL 后缓存自动失效（外部 DDL 需手动 `table.invalidate_cache()`）。mysqlite 无内置 rename/drop_column/backup——用原生 SQL 或连接 API 完成（见 `examples/mysqlite-scenarios/`）。
-
-## 反模式（避免）
-
-- ❌ 直接传文件路径给主 API（如 `Database("db/market.iosql")`）→ 必须用 `sqlite://` 前缀
-- ❌ `from iosql import DurationPartition` → 顶层已不导出分区类，用 `Partition.duration(...)` 工厂或 `iosql.partition.duration` 内部路径
-- ❌ 对已存在表重复声明不同契约 → 用 `db.table("name")` 获取引用而非重新声明
-- ❌ 在写入前未声明 `pk` → `write()` 必须有主键
-- ❌ 写入行缺主键字段 → 会抛 `BadArgument`（不会退回 rowid 自增），每行必须补齐主键
-- ❌ 给 `select()` / `iter_select*()` 传 `symbols`/`start`/`end`/`date`/`session` → 抛 BadArgument；业务过滤用 `query()` / `explain_select()`
-- ❌ 未声明 `symbol_column` 的普通表调用 `query(symbols=)`/`latest(symbols=)` → 报 BadArgument；先 `symbol_column="symbol"` 显式声明或改用 `by=`/`where=`
-- ❌ 依赖旧版 `select()` 默认返回 tuple → 现默认 dict 行，需要 tuple 显式 `to_dict=False`
-- ❌ 用 `delete(None)` → 已废弃，改用 `delete_all()` 或 `truncate(confirm=True)`
-- ❌ 假设 `repartition_to()` 会修改原库 → 它只写新库
-- ❌ 拼接原始 SQL 做 where → 用 dict/list/`Case`/文本表达式
-- ❌ 忽略 `WriteResult` 返回值 → 检查 `rows_seen` vs `rows_written`
-- ❌ 吞掉 buffered_writer 异常退出时的 RuntimeWarning → 提示的是未 flush 行数，意味着数据未落库
-- ❌ 忽略测试数据隔离 → 每个测试用独立 `tmp_path`
-- ❌ 用 `insert_all()` 替代 `write()` → `insert_all` 是低层 API，不自动使用表契约
-- ❌ mysqlite `insert_all(commit=False)` → 已显式拒绝；需要事务用 `db.transaction()`
-- ❌ mysqlite `Database(':memory:')` → 连接池不支持，直接用 `sqlite3.connect(':memory:')`
-
-## 引用资料
-
-所有资料均包含在 skills 目录内，同步分发：
-
-- **代码模板**：[usage-patterns.md](references/usage-patterns.md) —— 涵盖全部 Partition × Segment 组合、duration/calendar/range 分区、timeseries helper、缓冲写入、查询计划、布局诊断、重分区、晚到数据、金融场景（K线/orderbook/财报/新闻）、CLI 模式
-- **可运行示例**：[examples/](examples/) —— 可直接运行的 Python 脚本，按学习顺序编号：
-  - `01_quickstart_table.py`、`01_quickstart_timeseries.py` —— 入门：普通 Table vs timeseries helper
-  - `02_calendar_events_table.py`、`02_calendar_events.py` —— 日历分区处理日期字符串
-  - `03_buffered_ingest_and_query_plan.py` —— 批量缓冲写入 + 查询计划
-  - `04_layout_report_and_repartition.py` —— 布局诊断 + 重分区
-  - `05_partition_segments_smoke.py` —— 逻辑分区 + 物理 segment
-  - `06_row_segment_late_data.py` —— 纯 row segment + 晚到数据
-  - `07_partition_string_repartition_cli.py` —— 字符串 partition + CLI 重分区
-  - `08_doctor_time_first_suggestions.py` —— doctor 对历史 `partition_key` 表优先推荐时间分区
-  - `09_existing_database_append.py` —— 自包含地模拟已有库并按持久化契约继续写入
-  - `10_existing_database_repartition.py` —— 自包含地模拟已有源库并重分区到新目标
-  - `11_sqlite_to_postgresql_migration.py` —— SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询；未设置 `POSTGRES_DSN` 时只执行 dry-run
-  - `12_sqlite_postgresql_roundtrip.py` —— SQLite -> PostgreSQL -> SQLite 双向转换；未设置 `POSTGRES_DSN` 时只执行 dry-run
-  - `mysqlite/` —— 低层 mysqlite 工具：schema-on-write、批量写入与冲突处理、连接池清理（非主 API 入口）
-  - `mysqlite-scenarios/` —— mysqlite 场景教学：CRUD/事务、加删列与缓存边界、查询变体、RENAME 与表信息、索引操作与 autoindex 坑、在线备份
-  - `finance/` —— 金融场景：K线、orderbook、财报、新闻
-- **错误排查**：[troubleshooting.md](references/troubleshooting.md)
-- **写入性能**：[write-performance.md](references/write-performance.md) —— 2500 万行日线、orderbook、ext4 HDD benchmark、批次/分区/segment/PRAGMA 最佳实践
-- **API 签名**：[api-reference.md](references/api-reference.md)
+| 入口 | `Database(uri)` | `sqlite://` 或 `postgresql://` 前缀必带 |
+| | `db.table(name, pk, columns, partition=, segment=, order_key=, symbol_column=, session_column=)` | 核心建表入口 |
+| | `db.timeseries(name, time=, pk=, partition_every=)` | 时序语法糖（table 的薄封装） |
+| | `db.table_names()` / `db.close()` | 列表 / 关闭 |
+| 写入 | `table.write(rows, mode=None)` | mode: None（契约默认）/ append / ignore / upsert |
+| | `with table.buffered_writer(max_rows=N) as buf: buf.append(batch)` | 缓冲批量写 |
+| | `table.truncate(confirm=True)` / `table.delete(where)` | 清空 / 条件删除 |
+| 查询 | `table.query(symbols=, start=, end=, date=, session=, where=, order_by=, limit=)` → `.to_list() / .one() / .explain() / .iter_batches()` | 时序表（duration/calendar 分区表也可用） |
+| | `table.select(fields="*", where=None, order_by=, limit=, to_dict=True)` | 所有表；默认返回 dict |
+| | `table.explain_select(...)` | 查询计划（partition/segment 两级裁剪） |
+| | `table.latest(symbols=, as_of=, by=, columns=)` | 最新截面；别名 `asof()` |
+| 诊断 | `table.spec()` / `table.table_parts()` / `table.segments()` / `table.count_rows()` | 契约 / 逻辑分区 / 物理 segment / 行数 |
+| 维护 | `table.layout_report()` / `table.repartition_to(uri, spec=)` / `table.migrate_to(...)` | 诊断 / 重分区 / 迁移单表 |
+| | `db.to_postgresql(dsn, tables=, verify=)` | SQLite → PG |
+
+## 关键规则（违反即抛异常）
+
+- URI 必须 `sqlite://` / `postgresql://` 前缀，直接传文件路径报 `InvalidUriSchema`。
+- 每行必须含完整 pk 字段，缺列抛 `BadArgument`（不会退回 rowid 自增）。
+- 已存在的表用 `db.table("name")` 获取引用；重新声明不同契约抛 `TableSpecConflict`。
+- `select()`/`iter_select*()` 不接受 `symbols/start/end/date/session`（抛 BadArgument）；业务过滤用 `query()`。
+- `select()` 默认返回 dict 行；要 tuple 显式 `to_dict=False`。
+- `query(symbols=)`/`latest(symbols=)` 要求建表时显式 `symbol_column="symbol"`（timeseries 默认已带）。
+- 顶层导入只导出工厂与结果类型：用 `Partition.duration(...)`，不要 `from iosql import DurationPartition`。
+- 废弃参数不要在新代码使用：`partition_kind`/`time_unit`/`*_rows_per_file`/`group_by`/`select_all`/`delete(None)`。
+- `repartition_to()`/`migrate_to()` 只写新库，不修改源库。
+- 缓冲写入异常退出会发未 flush 行数的 RuntimeWarning——不要吞掉（意味着数据未落库）。
+- `upsert`/`replace` 模式当前不支持 `Segment.rows` 表。
+
+## 报错先查
+
+出错时直接把异常名/信息对照 [references/troubleshooting.md](references/troubleshooting.md)：契约冲突（`TableSpecConflict`/`SchemaConflict`）、参数错误（`BadArgument`/`PartitionSpecError`）、分区未裁剪、写入静默跳过、URI 错误、迁移问题等均有"错误信息 → 修复方法"对照。
+
+## 详细资料（按需打开）
+
+- [references/usage-patterns.md](references/usage-patterns.md) —— 全量代码模式（四种组合、写入模式、where 构造、布局维护、迁移、PG 引擎、mysqlite、测试建议）
+- [references/api-reference.md](references/api-reference.md) —— 全部 API 签名、结果/查询/异常类型、常量、mysqlite 完整契约
+- [references/troubleshooting.md](references/troubleshooting.md) —— 错误排查对照表
+- [references/write-performance.md](references/write-performance.md) —— 大批量写入性能（回灌/orderbook/PRAGMA/FD/HDD）
+- [references/cli.md](references/cli.md) —— CLI 命令与安全规则
+- [references/ui.md](references/ui.md) —— 可视化管理台 iosql ui
+- [references/design-contract.md](references/design-contract.md) —— 接口契约、设计偏好与开发守则（本仓库开发必读）
+- [examples/](examples/) —— 可运行脚本：`01~12` 主线（quickstart → calendar → 缓冲 → 布局 → segment → CLI → 已有库 → PG 迁移），子目录 `finance/`（K线/orderbook/财报/新闻）、`mysqlite/`、`mysqlite-scenarios/`
+
+Base directory for this skill: /home/lsl/.agents/skills/iosql-usage
+Relative paths in this skill (e.g., examples/, references/) are relative to this base directory.
