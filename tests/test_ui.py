@@ -359,6 +359,23 @@ class TestReadOnlyApi:
         ]
         assert len(filtered) == EVENTS_TOTAL // 2
 
+    def test_export_order_by_streams_sorted(self, demo_db_path):
+        # 引擎有序流式归并就位后，export 可带 order_by 且仍为流式产出
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.get(
+                "/api/table/ticks/export",
+                params={"format": "jsonl", "order_by": "ts desc"},
+            )
+        assert resp.status_code == 200
+        rows = [
+            json.loads(line)
+            for line in resp.text.splitlines()
+            if line.strip()
+        ]
+        assert len(rows) == TICKS_TOTAL
+        ts_list = [row["ts"] for row in rows]
+        assert ts_list == sorted(ts_list, reverse=True)
+
     def test_layout_report(self, demo_db_path):
         with _client(f"sqlite://{demo_db_path}") as client:
             resp = client.get("/api/table/ticks/layout_report")

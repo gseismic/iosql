@@ -797,7 +797,7 @@ database/
 
 - 核心 `Database.table(...)` 不需要 `time` 字段；分区字段由 `Partition.*(...)` 指定。duration/calendar 分区在未显式声明 time 时会自动反推 time 契约（`range` 分区不反推），因此普通分区表也可直接使用 `query(start/end/date)`、`latest()`、`asof()`。
 - `timeseries()` 是 `table()` 的薄语法糖；`partition_kind` / `time_unit` / `*_rows_per_file` 已废弃，迁移写法见"创建或打开表"一节的对照表。
-- 多分区查询支持全局 `order_by` 和 `limit`；`select()` 在两者同传时会把排序与 limit 下推到各 segment 后再归并（内存有界），只排序不限行时结果仍会在 Python 层合并排序。大结果集无排序导出优先使用 `iter_select_batches()` / `iter_batches()` 或 CLI `export --batch-size`。
+- 多分区查询支持全局 `order_by` 和 `limit`；`select()` 在两者同传时会把排序与 limit 下推到各 segment 后再归并（内存有界），只排序不限行时结果仍会在 Python 层合并排序。大结果集排序导出可使用 `iter_select_batches(order_by=...)`：带排序时走跨 partition 的 k 路归并流式读取（每 segment 按 ORDER BY 分页读取后归并，任一时刻至多打开 1 个分区连接，峰值驻留为单个内部页 ≤10 万行），排序值序对齐 SQLite（ASC NULL 最小 / DESC NULL 最大），结果与 `select(order_by=...)` 一致；无排序导出优先使用 `iter_select_batches()` / `iter_batches()` 或 CLI `export --batch-size`。
 - 大文件导入优先使用 JSONL/CSV 和 `iosql import --batch-size`；JSON 数组格式保持兼容但不推荐用于数 GB 文件。
 - 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment，可用 `compact()` 显式整理为新的 sealed generation，再用 `validate(deep=True)` / `cleanup_obsolete()` 释放旧文件。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。

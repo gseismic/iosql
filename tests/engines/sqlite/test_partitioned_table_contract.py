@@ -474,6 +474,125 @@ def test_iter_select_batches_streams_rows_and_honors_limit(tmp_path):
     db.close()
 
 
+def test_iter_select_batches_order_by_streams_without_full_select(tmp_path, monkeypatch):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": idx, "seq": idx, "kind": "trade"}
+        for idx in range(1, 7)
+    ])
+
+    def _must_not_eager_select(*args, **kwargs):
+        raise AssertionError(
+            'iter_select_batches(order_by=...) 不允许走 select() 全量物化路径'
+        )
+
+    monkeypatch.setattr(type(table), 'select', _must_not_eager_select)
+
+    rows = [
+        row
+        for batch in table.iter_select_batches(
+            "*",
+            order_by="seq desc",
+            batch_size=2,
+            limit=3,
+            to_dict=True,
+        )
+        for row in batch
+    ]
+
+    assert [row["seq"] for row in rows] == [6, 5, 4]
+
+    db.close()
+
+
+def test_iter_select_batches_order_by_matches_select_multi_part(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        partition=Partition.range("seq", every=10),
+    )
+    # seq 跨多个分区（0..70），乱序写入
+    seqs = [3, 45, 12, 9, 71, 50, 27, 64]
+    table.write([
+        {"event_id": idx + 1, "seq": seq, "kind": f"k{idx % 3}"}
+        for idx, seq in enumerate(seqs)
+    ])
+    assert len(table.table_parts()) > 1
+
+    for order_by in ("seq desc", "kind asc, seq desc", "seq"):
+        got = [
+            row
+            for batch in table.iter_select_batches(
+                "*", order_by=order_by, batch_size=2, to_dict=True,
+            )
+            for row in batch
+        ]
+        assert got == table.select("*", order_by=order_by, to_dict=True)
+
+    db.close()
+
+
+def test_iter_select_batches_order_by_limit_project(tmp_path):
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": idx, "seq": idx, "kind": f"kind{idx % 2}"}
+        for idx in range(1, 7)
+    ])
+    # NULL 排序值：归并路径与 select() 一致按 SQLite 语义（ASC 最小 / DESC 最大）
+    table.write([{"event_id": 100, "kind": "kind9"}])
+
+    order_by = "seq desc, event_id desc"
+    batches = list(table.iter_select_batches(
+        "event_id,kind",
+        order_by=order_by,
+        batch_size=2,
+        limit=3,
+        to_dict=False,
+    ))
+    rows = [row for batch in batches for row in batch]
+
+    assert [len(batch) for batch in batches] == [2, 1]
+    expected = table.select(
+        "event_id,kind",
+        order_by=order_by,
+        limit=3,
+        to_dict=False,
+    )
+    assert rows == expected
+    # 排序列 seq 不在投影中：输出行只含投影列，但全局仍按 seq 有序
+    assert len(expected[0]) == 2
+
+    got_nulls_last = [
+        row
+        for batch in table.iter_select_batches(
+            "event_id,seq", order_by="seq desc", batch_size=2, to_dict=True,
+        )
+        for row in batch
+    ]
+    assert got_nulls_last[-1]["event_id"] == 100
+    assert got_nulls_last == table.select(
+        "event_id,seq", order_by="seq desc", to_dict=True,
+    )
+
+    db.close()
+
+
 def test_compact_rejects_non_segment_table(tmp_path):
     db = Database(_uri(tmp_path))
     table = db.table(

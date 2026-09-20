@@ -1116,14 +1116,6 @@ def _export_endpoint(name: str, request: Request, format: str,
             hint="format 仅支持 csv 或 jsonl",
         )
     table = get_table(request.app.state.db, name)
-    if order_by:
-        # iter_select_batches 带 order_by 时引擎内部退化为全量物化排序，
-        # 大表会 OOM；导出语义本就无需稳定顺序，这里显式拒绝而非静默退化
-        raise _bad_request(
-            "export 暂不支持 order_by",
-            hint="导出按分区/segment 自然顺序流式产出以保证内存可控；"
-                 "如需有序结果请用 /rows 分页拉取",
-        )
     spec = table.spec()
     comps: Any = None
     if where:
@@ -1144,7 +1136,7 @@ def _export_endpoint(name: str, request: Request, format: str,
         "Content-Disposition": _content_disposition(name, format),
     }
     batch_iter = table.iter_select_batches(
-        "*", where=comps, limit=limit,
+        "*", where=comps, limit=limit, order_by=order_by,
         to_dict=True, batch_size=EXPORT_BATCH_SIZE,
     )
     # 预取首个批次：字段级错误（未知列名等）在响应头发出的 200 之前暴露，

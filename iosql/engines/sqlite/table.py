@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import heapq
 import json
 import math
 import os
@@ -109,6 +110,54 @@ def _canon_sqlite_type(type_):
     """声明类型归一到库规范类型（integer/float/text/blob）；无法识别返回 None。"""
     value = str(type_).strip().lower().split('(', 1)[0].strip()
     return _SQLITE_TYPE_ALIASES.get(value)
+
+
+def _sqlite_sort_rank(value):
+    """SQLite 值序的类别秩：NULL < 数值 < 文本 < blob < 其他（按 str 兜底）。"""
+    if value is None:
+        return 0
+    if isinstance(value, (int, float)):  # bool 是 int 子类，同数值秩
+        return 1
+    if isinstance(value, str):
+        return 2
+    if isinstance(value, bytes):
+        return 3
+    if isinstance(value, (bytearray, memoryview)):
+        return 3
+    return 4
+
+
+class _SqliteSortKey:
+    """对齐 SQLite 比较语义的单列排序键。
+
+    IEEE nulls-first/last、跨类型秩序、DESC 逐列内联反转；
+    供 heapq.merge 的 key 使用（只要求 __lt__，附 __eq__ 加速元组比较）。
+    """
+    __slots__ = ('rank', 'value', 'desc')
+
+    def __init__(self, value, reverse):
+        self.rank = _sqlite_sort_rank(value)
+        self.value = value
+        self.desc = reverse
+
+    def _value_lt(self, other_value):
+        try:
+            return self.value < other_value
+        except TypeError:
+            return str(self.value) < str(other_value)
+
+    def __lt__(self, other):
+        if self.rank != other.rank:
+            # DESC 反转整个比较（含秩）：SQLite desc 下 NULL 最大
+            less = self.rank < other.rank
+            return (not less) if self.desc else less
+        if self.desc:
+            return other._value_lt(self.value)
+        return self._value_lt(other.value)
+
+    def __eq__(self, other):
+        # 由 __lt__（严格全序）派生的相等判定，与元组比较的等价判定一致
+        return not (self < other) and not (other < self)
 
 
 class _TableQuery:
@@ -2844,16 +2893,14 @@ class Table(BaseTable):
             return
 
         if order_by:
-            rows = self.select(
+            yield from self._iter_select_ordered_batches(
                 fields,
                 where,
-                limit=limit,
-                order_by=order_by,
-                to_dict=to_dict,
-                **kwargs,
+                limit,
+                order_by,
+                to_dict,
+                batch_size,
             )
-            for start in range(0, len(rows), batch_size):
-                yield rows[start:start + batch_size]
             return
 
         meta = self.get_table_meta()
@@ -3349,7 +3396,8 @@ class Table(BaseTable):
                 batch_size,
             )
 
-    def _select_queries_for_where(self, fields, where_obj, column_types):
+    def _select_queries_for_where(self, fields, where_obj, column_types,
+                                  order_by_sql=None):
         if not where_obj.or_and_cases:
             for ref in self._get_select_part_refs(None):
                 yield (
@@ -3359,6 +3407,7 @@ class Table(BaseTable):
                         fields,
                         None,
                         column_types,
+                        order_by_sql=order_by_sql,
                     ),
                 )
             return
@@ -3373,6 +3422,7 @@ class Table(BaseTable):
                 fields,
                 where_obj.or_and_cases,
                 column_types,
+                order_by_sql=order_by_sql,
             )
             for ref in refs_by_key.values():
                 yield ref, query
@@ -3384,6 +3434,7 @@ class Table(BaseTable):
             fields,
             cases,
             column_types,
+            order_by_sql=order_by_sql,
         )
         for ref in self._get_select_part_refs(cases):
             yield ref, query
@@ -3408,6 +3459,122 @@ class Table(BaseTable):
             if len(rows) < batch_size:
                 break
             offset += len(rows)
+
+    def _iter_part_ordered_batches(self, part_dbfile, query, chunk_size):
+        """分页流式读取一个 part 的有序行。
+
+        与无序路径同为"每次 open/close 一个分区连接"的生命周期（任一时刻
+        至多打开 1 个分区文件，不与 max_open_partitions 冲突）；chunk 取
+        大粒度以摊薄 ORDER BY+LIMIT/OFFSET 每页重排的成本。
+        """
+        base_sql = query.sql.rstrip().rstrip(';')
+        offset = 0
+        while True:
+            sql = f'{base_sql} limit ? offset ?'
+            params = list(query.params) + [chunk_size, offset]
+            with self._part_db(part_dbfile, auto_commit=False) as db:
+                with db.get_connection() as conn:
+                    try:
+                        rows = conn.execute(sql, params).fetchall()
+                    except sqlite3.OperationalError as exc:
+                        if 'no such table' not in str(exc).lower():
+                            raise
+                        return
+            if not rows:
+                return
+            yield list(rows)
+            if len(rows) < chunk_size:
+                return
+            offset += len(rows)
+
+    def _iter_select_ordered_batches(
+        self, fields, where, limit, order_by, to_dict, batch_size
+    ):
+        """带 order_by 的流式条件查询：跨 part k 路归并，内存有界。
+
+        - 每 part 按 ORDER BY+LIMIT/OFFSET 分页流式读取，heapq.merge 归并；
+        - 任一时刻至多打开 1 个分区连接，峰值驻留 ≈ 单页 chunk（≤10 万行）；
+        - limit 归并侧提前终止；fields 投影/to_dict/batch_size 语义不变；
+        - tie 优先早 part（与 select() 的 part 顺序 + 稳定排序结果一致）。
+        """
+        meta = self.get_table_meta()
+        if not meta:
+            return
+        column_types = {
+            key: item["type"] for key, item in meta["column_info"].items()
+        }
+        w = self._build_where(where)
+        fetch_fields, project_fields = self._select_fields_with_order(
+            fields,
+            order_by,
+            column_types,
+        )
+        order_by_sql = self._order_by_sql(order_by, fetch_fields, column_types)
+        specs = self._parse_order_by(order_by)
+        sort_key = self._row_sort_key(specs)
+
+        stream_specs = []
+        for ref, query in self._select_queries_for_where(
+            fetch_fields,
+            w,
+            column_types,
+            order_by_sql=order_by_sql,
+        ):
+            self._ensure_ref_file_present(ref)
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            logger.debug(
+                f"{part_dbfile}: {ref.part_key}: "
+                f"SQL: {query.sql}; params={query.params}"
+            )
+            stream_specs.append((part_dbfile, query))
+        if not stream_specs:
+            return
+
+        chunk_size = self._ordered_fetch_chunk(batch_size)
+        part_streams = [
+            self._part_ordered_rows(part_dbfile, query, chunk_size)
+            for part_dbfile, query in stream_specs
+        ]
+
+        emitted = 0
+        pending = []
+        for row in heapq.merge(*part_streams, key=sort_key):
+            if limit is not None and emitted >= limit:
+                break
+            if project_fields is not None:
+                row = self._project_fields([row], project_fields, to_dict)[0]
+            elif to_dict:
+                row = dict(row)
+            pending.append(row)
+            emitted += 1
+            if len(pending) >= batch_size:
+                yield pending
+                pending = []
+        if pending:
+            yield pending
+
+    def _part_ordered_rows(self, part_dbfile, query, chunk_size):
+        """把 _iter_part_ordered_batches 的批次摊平为行流。"""
+        for batch in self._iter_part_ordered_batches(
+            part_dbfile, query, chunk_size,
+        ):
+            for row in batch:
+                yield row
+
+    @staticmethod
+    def _ordered_fetch_chunk(batch_size):
+        """有序分页的内部 fetch 粒度：大 chunk 摊薄每页 ORDER BY 重排成本，
+        峰值驻留为单 part 单页（≤10 万行），与归并 part 数无关。"""
+        return min(100_000, max(batch_size, 10_000))
+
+    def _row_sort_key(self, specs):
+        """构造对齐 SQLite 排序语义的 heap key 函数。"""
+        def key(row):
+            return tuple(
+                _SqliteSortKey(self._row_sort_value(row, field)[1], reverse)
+                for field, reverse in specs
+            )
+        return key
 
     def _select_or_cases(self, fields, or_cases, column_types,
                          order_by_sql=None, limit=None):
