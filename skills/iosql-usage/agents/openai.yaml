@@ -1,7 +1,7 @@
 interface:
   display_name: "iosql 使用指南"
-  short_description: "指导 iosql 分区表建模、写入、查询、布局诊断和错误排查"
-  default_prompt: "Use $iosql-usage to design, implement, or debug an iosql-backed partition table workflow."
+  short_description: "指导 iosql 常用建模、写入、查询、流式读取、布局维护和迁移场景"
+  default_prompt: "Use $iosql-usage to choose and implement a representative iosql workflow for partitioned tables, streaming ordered reads, layout maintenance, or database migration."
 
 policy:
   allow_implicit_invocation: true

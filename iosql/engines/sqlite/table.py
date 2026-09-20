@@ -52,6 +52,10 @@ from ...utils.column import sqlite_type_of_value, suggest_sqlite_column_types
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite import Database as MyDatabase
 from ...utils.mysqlite.const import _DEFAULT_PRAGMA as _MYSQLITE_DEFAULT_PRAGMA
+from ...utils.mysqlite.connection_pool import (
+    release_process_connections,
+    reserve_process_connections,
+)
 from ...utils.schema import parse_db_schema
 
 # from mysqlite import Database as MyDatabase
@@ -3490,19 +3494,13 @@ class Table(BaseTable):
             raise UnsafeOperation(
                 f'ordered stream part file missing: {part_dbfile}'
             )
-        conn = None
         try:
             uri = pathlib.Path(os.path.abspath(part_dbfile)).as_uri()
             conn = sqlite3.connect(f'{uri}?mode=ro', uri=True, timeout=30.0)
-        except (sqlite3.Error, ValueError):
-            # mode=ro 在 WAL 只读边缘场景可能失败，回退普通打开（isfile 已保证
-            # 不会创建缺失文件），仍以 query_only 防误写
-            try:
-                conn = sqlite3.connect(part_dbfile, timeout=30.0)
-            except sqlite3.Error as exc:
-                raise UnsafeOperation(
-                    f'ordered stream open part failed: {part_dbfile}: {exc}'
-                ) from exc
+        except (sqlite3.Error, ValueError) as exc:
+            raise UnsafeOperation(
+                f'ordered stream open part failed: {part_dbfile}: {exc}'
+            ) from exc
         try:
             conn.row_factory = sqlite3.Row  # 字符串索引/字典化与池路径对齐
             conn.execute('PRAGMA query_only=ON')
@@ -3522,8 +3520,7 @@ class Table(BaseTable):
         语句级读快照（WAL 下不阻塞写入），part 内不重不漏；
         峰值驻留 = 该流当前 fetchmany 的 chunk 行。
 
-        连接失败直接抛错（带 part_dbfile，见 _open_part_read_conn），
-        只有已成功连接后的 no such table 兼容为空流。
+        连接或查询失败都带 part_dbfile 抛出 UnsafeOperation，不静默跳过分片。
         """
         conn = self._open_part_read_conn(part_dbfile)
         try:
@@ -3537,8 +3534,9 @@ class Table(BaseTable):
             finally:
                 cursor.close()
         except sqlite3.DatabaseError as exc:
-            if 'no such table' not in str(exc).lower():
-                raise
+            raise UnsafeOperation(
+                f'ordered stream query part failed: {part_dbfile}: {exc}'
+            ) from exc
         finally:
             conn.close()
 
@@ -3546,13 +3544,13 @@ class Table(BaseTable):
     def _merge_stream_chunk(batch_size, part_count):
         """每 part 流的 fetch 粒度：驻留 ≈ P × chunk，总量钳在 ~10 万行。
 
-        P=归并 part 数（受 max_ordered_read_connections 上限约束，默认 128
-        → 100_000//128=781，64 下限在默认配置下不会触底）。cursor 存活期间
-        不重排，小 chunk 无额外排序成本。
+        P=归并 part 数（受 max_ordered_read_connections 与进程预算约束）；
+        chunk 至少为 1，保证 P × chunk 不因固定下限重新超过预算。cursor 存活
+        期间不重排，小 chunk 无额外排序成本。
         """
         if part_count <= 0:
             return batch_size
-        return max(64, min(batch_size, max(1, 100_000 // part_count)))
+        return max(1, min(batch_size, 100_000 // part_count))
 
     def _iter_select_ordered_batches(
         self, fields, where, limit, order_by, to_dict, batch_size
@@ -3564,7 +3562,7 @@ class Table(BaseTable):
         - 连接数受 max_ordered_read_connections 上限约束（默认 128，超出快速
           失败）；峰值 Python 驻留 ≈ P × chunk（总量钳在 ~10 万行）；
           每 part 的 SQLite 排序可落盘（temp_store=FILE），RAM 有界；
-        - 连接失败抛错（不静默空分区）；no such table 兼容为空流；
+        - 连接或分片查询失败抛错（不静默空分区）；
         - 快照语义：流建立后本迭代不可见新增 part/行（part 内语句级快照，
           跨 part 非原子）；tie 优先早 part（与 select() 稳定排序一致）。
         fields 投影/to_dict/batch_size 语义不变。
@@ -3615,28 +3613,52 @@ class Table(BaseTable):
                 '或去掉 order_by 改用分区自然序流式导出'
             )
 
-        chunk_size = self._merge_stream_chunk(batch_size, len(stream_specs))
-        part_streams = [
-            self._part_ordered_rows(part_dbfile, query, chunk_size)
-            for part_dbfile, query in stream_specs
-        ]
+        try:
+            reservation = reserve_process_connections(
+                len(stream_specs),
+                self._max_process_connections,
+            )
+        except (BadArgument, ValueError) as exc:
+            raise BadArgument(
+                f'ordered stream 需要 {len(stream_specs)} 条只读连接，'
+                f'超过当前进程可用的 max_process_connections='
+                f'{self._max_process_connections}；{exc}'
+            ) from exc
 
-        emitted = 0
-        pending = []
-        for row in heapq.merge(*part_streams, key=sort_key):
-            if limit is not None and emitted >= limit:
-                break
-            if project_fields is not None:
-                row = self._project_fields([row], project_fields, to_dict)[0]
-            elif to_dict:
-                row = dict(row)
-            pending.append(row)
-            emitted += 1
-            if len(pending) >= batch_size:
+        chunk_size = self._merge_stream_chunk(batch_size, len(stream_specs))
+        part_streams = []
+        merged_stream = None
+        try:
+            part_streams = [
+                self._part_ordered_rows(part_dbfile, query, chunk_size)
+                for part_dbfile, query in stream_specs
+            ]
+
+            emitted = 0
+            pending = []
+            merged_stream = heapq.merge(*part_streams, key=sort_key)
+            for row in merged_stream:
+                if limit is not None and emitted >= limit:
+                    break
+                if project_fields is not None:
+                    row = self._project_fields([row], project_fields, to_dict)[0]
+                elif to_dict:
+                    row = dict(row)
+                pending.append(row)
+                emitted += 1
+                if len(pending) >= batch_size:
+                    yield pending
+                    pending = []
+            if pending:
                 yield pending
-                pending = []
-        if pending:
-            yield pending
+        finally:
+            try:
+                if merged_stream is not None:
+                    merged_stream.close()
+                for stream in part_streams:
+                    stream.close()
+            finally:
+                release_process_connections(reservation)
 
     def _row_sort_key(self, specs):
         """构造对齐 SQLite 排序语义的 heap key 函数。"""

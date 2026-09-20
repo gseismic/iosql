@@ -438,7 +438,14 @@ iosql export \
   --batch-size 50000
 ```
 
-带全局 `order_by` 的跨 segment 查询为了保证排序正确性，仍需要 Python 层合并排序后再按批输出；`select()` 在 `order_by` 与 `limit` 同时给出时会把 `ORDER BY ... LIMIT` 下推到每个 segment 再归并（结果不变、内存有界）。`select()` / `iter_select*()` 不接受 `symbols/start/end/date/session` 等业务参数（抛 `BadArgument`），业务过滤请用 `query()` / `explain_select()`。
+带全局 `order_by` 的跨 segment 查询为了保证排序正确性，需要归并各 segment 的有序流；
+`iter_select*()` 和 `query(..., order_by=...).iter_rows()/iter_batches()` 使用每个分区的
+只读游标和堆归并，按批惰性输出，不先调用 `select()` 全量物化。单次归并受
+`max_ordered_read_connections` 与 `max_process_connections` 约束，超限会抛 `BadArgument`；
+大结果集示例见 `examples/13_streaming_ordered_query.py`。`select()` 在 `order_by` 与
+`limit` 同时给出时会把 `ORDER BY ... LIMIT` 下推到每个 segment 再归并（结果不变、内存有界）。
+`select()` / `iter_select*()` 不接受 `symbols/start/end/date/session` 等业务参数（抛
+`BadArgument`），业务过滤请用 `query()` / `explain_select()`。
 
 CLI 导入会批处理读取 JSONL/CSV 并写入既有契约表：
 

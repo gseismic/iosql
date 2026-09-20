@@ -1,6 +1,6 @@
-# PLAN-063 OUTCOME: iter_select 带 order_by 流式化
+# PLAN-063 OUTCOME: iter_select 带 order_by 流式化（v5）
 
-结果：已完成（经两轮评审修订，当前为 v2 实现）。SQLite 引擎带 `order_by` 的流式查询不再走
+结果：已完成（经五轮评审修订，当前为 v5 实现）。SQLite 引擎带 `order_by` 的流式查询不再走
 `select()` 全量物化，改为跨 partition 的 k 路归并流式读取；UI export 随之放开 `order_by`。
 
 ## 评审意见回应
@@ -13,7 +13,9 @@
   order_by 时走 `_iter_select_ordered_batches`：每 part 一条专用只读连接单游标（无 OFFSET），
   `heapq.merge` 归并，limit 归并侧提前终止；
 - 回归测试 `test_iter_select_batches_order_by_streams_without_full_select` 通过
-  monkeypatch `select()` 抛错的方式永久锁定"不许回退全量路径"。
+  monkeypatch `select()` 抛错的方式永久锁定"不许回退全量路径"；新增的
+  `test_query_iter_rows_order_by_streams_without_full_select` 覆盖用户实际的
+  `query(..., order_by=...).iter_rows(...)` 调用链。
 
 ## 第二轮评审（提交 1af0c76）三项发现与解决
 
@@ -25,7 +27,7 @@
 
 快照语义如实写进 README：分区文件内语句级读快照，跨分区非原子。
 
-## 第三轮评审（提交 1d32058）两项发现与解决
+## 第三轮评审（提交 1d32058）两项发现与 v3 处理
 
 | # | 发现 | 核实 | 解决（v3） |
 | --- | --- | --- | --- |
@@ -33,6 +35,24 @@
 | 2 | raw 连接绕开连接池，max_open_partitions/max_connections_per_file/max_process_connections 对排序流全部失效；1000 分区 limit=1 仍开 ~1000 连接；chunk 下限 64 使 P>1562 时驻留重新超 10 万行 | 属实 | 新增 `max_ordered_read_connections`（默认 128，Database 级配置，与既有三参数同模式透传）；归并连接数超上限直接抛 `BadArgument` 快速失败（不做信号量——k 路归并会互相等待死锁），错误信息给出三条修复路径；默认上限 128 下 chunk 下限 64 不会触底（100_000//128=781），驻留钳制声明成立。外部归并/临时排序文件方案列为后续 TODO |
 
 文档修正：OUTCOME 重复标题"评审意见回应"去重；测试统计更正为 676 passed, 16 skipped。
+
+## 第四轮评审（提交 3f83e46 后）三项发现与 v4 解决
+
+| # | 发现 | 核实 | 解决（v4） |
+| --- | --- | --- | --- |
+| 1 | `mode=ro` 失败后回退普通 `sqlite3.connect`，TOCTOU 下可重建空分片并被 `no such table` 静默跳过 | 属实（故障注入复现） | 删除普通打开回退；只读打开/初始化失败统一抛 `UnsafeOperation`，确定性故障注入测试锁定 |
+| 2 | raw 有序连接未纳入 mysqlite 的进程级连接预算；`max_process_connections=1` 仍可打开多条 raw 连接 | 属实（预算状态与 raw connect 计数复现） | 进程预算新增外部连接预留/释放；归并前一次性预留 P 条，预算不足快速失败，异常/提前 close/正常结束统一释放 |
+| 3 | `max(64, ...)` 在用户调大连接上限后重新突破 10 万行驻留预算 | 属实（P=2000 时为 128000 行槽位） | chunk 下限改为 1，并增加大 part 数公式回归测试 |
+|  |  |  | 外部归并（波次归并 + 临时排序文件）仍作为后续功能，不在本轮范围内 |
+
+## 第五轮评审：资源与错误边界修正
+
+1. `reserve_external` 先回收空闲池连接；仍无法立即预留时直接抛 `BadArgument`，避免同线程
+   持有池租约时在查询规划阶段或归并阶段永久等待。
+2. 删除已成功连接后对 `no such table` 的静默空流兼容；已登记分区缺少 `data` 表或查询失败时
+   统一抛带分区路径的 `UnsafeOperation`，防止导出静默缺数据。
+3. 新增同线程预算快速失败、缺表分区和直接 `query().iter_rows()` 回归测试；测试使用分段布局
+   覆盖有序预算检查，避免测试自身在查询规划阶段占满唯一池连接。
 
 ## 实施中的两次设计修正
 
@@ -45,18 +65,20 @@
    导致 NULL 在 DESC 排首（与 SQLite 及 `select()` 的 NULL 最后语义相悖）。已修复并由
    `test_iter_select_batches_order_by_limit_project` 的 NULL 断言锁定。
 
-## 变更清单（v3 后累计）
+## 变更清单（v5 后累计）
 
 - `iosql/engines/sqlite/table.py`
   - `+import heapq`/`+import pathlib`；新增模块级 `_sqlite_sort_rank` / `_SqliteSortKey`；
   - `_select_queries_for_where` 增加 `order_by_sql`/`limit` 透传；
-  - 新增 `_open_part_read_conn`（mode=ro，失败抛 UnsafeOperation）/
+  - 新增 `_open_part_read_conn`（严格 mode=ro，失败抛 UnsafeOperation）/
     `_part_ordered_rows` / `_iter_select_ordered_batches` / `_row_sort_key`
-    / `_merge_stream_chunk`；连接数上限检查；
+    / `_merge_stream_chunk`；连接数上限、进程预算检查与统一清理；
   - `iter_select_batches` 的 order_by 分支改调流式归并路径。
 - `iosql/database.py`：`+max_ordered_read_connections`（默认 128）配置与透传。
+- `iosql/utils/mysqlite/connection_pool.py`：外部 raw 连接进程预算预留/释放。
 - `iosql/ui/app.py`：export 端点移除 order_by 拒绝（引擎流式化后理由失效），透传给引擎。
-- `tests/engines/sqlite/test_partitioned_table_contract.py`：+7 测试。
+- `tests/engines/sqlite/test_partitioned_table_contract.py`：补充直接 `query().iter_rows()` 不走
+  `select()`、确定性连接失败、缺表失败、进程预算、chunk 上限和提前关闭释放测试。
 - `tests/test_ui.py`：+1 测试 `test_export_order_by_streams_sorted`。
 - `README.md`：排序导出的内存公式、快照语义、值序语义、与 `select()` 一致性。
 - 回退他人错误混入的 segment stats `nulls` 改动（无消费方、扩 manifest 契约、与本计划无关）；
@@ -65,9 +87,10 @@
 
 ## 验证
 
-- `python -m pytest tests/engines/sqlite/test_partitioned_table_contract.py -q`：24 passed。
+- `python -m pytest tests/engines/sqlite/test_partitioned_table_contract.py -q`：30 passed。
 - `python -m pytest tests/test_ui.py -q`：45 passed。
-- 全量 `python -m pytest tests/ -q --ignore=tests/01_large_partition.py`：678 passed, 16 skipped。
+- `python -m pytest tests/utils/mysqlite/test_connection_pool.py -q`：10 passed。
+- 全量 `python -m pytest tests/ -q`：684 passed, 16 skipped, 68 warnings。
 - 专项实测见"第二轮评审"表（26 分区 × limit=1 / 全量起始 / 快照一致性 / EQP / PRAGMA）。
 
 ## 已知边界 / 后续

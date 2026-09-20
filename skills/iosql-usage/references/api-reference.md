@@ -16,7 +16,7 @@
 
 ## 核心入口
 
-### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32)`
+### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32, max_ordered_read_connections=128)`
 
 数据库入口。支持 `sqlite://` 和 `postgresql://` URI。
 
@@ -38,8 +38,9 @@ python -m pip install "iosql[postgresql]"
 | `max_open_partitions` | `int` | 仅 SQLite；每张表最多缓存的打开分区数据库数，默认 `5` |
 | `max_connections_per_file` | `int` | 仅 SQLite；每个 SQLite 文件的连接池上限，默认 `1` |
 | `max_process_connections` | `int` | 仅 SQLite；进程内所有 mysqlite 池共享的真实连接预算，默认 `32` |
+| `max_ordered_read_connections` | `int` | 仅 SQLite；单次带全局 `order_by` 的流式归并同时读取的分区上限，默认 `128` |
 
-三个资源参数必须是正整数。分区数据库按带租约的线程安全 LRU 淘汰；两个元数据库
+四个资源参数必须是正整数。分区数据库按带租约的线程安全 LRU 淘汰；两个元数据库
 不计入 `max_open_partitions`，但计入 `max_process_connections`。多个活跃实例
 配置不同时，当前进程采用其中最小的进程预算。WAL 模式通常还会打开 `-wal` 和
 `-shm`，因此文件描述符数量高于连接数。
@@ -253,7 +254,11 @@ for batch in table.query(start=start, end=end).iter_batches(batch_size=50_000):
 
 - `iter_select_batches()` 每批最多返回 `batch_size` 行。
 - 无全局 `order_by` 时按分区/segment 分页读取，适合大结果集。
-- 有 `order_by` 时为保证全局排序正确性，会复用 `select()` 的合并排序结果，再按批输出。
+- SQLite 有全局 `order_by` 时，为保证全局排序正确性，使用每个分区的只读游标和堆归并，
+  按批惰性输出，不调用 `select()` 全量物化；`query(..., order_by=...).iter_rows()` 和
+  `.iter_batches()` 也走这条路径。
+- 单次有序归并同时读取的分区数受 `max_ordered_read_connections` 限制，并计入
+  `max_process_connections`；超过任一预算直接抛 `BadArgument`，应收窄查询范围或调高预算。
 - `limit` 会跨 batch 生效。
 - `select()` / `iter_select*()` 不接受 `symbols`/`start`/`end`/`date`/`session` 或任何未知 kwargs（抛 `BadArgument`，不静默忽略）；业务过滤请用 `query()` / `explain_select()`。
 - `select()` 同时给出全局 `order_by` 和 `limit` 时，`ORDER BY ... LIMIT` 会下推到每个 segment 再归并（结果不变、内存有界）；只排序不限行时仍需完整合并排序。

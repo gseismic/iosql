@@ -296,6 +296,7 @@ db = Database(
     max_open_partitions=5,
     max_connections_per_file=1,
     max_process_connections=32,
+    max_ordered_read_connections=128,
     pragma_dict={
         "journal_mode": "wal",
         "synchronous": "full",
@@ -308,8 +309,9 @@ db = Database(
 
 `max_open_partitions` 是每张逻辑表允许缓存的分区数据库数量，
 `max_connections_per_file` 是每个 SQLite 文件的连接池上限，
-`max_process_connections` 是所有 mysqlite 连接池共享的进程级真实连接预算。
-默认值分别为 `5`、`1` 和 `32`，由 iosql 在进程内强制执行，不依赖提高
+`max_process_connections` 是所有 mysqlite 连接池与有序 raw 读连接共享的进程级真实连接预算，
+`max_ordered_read_connections` 是单次有序归并允许同时读取的分区数。
+默认值分别为 `5`、`1`、`32` 和 `128`，由 iosql 在进程内强制执行，不依赖提高
 `ulimit -n`。WAL 模式下每条
 SQLite 连接可能同时占用数据库、WAL 和 SHM 文件描述符；包含两个元数据库时，
 单表稳态 FD 预算可粗略按
@@ -318,6 +320,8 @@ SQLite 连接可能同时占用数据库、WAL 和 SHM 文件描述符；包含�
 进程预算耗尽时会跨连接池回收空闲连接；大量分区扫描使用带租约的线程安全 LRU，
 不会关闭其他线程正在使用的分区。`Database.close()` 或上下文管理器仍是
 确定性释放资源的首选方式；低层清理注册表使用弱引用，遗弃对象不会再被全局注册表
+保留。带 `order_by` 的查询若分区数超过 `max_ordered_read_connections` 或当前进程预算，
+会直接抛 `BadArgument`；应收窄查询范围、提高预算或去掉全局排序。外部归并仍是后续能力。
 永久保活，但不应以垃圾回收替代正常的生命周期管理。
 
 只有原始抓取数据可确定重放时才考虑 `synchronous=OFF`；掉电或系统崩溃时它可能损坏最近事务。

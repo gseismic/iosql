@@ -1,6 +1,6 @@
 # iosql 示例
 
-本目录只保留主 API 的少量代表性示例。编号越小越适合入门，后面的示例覆盖批量写入、查询计划和布局维护。主线示例使用普通 `Table` + `Partition` + `Segment`；`timeseries()` 文件保留为 helper 版本。
+本目录按“一个示例解决一类问题”组织主 API 示例。编号越小越适合入门，后面的示例覆盖批量写入、查询计划、流式读取、布局维护、已有库和迁移。主线示例使用普通 `Table` + `Partition` + `Segment`；`timeseries()` 文件保留为 helper 版本。
 
 当前 `Segment.rows(...)` 示例均按 append-first 语义写入；在全局 pk index/tombstone 实现前，不演示跨 segment 的 `upsert`/`replace` 覆盖写。
 
@@ -22,6 +22,7 @@
 | `10_existing_database_repartition.py` | 高级 | 独立准备已有源库，重新打开后离线重分区到新的目标库。 |
 | `11_sqlite_to_postgresql_migration.py` | 高级 | SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询。 |
 | `12_sqlite_postgresql_roundtrip.py` | 高级 | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
+| `13_streaming_ordered_query.py` | 进阶 | 对跨分区结果按 `open_time` 全局排序，并用 `query(...).iter_rows(...)` 惰性逐行读取。 |
 
 ## 金融示例
 
@@ -59,6 +60,7 @@ python examples/09_existing_database_append.py
 python examples/10_existing_database_repartition.py
 python examples/11_sqlite_to_postgresql_migration.py
 python examples/12_sqlite_postgresql_roundtrip.py
+python examples/13_streaming_ordered_query.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

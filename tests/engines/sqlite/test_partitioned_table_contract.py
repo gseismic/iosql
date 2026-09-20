@@ -1,10 +1,16 @@
 import os
+import sqlite3
 
 import pytest
 
 from iosql import Database, Partition, Segment
 from iosql.exception import BadArgument, UnsafeOperation
+from iosql.engines.sqlite import table as sqlite_table_module
+from iosql.engines.sqlite.table import Table as SQLiteTable
 from iosql.partition import RangePartition
+from iosql.utils.mysqlite.connection_pool import (
+    get_process_connection_budget_status,
+)
 
 
 def _uri(tmp_path, name="partitioned.iosql"):
@@ -512,6 +518,54 @@ def test_iter_select_batches_order_by_streams_without_full_select(tmp_path, monk
     db.close()
 
 
+def test_query_iter_rows_order_by_streams_without_full_select(tmp_path, monkeypatch):
+    """query(..., order_by=...).iter_rows() 必须保持有序流式路径。"""
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "open_time": "integer"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": idx, "open_time": open_time}
+        for idx, open_time in enumerate([30, 10, 20], start=1)
+    ])
+
+    def _must_not_eager_select(*args, **kwargs):
+        raise AssertionError(
+            "query(..., order_by=...).iter_rows() 不允许走 select() 全量路径"
+        )
+
+    monkeypatch.setattr(type(table), "select", _must_not_eager_select)
+
+    observed = []
+    original_part_ordered_rows = type(table)._part_ordered_rows
+
+    def _track_part_ordered_rows(self, part_dbfile, query, chunk_size):
+        for row in original_part_ordered_rows(
+            self, part_dbfile, query, chunk_size
+        ):
+            observed.append(row["open_time"])
+            yield row
+
+    monkeypatch.setattr(
+        type(table), "_part_ordered_rows", _track_part_ordered_rows
+    )
+
+    query = table.query(order_by="open_time")
+    iterator = query.iter_rows(batch_size=1)
+    first = next(iterator)
+    assert first["open_time"] == 10
+    assert len(observed) < 3
+    rows = [first, *iterator]
+
+    assert [row["open_time"] for row in rows] == [10, 20, 30]
+
+    db.close()
+
+
 def test_iter_select_batches_order_by_matches_select_multi_part(tmp_path):
     db = Database(_uri(tmp_path))
     table = db.table(
@@ -672,7 +726,9 @@ def test_iter_select_batches_order_by_limit_pushdown_many_parts(tmp_path):
     db.close()
 
 
-def test_iter_select_batches_order_by_part_conn_failure_fails(tmp_path):
+def test_iter_select_batches_order_by_part_conn_failure_fails(
+    tmp_path, monkeypatch
+):
     """单分区连接失败必须让查询失败，不允许静默缺数据（评审 P1-1）。"""
     db = Database(_uri(tmp_path))
     table = db.table(
@@ -688,21 +744,55 @@ def test_iter_select_batches_order_by_part_conn_failure_fails(tmp_path):
     parts = table.table_parts()
     assert len(parts) >= 2
     victim = table._get_part_dbfile(parts[-1])
-    os.chmod(victim, 0o000)
+
+    original_connect = sqlite_table_module.sqlite3.connect
+
+    def fail_victim_connect(database, *args, **kwargs):
+        if kwargs.get('uri') and os.path.basename(victim) in str(database):
+            raise sqlite3.OperationalError('injected read-only open failure')
+        return original_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(
+        sqlite_table_module.sqlite3,
+        'connect',
+        fail_victim_connect,
+    )
+    with pytest.raises(UnsafeOperation) as exc_info:
+        list(table.iter_select_batches(
+            "*", order_by="seq", batch_size=2, to_dict=True,
+        ))
+    # 错误信息必须能定位到出问题的分区文件
+    assert str(victim) in str(exc_info.value)
+
+    db.close()
+
+
+def test_iter_select_batches_order_by_missing_part_table_fails(tmp_path):
+    """已登记分区缺少 data 表时不得静默返回空结果。"""
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        partition=Partition.range("seq", every=10),
+    )
+    table.write([
+        {"event_id": idx + 1, "seq": seq}
+        for idx, seq in enumerate([3, 15, 27])
+    ])
+    victim = table._get_part_dbfile(table.table_parts()[-1])
+
+    corruptor = sqlite3.connect(victim)
     try:
-        with pytest.raises(Exception) as exc_info:
-            list(table.iter_select_batches(
-                "*", order_by="seq", batch_size=2, to_dict=True,
-            ))
-        # 错误信息必须能定位到出问题的分区文件
-        assert 'events' in str(exc_info.value) or str(
-            victim
-        ) in str(exc_info.value) or os.path.basename(victim) in str(
-            exc_info.value
-        )
-        assert not isinstance(exc_info.value, StopIteration)
+        corruptor.execute("DROP TABLE data")
+        corruptor.commit()
     finally:
-        os.chmod(victim, 0o644)
+        corruptor.close()
+
+    with pytest.raises(UnsafeOperation, match=os.path.basename(victim)):
+        list(table.iter_select_batches(
+            "*", order_by="seq", batch_size=2, to_dict=True,
+        ))
 
     db.close()
 
@@ -739,6 +829,125 @@ def test_iter_select_batches_order_by_over_conn_cap_fails(tmp_path):
     assert len(rows) == 3
 
     db.close()
+
+
+def test_iter_select_batches_order_by_respects_process_connection_budget(
+    tmp_path,
+):
+    """raw 有序连接不能绕过 max_process_connections。"""
+    db = Database(
+        _uri(tmp_path),
+        max_process_connections=2,
+        max_ordered_read_connections=3,
+    )
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        partition=Partition.range("seq", every=10),
+    )
+    table.write([
+        {"event_id": idx + 1, "seq": seq}
+        for idx, seq in enumerate([3, 15, 27])
+    ])
+
+    before = get_process_connection_budget_status()["open_process_connections"]
+    with pytest.raises(BadArgument, match="max_process_connections"):
+        list(table.iter_select_batches(
+            "*", order_by="seq", batch_size=2, to_dict=True,
+        ))
+    after = get_process_connection_budget_status()["open_process_connections"]
+    assert after == before
+
+    db.close()
+
+
+def test_ordered_read_budget_fails_fast_for_same_thread_pool_lease(tmp_path):
+    """同线程持有池连接时预算不足必须失败，不能永久等待。"""
+    db = Database(
+        _uri(tmp_path),
+        max_process_connections=1,
+        max_ordered_read_connections=1,
+    )
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([{"event_id": 1, "seq": 3}])
+
+    try:
+        with table.table_meta_db.get_connection():
+            with pytest.raises(BadArgument, match="max_process_connections"):
+                list(table.iter_select_batches(
+                    "*", order_by="seq", batch_size=1, to_dict=True,
+                ))
+    finally:
+        db.close()
+
+
+def test_ordered_merge_chunk_keeps_memory_bound_for_large_part_count():
+    """part 数增大时不能由固定 chunk 下限突破驻留预算。"""
+    assert SQLiteTable._merge_stream_chunk(1000, 2000) == 50
+    assert SQLiteTable._merge_stream_chunk(1000, 100_000) == 1
+    assert 2000 * SQLiteTable._merge_stream_chunk(1000, 2000) <= 100_000
+
+
+def test_iter_select_batches_order_by_close_releases_process_reservation(
+    tmp_path, monkeypatch,
+):
+    """提前关闭有序迭代器必须释放 raw 连接预留。"""
+    db = Database(_uri(tmp_path), max_ordered_read_connections=10)
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        partition=Partition.range("seq", every=10),
+    )
+    table.write([
+        {"event_id": idx + 1, "seq": seq}
+        for idx, seq in enumerate([3, 15, 27])
+    ])
+
+    reserved = []
+    released = []
+    original_reserve = sqlite_table_module.reserve_process_connections
+    original_release = sqlite_table_module.release_process_connections
+
+    def track_reserve(*args, **kwargs):
+        token = original_reserve(*args, **kwargs)
+        reserved.append(token)
+        return token
+
+    def track_release(token):
+        released.append(token)
+        return original_release(token)
+
+    monkeypatch.setattr(
+        sqlite_table_module,
+        "reserve_process_connections",
+        track_reserve,
+    )
+    monkeypatch.setattr(
+        sqlite_table_module,
+        "release_process_connections",
+        track_release,
+    )
+
+    iterator = table.iter_select_batches(
+        "*", order_by="seq", batch_size=1, to_dict=True,
+    )
+    try:
+        assert len(next(iterator)) == 1
+        assert len(reserved) == 1
+        assert released == []
+    finally:
+        iterator.close()
+        db.close()
+
+    assert released == reserved
 
 
 def test_compact_rejects_non_segment_table(tmp_path):

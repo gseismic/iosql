@@ -186,8 +186,10 @@ print("跳过 segment:", plan.segment_skip_reasons)
 **症状**：多分区查询延迟高，特别是带 `order_by` 和 `limit` 时。
 
 **原因**：`select()` 在 `order_by` 与 `limit` 同时给出时会把 `ORDER BY ... LIMIT`
-下推到每个 segment 再归并（结果不变、内存有界）；但只排序不限行、或 `query()` /
-`iter_select_batches()` 的全局排序仍需完整合并排序，数据量大时性能受影响。
+下推到每个 segment 再归并（结果不变、内存有界）；`query()` /
+`iter_select_batches()` 的全局排序也需要完成各 segment 的排序并做堆归并，但有序流式
+路径按批输出，不会先把完整结果交给 `select()` 物化。分区数和进程连接预算仍可能成为
+上限，分别检查 `max_ordered_read_connections` 与 `max_process_connections`。
 
 **排查**：
 
@@ -496,16 +498,18 @@ db["t"].insert({...}, commit=True)
 
 **排查**：
 
-1. 主 API 显式设置 `Database(..., max_open_partitions=5, max_connections_per_file=1, max_process_connections=32)`。
+1. 主 API 显式设置 `Database(..., max_open_partitions=5, max_connections_per_file=1, max_process_connections=32, max_ordered_read_connections=128)`。
 2. `max_open_partitions` 是单表分区数据库缓存上限，分区按 LRU 自动关闭。
 3. `max_connections_per_file` 是每个 SQLite 文件的连接池上限；WAL 模式下每条连接
    可能对应数据库、WAL、SHM 三个文件描述符。
 4. `max_process_connections` 是跨数据库、跨表共享的真实连接预算；预算满时自动回收
    其他池的空闲连接。
-5. 使用上下文管理器或显式 `db.close()`，不要依赖进程退出或垃圾回收。
-6. 运行 `python benchmarks/stress_open_files.py --root <目标盘>`，检查报告中的
+5. `max_ordered_read_connections` 是单次有序归并允许同时读取的分区数；超过上限时收窄
+   查询范围或调大该配置。
+6. 使用上下文管理器或显式 `db.close()`，不要依赖进程退出或垃圾回收。
+7. 运行 `python benchmarks/stress_open_files.py --root <目标盘>`，检查报告中的
    `fd_peak`、`fd_final`、`peak_process_connections` 和 `peak_open_partitions`。
-7. 不要直接修改 `_num_opened_max_allowed` 私有字段，也不要把提高 `ulimit -n`
+8. 不要直接修改 `_num_opened_max_allowed` 私有字段，也不要把提高 `ulimit -n`
    当作库内资源泄漏的解决方案。
 
 ## 测试相关

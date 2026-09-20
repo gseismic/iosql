@@ -15,31 +15,32 @@
 ## 目标
 
 SQLite 引擎 `iter_select_batches` 带 `order_by` 时改为**有界内存的流式 k 路归并**：
-- 每 part（segment 文件）用 `ORDER BY + LIMIT/OFFSET` 分页流式读取；
+- 每 part（segment 文件）用 `ORDER BY` 单游标流式读取，`limit` 下推到每 part；
 - 跨 part 用 `heapq.merge` 归并，峰值驻留 = 单个内部页（≤10 万行）+ 归并堆（每 part 1 行），与结果集总量 N 解耦；
 - `limit` 归并侧提前终止；`fields` 投影、`to_dict`、`batch_size` 语义不变；
 - 结果与 `select(order_by=...)` 一致（纯类型列下逐行相等）。
 
 ## 关键设计决策（实施过程中修订）
 
-1. **连接生命周期（v3）：专用只读连接 + 每 part 单游标，无 OFFSET，失败不静默。**
+1. **连接生命周期（v4）：专用只读连接 + 每 part 单游标，无 OFFSET，失败不静默。**
    初版 A（单连接长游标）与 `max_open_partitions`（默认 5）冲突致自旋死锁；改版 B（每页
    open/close + LIMIT/OFFSET）规避了死锁，但被评审否决三项：内存实为 O(分区数 × 内部页)、
    每页重跑 ORDER BY（temp_store=memory 下临时 B 树驻 RAM 且重复排序）、OFFSET 分页在并发
-   写下重读/漏行。v3 定稿：`_open_part_read_conn` 以 `mode=ro` URI 打开专用只读连接
-   （WAL 边缘场景回退普通打开，isfile 前置保证绝不创建缺失文件；`query_only`、
-   `cache_size=-1024`、`temp_store=FILE`）；连接/初始化失败一律抛 `UnsafeOperation`
-   （带 part_dbfile），不做静默空分区；仅已成功连接后的 `no such table` 兼容为空流。
+   写下重读/漏行。v4 定稿：`_open_part_read_conn` 以 `mode=ro` URI 打开专用只读连接
+   （不回退普通可写打开，避免 TOCTOU 重建缺失文件；`query_only`、`cache_size=-1024`、
+   `temp_store=FILE`）；连接、初始化或分片查询失败一律抛带 part_dbfile 的
+   `UnsafeOperation`，不做静默空分区。
    每 part 一条连接一个游标流式 fetchmany——排序每 part 一次；游标存活期间语句级读快照
    （part 内不重不漏）；专用连接绕开连接池，不受 `max_open_partitions` 约束。
-2. **连接数预算（v3）**：`max_ordered_read_connections`（默认 128，Database 级配置）；
-   归并连接数超上限直接抛 `BadArgument` 快速失败（不做信号量——k 路归并会互相等待死锁），
-   错误信息给出三条修复路径。默认上限下 chunk 下限 64 不会触底，驻留钳制声明成立；
-   外部归并（波次 + 临时排序文件）列为后续 TODO。
+2. **连接数预算（v4）**：`max_ordered_read_connections`（默认 128，Database 级配置）
+   先限制单次归并分区数，再向 mysqlite 进程级预算预留同等数量的 raw 连接；预算不足直接抛
+   `BadArgument`，不打开超预算连接，也不无限等待当前占用的预算。预留覆盖并发有序查询，
+   迭代结束或异常时统一释放；
+   外部归并（波次 + 临时排序文件）仍列为后续 TODO。
 3. **limit 下推 per-part LIMIT**：全局 limit 直接编入每 part 的 SQL（`LIMIT ?`），
    SQLite top-N 排序器排序内存 O(limit)；实测多分区 limit=1 归并 Python 峰值 218 KB。
-4. **P 自适应 fetch 粒度**：`_merge_stream_chunk(batch_size, P) = max(64, min(batch_size, 100_000 // P))`，
-   Python 峰值驻留 ≈ P × chunk，总量钳在 ~10 万行（由连接数上限保证公式成立）。
+4. **P 自适应 fetch 粒度**：`_merge_stream_chunk(batch_size, P) = max(1, min(batch_size, 100_000 // P))`，
+   Python 峰值驻留 ≈ P × chunk，总量钳在 ~10 万行；不以固定 chunk 下限破坏预算。
 5. **归并排序键 `_SqliteSortKey`（模块级）**：对齐 SQLite 值序
    （NULL→数值→文本→blob→其他 rank；ASC NULL 最小 / DESC NULL 最大，方向内联含秩反转）。
    首版缺陷（DESC 未反转秩比较导致 NULL 排首）已在实施中修复并由测试锁定。
@@ -50,21 +51,40 @@ SQLite 引擎 `iter_select_batches` 带 `order_by` 时改为**有界内存的流
 8. **混入改动回退**：他人错误混入的 segment stats `nulls` 计数（无消费方、扩 manifest 契约、
    与本计划无关）已回退；其遗留的两份 competing 设计/计划文档一并移除（见 OUTCOME）。
 
-## 实施点（as-built, v3）
+## 第四轮修复方案（已实施）
+
+1. `_open_part_read_conn` 只允许 `file:...?...mode=ro` 打开；任何只读打开错误都带文件路径抛
+   `UnsafeOperation`，删除普通 `sqlite3.connect(part_dbfile)` 回退，消除缺失文件 TOCTOU 创建。
+2. 在 mysqlite 进程连接预算中增加 raw 外部连接预留/释放接口；有序归并在创建 part stream
+   前一次性预留 P 个连接，预算不足快速失败，异常、提前 close、正常结束均释放。
+3. 去掉 `_merge_stream_chunk` 的 64 行硬下限，使任意配置的 part 数仍满足约 10 万行驻留预算。
+4. 将 chmod 依赖的连接失败测试改为确定性的 `sqlite3.connect` 故障注入，并新增进程预算和大
+   part 数 chunk 回归测试。
+
+## 第五轮修复（已实施）
+
+1. `reserve_external` 回收可回收的空闲池连接后，若仍不能立即预留 P 条 raw 连接则直接抛错，
+   不进入无期限等待，避免同线程持有池租约时自锁。
+2. `_part_ordered_rows` 删除 `no such table` 空流兼容分支；已登记分片缺少 `data` 表或查询
+   发生 SQLite 错误时统一包装为带分片路径的 `UnsafeOperation`。
+3. 新增同线程池租约、缺表分片和预算快速失败回归测试，锁定错误可见且资源不泄漏。
+
+## 实施点（as-built, v5）
 
 1. `_select_queries_for_where(..., order_by_sql=None, limit=None)`：透传给两个 query builder
    （均已支持 order_by_sql/limit）。
-2. `_open_part_read_conn(part_dbfile)`：专用只读连接（mode=ro URI 优先、row_factory=Row、
+2. `_open_part_read_conn(part_dbfile)`：专用只读连接（mode=ro URI、row_factory=Row、
    query_only=ON、temp_store=FILE、cache_size=-1024），绕开分区连接池；
    文件缺失/打不开/初始化失败 → `UnsafeOperation`（带 part_dbfile）。
 3. `_part_ordered_rows(part_dbfile, query, chunk_size)`：单游标 fetchmany 行流；
-   `no such table` → 空流（与无序路径 NoSuchTable 跳过行为一致）；其余错误上抛。
+   SQLite 查询错误统一转换为带 part_dbfile 的 `UnsafeOperation`。
 4. `_iter_select_ordered_batches(...)`：
    - meta/column_types/fetch_fields/project_fields 与 `select()` 同一套 helper；
    - per-part LIMIT 下推（全局 limit 编入每 part SQL）；
-   - 先收集全部 (ref, query)，连接数超 `max_ordered_read_connections` 快速失败；
+   - 先收集全部 (ref, query)，连接数超 `max_ordered_read_connections` 或进程预算不足快速失败；
    - chunk 按 P 自适应；`heapq.merge(*streams, key=_row_sort_key(specs))`；
-   - 归并侧：投影/`to_dict` 归一、limit 提前 break、攒批 batch_size yield。
+   - 归并侧：预留 raw 连接、投影/`to_dict` 归一、limit 提前 break、攒批 batch_size yield，
+     统一关闭 stream 并释放预留。
 5. `iter_select_batches` 的 `if order_by:` 分支改调新方法；`select()` 急切契约不变；PG 引擎不动。
 
 ## UI 导出（超出原计划的连带修正）
@@ -76,7 +96,9 @@ SQLite 引擎 `iter_select_batches` 带 `order_by` 时改为**有界内存的流
 ## 测试（tests/engines/sqlite/test_partitioned_table_contract.py）
 
 1. `test_iter_select_batches_order_by_streams_without_full_select`：monkeypatch `Table.select`
-   抛错，带 order_by 的 `iter_select_batches` 仍产出（回归：不再走全量路径）。
+   抛错，带 order_by 的 `iter_select_batches` 仍产出（回归：不再走全量路径）；
+   `test_query_iter_rows_order_by_streams_without_full_select` 进一步锁定用户实际的
+   `query(..., order_by=...).iter_rows()` 调用链也不进入 `select()`。
 2. `test_iter_select_batches_order_by_matches_select_multi_part`：多分区 + 乱序写入，
    asc/desc/多列混合方向三种 order_by 与 `select()` 逐行相等。
 3. `test_iter_select_batches_order_by_limit_project`：投影不含排序列时输出仍按其有序；
@@ -86,10 +108,15 @@ SQLite 引擎 `iter_select_batches` 带 `order_by` 时改为**有界内存的流
 5. `test_iter_select_batches_order_by_limit_pushdown_many_parts`：多分区 limit=1 归并出
    1 行且与 `select()` 一致；per-part `LIMIT ?` 结构锁定。
 6. `test_iter_select_batches_order_by_part_conn_failure_fails`：单分区连接失败
-   （chmod 000）查询必须失败，错误信息可定位分区文件（评审 P1-1）。
+   （确定性故障注入）查询必须失败，错误信息可定位分区文件（评审 P1-1）。
 7. `test_iter_select_batches_order_by_over_conn_cap_fails`：连接数超
    `max_ordered_read_connections` 快速失败；无 order_by 路径不受影响（评审 P1-2）。
-8. 回归：既有 `test_iter_select_batches_streams_rows_and_honors_limit` 继续通过。
+8. `test_iter_select_batches_order_by_respects_process_connection_budget`：raw 连接预留不能
+   超过 `max_process_connections`，错误明确可修复。
+9. `_merge_stream_chunk` 大 part 数仍满足约 10 万行驻留预算，且提前关闭迭代器释放连接。
+10. 同线程持有连接池租约时预算不足快速失败，不发生永久等待。
+11. 已登记分片缺少 `data` 表时查询失败且错误包含分片路径。
+12. 回归：既有 `test_iter_select_batches_streams_rows_and_honors_limit` 继续通过。
 
 ## 产出
 

@@ -47,11 +47,15 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - manifest 引用文件缺失时读取直接抛 `UnsafeOperation`（不隐式重建）；`validate()` 会以 `orphan_segment_file`
   警告列出孤儿文件；compact 可安全复用被孤儿占用的目标文件名。需要释放旧文件时先 `validate(deep=True)`，
   再用 `cleanup_obsolete(dry_run=False)`。
-- 连接预算：主 API 默认 `max_open_partitions=5`、`max_connections_per_file=1`、`max_process_connections=32`，
-  分别限制单表分区缓存、单文件连接池和进程真实连接总数；不要依赖提高 `ulimit -n`，也不要直接修改私有字段。
+- 连接预算：主 API 默认 `max_open_partitions=5`、`max_connections_per_file=1`、
+  `max_process_connections=32`、`max_ordered_read_connections=128`，分别限制单表分区缓存、
+  单文件连接池、进程真实连接总数和单次有序归并分区数；不要依赖提高 `ulimit -n`，也不要直接修改私有字段。
   分区 LRU 使用租约保护并发访问。长期进程必须使用上下文管理器或显式 `db.close()`。
-- 大结果集读取优先用 `iter_select_batches()` / `iter_batches()` / `query(...).iter_batches()` 或 CLI `export --batch-size`；
-  `select()` 的 `order_by`+`limit` 会按 segment 下推后归并（内存有界），只排序不限行时仍可能需要 Python 层合并排序。
+- 大结果集读取优先用 `iter_select_batches()` / `iter_batches()` / `query(...).iter_rows()` /
+  `query(...).iter_batches()` 或 CLI `export --batch-size`；SQLite 带全局 `order_by` 时使用
+  分区只读游标和堆归并惰性输出，不先走 `select()` 全量物化，但受
+  `max_ordered_read_connections` 与 `max_process_connections` 约束。`select()` 的
+  `order_by`+`limit` 会按 segment 下推后归并（内存有界）。
 - 大文件导入优先用 `iosql import --batch-size` 读取 JSONL/CSV；JSON 数组兼容但不适合数 GB 文件。
 - SQLite→PostgreSQL 迁移优先用 `Database.migrate_to()` / `to_postgresql()`；按 `batch_size` 逐批读取 SQLite 物理文件，
   不会一次性载入全库。生产迁移先 `dry_run=True` 预览，再 `verify="row-count"` 校验。`migrate_to(dry_run=True)`

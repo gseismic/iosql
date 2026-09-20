@@ -28,9 +28,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
             "skills/iosql-usage/examples/10_existing_database_repartition.py",
             "源/目标行数: 4 4",
         ),
+        (
+            "examples/13_streaming_ordered_query.py",
+            "按 open_time 排序:",
+        ),
+        (
+            "skills/iosql-usage/examples/13_streaming_ordered_query.py",
+            "按 open_time 排序:",
+        ),
     ],
 )
-def test_existing_database_example_is_self_contained(script, expected):
+def test_example_is_self_contained(script, expected):
     env = dict(os.environ)
     for name in [
         "IOSQL_EXISTING_URI",

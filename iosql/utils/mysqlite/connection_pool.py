@@ -18,6 +18,9 @@ class _ProcessConnectionBudget:
     def __init__(self):
         self._condition = threading.Condition()
         self._pools = weakref.WeakKeyDictionary()
+        # 非 mysqlite 池的外部 SQLite 连接（例如有序跨分区 raw 读连接）。
+        # value=(声明的进程上限, 预留数量)，预留期间计入同一进程预算。
+        self._external_reservations = {}
         self._in_use = 0
 
     def register(self, pool, limit: int) -> None:
@@ -30,7 +33,7 @@ class _ProcessConnectionBudget:
             self._pools.pop(pool, None)
             self._condition.notify_all()
 
-    def _effective_limit_locked(self, requester=None) -> int:
+    def _effective_limit_locked(self, requester=None, external_limit=None) -> int:
         """计算进程连接预算。
 
         - 有活跃池（正在 checkout，含 requester）时取活跃池声明上限的最小值：
@@ -43,6 +46,12 @@ class _ProcessConnectionBudget:
             for pool, limit in self._pools.items()
             if pool is requester or pool._checked_out > 0
         ]
+        limits.extend(
+            limit
+            for limit, _ in self._external_reservations.values()
+        )
+        if external_limit is not None:
+            limits.append(int(external_limit))
         if limits:
             return min(limits)
         all_limits = list(self._pools.values())
@@ -52,6 +61,7 @@ class _ProcessConnectionBudget:
         """fork 后子进程重建预算状态，丢弃从父进程继承的连接计数。"""
         with self._condition:
             self._in_use = 0
+            self._external_reservations.clear()
             self._pools[pool] = pool._max_process_connections
             self._condition.notify_all()
 
@@ -85,6 +95,69 @@ class _ProcessConnectionBudget:
                 self._in_use -= 1
             self._condition.notify_all()
 
+    def reserve_external(self, count: int, max_process_connections: int):
+        """为不属于连接池的连接一次性预留进程预算。
+
+        预留数量必须一次性满足，避免 k 路归并打开一半连接后才发现预算不足。
+        先回收其他池的空闲连接；若仍不能立即满足，则直接失败，避免有序迭代器自锁。
+        """
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise BadArgument('external connection count must be a positive integer')
+        if (
+            isinstance(max_process_connections, bool)
+            or not isinstance(max_process_connections, int)
+            or max_process_connections <= 0
+        ):
+            raise BadArgument('max_process_connections must be a positive integer')
+
+        while True:
+            with self._condition:
+                limit = self._effective_limit_locked(
+                    external_limit=max_process_connections,
+                )
+                if count > limit:
+                    raise BadArgument(
+                        f'ordered stream needs {count} raw connections, '
+                        f'exceeding process connection budget {limit}; '
+                        'reduce the ordered partition range or increase '
+                        'max_process_connections'
+                    )
+                if self._in_use + count <= limit:
+                    token = object()
+                    self._external_reservations[token] = (
+                        max_process_connections,
+                        count,
+                    )
+                    self._in_use += count
+                    return token, count
+                pools = list(self._pools)
+
+            reclaimed = False
+            for pool in pools:
+                if pool._close_one_idle_connection_for_budget():
+                    reclaimed = True
+                    break
+            if reclaimed:
+                continue
+
+            raise BadArgument(
+                f'ordered stream needs {count} raw connections, but only '
+                f'{max(0, limit - self._in_use)} are available immediately '
+                f'within process connection budget {limit}; '
+                'close the active connection or reduce the ordered partition range'
+            )
+
+    def release_external(self, reservation) -> None:
+        """释放 ``reserve_external`` 返回的进程预算预留。"""
+        if reservation is None:
+            return
+        token, _ = reservation
+        with self._condition:
+            entry = self._external_reservations.pop(token, None)
+            if entry is not None:
+                self._in_use = max(0, self._in_use - entry[1])
+            self._condition.notify_all()
+
     def status(self) -> Dict[str, int]:
         with self._condition:
             return {
@@ -99,6 +172,19 @@ _PROCESS_CONNECTION_BUDGET = _ProcessConnectionBudget()
 
 def get_process_connection_budget_status() -> Dict[str, int]:
     return _PROCESS_CONNECTION_BUDGET.status()
+
+
+def reserve_process_connections(count: int, max_process_connections: int):
+    """为外部 SQLite 连接预留与 mysqlite 池共享的进程预算。"""
+    return _PROCESS_CONNECTION_BUDGET.reserve_external(
+        count,
+        max_process_connections,
+    )
+
+
+def release_process_connections(reservation) -> None:
+    """释放外部 SQLite 连接的进程预算预留。"""
+    _PROCESS_CONNECTION_BUDGET.release_external(reservation)
 
 
 class DatabaseConnectionPool:
