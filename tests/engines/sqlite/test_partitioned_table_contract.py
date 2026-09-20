@@ -672,6 +672,75 @@ def test_iter_select_batches_order_by_limit_pushdown_many_parts(tmp_path):
     db.close()
 
 
+def test_iter_select_batches_order_by_part_conn_failure_fails(tmp_path):
+    """单分区连接失败必须让查询失败，不允许静默缺数据（评审 P1-1）。"""
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        partition=Partition.range("seq", every=10),
+    )
+    table.write([
+        {"event_id": idx + 1, "seq": seq}
+        for idx, seq in enumerate([3, 15, 27])
+    ])
+    parts = table.table_parts()
+    assert len(parts) >= 2
+    victim = table._get_part_dbfile(parts[-1])
+    os.chmod(victim, 0o000)
+    try:
+        with pytest.raises(Exception) as exc_info:
+            list(table.iter_select_batches(
+                "*", order_by="seq", batch_size=2, to_dict=True,
+            ))
+        # 错误信息必须能定位到出问题的分区文件
+        assert 'events' in str(exc_info.value) or str(
+            victim
+        ) in str(exc_info.value) or os.path.basename(victim) in str(
+            exc_info.value
+        )
+        assert not isinstance(exc_info.value, StopIteration)
+    finally:
+        os.chmod(victim, 0o644)
+
+    db.close()
+
+
+def test_iter_select_batches_order_by_over_conn_cap_fails(tmp_path):
+    """有序归并连接数超过 max_ordered_read_connections 时快速失败（评审 P1-2）。"""
+    db = Database(
+        _uri(tmp_path),
+        max_ordered_read_connections=2,
+    )
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        partition=Partition.range("seq", every=10),
+    )
+    table.write([
+        {"event_id": idx + 1, "seq": seq}
+        for idx, seq in enumerate([3, 15, 27])
+    ])
+    assert len(table.table_parts()) >= 3
+
+    with pytest.raises(BadArgument, match="max_ordered_read_connections"):
+        list(table.iter_select_batches(
+            "*", order_by="seq", batch_size=2, to_dict=True,
+        ))
+
+    # 无 order_by 的流式路径不受该上限影响
+    rows = [
+        row
+        for batch in table.iter_select_batches("*", batch_size=2, to_dict=True)
+        for row in batch
+    ]
+    assert len(rows) == 3
+
+    db.close()
+
+
 def test_compact_rejects_non_segment_table(tmp_path):
     db = Database(_uri(tmp_path))
     table = db.table(

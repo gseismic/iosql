@@ -5,6 +5,7 @@ import heapq
 import json
 import math
 import os
+import pathlib
 import shutil
 import sqlite3
 import threading
@@ -294,6 +295,9 @@ class Table(BaseTable):
         max_open_partitions = kwargs.pop("max_open_partitions", 5)
         max_connections_per_file = kwargs.pop("max_connections_per_file", 1)
         max_process_connections = kwargs.pop("max_process_connections", 32)
+        max_ordered_read_connections = kwargs.pop(
+            "max_ordered_read_connections", 128
+        )
         self._num_opened_max_allowed = self._positive_int_option(
             "max_open_partitions",
             max_open_partitions,
@@ -305,6 +309,10 @@ class Table(BaseTable):
         self._max_process_connections = self._positive_int_option(
             "max_process_connections",
             max_process_connections,
+        )
+        self._max_ordered_read_connections = self._positive_int_option(
+            "max_ordered_read_connections",
+            max_ordered_read_connections,
         )
         self._pragma_dict = copy.deepcopy(_MYSQLITE_DEFAULT_PRAGMA)
         self._pragma_dict.update(pragma_dict or {})
@@ -348,6 +356,10 @@ class Table(BaseTable):
     @property
     def max_process_connections(self):
         return self._max_process_connections
+
+    @property
+    def max_ordered_read_connections(self):
+        return self._max_ordered_read_connections
 
     def connect(self):
         """连接
@@ -3466,6 +3478,8 @@ class Table(BaseTable):
     def _open_part_read_conn(self, part_dbfile):
         """为有序流式扫描打开专用只读连接（绕开分区连接池）。
 
+        - mode=ro URI：绝不创建缺失文件；文件缺失/无法打开直接抛错（带
+          part_dbfile），不做"静默空分区"——否则导出会 200 但缺数据；
         - query_only 防误写；cache_size 压到 1MB/连接（归并态多连接并发）；
         - temp_store=FILE：ORDER BY 的临时 B 树/排序器可落盘，RAM 有界
           （连接池默认 temp_store=memory，大 segment 排序会占 O(segment) 内存）；
@@ -3473,20 +3487,32 @@ class Table(BaseTable):
           归并期间文件被 compact/repartition 替换时，游标继续读旧快照（一致性读）。
         """
         if not os.path.isfile(part_dbfile):
-            return None
+            raise UnsafeOperation(
+                f'ordered stream part file missing: {part_dbfile}'
+            )
+        conn = None
         try:
-            conn = sqlite3.connect(part_dbfile, timeout=30.0)
-        except sqlite3.DatabaseError:
-            return None
+            uri = pathlib.Path(os.path.abspath(part_dbfile)).as_uri()
+            conn = sqlite3.connect(f'{uri}?mode=ro', uri=True, timeout=30.0)
+        except (sqlite3.Error, ValueError):
+            # mode=ro 在 WAL 只读边缘场景可能失败，回退普通打开（isfile 已保证
+            # 不会创建缺失文件），仍以 query_only 防误写
+            try:
+                conn = sqlite3.connect(part_dbfile, timeout=30.0)
+            except sqlite3.Error as exc:
+                raise UnsafeOperation(
+                    f'ordered stream open part failed: {part_dbfile}: {exc}'
+                ) from exc
         try:
-            # 行为与连接池路径对齐：字符串索引/字典化都依赖 sqlite3.Row
-            conn.row_factory = sqlite3.Row
+            conn.row_factory = sqlite3.Row  # 字符串索引/字典化与池路径对齐
             conn.execute('PRAGMA query_only=ON')
             conn.execute('PRAGMA temp_store=FILE')
             conn.execute('PRAGMA cache_size=-1024')
-        except sqlite3.DatabaseError:
+        except sqlite3.Error as exc:
             conn.close()
-            return None
+            raise UnsafeOperation(
+                f'ordered stream init part failed: {part_dbfile}: {exc}'
+            ) from exc
         return conn
 
     def _part_ordered_rows(self, part_dbfile, query, chunk_size):
@@ -3495,10 +3521,11 @@ class Table(BaseTable):
         一条 SQL 一个游标：每 part 只排序一次；游标存活期间 SQLite 保持
         语句级读快照（WAL 下不阻塞写入），part 内不重不漏；
         峰值驻留 = 该流当前 fetchmany 的 chunk 行。
+
+        连接失败直接抛错（带 part_dbfile，见 _open_part_read_conn），
+        只有已成功连接后的 no such table 兼容为空流。
         """
         conn = self._open_part_read_conn(part_dbfile)
-        if conn is None:
-            return
         try:
             cursor = conn.execute(query.sql, query.params)
             try:
@@ -3519,7 +3546,9 @@ class Table(BaseTable):
     def _merge_stream_chunk(batch_size, part_count):
         """每 part 流的 fetch 粒度：驻留 ≈ P × chunk，总量钳在 ~10 万行。
 
-        P=归并 part 数。cursor 存活期间不重排，小 chunk 无额外排序成本。
+        P=归并 part 数（受 max_ordered_read_connections 上限约束，默认 128
+        → 100_000//128=781，64 下限在默认配置下不会触底）。cursor 存活期间
+        不重排，小 chunk 无额外排序成本。
         """
         if part_count <= 0:
             return batch_size
@@ -3532,8 +3561,10 @@ class Table(BaseTable):
 
         - 每 part 一条专用只读连接 + 单游标（无 OFFSET），单次排序流式产出；
           limit 下推为 per-part LIMIT（SQLite top-N 排序器，排序内存 O(limit)）；
-        - 峰值 Python 驻留 ≈ P × chunk（P=part 数，总量钳在 ~10 万行）；
+        - 连接数受 max_ordered_read_connections 上限约束（默认 128，超出快速
+          失败）；峰值 Python 驻留 ≈ P × chunk（总量钳在 ~10 万行）；
           每 part 的 SQLite 排序可落盘（temp_store=FILE），RAM 有界；
+        - 连接失败抛错（不静默空分区）；no such table 兼容为空流；
         - 快照语义：流建立后本迭代不可见新增 part/行（part 内语句级快照，
           跨 part 非原子）；tie 优先早 part（与 select() 稳定排序一致）。
         fields 投影/to_dict/batch_size 语义不变。
@@ -3571,6 +3602,18 @@ class Table(BaseTable):
             stream_specs.append((part_dbfile, query))
         if not stream_specs:
             return
+
+        # 有序归并需同时打开全部 part 的只读连接：超出上限直接快速失败，
+        # 不做静默降级（否则既丢数据语义，又可能撞 fd/内存上限）
+        max_conns = self._max_ordered_read_connections
+        if len(stream_specs) > max_conns:
+            raise BadArgument(
+                f'ordered stream 需要 {len(stream_specs)} 条只读连接，'
+                f'超过 max_ordered_read_connections={max_conns}；'
+                '修复: 收窄 where 的时间范围，'
+                '或调大 max_ordered_read_connections，'
+                '或去掉 order_by 改用分区自然序流式导出'
+            )
 
         chunk_size = self._merge_stream_chunk(batch_size, len(stream_specs))
         part_streams = [

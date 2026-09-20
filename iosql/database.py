@@ -73,6 +73,7 @@ def _binding_fields():
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
 _DEFAULT_MAX_CONNECTIONS_PER_FILE = 1
 _DEFAULT_MAX_PROCESS_CONNECTIONS = 32
+_DEFAULT_MAX_ORDERED_READ_CONNECTIONS = 128
 
 
 def _normalize_pk(value):
@@ -122,6 +123,7 @@ class Database(object):
         max_open_partitions=_DEFAULT_MAX_OPEN_PARTITIONS,
         max_connections_per_file=_DEFAULT_MAX_CONNECTIONS_PER_FILE,
         max_process_connections=_DEFAULT_MAX_PROCESS_CONNECTIONS,
+        max_ordered_read_connections=_DEFAULT_MAX_ORDERED_READ_CONNECTIONS,
     ):
         self._uri = uri
         self._table_cls = Database.get_engine(uri)
@@ -138,6 +140,8 @@ class Database(object):
             max_open_partitions != _DEFAULT_MAX_OPEN_PARTITIONS
             or max_connections_per_file != _DEFAULT_MAX_CONNECTIONS_PER_FILE
             or max_process_connections != _DEFAULT_MAX_PROCESS_CONNECTIONS
+            or max_ordered_read_connections
+            != _DEFAULT_MAX_ORDERED_READ_CONNECTIONS
         ):
             raise BadArgument(
                 "SQLite file limits are only supported by the SQLite engine"
@@ -153,6 +157,10 @@ class Database(object):
         self._max_process_connections = self._positive_int(
             "max_process_connections",
             max_process_connections,
+        )
+        self._max_ordered_read_connections = self._positive_int(
+            "max_ordered_read_connections",
+            max_ordered_read_connections,
         )
         self._pragma_dict = pragma_dict
 
@@ -180,6 +188,9 @@ class Database(object):
                     "max_open_partitions": self._max_open_partitions,
                     "max_connections_per_file": self._max_connections_per_file,
                     "max_process_connections": self._max_process_connections,
+                    "max_ordered_read_connections": (
+                        self._max_ordered_read_connections
+                    ),
                 })
                 if self._pragma_dict is not None:
                     table_options["pragma_dict"] = self._pragma_dict
