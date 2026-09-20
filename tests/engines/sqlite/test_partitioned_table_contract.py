@@ -593,6 +593,85 @@ def test_iter_select_batches_order_by_limit_project(tmp_path):
     db.close()
 
 
+def test_iter_select_batches_order_by_concurrent_write_snapshot(tmp_path):
+    """迭代期间并发写入：语句级快照保证不重不漏，新行不可见（评审复现场景）。"""
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer", "kind": "text"},
+        segment=Segment.rows(max_rows=2, target_rows=2),
+        order_key="event_id",
+    )
+    table.write([
+        {"event_id": idx, "seq": idx, "kind": "trade"}
+        for idx in range(1, 9)
+    ])
+    snapshot = table.select("*", order_by="seq", to_dict=True)
+
+    got = []
+    for i, batch in enumerate(table.iter_select_batches(
+        "*", order_by="seq", batch_size=2, to_dict=True,
+    )):
+        ids = [row["event_id"] for row in batch]
+        assert len(ids) == len(set(ids)), '批内 event_id 重复'
+        if i == 1:
+            # 模拟并发写：更小排序值（评审复现 -1 场景）+ 更大值
+            table.insert_all([
+                {"event_id": 100, "seq": -1, "kind": "late"},
+                {"event_id": 101, "seq": 99, "kind": "late"},
+            ])
+        got.extend(ids)
+    assert len(got) == len(set(got)), '跨批 event_id 重复（OFFSET 重读）'
+    assert [row["event_id"] for row in snapshot] == got
+    assert 100 not in got and 101 not in got, '迭代中新行可见 → 非快照读'
+
+    db.close()
+
+
+def test_iter_select_batches_order_by_limit_pushdown_many_parts(tmp_path):
+    """limit 下推 per-part LIMIT：多分区 limit=1 只归并出 1 行且与 select() 一致。"""
+    db = Database(_uri(tmp_path))
+    table = db.table(
+        "events",
+        pk=["event_id"],
+        columns={"event_id": "integer", "seq": "integer"},
+        partition=Partition.range("seq", every=10),
+    )
+    seqs = [3, 45, 12, 9, 71, 50, 27, 64, 18, 33]
+    table.write([
+        {"event_id": idx + 1, "seq": seq}
+        for idx, seq in enumerate(seqs)
+    ])
+    assert len(table.table_parts()) >= 8
+
+    # 结构回归：limit 生成 per-part LIMIT ?（top-N 排序器，排序内存 O(limit)）
+    ref, query = next(table._select_queries_for_where(
+        "*",
+        table._build_where(None),
+        table.get_table_meta()["column_info"],
+        order_by_sql=table._order_by_sql("seq desc", "*", {}),
+        limit=1,
+    ))
+    assert query.sql.rstrip().rstrip(';').endswith('limit ?')
+    assert query.params[-1] == 1
+
+    rows = [
+        row
+        for batch in table.iter_select_batches(
+            "*", order_by="seq desc", batch_size=2, limit=1, to_dict=True,
+        )
+        for row in batch
+    ]
+    assert len(rows) == 1
+    assert rows == table.select(
+        "*", order_by="seq desc", limit=1, to_dict=True,
+    )
+    assert rows[0]["seq"] == 71
+
+    db.close()
+
+
 def test_compact_rejects_non_segment_table(tmp_path):
     db = Database(_uri(tmp_path))
     table = db.table(

@@ -3397,7 +3397,7 @@ class Table(BaseTable):
             )
 
     def _select_queries_for_where(self, fields, where_obj, column_types,
-                                  order_by_sql=None):
+                                  order_by_sql=None, limit=None):
         if not where_obj.or_and_cases:
             for ref in self._get_select_part_refs(None):
                 yield (
@@ -3408,6 +3408,7 @@ class Table(BaseTable):
                         None,
                         column_types,
                         order_by_sql=order_by_sql,
+                        limit=limit,
                     ),
                 )
             return
@@ -3423,6 +3424,7 @@ class Table(BaseTable):
                 where_obj.or_and_cases,
                 column_types,
                 order_by_sql=order_by_sql,
+                limit=limit,
             )
             for ref in refs_by_key.values():
                 yield ref, query
@@ -3435,6 +3437,7 @@ class Table(BaseTable):
             cases,
             column_types,
             order_by_sql=order_by_sql,
+            limit=limit,
         )
         for ref in self._get_select_part_refs(cases):
             yield ref, query
@@ -3460,42 +3463,80 @@ class Table(BaseTable):
                 break
             offset += len(rows)
 
-    def _iter_part_ordered_batches(self, part_dbfile, query, chunk_size):
-        """分页流式读取一个 part 的有序行。
+    def _open_part_read_conn(self, part_dbfile):
+        """为有序流式扫描打开专用只读连接（绕开分区连接池）。
 
-        与无序路径同为"每次 open/close 一个分区连接"的生命周期（任一时刻
-        至多打开 1 个分区文件，不与 max_open_partitions 冲突）；chunk 取
-        大粒度以摊薄 ORDER BY+LIMIT/OFFSET 每页重排的成本。
+        - query_only 防误写；cache_size 压到 1MB/连接（归并态多连接并发）；
+        - temp_store=FILE：ORDER BY 的临时 B 树/排序器可落盘，RAM 有界
+          （连接池默认 temp_store=memory，大 segment 排序会占 O(segment) 内存）；
+        - 只读扫描不经过 _db_parts 池，不受 max_open_partitions 约束；
+          归并期间文件被 compact/repartition 替换时，游标继续读旧快照（一致性读）。
         """
-        base_sql = query.sql.rstrip().rstrip(';')
-        offset = 0
-        while True:
-            sql = f'{base_sql} limit ? offset ?'
-            params = list(query.params) + [chunk_size, offset]
-            with self._part_db(part_dbfile, auto_commit=False) as db:
-                with db.get_connection() as conn:
-                    try:
-                        rows = conn.execute(sql, params).fetchall()
-                    except sqlite3.OperationalError as exc:
-                        if 'no such table' not in str(exc).lower():
-                            raise
+        if not os.path.isfile(part_dbfile):
+            return None
+        try:
+            conn = sqlite3.connect(part_dbfile, timeout=30.0)
+        except sqlite3.DatabaseError:
+            return None
+        try:
+            # 行为与连接池路径对齐：字符串索引/字典化都依赖 sqlite3.Row
+            conn.row_factory = sqlite3.Row
+            conn.execute('PRAGMA query_only=ON')
+            conn.execute('PRAGMA temp_store=FILE')
+            conn.execute('PRAGMA cache_size=-1024')
+        except sqlite3.DatabaseError:
+            conn.close()
+            return None
+        return conn
+
+    def _part_ordered_rows(self, part_dbfile, query, chunk_size):
+        """单游标流式读取一个 part 的有序行（无 OFFSET）。
+
+        一条 SQL 一个游标：每 part 只排序一次；游标存活期间 SQLite 保持
+        语句级读快照（WAL 下不阻塞写入），part 内不重不漏；
+        峰值驻留 = 该流当前 fetchmany 的 chunk 行。
+        """
+        conn = self._open_part_read_conn(part_dbfile)
+        if conn is None:
+            return
+        try:
+            cursor = conn.execute(query.sql, query.params)
+            try:
+                while True:
+                    rows = cursor.fetchmany(chunk_size)
+                    if not rows:
                         return
-            if not rows:
-                return
-            yield list(rows)
-            if len(rows) < chunk_size:
-                return
-            offset += len(rows)
+                    yield from rows
+            finally:
+                cursor.close()
+        except sqlite3.DatabaseError as exc:
+            if 'no such table' not in str(exc).lower():
+                raise
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _merge_stream_chunk(batch_size, part_count):
+        """每 part 流的 fetch 粒度：驻留 ≈ P × chunk，总量钳在 ~10 万行。
+
+        P=归并 part 数。cursor 存活期间不重排，小 chunk 无额外排序成本。
+        """
+        if part_count <= 0:
+            return batch_size
+        return max(64, min(batch_size, max(1, 100_000 // part_count)))
 
     def _iter_select_ordered_batches(
         self, fields, where, limit, order_by, to_dict, batch_size
     ):
         """带 order_by 的流式条件查询：跨 part k 路归并，内存有界。
 
-        - 每 part 按 ORDER BY+LIMIT/OFFSET 分页流式读取，heapq.merge 归并；
-        - 任一时刻至多打开 1 个分区连接，峰值驻留 ≈ 单页 chunk（≤10 万行）；
-        - limit 归并侧提前终止；fields 投影/to_dict/batch_size 语义不变；
-        - tie 优先早 part（与 select() 的 part 顺序 + 稳定排序结果一致）。
+        - 每 part 一条专用只读连接 + 单游标（无 OFFSET），单次排序流式产出；
+          limit 下推为 per-part LIMIT（SQLite top-N 排序器，排序内存 O(limit)）；
+        - 峰值 Python 驻留 ≈ P × chunk（P=part 数，总量钳在 ~10 万行）；
+          每 part 的 SQLite 排序可落盘（temp_store=FILE），RAM 有界；
+        - 快照语义：流建立后本迭代不可见新增 part/行（part 内语句级快照，
+          跨 part 非原子）；tie 优先早 part（与 select() 稳定排序一致）。
+        fields 投影/to_dict/batch_size 语义不变。
         """
         meta = self.get_table_meta()
         if not meta:
@@ -3519,6 +3560,7 @@ class Table(BaseTable):
             w,
             column_types,
             order_by_sql=order_by_sql,
+            limit=limit,
         ):
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
@@ -3530,7 +3572,7 @@ class Table(BaseTable):
         if not stream_specs:
             return
 
-        chunk_size = self._ordered_fetch_chunk(batch_size)
+        chunk_size = self._merge_stream_chunk(batch_size, len(stream_specs))
         part_streams = [
             self._part_ordered_rows(part_dbfile, query, chunk_size)
             for part_dbfile, query in stream_specs
@@ -3552,20 +3594,6 @@ class Table(BaseTable):
                 pending = []
         if pending:
             yield pending
-
-    def _part_ordered_rows(self, part_dbfile, query, chunk_size):
-        """把 _iter_part_ordered_batches 的批次摊平为行流。"""
-        for batch in self._iter_part_ordered_batches(
-            part_dbfile, query, chunk_size,
-        ):
-            for row in batch:
-                yield row
-
-    @staticmethod
-    def _ordered_fetch_chunk(batch_size):
-        """有序分页的内部 fetch 粒度：大 chunk 摊薄每页 ORDER BY 重排成本，
-        峰值驻留为单 part 单页（≤10 万行），与归并 part 数无关。"""
-        return min(100_000, max(batch_size, 10_000))
 
     def _row_sort_key(self, specs):
         """构造对齐 SQLite 排序语义的 heap key 函数。"""
