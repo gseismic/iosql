@@ -1068,3 +1068,145 @@ def test_cli_doctor_range_partition_suggestion(tmp_path):
     assert _suggest_range_every_down(avg_rows=500_000, target=200_000, current_every=1) == 1
     assert _recommended_calendar_every(4) == ("4day", 4)
     assert _recommended_calendar_every(1582) == ("5year", 1260)
+
+
+def test_cli_describe_outputs_normalized_structure(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke("describe", "-s", str(db_path), "-t", "ticks")
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.output)
+    assert info["name"] == "ticks"
+    assert info["primary_key"] == ["symbol", "ts"]
+    names = [c["name"] for c in info["columns"]]
+    assert names == ["symbol", "ts", "price"]
+    for col in info["columns"]:
+        assert set(col) == {"name", "type", "description", "range"}
+        assert col["description"] is None and col["range"] is None
+
+    result = _invoke("describe", "-s", str(db_path), "-t", "nope")
+    assert result.exit_code != 0
+    assert "表不存在" in result.output
+
+
+def test_cli_update_metadata_sets_descriptions_and_ranges(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--description", "1 分钟行情，UTC 毫秒时间戳。",
+        "--column-desc", "price=收盘成交价。",
+        "--column-desc", "symbol=证券代码。",
+        "--column-range", "price=0:inf",
+    )
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.output)
+    assert info["description"] == "1 分钟行情，UTC 毫秒时间戳。"
+    by_name = {c["name"]: c for c in info["columns"]}
+    assert by_name["price"]["description"] == "收盘成交价。"
+    assert by_name["price"]["range"] == {"low": 0, "high": "+inf"}
+    assert by_name["symbol"]["description"] == "证券代码。"
+    assert by_name["symbol"]["range"] is None
+
+    # 重开数据库后 describe 仍可读到（SQLite sidecar 持久化）
+    result = _invoke("describe", "-s", str(db_path), "-t", "ticks")
+    assert result.exit_code == 0, result.output
+    again = json.loads(result.output)
+    assert again["description"] == "1 分钟行情，UTC 毫秒时间戳。"
+
+    # 有界值域与负无穷边界
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-range", "price=-1:1",
+    )
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.output)
+    by_name = {c["name"]: c for c in info["columns"]}
+    assert by_name["price"]["range"] == {"low": -1, "high": 1}
+
+
+def test_cli_update_metadata_clear_semantics(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--description", "临时表介绍",
+        "--column-desc", "price=临时解释",
+        "--column-range", "price=0:100",
+    )
+    assert result.exit_code == 0, result.output
+
+    # COL=（空文本）只清除该列解释；同时验证省略项不受影响
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-desc", "price=",
+    )
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.output)
+    by_name = {c["name"]: c for c in info["columns"]}
+    assert by_name["price"]["description"] is None
+    assert by_name["price"]["range"] == {"low": 0, "high": 100}
+    assert info["description"] == "临时表介绍"
+
+    # 清空类操作与清除表介绍
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--clear-column-ranges", "--clear-description",
+    )
+    assert result.exit_code == 0, result.output
+    info = json.loads(result.output)
+    assert info["description"] is None
+    assert all(c["range"] is None for c in info["columns"])
+
+
+def test_cli_update_metadata_rejects_invalid_input(tmp_path):
+    db_path = _make_sample_db(tmp_path)
+
+    # 无任何修改
+    result = _invoke("update-metadata", "-s", str(db_path), "-t", "ticks")
+    assert result.exit_code != 0
+    assert "没有任何修改" in result.output
+
+    # 互斥选项
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--description", "x", "--clear-description",
+    )
+    assert result.exit_code != 0
+    assert "不能同时使用" in result.output
+
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-desc", "price=x", "--clear-column-descs",
+    )
+    assert result.exit_code != 0
+
+    # 非法值域格式 / low > high / 未知列
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-range", "price=0",
+    )
+    assert result.exit_code != 0
+    assert "缺少上界" in result.output
+
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-range", "price=abc:1",
+    )
+    assert result.exit_code != 0
+    assert "low 边界无效" in result.output
+
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-range", "price=5:1",
+    )
+    assert result.exit_code != 0
+    assert "low(5.0) > high(1.0)" in result.output
+
+    # 未知列：核心校验 BadArgument → 错误信息含列名（经守卫转 _fail）
+    result = _invoke(
+        "update-metadata", "-s", str(db_path), "-t", "ticks",
+        "--column-desc", "nope=解释",
+    )
+    assert result.exit_code != 0
+    assert "nope" in result.output

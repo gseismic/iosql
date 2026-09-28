@@ -589,6 +589,26 @@ iosql cleanup-obsolete -s sqlite://database/market.iosql -t ticks        # dry-r
 iosql cleanup-obsolete -s sqlite://database/market.iosql -t ticks --yes  # 执行删除
 ```
 
+### 表说明、字段解释与声明值域
+
+为表持久化"给人看和给 LLM 看"的元信息：表介绍、逐列解释、以及业务/模型约定的闭区间值域（`low`/`high`，只存契约，不做写入校验、不参与统计）。建表时可在 `db.table()` / `db.timeseries()` 传 `description` / `column_descriptions` / `column_ranges`；已有表用 `table.update_metadata(...)` 增补，或直接用 CLI：
+
+```bash
+# 读取规范 JSON 结构（表介绍 / 主键 / 逐列 类型·解释·值域；+inf/-inf 表示无穷边界）
+iosql describe -s sqlite://database/market.iosql -t ticks
+
+# 增量更新：省略的项不修改
+iosql update-metadata -s sqlite://database/market.iosql -t ticks \
+  --description "1 分钟行情，UTC 毫秒时间戳。" \
+  --column-desc "price=未复权收盘价。" \
+  --column-range "price=0:inf"
+
+# 清除：--clear-description / --clear-column-descs / --clear-column-ranges，
+# 或 --column-desc "price="（空文本清除该列解释）
+```
+
+Python 侧对应 `table.describe()` 与 `table.update_metadata(...)`，返回/输入均为 JSON 安全结构，适合程序与 LLM 直接消费。
+
 ### SQLite 迁移到 PostgreSQL
 
 已有 SQLite 版 iosql 库可以直接迁移到 PostgreSQL。表契约会复用源库的主键、列类型、分区和排序字段；源库不会被修改。

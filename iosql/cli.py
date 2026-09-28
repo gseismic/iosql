@@ -1134,6 +1134,123 @@ def spec(
 
 
 @app.command()
+def describe(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="表名"),
+):
+    """输出表说明、字段解释与声明值域（面向人和 LLM 的 JSON 规范结构）。"""
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        t = _require_table(db, table)
+        _echo_json(t.describe())
+    finally:
+        db.close()
+
+
+@app.command("update-metadata")
+def update_metadata(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    table: str = typer.Option(..., "--table", "-t", help="表名"),
+    description: Optional[str] = typer.Option(None, "--description", help="表介绍（省略则不修改）"),
+    clear_description: bool = typer.Option(False, "--clear-description", help="清除表介绍"),
+    column_descs: List[str] = typer.Option([], "--column-desc", help="字段解释 COL=TEXT，可重复；COL=（空文本）清除该列解释"),
+    clear_column_descs: bool = typer.Option(False, "--clear-column-descs", help="清空全部字段解释"),
+    column_ranges: List[str] = typer.Option([], "--column-range", help="声明值域 COL=LOW:HIGH，可重复；LOW/HIGH 支持数值与 inf/-inf"),
+    clear_column_ranges: bool = typer.Option(False, "--clear-column-ranges", help="清空全部声明值域"),
+):
+    """增量更新表介绍、字段解释与声明值域（不改写业务数据）。"""
+    if description is not None and clear_description:
+        _fail("--description 与 --clear-description 不能同时使用")
+    if column_descs and clear_column_descs:
+        _fail("--column-desc 与 --clear-column-descs 不能同时使用")
+    if column_ranges and clear_column_ranges:
+        _fail("--column-range 与 --clear-column-ranges 不能同时使用")
+
+    kwargs: dict = {}
+    if clear_description:
+        kwargs["description"] = None
+    elif description is not None:
+        kwargs["description"] = description
+
+    if clear_column_descs:
+        kwargs["column_descriptions"] = None
+    elif column_descs:
+        kwargs["column_descriptions"] = _parse_column_texts(column_descs)
+
+    if clear_column_ranges:
+        kwargs["column_ranges"] = None
+    elif column_ranges:
+        kwargs["column_ranges"] = _parse_column_ranges(column_ranges)
+
+    if not kwargs:
+        _fail("没有任何修改：请提供 --description/--column-desc/--column-range 或对应 --clear 选项")
+
+    source_uri, _ = _require_source(source)
+    db = Database(source_uri)
+    try:
+        t = _require_table(db, table)
+        result = t.update_metadata(**kwargs)
+        _echo_json(result if result is not None else t.describe())
+    finally:
+        db.close()
+
+
+def _parse_column_texts(pairs: List[str]) -> dict:
+    """解析 COL=TEXT 重复选项；空文本表示清除该列解释（映射为 None）。"""
+    result: dict = {}
+    for pair in pairs:
+        if "=" not in pair:
+            _fail(f"无效的字段解释: {pair}（格式应为 COL=TEXT，例如 price=收盘价）")
+        col, text = pair.split("=", 1)
+        col = col.strip()
+        if not col:
+            _fail(f"无效的字段解释: {pair}（列名不能为空）")
+        result[col] = text if text != "" else None
+    return result
+
+
+_RANGE_INFINITY = {"inf": float("inf"), "+inf": float("inf"), "-inf": float("-inf")}
+
+
+def _parse_range_bound(text: str, col: str, which: str) -> Any:
+    key = text.strip().lower()
+    if key in _RANGE_INFINITY:
+        return _RANGE_INFINITY[key]
+    try:
+        value = float(text)
+    except ValueError:
+        _fail(
+            f"列 {col} 的 {which} 边界无效: {text}"
+            "（应为数值或 inf/-inf，例如 --column-range price=0:inf）"
+        )
+    if value != value:  # NaN
+        _fail(f"列 {col} 的 {which} 边界不能是 NaN")
+    return value
+
+
+def _parse_column_ranges(pairs: List[str]) -> dict:
+    """解析 COL=LOW:HIGH 重复选项为 {col: {low, high}}；边界为闭区间。"""
+    result: dict = {}
+    for pair in pairs:
+        if "=" not in pair:
+            _fail(f"无效的值域声明: {pair}（格式应为 COL=LOW:HIGH，例如 price=0:inf）")
+        col, bounds = pair.split("=", 1)
+        col = col.strip()
+        if not col:
+            _fail(f"无效的值域声明: {pair}（列名不能为空）")
+        if ":" not in bounds:
+            _fail(f"列 {col} 的值域缺少上界: {pair}（格式应为 COL=LOW:HIGH，例如 return=-1:1）")
+        low_text, high_text = bounds.split(":", 1)
+        low = _parse_range_bound(low_text, col, "low")
+        high = _parse_range_bound(high_text, col, "high")
+        if low > high:
+            _fail(f"列 {col} 的值域无效: low({low}) > high({high})（示例: price=0:inf）")
+        result[col] = {"low": low, "high": high}
+    return result
+
+
+@app.command()
 def layout(
     source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
     table: str = typer.Option(..., "--table", "-t", help="表名"),
