@@ -214,12 +214,17 @@ class Database(object):
         time=None,
         symbol_column=None,
         session_column=None,
+        description=None,
+        column_descriptions=None,
+        column_ranges=None,
     ):
         """创建或打开逻辑表（主入口）。
 
         `time` / `symbol_column` / `session_column` 让契约感知能力
         （query()/latest()/asof()）无需 timeseries() 即可使用；
         duration/calendar 分区还会在未显式声明 time 时自动反推。
+        `description`、`column_descriptions`、`column_ranges` 描述表和列的
+        领域语义；只提供这些参数时会增量更新已有 SQLite 表的元数据。
         """
         table = self[table_name]
         shortcut_values = [
@@ -233,11 +238,53 @@ class Database(object):
             symbol_column,
             session_column,
         ]
+        metadata_values = {
+            "description": description,
+            "column_descriptions": column_descriptions,
+            "column_ranges": column_ranges,
+        }
+        if (
+            column_descriptions is not None
+            and not isinstance(column_descriptions, dict)
+        ):
+            raise BadArgument(
+                "column_descriptions must be a dict of column -> str/None"
+            )
+        if column_ranges is not None and not isinstance(column_ranges, dict):
+            raise BadArgument(
+                "column_ranges must be a dict of column -> {low, high}"
+            )
+        has_metadata_values = (
+            description is not None
+            or bool(column_descriptions)
+            or bool(column_ranges)
+        )
         if spec is not None and any(value is not None for value in shortcut_values):
             raise BadArgument('Database.table: spec conflicts with shortcut arguments')
 
         if spec is not None:
             contract = TableContract.ensure(spec)
+            if description is not None:
+                contract = replace(contract, description=description)
+            if column_descriptions is not None:
+                if not isinstance(column_descriptions, dict):
+                    raise BadArgument(
+                        "column_descriptions must be a dict of column -> str/None"
+                    )
+                merged_descriptions = dict(contract.column_descriptions or {})
+                merged_descriptions.update(column_descriptions)
+                contract = replace(
+                    contract,
+                    column_descriptions=merged_descriptions,
+                )
+            if column_ranges is not None:
+                if not isinstance(column_ranges, dict):
+                    raise BadArgument(
+                        "column_ranges must be a dict of column -> {low, high}"
+                    )
+                merged_ranges = dict(contract.column_ranges or {})
+                merged_ranges.update(column_ranges)
+                contract = replace(contract, column_ranges=merged_ranges)
             overrides = {}
             if conflict != 'append':
                 overrides['conflict'] = conflict
@@ -248,6 +295,13 @@ class Database(object):
             if bool(contract.force_partition) != bool(force_partition):
                 contract = replace(contract, force_partition=force_partition)
             self._bind_contract(table, contract, force_partition)
+        elif not any(value is not None for value in shortcut_values):
+            if has_metadata_values:
+                table.update_metadata(**{
+                    key: value
+                    for key, value in metadata_values.items()
+                    if value is not None
+                })
         elif any(value is not None for value in shortcut_values):
             normalized_pk = _normalize_pk(pk)
             normalized_primary_key = _normalize_pk(primary_key)
@@ -273,6 +327,9 @@ class Database(object):
                 conflict=conflict,
                 schema_policy=schema_policy,
                 force_partition=force_partition,
+                description=description,
+                column_descriptions=column_descriptions,
+                column_ranges=column_ranges,
                 **contract_kwargs,
             )
             self._bind_contract(table, contract, force_partition)
@@ -395,12 +452,16 @@ class Database(object):
                    force_partition=False,
                    partition_kind=None, time_unit=None,
                    target_rows_per_file=None, min_rows_per_file=None,
-                   max_rows_per_file=None):
+                   max_rows_per_file=None, description=None,
+                   column_descriptions=None, column_ranges=None):
         """时序语法糖：`table()` 的薄封装。
 
         等价于 `db.table(..., partition=Partition.duration(time, every=partition_every),
         order_key=time, time=time, ...)`；calendar 场景传
         `partition=Partition.calendar(...)`。
+
+        `description`、`column_descriptions`、`column_ranges` 与 `table()` 相同，
+        会随时序契约传递。
 
         废弃参数（触发 DeprecationWarning，行为等价迁移）：
         - `partition_kind='calendar'` → 改传 `partition=Partition.calendar(...)`
@@ -500,6 +561,9 @@ class Database(object):
             time=time_column,
             symbol_column=symbol_column,
             session_column=session_column,
+            description=description,
+            column_descriptions=column_descriptions,
+            column_ranges=column_ranges,
         )
 
     def __enter__(self):

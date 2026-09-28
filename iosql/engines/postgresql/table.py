@@ -415,6 +415,7 @@ class Table(BaseTable):
 
     def use_contract(self, contract):
         contract = TableContract.ensure(contract)
+        self._validate_contract_metadata(contract)
         self._contract = contract
         self._partition = contract.to_partition()
         self._primary_key = list(contract.primary_key)
@@ -426,6 +427,30 @@ class Table(BaseTable):
         )
         self._table_created = True
         return self
+
+    def _validate_contract_metadata(self, contract):
+        """确保元数据映射只引用契约列，且值域对应 PostgreSQL 数值列。"""
+        columns = contract.columns or {}
+        declared_columns = set(columns)
+
+        for field_name in ("column_descriptions", "column_ranges"):
+            metadata_columns = set(getattr(contract, field_name) or {})
+            unknown_columns = sorted(metadata_columns - declared_columns)
+            if unknown_columns:
+                raise BadArgument(
+                    f"{field_name} references undeclared columns "
+                    f"{unknown_columns}; include them in columns"
+                )
+
+        numeric_pg_types = {"BIGINT", "DOUBLE PRECISION"}
+        for column in contract.column_ranges or {}:
+            declared_type = columns[column]
+            pg_type = self._pg_column_type(declared_type)
+            if pg_type not in numeric_pg_types:
+                raise BadArgument(
+                    f"column_ranges[{column!r}] requires a numeric PostgreSQL "
+                    f"column type; got {declared_type!r}"
+                )
 
     def use_spec(self, spec):
         return self.use_contract(spec)

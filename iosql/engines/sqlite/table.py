@@ -11,6 +11,7 @@ import sqlite3
 import threading
 import time
 import warnings
+from dataclasses import replace
 
 # from itertools import chain
 from collections import OrderedDict
@@ -46,6 +47,9 @@ from ...spec import (
     SegmentInfo,
     TableSpec,
     WriteResult,
+    _is_numeric_column_type,
+    _normalize_column_descriptions,
+    _normalize_column_ranges,
 )
 from ...table import BaseTable, resolve_select_fields
 from ...utils.column import sqlite_type_of_value, suggest_sqlite_column_types
@@ -86,6 +90,9 @@ from .query_util import (
 # （timestamp/json 等）不做强校验，回落宽松行为，避免误拒既有用法
 _SQLITE_TYPE_ALIASES = {
     'int': 'integer',
+    'int2': 'integer',
+    'int4': 'integer',
+    'int8': 'integer',
     'integer': 'integer',
     'bigint': 'integer',
     'smallint': 'integer',
@@ -94,8 +101,11 @@ _SQLITE_TYPE_ALIASES = {
     'boolean': 'integer',
     'bool': 'integer',
     'float': 'float',
+    'float4': 'float',
+    'float8': 'float',
     'real': 'float',
     'double': 'float',
+    'double precision': 'float',
     'numeric': 'float',
     'decimal': 'float',
     'text': 'text',
@@ -109,6 +119,8 @@ _SQLITE_TYPE_ALIASES = {
 # 类型强校验只扫批次头部样本：类型冲突几乎必然在头部显形，且同路径依赖的
 # suggest_column_types 本身就按 n_suggest_check 采样推断，全量扫描只增加热路径成本
 _TYPE_CHECK_SAMPLE_ROWS = 1000
+_IOSQL_METADATA_TABLE_NAME = "_iosql_metadata"
+_METADATA_UNSET = object()
 
 
 def _canon_sqlite_type(type_):
@@ -546,6 +558,10 @@ class Table(BaseTable):
         current_contract = self.spec()
         if current_contract:
             self._ensure_spec_compatible(current_contract, contract)
+        self._persist_contract_metadata(
+            contract,
+            persist=self.get_table_meta() is not None,
+        )
         self._declared_spec = contract
         self._partition = contract.to_partition()
         return self
@@ -554,14 +570,340 @@ class Table(BaseTable):
         return self.use_contract(spec)
 
     def spec(self):
-        stored_spec = TableContract.from_table_meta(self.get_table_meta())
+        table_meta = self.get_table_meta()
+        stored_spec = TableContract.from_table_meta(table_meta)
+        if stored_spec is not None and table_meta:
+            schema_columns = {}
+            for column, info in (table_meta.get("column_info") or {}).items():
+                if isinstance(info, dict) and info.get("type") is not None:
+                    schema_columns[column] = info["type"]
+            schema_columns.update(stored_spec.columns or {})
+            if list(schema_columns.items()) != list(
+                (stored_spec.columns or {}).items()
+            ):
+                stored_spec = replace(stored_spec, columns=schema_columns)
         if stored_spec is None:
-            return self._declared_spec
-        if self._declared_spec is None:
-            return stored_spec
-        # 已有表：声明侧只覆盖随实例生效的行为字段（pk/分区/段/列已校验兼容），
-        # 动态演进出的列等 schema 信息以存量为准，保证 spec() 始终是最新快照
-        return self._merge_contract_bindings(stored_spec, self._declared_spec)
+            contract = self._declared_spec
+        elif self._declared_spec is None:
+            contract = stored_spec
+        else:
+            # 已有表：声明侧只覆盖随实例生效的行为字段（pk/分区/段/列已校验兼容），
+            # 动态演进出的列等 schema 信息以存量为准，保证 spec() 始终是最新快照
+            contract = self._merge_contract_bindings(
+                stored_spec,
+                self._declared_spec,
+            )
+        if contract is None:
+            return None
+
+        extended = self._read_extended_metadata()
+        column_descriptions = {}
+        if table_meta:
+            for column, info in (table_meta.get("column_info") or {}).items():
+                comment = info.get("comment") if isinstance(info, dict) else None
+                if isinstance(comment, str):
+                    column_descriptions[column] = comment
+        else:
+            column_descriptions.update(contract.column_descriptions or {})
+        column_descriptions.update(extended["column_descriptions"])
+        return replace(
+            contract,
+            description=(
+                extended["description"]
+                if extended["description"] is not None or table_meta
+                else contract.description
+            ),
+            column_descriptions=column_descriptions,
+            column_ranges=(
+                extended["column_ranges"]
+                if table_meta
+                else {
+                    **(contract.column_ranges or {}),
+                    **extended["column_ranges"],
+                }
+            ),
+        )
+
+    def _read_extended_metadata(self):
+        """读取 sidecar；旧库没有扩展表时视为没有新元信息。"""
+        table_metadata = {"description": None}
+        column_descriptions = {}
+        raw_ranges = {}
+        try:
+            with self.table_meta_db.get_connection() as conn:
+                rows = conn.execute(
+                    f"SELECT scope, name, metadata_json "
+                    f"FROM {_IOSQL_METADATA_TABLE_NAME}"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return {
+                    "description": None,
+                    "column_descriptions": {},
+                    "column_ranges": {},
+                }
+            raise
+
+        for scope, name, metadata_json in rows:
+            try:
+                payload = json.loads(metadata_json)
+            except (TypeError, ValueError) as exc:
+                raise BadArgument(
+                    f"invalid {_IOSQL_METADATA_TABLE_NAME} JSON for {scope}:{name}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise BadArgument(
+                    f"invalid {_IOSQL_METADATA_TABLE_NAME} payload for {scope}:{name}"
+                )
+            if scope == "table":
+                description = payload.get("description")
+                if description is not None and not isinstance(description, str):
+                    raise BadArgument("stored table description must be a string")
+                table_metadata["description"] = description
+            elif scope == "column":
+                description = payload.get("description")
+                if description is not None:
+                    if not isinstance(description, str):
+                        raise BadArgument(
+                            f"stored description for column {name!r} must be a string"
+                        )
+                    column_descriptions[name] = description
+                if "range" in payload:
+                    raw_ranges[name] = payload["range"]
+
+        return {
+            "description": table_metadata["description"],
+            "column_descriptions": _normalize_column_descriptions(
+                column_descriptions
+            ),
+            "column_ranges": _normalize_column_ranges(raw_ranges),
+        }
+
+    def _metadata_schema(self, contract=None, table_meta=None):
+        if table_meta is None:
+            table_meta = self.get_table_meta()
+        columns = {}
+        if table_meta:
+            for column, info in (table_meta.get("column_info") or {}).items():
+                if isinstance(info, dict) and info.get("type") is not None:
+                    columns[column] = info["type"]
+            stored_contract = TableContract.from_table_meta(table_meta)
+            if stored_contract is not None:
+                columns.update(stored_contract.columns or {})
+        if contract is not None:
+            columns.update({
+                column: type_
+                for column, type_ in (contract.columns or {}).items()
+                if type_ is not None
+            })
+        return table_meta, columns
+
+    def _validate_metadata_state(self, metadata, columns, touched_columns=()):
+        names = set(columns)
+        referenced = (
+            set(metadata["column_descriptions"])
+            | set(metadata["column_ranges"])
+            | set(touched_columns)
+        )
+        unknown = sorted(referenced - names)
+        if unknown:
+            available = ", ".join(sorted(names)) or "(none)"
+            raise BadArgument(
+                f"metadata references unknown column(s) {unknown!r}; "
+                f"available columns: {available}"
+            )
+        for column in metadata["column_ranges"]:
+            type_ = columns.get(column)
+            normalized = _canon_sqlite_type(type_) if type_ is not None else None
+            if (
+                not _is_numeric_column_type(type_)
+                or normalized not in ("integer", "float")
+            ):
+                raise BadArgument(
+                    f"column_ranges[{column!r}] requires a numeric column type; "
+                    f"stored type is {type_!r}"
+                )
+
+    def _write_extended_metadata(self, metadata):
+        """在单个事务中替换已知 scope 的元数据行。"""
+        table_rows = []
+        if metadata["description"] is not None:
+            table_rows.append((
+                "table",
+                "",
+                json.dumps(
+                    {"description": metadata["description"]},
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
+            ))
+        column_names = (
+            set(metadata["column_descriptions"])
+            | set(metadata["column_ranges"])
+        )
+        for column in sorted(column_names):
+            payload = {}
+            description = metadata["column_descriptions"].get(column)
+            if description is not None:
+                payload["description"] = description
+            bounds = metadata["column_ranges"].get(column)
+            if bounds is not None:
+                payload["range"] = TableContract(
+                    column_ranges={column: bounds},
+                ).to_dict()["column_ranges"][column]
+            table_rows.append((
+                "column",
+                column,
+                json.dumps(payload, ensure_ascii=False, allow_nan=False),
+            ))
+
+        with self.table_meta_db.transaction(immediate=True) as conn:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {_IOSQL_METADATA_TABLE_NAME} ("
+                "scope TEXT NOT NULL, "
+                "name TEXT NOT NULL, "
+                "metadata_json TEXT NOT NULL, "
+                "PRIMARY KEY (scope, name))"
+            )
+            conn.execute(
+                f"DELETE FROM {_IOSQL_METADATA_TABLE_NAME} "
+                "WHERE scope IN ('table', 'column')"
+            )
+            if table_rows:
+                conn.executemany(
+                    f"INSERT INTO {_IOSQL_METADATA_TABLE_NAME} "
+                    "(scope, name, metadata_json) VALUES (?, ?, ?)",
+                    table_rows,
+                )
+
+    def _apply_metadata_patch(
+        self,
+        *,
+        description=_METADATA_UNSET,
+        column_descriptions=_METADATA_UNSET,
+        column_ranges=_METADATA_UNSET,
+        contract=None,
+        require_table_meta=False,
+        persist=True,
+    ):
+        # 把读取、合并、校验和写入放在同一个 BEGIN IMMEDIATE 中，避免并发补充
+        # 不同字段时互相覆盖；内部写入方法会复用当前事务连接。
+        with self.table_meta_db.transaction(immediate=True):
+            return self._apply_metadata_patch_in_transaction(
+                description=description,
+                column_descriptions=column_descriptions,
+                column_ranges=column_ranges,
+                contract=contract,
+                require_table_meta=require_table_meta,
+                persist=persist,
+            )
+
+    def _apply_metadata_patch_in_transaction(
+        self,
+        *,
+        description=_METADATA_UNSET,
+        column_descriptions=_METADATA_UNSET,
+        column_ranges=_METADATA_UNSET,
+        contract=None,
+        require_table_meta=False,
+        persist=True,
+    ):
+        table_meta, columns = self._metadata_schema(contract=contract)
+        if require_table_meta and table_meta is None:
+            raise BadArgument(
+                f"table {self.table_name!r} has no persisted schema metadata; "
+                "write/create the table before calling update_metadata()"
+            )
+
+        metadata = self._read_extended_metadata()
+        touched_columns = set()
+        if description is not _METADATA_UNSET:
+            if description is not None and not isinstance(description, str):
+                raise BadArgument("description must be str or None")
+            metadata["description"] = description
+
+        if column_descriptions is not _METADATA_UNSET:
+            if column_descriptions is None:
+                metadata["column_descriptions"] = {}
+            else:
+                patch = _normalize_column_descriptions(column_descriptions)
+                touched_columns.update(patch)
+                current = dict(metadata["column_descriptions"])
+                for column, value in patch.items():
+                    if value is None:
+                        current.pop(column, None)
+                    else:
+                        current[column] = value
+                metadata["column_descriptions"] = current
+
+        if column_ranges is not _METADATA_UNSET:
+            if column_ranges is None:
+                metadata["column_ranges"] = {}
+            else:
+                if not isinstance(column_ranges, dict):
+                    raise BadArgument(
+                        "column_ranges must be a dict of column -> {low, high}/None"
+                    )
+                invalid_columns = [
+                    column for column in column_ranges
+                    if not isinstance(column, str) or not column
+                ]
+                if invalid_columns:
+                    raise BadArgument(
+                        "column_ranges keys must be non-empty column names"
+                    )
+                clear_columns = {
+                    column for column, bounds in column_ranges.items()
+                    if bounds is None
+                }
+                touched_columns.update(column_ranges)
+                normalized_patch = _normalize_column_ranges({
+                    column: bounds
+                    for column, bounds in column_ranges.items()
+                    if bounds is not None
+                })
+                current = dict(metadata["column_ranges"])
+                for column in clear_columns:
+                    current.pop(column, None)
+                current.update(normalized_patch)
+                metadata["column_ranges"] = current
+
+        self._validate_metadata_state(metadata, columns, touched_columns)
+        if persist:
+            self._write_extended_metadata(metadata)
+            return self.describe()
+        return None
+
+    def _persist_contract_metadata(self, contract, persist=True):
+        """将声明中的非空元信息作为增量更新写入 sidecar。"""
+        patch = {}
+        if contract.description is not None:
+            patch["description"] = contract.description
+        if contract.column_descriptions:
+            patch["column_descriptions"] = contract.column_descriptions
+        if contract.column_ranges:
+            patch["column_ranges"] = contract.column_ranges
+        if patch:
+            self._apply_metadata_patch(
+                contract=contract,
+                persist=persist,
+                **patch,
+            )
+
+    def update_metadata(
+        self,
+        *,
+        description=_METADATA_UNSET,
+        column_descriptions=_METADATA_UNSET,
+        column_ranges=_METADATA_UNSET,
+    ):
+        """增量更新已有 SQLite 表的说明和值域，不改写业务数据。"""
+        return self._apply_metadata_patch(
+            description=description,
+            column_descriptions=column_descriptions,
+            column_ranges=column_ranges,
+            require_table_meta=True,
+        )
 
     def _merge_contract_bindings(self, stored_spec, declared_spec):
         data = stored_spec.to_dict()
@@ -4221,6 +4563,11 @@ class Table(BaseTable):
         # Store partition info in createtable_meta if it exists
         if partition is not None:
             createtable_meta["partition"] = partition.to_meta()
+        contract_data = createtable_meta.get("table_contract")
+        if isinstance(contract_data, dict):
+            self._persist_contract_metadata(
+                TableContract.from_dict(contract_data)
+            )
         self._overwrite_table_meta(createtable_meta)
 
         # 增加table_part信息, 设置更新时间，方便今后缓存访问
@@ -4270,9 +4617,24 @@ class Table(BaseTable):
         # table_meta_db = MyDatabase(self.table_meta_path, pragma_dict=self._pragma_dict)
         # table_meta_db.enable_wal()
 
+        # 扩展元信息只写 sidecar；legacy JSON 继续保持旧版契约结构。
+        legacy_meta = dict(createtable_meta)
+        for contract_key in ("table_contract", "table_spec"):
+            contract = legacy_meta.get(contract_key)
+            if isinstance(contract, dict):
+                contract = dict(contract)
+                for metadata_key in (
+                    "description",
+                    "column_descriptions",
+                    "column_ranges",
+                ):
+                    contract.pop(metadata_key, None)
+                legacy_meta[contract_key] = contract
+
         # OrderDict
         createtable_meta["column_info"] = list(createtable_meta["column_info"].items())
-        meta = json.dumps(createtable_meta)
+        legacy_meta["column_info"] = createtable_meta["column_info"]
+        meta = json.dumps(legacy_meta)
 
         updated_at = arrow.now().format("YYYY-MM-DD HH:mm:ss")
         info = {

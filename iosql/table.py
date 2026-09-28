@@ -63,6 +63,41 @@ class BaseTable(metaclass=ABCMeta):
             'BaseTable.create_table must be overridden by the engine subclass'
         )
 
+    def describe(self):
+        """返回可供程序与 LLM 消费的表结构和说明，不读取业务数据。"""
+        spec = self.spec()
+        if spec is None:
+            return {
+                "name": self.table_name,
+                "description": None,
+                "primary_key": [],
+                "columns": [],
+            }
+
+        wire_spec = spec.to_dict()
+        descriptions = spec.column_descriptions or {}
+        ranges = wire_spec.get("column_ranges") or {}
+        return {
+            "name": self.table_name,
+            "description": spec.description,
+            "primary_key": list(spec.primary_key),
+            "columns": [
+                {
+                    "name": column,
+                    "type": str(type_) if type_ is not None else None,
+                    "description": descriptions.get(column),
+                    "range": dict(ranges[column]) if column in ranges else None,
+                }
+                for column, type_ in (spec.columns or {}).items()
+            ],
+        }
+
+    def update_metadata(self, **kwargs):
+        """更新持久化元信息；仅支持此能力的后端会覆盖此方法。"""
+        raise BadArgument(
+            "update_metadata is only supported by the SQLite engine"
+        )
+
     def insert(self, dic, pk=None, extra_data=None, partition=None, 
                replace=False, ignore=False, commit=True, **kwargs):
         if not dic: 

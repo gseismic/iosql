@@ -1,4 +1,5 @@
 import math
+import numbers
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -18,6 +19,86 @@ DEFAULT_LOGICAL_PART = "__all__"
 
 
 _PARTITION_KINDS = {"duration", "calendar", "range"}
+
+_NUMERIC_COLUMN_TYPES = {
+    "int", "integer", "int2", "int4", "int8", "smallint", "mediumint",
+    "bigint", "tinyint", "float", "float4", "float8",
+    "real", "double", "double precision", "numeric", "decimal",
+}
+
+
+def _normalize_range_bound(value: Any, column: str, bound: str) -> Any:
+    label = f"column_ranges[{column!r}][{bound!r}]"
+    if isinstance(value, str) and value in ("+inf", "-inf"):
+        return math.inf if value == "+inf" else -math.inf
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise BadArgument(f"{label} must be a scalar number or +/-inf")
+    if isinstance(value, numbers.Integral):
+        return int(value)
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise BadArgument(f"{label} must be a finite number or +/-inf") from exc
+    if math.isnan(numeric):
+        raise BadArgument(f"{label} must not be NaN")
+    if math.isinf(numeric):
+        return math.inf if numeric > 0 else -math.inf
+    return numeric
+
+
+def _normalize_column_ranges(value: Any) -> Dict[str, Dict[str, Any]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise BadArgument("column_ranges must be a dict of column -> {low, high}")
+    ranges = {}
+    for column, bounds in value.items():
+        if not isinstance(column, str) or not column:
+            raise BadArgument("column_ranges keys must be non-empty column names")
+        if not isinstance(bounds, dict) or set(bounds) != {"low", "high"}:
+            raise BadArgument(
+                f"column_ranges[{column!r}] must contain exactly 'low' and 'high'"
+            )
+        low = _normalize_range_bound(bounds["low"], column, "low")
+        high = _normalize_range_bound(bounds["high"], column, "high")
+        if low > high:
+            raise BadArgument(
+                f"column_ranges[{column!r}] requires low <= high; got {low!r} > {high!r}"
+            )
+        ranges[column] = {"low": low, "high": high}
+    return ranges
+
+
+def _range_for_json(bounds: Dict[str, Any]) -> Dict[str, Any]:
+    encoded = {}
+    for bound, value in bounds.items():
+        if isinstance(value, float) and math.isinf(value):
+            encoded[bound] = "+inf" if value > 0 else "-inf"
+        else:
+            encoded[bound] = value
+    return encoded
+
+
+def _normalize_column_descriptions(value: Any) -> Dict[str, Optional[str]]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise BadArgument("column_descriptions must be a dict of column -> str/None")
+    descriptions = {}
+    for column, description in value.items():
+        if not isinstance(column, str) or not column:
+            raise BadArgument("column_descriptions keys must be non-empty column names")
+        if description is not None and not isinstance(description, str):
+            raise BadArgument(
+                f"column_descriptions[{column!r}] must be str or None"
+            )
+        descriptions[column] = description
+    return descriptions
+
+
+def _is_numeric_column_type(type_: Any) -> bool:
+    normalized = str(type_).strip().lower().split("(", 1)[0].strip()
+    return normalized in _NUMERIC_COLUMN_TYPES
 
 _TIME_UNIT_ALIASES = {
     "s": "s",
@@ -750,6 +831,9 @@ class TableContract:
     physical_layout: PhysicalLayout = field(default_factory=PhysicalLayout)
     version: int = 1
     force_partition: bool = False
+    description: Optional[str] = None
+    column_descriptions: Dict[str, Optional[str]] = field(default_factory=dict)
+    column_ranges: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def __post_init__(self):
         if isinstance(self.primary_key, str):
@@ -819,6 +903,19 @@ class TableContract:
         if self.segment is not None:
             self.physical_layout = self.segment.to_physical_layout()
         self.columns = dict(self.columns or {})
+        if self.description is not None and not isinstance(self.description, str):
+            raise BadArgument("description must be str or None")
+        self.column_descriptions = _normalize_column_descriptions(
+            self.column_descriptions
+        )
+        self.column_ranges = _normalize_column_ranges(self.column_ranges)
+        for column in self.column_ranges:
+            type_ = self.columns.get(column)
+            if type_ is not None and not _is_numeric_column_type(type_):
+                raise BadArgument(
+                    f"column_ranges[{column!r}] requires a numeric column type; "
+                    f"got {type_!r}"
+                )
         self.schema_policy = str(self.schema_policy or "evolve")
         if self.order_key is not None:
             self.order_key = str(self.order_key)
@@ -934,6 +1031,15 @@ class TableContract:
             data["symbol_column"] = self.symbol_column
         if self.session_column is not None:
             data["session_column"] = self.session_column
+        if self.description is not None:
+            data["description"] = self.description
+        if self.column_descriptions:
+            data["column_descriptions"] = dict(self.column_descriptions)
+        if self.column_ranges:
+            data["column_ranges"] = {
+                column: _range_for_json(bounds)
+                for column, bounds in self.column_ranges.items()
+            }
         return data
 
     @classmethod
@@ -952,6 +1058,9 @@ class TableContract:
             physical_layout=data.get("physical_layout") or {},
             version=data.get("version", 1),
             force_partition=data.get("force_partition", False),
+            description=data.get("description"),
+            column_descriptions=data.get("column_descriptions") or {},
+            column_ranges=data.get("column_ranges") or {},
         )
 
     @classmethod
