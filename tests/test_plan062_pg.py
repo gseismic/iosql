@@ -850,6 +850,33 @@ class TestApiParityP2:
         assert fake_pg.commit_count == 1
         assert fake_pg.autocommit is True
 
+    def test_named_cursor_description_arrives_after_first_fetch(self, fake_pg):
+        table = _make_table(fake_pg)
+
+        class DeferredDescriptionCursor(FakeCursor):
+            def __init__(self):
+                self._description_ready = False
+                super().__init__()
+                self.description = [('symbol',), ('ts',)]
+
+            @property
+            def description(self):
+                return self._description if self._description_ready else None
+
+            @description.setter
+            def description(self, value):
+                self._description = value
+
+            def fetchmany(self, size=None):
+                self._description_ready = True
+                return super().fetchmany(size)
+
+        fake_pg.cursor_obj = DeferredDescriptionCursor()
+        fake_pg.cursor_obj.results = [('A', 1), ('B', 2)]
+        assert list(table.iter_rows(batch_size=1)) == [
+            {'symbol': 'A', 'ts': 1}, {'symbol': 'B', 'ts': 2},
+        ]
+
     def test_index_name_truncated_and_hash_unique(self, fake_pg):
         table = _make_table(fake_pg, table_name='t' * 60)
 

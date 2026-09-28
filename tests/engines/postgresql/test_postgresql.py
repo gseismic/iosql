@@ -154,6 +154,10 @@ def test_sqlite_to_postgresql_migration_verify_and_query(tmp_path):
                 order_by='ts',
             )
             assert [row['price'] for row in rows] == [187.4, 189.1]
+            streamed = list(target_table.iter_rows(batch_size=2))
+            assert len(streamed) == 4
+            assert all(isinstance(row, dict) for row in streamed)
+            assert [len(batch) for batch in target_table.iter_batches(batch_size=2)] == [2, 2]
 
             roundtrip_uri = f"sqlite://{tmp_path}/roundtrip.iosql"
             roundtrip_result = target.migrate_to(

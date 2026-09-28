@@ -1167,6 +1167,10 @@ class Table(BaseTable):
                 self._ensure_segment_conflict_supported(contract, 'replace')
                 self._ensure_partition_conflict_supported(contract)
 
+        if replace:
+            runtime_partition = partition if partition is not None else self._partition
+            self._reject_cross_partition_replace(runtime_partition, pk)
+
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
         rows = self._add_extra_data(data, extra_data)
@@ -1283,7 +1287,13 @@ class Table(BaseTable):
             )
 
     def _ensure_partition_conflict_supported(self, spec):
-        if spec.partition and spec.partition.column not in spec.primary_key:
+        self._reject_cross_partition_replace(spec.to_partition(), spec.primary_key)
+
+    def _reject_cross_partition_replace(self, partition, pk):
+        if partition is None:
+            return
+        pk_fields = [pk] if isinstance(pk, str) else list(pk or [])
+        if partition.TS_COL not in pk_fields:
             raise BadArgument(
                 '分区表 upsert/replace 要求分区列属于主键；'
                 '当前布局没有跨分区全局主键索引，请将分区列加入主键，'

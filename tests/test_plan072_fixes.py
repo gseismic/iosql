@@ -23,6 +23,13 @@ def _table(db, name, value=1):
     return table
 
 
+def _tree_bytes(root):
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in root.rglob("*") if path.is_file()
+    }
+
+
 def _concurrent_segment_writer(uri, row_id, ready, second_done, result):
     from iosql.engines.sqlite.table import Table
 
@@ -156,12 +163,14 @@ def test_restore_rejects_bad_backup_and_false_target(tmp_path):
     ordinary = tmp_path / "ordinary"
     ordinary.mkdir()
     (ordinary / "note.txt").write_text("original", encoding="utf-8")
+    before = _tree_bytes(source_path)
     runner = CliRunner()
     result = runner.invoke(app, [
         "restore", "--backup", str(ordinary), "--target", str(source_path),
         "--replace", "--yes",
     ])
     assert result.exit_code == 1
+    assert _tree_bytes(source_path) == before
     assert is_iosql_database(source_path, deep=True)
 
     fake = ordinary / "fake"
@@ -224,6 +233,24 @@ def test_partition_upsert_rejected_before_write(tmp_path):
         with pytest.raises(BadArgument, match="分区列属于主键"):
             table.insert_all([{"id": 1, "bucket": 11, "v": 20}], replace=True)
         assert table.count_rows() == 1
+    finally:
+        db.close()
+
+
+def test_low_level_first_replace_rejects_cross_partition_pk(tmp_path):
+    db = _db(tmp_path / "low-level-parts.iosql")
+    try:
+        table = db.table("raw")
+        with pytest.raises(BadArgument, match="分区列属于主键"):
+            table.insert_all(
+                [
+                    {"id": 1, "bucket": 1, "v": 10},
+                    {"id": 1, "bucket": 11, "v": 20},
+                ],
+                pk=["id"], partition=Partition.range("bucket", every=10),
+                replace=True,
+            )
+        assert table.table_parts() == []
     finally:
         db.close()
 
@@ -307,6 +334,28 @@ def test_numeric_text_buckets_and_overflow(tmp_path):
         table.write({"id": 4, "x": "9223372036854775808", "v": 4})
         with pytest.raises(BadArgument, match="64 位"):
             table.aggregate_by_bucket("x", ["v"], 4)
+    finally:
+        db.close()
+
+
+def test_numeric_text_bounds_merge_across_partitions(tmp_path):
+    db = _db(tmp_path / "chart-parts.iosql")
+    try:
+        table = db.table(
+            "t", pk=["part", "id"], order_key="x",
+            partition=Partition.range("part", every=10),
+            columns={
+                "part": "integer", "id": "integer", "x": "text", "v": "integer",
+            },
+        )
+        table.write([
+            {"part": 0, "id": 1, "x": "2", "v": 2},
+            {"part": 10, "id": 2, "x": "10", "v": 10},
+            {"part": 20, "id": 3, "x": "3", "v": 3},
+        ])
+        agg = table.aggregate_by_bucket("x", ["v"], 4)
+        assert (agg["x_min"], agg["x_max"]) == ("2", "10")
+        assert sum(agg["counts"]["v"]) == 3
     finally:
         db.close()
 

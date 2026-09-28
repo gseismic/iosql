@@ -32,7 +32,7 @@
 | P1-3 | SQLite/PG 数字文本横轴按数值求边界，异常大数显式报错；Web 接口同测。 | `2/10/3` 三点均进入桶；定宽日期不回归。 |
 | P1-4 | candle 桶内按横轴值选开收盘，同值时定义稳定规则。 | 乱序写入仍返回最早 open、最晚 close。 |
 | P1-5 | 无唯一排序键时不提供会静默漏行的 keyset 游标，明确返回可操作错误。 | 无 pk 同值场景不再返回看似完整的错误分页。 |
-| P1-6 | PG `iter_rows` 改逐行；引入 `iter_batches` 给迁移使用。 | 两引擎同名 API 返回形状一致，迁移仍按批复制。 |
+| P1-6 | PG `iter_rows` 改逐行；引入 `iter_batches` 给迁移使用。live PG 验证发现命名游标在首次 `fetchmany` 前 `description=None`，读取列名须推迟到首次 fetch 后。 | 两引擎同名 API 返回形状一致，迁移仍按批复制；真实 PG 与延迟描述 mock 均通过。 |
 | P1-7 | SQLite `table_names` 仅识别真实表；读路径对普通目录无副作用。 | 普通子目录不在列表，Web/CLI 不当作表；真实表正常列出。 |
 | P1-8 | PG 表枚举与引擎使用一致的 schema/search_path 规则。 | mock 验证 SQL，能用 live PG 时覆盖非 public schema。 |
 

@@ -1022,14 +1022,15 @@ class Table(BaseTable):
             with conn.cursor(name=cursor_name) as cursor:
                 cursor.itersize = batch_size
                 cursor.execute(query, params)
-                column_names = (
-                    [desc[0] for desc in cursor.description] if to_dict else None
-                )
+                # psycopg2 命名游标在首批 FETCH 前 description 为 None。
+                column_names = None
                 while True:
                     rows = cursor.fetchmany(batch_size)
                     if not rows:
                         break
                     if to_dict:
+                        if column_names is None:
+                            column_names = [desc[0] for desc in cursor.description]
                         rows = [dict(zip(column_names, row)) for row in rows]
                     yield rows
 
