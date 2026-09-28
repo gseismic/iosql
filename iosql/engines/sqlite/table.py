@@ -61,6 +61,7 @@ from ...utils.mysqlite.connection_pool import (
     reserve_process_connections,
 )
 from ...utils.schema import parse_db_schema
+from ...utils.storage_identity import iosql_table_names, is_iosql_table
 
 # from mysqlite import Database as MyDatabase
 from ...utils.mysqlite.exception import DuplicateColumn, NoSuchColumn, NoSuchTable
@@ -346,6 +347,7 @@ class Table(BaseTable):
         self._db_parts_closing = False
         self._db_parts_closed = False
         self._compact_lock = threading.RLock()
+        self._mutation_lock_state = threading.local()
         # schema 演进锁：只串行化 NoSuchTable/NoSuchColumn 冷路径，
         # 防止并发加列时基于过时 meta 快照互相覆盖；稳态插入不经过这些分支
         self._schema_lock = threading.RLock()
@@ -356,6 +358,51 @@ class Table(BaseTable):
         # Load partition from metadata after initialization
         self._partition = self._load_partition()
         self.logger = logger
+
+    @contextmanager
+    def _mutation_lock(self):
+        """同表跨实例/跨进程串行化数据文件与 manifest 的复合写入。"""
+        with self._compact_lock:
+            depth = getattr(self._mutation_lock_state, 'depth', 0)
+            if depth:
+                self._mutation_lock_state.depth = depth + 1
+                try:
+                    yield
+                finally:
+                    self._mutation_lock_state.depth -= 1
+                return
+
+            lock_path = os.path.join(self.table_path, '.iosql.write.lock')
+            if os.path.islink(lock_path):
+                raise UnsafeOperation(f'表锁文件不能是符号链接: {lock_path}')
+            fd = os.open(
+                lock_path,
+                os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0),
+                0o600,
+            )
+            try:
+                try:
+                    import fcntl
+                except ImportError:
+                    import msvcrt
+                    if os.fstat(fd).st_size == 0:
+                        os.write(fd, b'\0')
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                    def unlock():
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    def unlock():
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                self._mutation_lock_state.depth = 1
+                try:
+                    yield
+                finally:
+                    self._mutation_lock_state.depth = 0
+                    unlock()
+            finally:
+                os.close(fd)
 
     @staticmethod
     def _positive_int_option(name, value):
@@ -436,7 +483,7 @@ class Table(BaseTable):
                 self._db_parts_condition.notify_all()
 
     def rename(self, new_name, exist_ok=False, overwrite=False):
-        """重命名 SQLite 逻辑表目录并刷新表内 manifest。"""
+        """重命名 SQLite 逻辑表；覆盖目标先暂存，失败时恢复两张表。"""
         new_name = self._validate_table_name(new_name)
         old_name = self._table_name
         if new_name == old_name:
@@ -452,6 +499,8 @@ class Table(BaseTable):
             raise UnsafeOperation(f'unsafe table rename target: {target_path}')
         if not os.path.isdir(source_path):
             raise BadArgument(f'table does not exist: {old_name}')
+        if not is_iosql_table(source_path):
+            raise UnsafeOperation(f'源目录不是有效 iosql 表: {source_path}')
         if os.path.exists(target_path):
             if not overwrite:
                 raise BadArgument(f'table already exists: {new_name}')
@@ -459,16 +508,63 @@ class Table(BaseTable):
                 raise UnsafeOperation(
                     f'table rename target exists and is not a directory: {target_path}'
                 )
+            if not is_iosql_table(target_path):
+                raise UnsafeOperation(f'目标目录不是有效 iosql 表: {target_path}')
 
-        self.close()
+        owner_ref = getattr(self, '_owner_db', None)
+        owner = owner_ref() if owner_ref is not None else None
+        cached_target = None
+        if owner is not None:
+            with owner._tables_lock:
+                cached_target = owner._tables.get(new_name)
+            if cached_target is self:
+                cached_target = None
+        backup_path = None
         if os.path.exists(target_path):
-            shutil.rmtree(target_path)
-        os.replace(source_path, target_path)
-
-        self._table_name = new_name
-        self.connect()
-        self._rename_table_manifest(old_name, new_name)
-        self._partition = self._load_partition()
+            from ...database import Database
+            backup_path = Database._rename_backup_path(target_path)
+        moved = False
+        try:
+            self.close()
+            if cached_target is not None:
+                cached_target.close()
+            if backup_path is not None:
+                os.replace(target_path, backup_path)
+            os.replace(source_path, target_path)
+            moved = True
+            self._table_name = new_name
+            self.connect()
+            self._rename_table_manifest(old_name, new_name)
+            self._partition = self._load_partition()
+        except Exception as exc:
+            if moved:
+                try:
+                    self._rename_table_manifest(new_name, old_name)
+                except Exception:
+                    pass
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                os.replace(target_path, source_path)
+            self._table_name = old_name
+            if backup_path is not None and os.path.exists(backup_path):
+                os.replace(backup_path, target_path)
+            self.connect()
+            if cached_target is not None:
+                cached_target.connect()
+            if isinstance(exc, OSError):
+                raise BadArgument(
+                    f'重命名表失败: {exc}；修复: 检查目录权限/跨设备限制后重试'
+                ) from exc
+            raise
+        if owner is not None:
+            owner._on_table_renamed(self, old_name, new_name)
+        if backup_path is not None:
+            try:
+                shutil.rmtree(backup_path)
+            except OSError as exc:
+                warnings.warn(f'旧目标表残留在 {backup_path}: {exc}', RuntimeWarning)
         return self
 
     def _validate_table_name(self, name):
@@ -489,20 +585,24 @@ class Table(BaseTable):
         return os.path.dirname(real) == base
 
     def _rename_table_manifest(self, old_name, new_name):
-        for table_name in [
-            _TABLE_META_TABLE_NAME,
-            _TABLE_PART_TABLE_NAME,
-            _TABLE_PART_COLUMN_RANGE_TABLE_NAME,
-            _TABLE_SEGMENT_TABLE_NAME,
-        ]:
-            try:
-                self.table_meta_db[table_name].execute_params(
-                    f'update {table_name} set table_name = ? where table_name = ?',
-                    [new_name, old_name],
-                    commit=True,
+        # 同一 meta.sqlite3 内一次事务更新，避免中途异常留下半张表的新名字。
+        with self.table_meta_db.transaction() as conn:
+            existing = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
                 )
-            except NoSuchTable:
-                continue
+            }
+            for table_name in [
+                _TABLE_META_TABLE_NAME,
+                _TABLE_PART_TABLE_NAME,
+                _TABLE_PART_COLUMN_RANGE_TABLE_NAME,
+                _TABLE_SEGMENT_TABLE_NAME,
+            ]:
+                if table_name in existing:
+                    conn.execute(
+                        f'UPDATE "{table_name}" SET table_name = ? WHERE table_name = ?',
+                        (new_name, old_name),
+                    )
 
     def _load_partition(self) -> Partition | None:
         """Load partition from table metadata.
@@ -524,6 +624,10 @@ class Table(BaseTable):
 
     @partition.setter
     def partition(self, value: Partition | None):
+        with self._mutation_lock():
+            self._set_partition_locked(value)
+
+    def _set_partition_locked(self, value: Partition | None):
         """Set the partition object for this table and persist to metadata.
 
         Args:
@@ -556,6 +660,10 @@ class Table(BaseTable):
         self._overwrite_table_meta(meta)
 
     def use_contract(self, contract):
+        with self._mutation_lock():
+            return self._use_contract_locked(contract)
+
+    def _use_contract_locked(self, contract):
         contract = TableContract.ensure(contract)
         current_contract = self.spec()
         if current_contract:
@@ -900,12 +1008,13 @@ class Table(BaseTable):
         column_ranges=_METADATA_UNSET,
     ):
         """增量更新已有 SQLite 表的说明和值域，不改写业务数据。"""
-        return self._apply_metadata_patch(
-            description=description,
-            column_descriptions=column_descriptions,
-            column_ranges=column_ranges,
-            require_table_meta=True,
-        )
+        with self._mutation_lock():
+            return self._apply_metadata_patch(
+                description=description,
+                column_descriptions=column_descriptions,
+                column_ranges=column_ranges,
+                require_table_meta=True,
+            )
 
     def _merge_contract_bindings(self, stored_spec, declared_spec):
         data = stored_spec.to_dict()
@@ -1056,6 +1165,7 @@ class Table(BaseTable):
                     ignore = True
             if replace:
                 self._ensure_segment_conflict_supported(contract, 'replace')
+                self._ensure_partition_conflict_supported(contract)
 
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
@@ -1133,6 +1243,8 @@ class Table(BaseTable):
         if mode not in ['append', 'upsert', 'replace', 'ignore']:
             raise BadArgument(f'Unsupported write mode `{mode}`')
         self._ensure_segment_conflict_supported(spec, mode)
+        if mode in ['upsert', 'replace']:
+            self._ensure_partition_conflict_supported(spec)
 
         partition = spec.to_partition()
         self._partition = partition
@@ -1168,6 +1280,14 @@ class Table(BaseTable):
                 'Segment.rows does not support upsert/replace before '
                 'global pk index and tombstone are implemented; use '
                 'append/ignore or disable segment'
+            )
+
+    def _ensure_partition_conflict_supported(self, spec):
+        if spec.partition and spec.partition.column not in spec.primary_key:
+            raise BadArgument(
+                '分区表 upsert/replace 要求分区列属于主键；'
+                '当前布局没有跨分区全局主键索引，请将分区列加入主键，'
+                '或使用 append/ignore 并自行保证跨分区唯一性'
             )
 
     def query(self, symbols=None, start=None, end=None, date=None, session=None,
@@ -1267,7 +1387,7 @@ class Table(BaseTable):
         partitions = self._compact_partitions(partition)
         result = CompactResult(table=self._table_name, partitions=list(partitions))
 
-        with self._compact_lock:
+        with self._mutation_lock():
             for logical_part in partitions:
                 part_result = self._compact_partition(
                     logical_part,
@@ -1308,6 +1428,12 @@ class Table(BaseTable):
         return result
 
     def cleanup_obsolete(self, partition=None, dry_run=True, validate=True):
+        if dry_run:
+            return self._cleanup_obsolete_locked(partition, dry_run, validate)
+        with self._mutation_lock():
+            return self._cleanup_obsolete_locked(partition, dry_run, validate)
+
+    def _cleanup_obsolete_locked(self, partition, dry_run, validate):
         spec = self.spec()
         if not spec:
             raise BadArgument('cleanup_obsolete requires a TableContract')
@@ -1355,7 +1481,7 @@ class Table(BaseTable):
                 )
 
         # 与 compact/write 互斥：文件删除 + manifest 清理不能与重建 segment 交错
-        with self._compact_lock:
+        with self._mutation_lock():
             deleted_refs = []
             for ref in refs:
                 if not self._is_safe_part_path(ref.path):
@@ -3410,6 +3536,7 @@ class Table(BaseTable):
         scanned = 0
         numeric_rows = 0
         digit_text_rows = 0
+        text_overflow_rows = 0
         num_min = num_max = None   # 纯数值分区的 min/max（类型安全合并）
         txt_min = txt_max = None   # 纯数字文本分区的 min/max
         value_bad = [0] * len(value_cols)
@@ -3449,7 +3576,8 @@ class Table(BaseTable):
             scanned += cnt
             numeric_rows += int(row[3] or 0)
             digit_text_rows += int(row[4] or 0)
-            for i, bad in enumerate(row[5:]):
+            text_overflow_rows += int(row[7] or 0)
+            for i, bad in enumerate(row[8:]):
                 value_bad[i] += int(bad or 0)
             p_min, p_max = row[1], row[2]
             if cnt == 0 or p_min is None or p_max is None:
@@ -3461,6 +3589,7 @@ class Table(BaseTable):
                 if num_max is None or p_max > num_max:
                     num_max = p_max
             elif int(row[4] or 0) == cnt:
+                p_min, p_max = row[5], row[6]
                 if txt_min is None or p_min < txt_min:
                     txt_min = p_min
                 if txt_max is None or p_max > txt_max:
@@ -3479,8 +3608,10 @@ class Table(BaseTable):
             x_mode = 'mixed'      # 有数值也有文本
             x_min = x_max = None
         elif digit_text_rows == scanned:
+            if text_overflow_rows:
+                raise BadArgument('数字文本横轴超出 SQLite 64 位整数范围')
             x_mode = 'text'
-            x_min, x_max = txt_min, txt_max
+            x_min, x_max = str(txt_min), str(txt_max)
         else:
             x_mode = 'non_numeric'
             x_min = x_max = None
@@ -3510,6 +3641,8 @@ class Table(BaseTable):
             grid_min = x_min
             grid_max = x_max
         span = grid_max - grid_min
+        if x_mode == 'text' and span > 2**63 - 1:
+            raise BadArgument('数字文本横轴跨度超出 SQLite 64 位整数范围')
         width = span // n_buckets + 1 if span >= 0 else 1
         sums = {c: [0.0] * n_buckets for c in value_cols}
         counts = {c: [0] * n_buckets for c in value_cols}
@@ -4296,7 +4429,7 @@ class Table(BaseTable):
             raise BadArgument(
                 f'invalid index order: {order}；合法值: asc/desc'
             )
-        with self._compact_lock:
+        with self._mutation_lock():
             for ref in self._physical_part_refs():
                 part_dbfile = self._get_part_dbfile(ref.part_key)
                 with self._part_db(part_dbfile, auto_commit=True) as part_db:
@@ -4306,7 +4439,7 @@ class Table(BaseTable):
 
     def drop_index(self, column):
         dropped = 0
-        with self._compact_lock:
+        with self._mutation_lock():
             for ref in self._physical_part_refs():
                 part_dbfile = self._get_part_dbfile(ref.part_key)
                 with self._part_db(part_dbfile, auto_commit=True) as part_db:
@@ -4314,6 +4447,14 @@ class Table(BaseTable):
         return dropped
 
     def upsert_all(
+        self, kv_list, pk, partition=None, commit=True, **kwargs
+    ):
+        with self._mutation_lock():
+            return self._upsert_all_locked(
+                kv_list, pk, partition=partition, commit=commit, **kwargs,
+            )
+
+    def _upsert_all_locked(
         self, kv_list, pk, partition=None, commit=True, **kwargs
     ):
         """Update or insert rows based on primary key.
@@ -4411,7 +4552,7 @@ class Table(BaseTable):
 
         # 与 compact/write 共用 _compact_lock：防止 compact 读取旧 segment 后
         # delete 已删行被重建的新 segment“复活”（P0-2）
-        with self._compact_lock:
+        with self._mutation_lock():
             total_deleted = 0
             for cases in w.or_and_cases:
                 deleted = self._delete_and_cases(cases, column_types)
@@ -4426,7 +4567,7 @@ class Table(BaseTable):
     def truncate(self, confirm=False):
         if not confirm:
             raise UnsafeOperation('truncate requires confirm=True')
-        with self._compact_lock:
+        with self._mutation_lock():
             partitions = list(self.table_parts())
             self._delete_all_count()
         return WriteResult(partitions_touched=partitions)
@@ -4436,7 +4577,7 @@ class Table(BaseTable):
         if not meta:
             return 0
         column_types = {key: item["type"] for key, item in meta["column_info"].items()}
-        with self._compact_lock:
+        with self._mutation_lock():
             return self._delete_and_cases(None, column_types)
 
     def _delete_and_cases(self, cases, column_types):
@@ -4446,7 +4587,7 @@ class Table(BaseTable):
         spec = self.spec()
         layout = spec.physical_layout if spec else PhysicalLayout()
 
-        with self._compact_lock:
+        with self._mutation_lock():
             for ref in need_refs:
                 self._ensure_ref_file_present(ref)
                 part_dbfile = self._get_part_dbfile(ref.part_key)
@@ -4537,7 +4678,7 @@ class Table(BaseTable):
         segment_kwargs.pop("table_contract", None)
         segment_kwargs.pop("table_spec", None)
 
-        with self._compact_lock:
+        with self._mutation_lock():
             for part_key, part_data in partitioned_data.items():
                 if use_segment:
                     self._do_insert_segmented(
@@ -4848,13 +4989,7 @@ class Table(BaseTable):
             return None
 
     def table_names(self):
-        if not os.path.isdir(self.db_path):
-            return []
-        return sorted([
-            item for item in os.listdir(self.db_path)
-            if os.path.isdir(os.path.join(self.db_path, item))
-            and not item.startswith('__')
-        ])
+        return iosql_table_names(self.db_path)
 
     def _overwrite_table_meta(self, createtable_meta):
         """table 创建信息"""

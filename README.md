@@ -227,6 +227,7 @@ with table.buffered_writer(max_rows=10_000) as buffer:
 `insert_all()` 是低层基础入口（布尔标志 `replace=`/`ignore=`，两者互斥），供进阶场景使用；日常写入统一使用 `write()`。
 
 每行必须包含契约声明的全部主键字段；行缺失主键列会立即抛 `BadArgument`，不会退回 SQLite rowid 自增。
+分区表使用 `upsert`/`replace` 时，分区列必须属于主键；否则没有跨文件全局主键索引，写入会明确报错。`append`/`ignore` 仍只保证各物理文件内的主键冲突语义，调用方须自行维护跨分区唯一性。
 
 ### 大批量写入性能
 
@@ -324,6 +325,8 @@ SQLite 连接可能同时占用数据库、WAL 和 SHM 文件描述符；包含�
 会直接抛 `BadArgument`；应收窄查询范围、提高预算或去掉全局排序。外部归并仍是后续能力。
 永久保活，但不应以垃圾回收替代正常的生命周期管理。
 
+同机多个进程通过表级文件锁串行化同表写入及 `compact`/删除等维护操作；读者仍可在 WAL 下并行读取。跨分区查询没有统一快照，跨文件写入也没有崩溃原子性。`rename`、`restore`、备份和重分区需要维护窗口并关闭其他访问进程；详见 [多用户并发设计](docs/design/multi-user-concurrency-20260929-overview.md)。
+
 只有原始抓取数据可确定重放时才考虑 `synchronous=OFF`；掉电或系统崩溃时它可能损坏最近事务。
 
 在 Linux ext4 HDD 上直接运行目标盘 benchmark：
@@ -397,7 +400,7 @@ plan = table.explain_select(where=where, order_by="ts desc", limit=100)
 segments = table.segments()
 ```
 
-`select(fields, where)` 的两个位置参数均可省略：`select()` 即全表扫描；`columns=` 是 `fields=` 的别名（与 `query(columns=)` 对齐），两者同传冲突报错。返回值语义：`select()` 急切求值并返回完整列表（默认行元组，`to_dict=True` 返回 dict 行）；`query()` 返回惰性 fluent 对象（`.to_list()` / `.iter_batches()` / `.explain()`）。`select_all()` 已废弃，等价于 `select(to_dict=True)`。
+`select(fields, where)` 的两个位置参数均可省略：`select()` 即全表扫描；`columns=` 是 `fields=` 的别名（与 `query(columns=)` 对齐），两者同传冲突报错。返回值语义：`select()` 急切求值并返回完整列表（默认 dict 行，`to_dict=False` 返回行元组）；`query()` 返回惰性 fluent 对象（`.to_list()` / `.iter_batches()` / `.explain()`）。`select_all()` 已废弃，等价于 `select(to_dict=True)`。
 
 `select()` / `iter_select()` / `iter_select_batches()` 只接受底层参数（`fields`、`where`、`order_by`、`limit`、`columns`、`batch_size`）；传入 `symbols`/`start`/`end`/`date`/`session` 或其他未知参数会抛 `BadArgument` 而不是被静默忽略，业务过滤请改用 `query()` / `explain_select()`。
 
@@ -785,7 +788,7 @@ iosql web -s database/market.iosql
 iosql web -s database/market.iosql --write
 ```
 
-其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`（不自动打开浏览器）。绑定非 loopback 的 `--host` 时会打印暴露警告；服务端只信任 `localhost`/`127.0.0.1`/`[::1]` 的 Host 头。
+其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`（不自动打开浏览器）。绑定具体非回环 IPv4/主机名时，该地址会加入 Host 白名单；绑定 `0.0.0.0` 时必须传一个或多个 `--allowed-host <访问地址>`。其余 Host 头仍被拒绝；网络暴露会打印警告。
 
 功能分区：
 

@@ -31,6 +31,7 @@ import typer
 from iosql import Database, PartitionSpec, format_partition_spec
 from iosql.exception import IosqlError, PartitionSpecError
 from iosql.utils.mysqlite import Database as MyDatabase
+from iosql.utils.storage_identity import is_iosql_database
 
 
 app = typer.Typer(help="iosql SQLite 目录库管理工具")
@@ -188,32 +189,9 @@ def _backup_path(source_path: Path) -> Path:
     return source_path.with_name(f"{source_path.name}.backup_{ts}_{os.getpid()}")
 
 
-def _is_sqlite_file(path: Path) -> bool:
-    """按 SQLite 文件头判断，避免空文件伪造 meta。"""
-    try:
-        with open(path, "rb") as file:
-            return file.read(16) == b"SQLite format 3\x00"
-    except OSError:
-        return False
-
-
 def _is_iosql_like_database(path: Path) -> bool:
-    """判断目录是否为 iosql 目录库。
-
-    决策：真实 iosql 库没有库级 `<db>/meta.sqlite3`，元数据位于表级
-    `<db>/<table>/meta.sqlite3`。因此只认可“至少一个表级 meta 文件”，
-    且该文件必须是真实 SQLite 文件；旧实现只检查库级 `meta.sqlite3`，
-    任何空文件伪造的普通目录都能通过，可能被 `restore --replace` 误删。
-    """
-    try:
-        if not path.is_dir():
-            return False
-        for child in path.iterdir():
-            if child.is_dir() and _is_sqlite_file(child / "meta.sqlite3"):
-                return True
-    except OSError:
-        return False
-    return False
+    """只接受有完整表级 manifest 的非空 iosql 库。"""
+    return is_iosql_database(path, deep=True)
 
 
 def _rmtree_robust(path: Path) -> None:
@@ -1998,7 +1976,7 @@ def restore(
 ):
     """从备份恢复 SQLite 目录库。
 
-    覆盖恢复前会校验目标身份（至少包含一个 `<table>/meta.sqlite3`），
+    覆盖恢复前会校验备份和目标的真实表级 manifest，
     并拒绝根/家目录、符号链接、以及与备份互相包含的路径；替换过程先把
     备份复制到临时目录，成功后再原子换入，任一步失败都保持原目标不变。"""
     if not backup_path.exists() or not backup_path.is_dir():
@@ -2026,6 +2004,9 @@ def restore(
     if _is_within(backup_real, target_real):
         _fail(f"备份目录不能位于恢复目标内部: {target_path}")
 
+    if not _is_iosql_like_database(backup_path):
+        _fail(f"备份目录不是完整的 iosql 库，拒绝恢复: {backup_path}")
+
     if target_exists:
         if not replace or not yes:
             _fail("目标已存在，覆盖恢复必须同时提供 --replace --yes")
@@ -2033,7 +2014,7 @@ def restore(
             _fail(f"覆盖目标不是目录，拒绝删除: {target_path}")
         if not _is_iosql_like_database(target_real):
             _fail(
-                "目标目录不像 iosql 库（未发现 <表>/meta.sqlite3），"
+                "目标目录不像 iosql 库（manifest 或分区文件无效），"
                 f"拒绝覆盖: {target_path}"
             )
 
@@ -2045,6 +2026,8 @@ def restore(
     tmp_new = target_path.with_name(f".{target_path.name}.restore_new_{stamp}_{os.getpid()}")
     try:
         shutil.copytree(backup_path, tmp_new, dirs_exist_ok=False)
+        if not _is_iosql_like_database(tmp_new):
+            _fail(f"复制后的备份校验失败，拒绝换入: {tmp_new}")
     except BaseException:
         if tmp_new.exists():
             _rmtree_robust(tmp_new)
@@ -2081,6 +2064,7 @@ def web(
     source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
     write: bool = typer.Option(False, "--write", help="开启可修改模式（默认只读）"),
     host: str = typer.Option("127.0.0.1", "--host", help="服务绑定地址"),
+    allowed_host: Optional[List[str]] = typer.Option(None, "--allowed-host", help="允许访问的具体 Host，可重复；绑定 0.0.0.0 时必填"),
     port: int = typer.Option(8686, "--port", help="服务端口"),
     no_browser: bool = typer.Option(False, "--no-browser", help="启动后不自动打开浏览器"),
 ):
@@ -2098,7 +2082,12 @@ def web(
         _fail('Web 依赖未安装，请先执行: pip install "iosql[web]"')
 
     mode = "write" if write else "readonly"
-    web_app = create_app(source_uri, mode=mode)
+    hosts = list(allowed_host or [])
+    if host == "0.0.0.0" and not hosts:
+        raise typer.BadParameter("绑定 0.0.0.0 时须提供 --allowed-host 具体访问地址")
+    if host not in ("127.0.0.1", "localhost", "::1", "[::1]", "0.0.0.0"):
+        hosts.append(host)
+    web_app = create_app(source_uri, mode=mode, allowed_hosts=hosts)
     url = f"http://{host}:{port}"
     mode_label = "WRITABLE" if write else "READ-ONLY"
     typer.secho(f"iosql Web: {url} ({mode_label})", fg=typer.colors.GREEN)
@@ -2119,6 +2108,7 @@ def ui(
     source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
     write: bool = typer.Option(False, "--write", help="开启可修改模式（默认只读）"),
     host: str = typer.Option("127.0.0.1", "--host", help="服务绑定地址"),
+    allowed_host: Optional[List[str]] = typer.Option(None, "--allowed-host", help="允许访问的具体 Host，可重复"),
     port: int = typer.Option(8686, "--port", help="服务端口"),
     no_browser: bool = typer.Option(False, "--no-browser", help="启动后不自动打开浏览器"),
 ):
@@ -2128,7 +2118,8 @@ def ui(
         fg=typer.colors.YELLOW,
     )
     web(
-        source=source, write=write, host=host, port=port, no_browser=no_browser,
+        source=source, write=write, host=host, allowed_host=allowed_host,
+        port=port, no_browser=no_browser,
     )
 
 

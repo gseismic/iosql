@@ -39,6 +39,9 @@ Repository = "http://github.com/gseismic/iosql"
 include-package-data = true
 zip-safe = false
 
+[tool.setuptools.package-data]
+"iosql.web" = ["static/*", "static/js/*", "static/vendor/*"]
+
 [tool.setuptools.dynamic]
 version = { attr = "iosql.version.__version__" }
 

@@ -366,12 +366,17 @@ def resolve_sort_col(
     if order_by_raw:
         text = str(order_by_raw).strip()
         segments = [seg.strip() for seg in text.split(",") if seg.strip()]
-        if len(segments) > 1:
+        if len(segments) != 1 or len(text.split(',')) != 1:
             raise _bad_request(
                 "keyset 分页仅支持单列排序",
                 hint=f"order_by 请传单列（可带 asc/desc），例如 `ts` 或 `ts desc`；收到: {text}",
             )
         tokens = segments[0].split()
+        if len(tokens) not in (1, 2):
+            raise _bad_request(
+                "非法 order_by 格式",
+                hint="请传单列及可选方向，例如 `ts` 或 `ts desc`",
+            )
         col = tokens[0]
         direction = tokens[1].lower() if len(tokens) > 1 else "asc"
         if direction not in ("asc", "desc"):
@@ -627,6 +632,11 @@ def _register_read_routes(app: FastAPI) -> None:
         # 游标为 [各排序列值...]，条件展开为 OR 链：
         #   (c1 > v1) OR (c1 == v1 AND c2 > v2) OR ...（desc 时比较方向反转）
         pk_cols = list(spec.primary_key or []) if spec is not None else []
+        if not pk_cols:
+            raise _bad_request(
+                "无主键表不能安全使用 keyset 分页",
+                hint="请为表声明唯一主键后使用数据浏览；导出可使用 /export",
+            )
         order_cols = [col] + [p for p in pk_cols if p != col]
         word = "desc" if direction == "desc" else "asc"
         applied = ", ".join(f"{c} {word}" for c in order_cols)
@@ -943,10 +953,19 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
                     f"x 轴列 `{x_col}` 含混合类型数据",
                     hint="同一列内文本与数值混存无法分桶，请先清洗该列",
                 )
-            if x_min is None or value < x_min:
-                x_min = value
-            if x_max is None or value > x_max:
-                x_max = value
+            comparison_value = value
+            if is_str:
+                stripped = value.strip()
+                if not stripped.lstrip('-').isdigit() or stripped in ('', '-'):
+                    raise _bad_request(
+                        f"x 轴列 `{x_col}` 是非数字文本，无法分桶绘图",
+                        hint="请使用整数/浮点或纯数字日期文本",
+                    )
+                comparison_value = int(stripped)
+            if x_min is None or comparison_value < x_min:
+                x_min = comparison_value
+            if x_max is None or comparison_value > x_max:
+                x_max = comparison_value
 
     if scanned == 0 or x_min is None or x_max is None:
         return {"kind": kind, "x": [], "open": [], "high": [], "low": [],
@@ -957,15 +976,8 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
     # spec 缺失时以扫描期类型探测兜底（Oracle M4）
     x_text_mode = x_is_text or bool(first_is_str)
     if x_text_mode:
-        if not (isinstance(x_min, str) and x_min.strip().isdigit()
-                and isinstance(x_max, str) and x_max.strip().isdigit()):
-            raise _bad_request(
-                f"x 轴列 `{x_col}` 是非数字文本，无法分桶绘图",
-                hint="支持整数/浮点与 YYYYMMDD 等纯数字日期字符串；"
-                     "ISO 日期请改用 duration 毫秒时间戳分区表",
-            )
-        x_num_min: Any = int(x_min.strip())
-        x_num_max: Any = int(x_max.strip())
+        x_num_min: Any = int(x_min)
+        x_num_max: Any = int(x_max)
     else:
         x_num_min = x_min
         x_num_max = x_max
@@ -988,6 +1000,8 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
         # 只投影 OHLC 五列：宽表（几十个因子列）下扫描成本从 24 列降到 5 列
         opens: list[Any] = [None] * n_buckets
         closes: list[Any] = [None] * n_buckets
+        open_x: list[Any] = [None] * n_buckets
+        close_x: list[Any] = [None] * n_buckets
         has_data = [False] * n_buckets
         high_map: dict[int, float] = {}
         low_map: dict[int, float] = {}
@@ -1001,11 +1015,16 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
                     if xv is None:
                         continue
                     idx = bucket_index(xv)
+                    numeric_x = to_num(xv)
                     if not has_data[idx]:
                         has_data[idx] = True
+                    # 同一时间戳：open 保留首次扫描行，close 采用末次非空值。
+                    if open_x[idx] is None or numeric_x < open_x[idx]:
+                        open_x[idx] = numeric_x
                         opens[idx] = row.get(o_col)
                     cv = row.get(c_col)
-                    if cv is not None:
+                    if cv is not None and (close_x[idx] is None or numeric_x >= close_x[idx]):
+                        close_x[idx] = numeric_x
                         closes[idx] = cv
                     hv = row.get(h_col)
                     if hv is not None:
@@ -1369,7 +1388,7 @@ def _register_api_fallback(app: FastAPI) -> None:
         )
 
 
-def create_app(db_uri: str, mode: str = "readonly") -> FastAPI:
+def create_app(db_uri: str, mode: str = "readonly", allowed_hosts: Optional[list[str]] = None) -> FastAPI:
     """创建 iosql Web 的 FastAPI 应用。
 
     - mode="readonly"（默认）：只注册读路由，写端点不存在（404）。
@@ -1387,12 +1406,16 @@ def create_app(db_uri: str, mode: str = "readonly") -> FastAPI:
     app.state.mode = mode
     app.state.db = None
 
-    # Host 头安全（DNS rebinding 纵深防御）：默认只信任本机回环地址；
-    # 不加 CORS（同源部署，无需跨域放行）。CLI --host 绑定非回环地址时
-    # 应由 CLI 打印警告（见 cli.py:1732 附近，本任务不修改 CLI）。
+    # Host 头安全：默认只信任本机回环地址；非本机绑定需显式添加访问主机名。
+    trusted_hosts = ["127.0.0.1", "localhost", "[::1]", "::1"]
+    for host in allowed_hosts or []:
+        if not host or any(char in host for char in ('*', '/', '\\', ':')):
+            raise BadArgument(f"非法 allowed_host: {host!r}；请输入具体主机名或 IPv4 地址")
+        if host not in trusted_hosts:
+            trusted_hosts.append(host)
     app.add_middleware(
         TrustedHostMiddleware,
-        allowed_hosts=["127.0.0.1", "localhost", "[::1]", "::1"],
+        allowed_hosts=trusted_hosts,
     )
     app.add_middleware(_IPv6HostNormalizer)
 

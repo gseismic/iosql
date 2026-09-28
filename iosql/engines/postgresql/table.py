@@ -301,6 +301,10 @@ class Table(BaseTable):
 
         self._table_name = new_name
         self._table_created = True
+        owner_ref = getattr(self, '_owner_db', None)
+        owner = owner_ref() if owner_ref is not None else None
+        if owner is not None:
+            owner._on_table_renamed(self, old_name, new_name)
         return self
 
     def _trash_name(self, name):
@@ -1111,13 +1115,20 @@ class Table(BaseTable):
 
         # ---- 探测：空值数/范围 + text 列的纯数字行数 ----
         if x_is_text:
-            digit_expr = f"SUM(CASE WHEN TRIM({x_sql}::text) ~ '^[0-9]+$'"\
+            digit_expr = f"SUM(CASE WHEN TRIM({x_sql}::text) ~ '^-?[0-9]+$'"\
                 ' THEN 1 ELSE 0 END)'
+            numeric_min = (
+                f"MIN(CASE WHEN TRIM({x_sql}::text) ~ '^-?[0-9]+$' "
+                f'THEN TRIM({x_sql}::text)::numeric END)'
+            )
+            numeric_max = numeric_min.replace('MIN(', 'MAX(', 1)
         else:
             digit_expr = '0'
+            numeric_min = numeric_max = 'NULL'
         stats_sql = (
             f'SELECT COUNT({x_sql}), MIN({x_sql}), MAX({x_sql}),'
-            f' {digit_expr} FROM {_pg_identifier(self._table_name)}'
+            f' {digit_expr}, {numeric_min}, {numeric_max}'
+            f' FROM {_pg_identifier(self._table_name)}'
         )
         if where_sql:
             stats_sql += f' WHERE {where_sql}'
@@ -1137,7 +1148,10 @@ class Table(BaseTable):
             digit_rows = int(stats[3] or 0)
             if digit_rows == scanned:
                 x_mode = 'text'
-                x_min, x_max = stats[1], stats[2]
+                grid_min, grid_max = int(stats[4]), int(stats[5])
+                if grid_min < -(2**63) or grid_max > 2**63 - 1:
+                    raise BadArgument('数字文本横轴超出 PostgreSQL bigint 范围')
+                x_min, x_max = str(grid_min), str(grid_max)
             elif digit_rows == 0:
                 x_mode = 'non_numeric'
                 x_min = x_max = None
@@ -1171,6 +1185,8 @@ class Table(BaseTable):
             grid_max = x_max
             bucket_expr = f'FLOOR(({x_sql} - %s) / %s)'
         span = grid_max - grid_min
+        if x_mode == 'text' and span > 2**63 - 1:
+            raise BadArgument('数字文本横轴跨度超出 PostgreSQL bigint 范围')
         width = span // n_buckets + 1 if span >= 0 else 1
         select_items = [bucket_expr]
         for col in value_cols:
@@ -1214,13 +1230,17 @@ class Table(BaseTable):
             names = ', '.join(sorted(kwargs))
             raise BadArgument(f'{func_name}() 收到未知参数: {names}')
 
-    def iter_rows(self, batch_size=10_000):
+    def iter_batches(self, batch_size=10_000):
         yield from self.iter_select_batches(
             '*',
             where=None,
             batch_size=batch_size,
             to_dict=True,
         )
+
+    def iter_rows(self, batch_size=10_000):
+        for batch in self.iter_batches(batch_size=batch_size):
+            yield from batch
 
     def migrate_to(self, target_uri, target_table=None, mode='append',
                    batch_size=10_000, verify=None, dry_run=False):
@@ -1261,7 +1281,7 @@ class Table(BaseTable):
         source_rows = self.count_rows() if verify == 'row-count' else None
         rows_copied = 0
         batches = 0
-        for batch in self.iter_rows(batch_size=batch_size):
+        for batch in self.iter_batches(batch_size=batch_size):
             if not batch:
                 continue
             target_table.write(batch, mode=mode)

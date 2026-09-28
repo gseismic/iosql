@@ -259,6 +259,18 @@ def build_bucket_stats_query(part_table_name, x_col, value_cols,
     """
     _bucket_require_column(column_types, x_col)
     x_sql = _quote_sql_identifier(x_col)
+    trimmed = f'TRIM({x_sql})'
+    unsigned = f"(CASE WHEN SUBSTR({trimmed},1,1)='-' THEN SUBSTR({trimmed},2) ELSE {trimmed} END)"
+    normalized = f"LTRIM({unsigned}, '0')"
+    digit = (
+        f"({unsigned} <> '' AND {unsigned} NOT GLOB '*[^0-9]*'"
+        f" AND {trimmed} <> '')"
+    )
+    overflow = (
+        f'(LENGTH({normalized}) > 19 OR (LENGTH({normalized}) = 19 AND '
+        f"{normalized} > CASE WHEN SUBSTR({trimmed},1,1)='-' "
+        f"THEN '9223372036854775808' ELSE '9223372036854775807' END))"
+    )
     select_items = [
         f'COUNT({x_sql})',
         f'MIN({x_sql})',
@@ -266,8 +278,10 @@ def build_bucket_stats_query(part_table_name, x_col, value_cols,
         # 数值行数 / 纯数字文本行数：无约束类型下的 x 模式分类依据
         f"SUM(CASE WHEN typeof({x_sql}) IN ('integer','real')"
         f' THEN 1 ELSE 0 END)',
-        f"SUM(CASE WHEN typeof({x_sql})='text' AND TRIM({x_sql}) <> ''"
-        f" AND TRIM({x_sql}) NOT GLOB '*[^0-9]*' THEN 1 ELSE 0 END)",
+        f"SUM(CASE WHEN typeof({x_sql})='text' AND {digit} THEN 1 ELSE 0 END)",
+        f'MIN(CASE WHEN {digit} THEN CAST({trimmed} AS INTEGER) END)',
+        f'MAX(CASE WHEN {digit} THEN CAST({trimmed} AS INTEGER) END)',
+        f'SUM(CASE WHEN {digit} AND {overflow} THEN 1 ELSE 0 END)',
     ]
     for col in value_cols:
         _bucket_require_column(column_types, col)

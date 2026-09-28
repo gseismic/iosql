@@ -53,7 +53,7 @@ with Database("sqlite://db/test.iosql") as db:
 # 自动 close()
 ```
 
-#### `Database.table(table_name, spec=None, pk=None, primary_key=None, columns=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, time=None, symbol_column=None, session_column=None)`
+#### `Database.table(table_name, spec=None, pk=None, primary_key=None, columns=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=None, time=None, symbol_column=None, session_column=None)`
 
 核心表入口。创建或打开一张分区表。
 
@@ -76,8 +76,7 @@ with Database("sqlite://db/test.iosql") as db:
 已有表上再次传 `spec=`（或快捷参数）时，声明的绑定字段
 （`order_key`/`symbol_column`/`session_column`/`conflict`/`schema_policy`）会通过
 `TableSpecConflict` 校验并写回持久化契约：存量仍为默认值或未声明时可被覆盖，
-否则报 `TableSpecConflict`（含修复提示）。`force_partition=True` 在快捷参数路径
-生效（走 `spec=` 时请同时显式传同名参数），会跳过分区冲突检查并把新分区契约落盘。
+否则报 `TableSpecConflict`（含修复提示）。快捷参数路径省略 `force_partition` 时按 False 处理；`spec=` 路径省略时保留契约原值，显式传入与契约冲突的值会报错。`force_partition=True` 会跳过分区冲突检查并把新分区契约落盘。
 
 #### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None)`
 
@@ -189,7 +188,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `iter_select` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, batch_size=10_000, columns=None) -> Iterator` |
 | `iter_select_batches` | `(fields='*', where=None, limit=None, order_by=None, to_dict=True, batch_size=10_000, columns=None) -> Iterator[list]` |
 | `iter_rows` | `(batch_size=10_000) -> Iterator[row]`（流式读取全表，逐行；PG 同签名） |
-| `iter_batches` | `(batch_size=10_000) -> Iterator[list]`（SQLite；流式读取全表，按批；`iter_rows` 的批量版） |
+| `iter_batches` | `(batch_size=10_000) -> Iterator[list]`（SQLite / PG；流式读取全表，按批；`iter_rows` 的批量版） |
 | `select_all` | 已废弃：等价于 `select(fields, where, to_dict=True)`，触发 DeprecationWarning，永久保留 |
 | `explain_select` | `(fields='*', where=None, order_by=None, limit=None, columns=None, symbols=None, start=None, end=None, date=None, session=None) -> QueryPlan`（业务参数与 `query()` 对齐） |
 | `latest` | `(symbols=None, as_of=None, columns='*', where=None, session=None, by=None, group_by=None) -> LatestQuery`（`group_by` 已废弃，改用 `by=`；未声明 symbol_column 且无 `by=` 时抛 `BadArgument`） |
@@ -638,7 +637,7 @@ python -m pip install -e ".[ui]"
 CLI 入口：
 
 ```bash
-iosql web -s database/market.iosql [--write] [--host 127.0.0.1] [--port 8686] [--no-browser]
+iosql web -s database/market.iosql [--write] [--host 127.0.0.1] [--allowed-host example.internal] [--port 8686] [--no-browser]
 ```
 
 Python 入口（惰性导入，未装 fastapi 时抛带安装指引的 `ImportError`）：

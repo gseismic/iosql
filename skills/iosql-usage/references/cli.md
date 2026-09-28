@@ -16,7 +16,7 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 | 类别 | 命令 | 说明 |
 |------|------|------|
 | **发现** | `iosql tables -s DB` | 列出逻辑表 |
-| | `iosql web -s DB [--write] [--host] [--port] [--no-browser]` | 启动本地 Web 管理台（旧名 `iosql ui` 仍可用）（默认只读，详见 [ui.md](ui.md)） |
+| | `iosql web -s DB [--write] [--host] [--allowed-host] [--port] [--no-browser]` | 启动 Web 管理台；绑定 `0.0.0.0` 时必须指定具体 `--allowed-host`，其余 Host 头拒绝（默认只读，详见 [ui.md](ui.md)） |
 | | `iosql rename-database -s DB --target NEW_DB` | 重命名 SQLite 目录库；覆盖目标需 `--overwrite --yes`，目标须为 iosql 库且非根/家目录/符号链接，失败可回滚 |
 | | `iosql rename-table -s DB -t OLD --new-table NEW` | 重命名逻辑表；覆盖目标需 `--overwrite --yes` |
 | | `iosql spec -s DB -t TABLE` | 输出表契约 JSON |
@@ -34,14 +34,14 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 | | `iosql migrate -s DB --target postgresql://... [--dry-run] [--verify row-count]` | 迁移 SQLite iosql 库到 PostgreSQL；拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表 |
 | | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库；`--dry-run` 也校验 interval/timezone 与目标父目录，目标不能等于/嵌套源库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份；拒绝与源库互相包含的路径 |
-| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；覆盖目标需 `--replace --yes`，目标必须是真实 iosql 库（表级 `<表>/meta.sqlite3` 且为有效 SQLite 文件），拒绝伪造 meta、根/家目录、符号链接及与备份重叠的路径；替换原子化、失败回滚 |
+| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；备份和覆盖目标均须有真实表级 manifest 且分区文件完整，空目录不能作为备份；覆盖需 `--replace --yes`；复制后的副本会再次校验，替换失败回滚 |
 | | `iosql index list/check/create/drop ...` | 检查、创建或删除物理分区索引；`index create` 校验列存在，`index check` 未通过退出码 2 |
 
 ## CLI 安全规则
 
 - `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。`--dry-run` 也会先解析 interval/timezone 并校验目标父目录，且拒绝目标等于源库/位于源库内部。
 - 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。替换过程原子化：备份用 `os.replace` 改名（近零成本），跨文件系统传 `--backup` 会明确拒绝（EXDEV，源库原封不动），失败自动回滚。
-- `restore --replace --yes` 只允许覆盖真实 iosql 库（表级 `<表>/meta.sqlite3` 且为有效 SQLite 文件）；伪造 meta 的普通目录、根/家目录、符号链接、以及与备份互相包含的路径全部拒绝。替换先把备份复制到临时目录，再原子换入，失败保留原目标。
+- `restore --replace --yes` 只允许覆盖有真实表级 manifest 和完整分区文件的 iosql 库；备份也须通过同样的校验，空库没有可靠身份标记，当前不支持从空目录恢复。伪造 meta 的普通目录、根/家目录、符号链接以及与备份互相包含的路径全部拒绝。替换前校验临时副本，失败保留原目标。
 - `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表（否则迁移前直接报错）。
 - `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验；`--partition` 拼写错误会报错并列出可用分区（compact 同理）。
 - `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取并支持 UTF-8 BOM，坏 JSONL 行/CSV 字段数不匹配会报行号；中途失败输出 `rows_seen`/`rows_written`/`batches_committed` JSON 汇总，以退出码 1 结束。

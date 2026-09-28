@@ -330,8 +330,24 @@ def test_postgresql_table_names_filters_native_partition_children(monkeypatch):
     query, params = fake_conn.cursor_obj.executed[-1]
     assert "pg_inherits" in query
     assert "relkind in ('r', 'p')" in query
+    assert "n.nspname = coalesce(current_schema(), 'public')" in query
     assert params is None
     assert fake_conn.closed is True
+
+
+def test_postgresql_iter_rows_flattens_batches():
+    from iosql.engines.postgresql import Table
+
+    table = object.__new__(Table)
+    table.iter_select_batches = lambda *args, **kwargs: iter([
+        [{"id": 1}, {"id": 2}], [{"id": 3}],
+    ])
+    assert list(table.iter_batches(batch_size=2)) == [
+        [{"id": 1}, {"id": 2}], [{"id": 3}],
+    ]
+    assert list(table.iter_rows(batch_size=2)) == [
+        {"id": 1}, {"id": 2}, {"id": 3},
+    ]
 
 
 def test_postgresql_database_table_accepts_contract_and_write(monkeypatch):

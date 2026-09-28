@@ -104,18 +104,33 @@ def test_text_mode_uses_cast_and_digit_probe(fake_pg):
     columns = {'symbol': 'text', 'ts': 'text', 'price': 'float'}
     table = _make_table(fake_pg, columns=columns, pk=('symbol', 'ts'))
     cur = fake_pg.cursor_obj
-    cur.fetchone_result = (2, '20250101', '20250110', 2)
+    cur.fetchone_result = (2, '20250101', '20250110', 2, 20250101, 20250110)
     cur.results = [(0, 3.0, 2)]
 
     agg = table.aggregate_by_bucket('ts', ['price'], 3)
 
     stats_sql, _ = _user_statements(cur)[0]
-    assert "~ '^[0-9]+$'" in stats_sql
+    assert "~ '^-?[0-9]+$'" in stats_sql
+    assert '::numeric' in stats_sql
     agg_sql, agg_params = _user_statements(cur)[1]
     assert 'CAST("ts" AS bigint)' in agg_sql
     # span=9, width=9//3+1=4，网格原点 int 化
     assert agg_params[:2] == [20250101, 4]
     assert agg['x_mode'] == 'text'
+
+
+def test_text_mode_variable_width_uses_numeric_bounds(fake_pg):
+    table = _make_table(fake_pg, columns={
+        'symbol': 'text', 'ts': 'text', 'price': 'float',
+    })
+    cur = fake_pg.cursor_obj
+    # SQL 的词典序边界为 10/3，数值边界为 2/10。
+    cur.fetchone_result = (3, '10', '3', 3, 2, 10)
+    cur.results = [(0, 2.0, 1), (1, 3.0, 1), (3, 10.0, 1)]
+    agg = table.aggregate_by_bucket('ts', ['price'], 4)
+    assert (agg['x_min'], agg['x_max']) == ('2', '10')
+    assert sum(agg['counts']['price']) == 3
+    assert _user_statements(cur)[1][1][:2] == [2, 3]
 
 
 def test_text_mode_non_digit_rejected(fake_pg):

@@ -2,6 +2,7 @@ import os
 import shutil
 import threading
 import warnings
+import weakref
 from dataclasses import replace
 
 from .utils.schema import parse_db_schema
@@ -15,6 +16,9 @@ from .exception import (
 from .engines import sqlite
 from .partition import Partition
 from .spec import MigrationResult, Segment, TableContract, TimeColumn, PartitionSpec
+from .utils.storage_identity import (
+    iosql_table_names, is_iosql_database, is_iosql_scaffold, is_iosql_table,
+)
 
 
 def _is_calendar_partition(partition):
@@ -27,27 +31,8 @@ _BINDING_DEFAULTS = {'conflict': 'append', 'schema_policy': 'evolve'}
 
 
 def _looks_like_iosql_database(path):
-    """目录是否像一个 iosql 目录库。
-
-    判定依据：任一表级 `<table>/meta.sqlite3`（真实库结构）；
-    空目录无内容可丢，视为可接管。不接受库级 meta.sqlite3 作为标记，
-    避免一个空文件即可伪造身份（review P0-4 的教训）。
-    """
-    if not os.path.isdir(path):
-        return False
-    try:
-        entries = os.listdir(path)
-    except OSError:
-        return False
-    if not entries:
-        return True
-    for name in entries:
-        table_dir = os.path.join(path, name)
-        if os.path.isdir(table_dir) and os.path.isfile(
-            os.path.join(table_dir, 'meta.sqlite3')
-        ):
-            return True
-    return False
+    """目录是否是可接管的 iosql 库（空目录仅供重命名目标使用）。"""
+    return is_iosql_database(path, allow_empty=True)
 
 
 def _forbidden_rename_target_reason(path):
@@ -184,6 +169,16 @@ class Database(object):
                 "verbose": self.verbose,
             }
             if self._uri_schema in ["sqlite", "sqlite3"]:
+                table_path = os.path.join(_sqlite_path_from_uri(self._uri), str(table_name))
+                if os.path.lexists(table_path):
+                    if os.path.islink(table_path) or not os.path.isdir(table_path):
+                        raise UnsafeOperation(f"表路径不是普通目录: {table_path}")
+                    if os.listdir(table_path) and not (
+                        is_iosql_table(table_path) or is_iosql_scaffold(table_path)
+                    ):
+                        raise UnsafeOperation(
+                            f"目录不是有效 iosql 表，拒绝在其中创建元数据: {table_path}"
+                        )
                 table_options.update({
                     "max_open_partitions": self._max_open_partitions,
                     "max_connections_per_file": self._max_connections_per_file,
@@ -195,6 +190,7 @@ class Database(object):
                 if self._pragma_dict is not None:
                     table_options["pragma_dict"] = self._pragma_dict
             table = self._table_cls(self._uri, **table_options)
+            table._owner_db = weakref.ref(self)
             self._tables[table_name] = table
             return table
 
@@ -210,7 +206,7 @@ class Database(object):
         order_key=None,
         conflict='append',
         schema_policy='evolve',
-        force_partition=False,
+        force_partition=None,
         time=None,
         symbol_column=None,
         session_column=None,
@@ -292,9 +288,9 @@ class Database(object):
                 overrides['schema_policy'] = schema_policy
             if overrides:
                 contract = replace(contract, **overrides)
-            if bool(contract.force_partition) != bool(force_partition):
-                contract = replace(contract, force_partition=force_partition)
-            self._bind_contract(table, contract, force_partition)
+            if force_partition is not None and bool(contract.force_partition) != bool(force_partition):
+                raise BadArgument('Database.table: force_partition 与 spec 冲突')
+            self._bind_contract(table, contract, contract.force_partition)
         elif not any(value is not None for value in shortcut_values):
             if has_metadata_values:
                 table.update_metadata(**{
@@ -326,13 +322,13 @@ class Database(object):
                 order_key=order_key,
                 conflict=conflict,
                 schema_policy=schema_policy,
-                force_partition=force_partition,
+                force_partition=bool(force_partition),
                 description=description,
                 column_descriptions=column_descriptions,
                 column_ranges=column_ranges,
                 **contract_kwargs,
             )
-            self._bind_contract(table, contract, force_partition)
+            self._bind_contract(table, contract, bool(force_partition))
         return table
 
     def _bind_contract(self, table, contract, force_partition):
@@ -587,7 +583,7 @@ class Database(object):
                         select c.relname
                         from pg_class c
                         join pg_namespace n on n.oid = c.relnamespace
-                        where n.nspname = 'public'
+                        where n.nspname = coalesce(current_schema(), 'public')
                           and c.relkind in ('r', 'p')
                           and not exists (
                               select 1
@@ -603,11 +599,7 @@ class Database(object):
         db_path = os.path.join(options.get('path') or '', options.get('db') or '')
         if not os.path.isdir(db_path):
             return []
-        return sorted([
-            item for item in os.listdir(db_path)
-            if os.path.isdir(os.path.join(db_path, item))
-            and not item.startswith('__')
-        ])
+        return iosql_table_names(db_path)
 
     def rename(self, new_uri_or_name, exist_ok=False, overwrite=False):
         """重命名当前 SQLite 目录库。
@@ -741,11 +733,7 @@ class Database(object):
         return os.path.abspath(os.path.join(os.path.dirname(source_path), value))
 
     def rename_table(self, old_name, new_name, exist_ok=False, overwrite=False):
-        """重命名逻辑表并维护当前 Database 的表对象缓存。
-
-        覆盖目标时先把目标目录改名到临时目录，失败时回滚，
-        避免引擎 rmtree 之后失败导致旧表对象保持 closed、数据不可恢复。
-        """
+        """委托引擎重命名；表对象回调同步 Database 缓存。"""
         old_name = str(old_name or "").strip()
         new_name = str(new_name or "").strip()
         if not old_name or not new_name:
@@ -759,71 +747,26 @@ class Database(object):
         if old_name not in self.table_names():
             raise BadArgument(f"table does not exist: {old_name}")
 
-        with self._tables_lock:
-            table = self[old_name]
-            cached_target = self._tables.get(new_name)
-            if cached_target is not None and cached_target is not table and overwrite:
-                cached_target.close()
-                self._tables.pop(new_name, None)
-
-        # 不持 _tables_lock 执行目录移动：引擎 close() 会等待连接租约，
-        # 持锁等待可能与被租约阻塞在 __getitem__ 的线程互相死锁
-        db_path = (
-            _sqlite_path_from_uri(self._uri)
-            if self._uri_schema in ["sqlite", "sqlite3"]
-            else ""
+        return self[old_name].rename(
+            new_name, exist_ok=exist_ok, overwrite=overwrite,
         )
-        source_path = os.path.join(db_path, old_name) if db_path else old_name
-        target_path = os.path.join(db_path, new_name) if db_path else new_name
-        backup_path = None
-        if (
-            self._uri_schema in ["sqlite", "sqlite3"]
-            and overwrite
-            and os.path.isdir(target_path)
-        ):
-            backup_path = self._rename_backup_path(target_path)
-            try:
-                os.replace(target_path, backup_path)
-            except OSError as e:
-                raise BadArgument(
-                    f"重命名表失败（无法移走目标目录）: {e}；"
-                    "修复: 检查目标目录权限后重试"
-                ) from e
-        try:
-            table.rename(new_name, exist_ok=exist_ok, overwrite=False)
-        except Exception as e:
-            # 回滚：目标目录移回；尽量重开源表对象，避免缓存里留下 closed 表
-            if (
-                backup_path is not None
-                and os.path.exists(backup_path)
-                and not os.path.exists(target_path)
-            ):
-                try:
-                    os.replace(backup_path, target_path)
-                except OSError:
-                    pass
-            with self._tables_lock:
-                self._tables.pop(old_name, None)
-                if not os.path.isdir(source_path) and os.path.isdir(target_path):
-                    # 移动已成功，只是后续 manifest/重连失败：挂到新名字下
-                    self._tables[new_name] = table
-                elif os.path.isdir(source_path):
-                    try:
-                        self[old_name]
-                    except Exception:
-                        pass
-            if isinstance(e, OSError):
-                raise BadArgument(
-                    f"重命名表失败: {e}；修复: 检查目录权限/跨设备限制后重试"
-                ) from e
-            raise
-        else:
-            if backup_path is not None and os.path.exists(backup_path):
-                shutil.rmtree(backup_path, ignore_errors=True)
+
+    def _on_table_renamed(self, table, old_name, new_name):
+        """同步由表对象直接发起的重命名。"""
         with self._tables_lock:
-            self._tables.pop(old_name, None)
+            replaced = self._tables.get(new_name)
+        if replaced is not None and replaced is not table:
+            try:
+                replaced.close()
+            except Exception as exc:
+                warnings.warn(
+                    f"被覆盖表对象关闭失败: {exc}", RuntimeWarning, stacklevel=2,
+                )
+        with self._tables_lock:
+            if self._tables.get(old_name) is table:
+                self._tables.pop(old_name, None)
+            self._tables.pop(new_name, None)
             self._tables[new_name] = table
-        return table
 
     def close(self):
         # 先快照并清空缓存再关闭：避免持锁等待引擎连接租约释放

@@ -656,6 +656,25 @@ class TestPartitionBoundsChecksP2:
 
 
 class TestRenameP2:
+    def test_database_overwrite_forwards_flag_and_updates_cache(self, fake_pg, monkeypatch):
+        db = Database('postgresql://user:pass@localhost:5432/market')
+        source = db.table('ticks')
+        replaced = db.table('target')
+        monkeypatch.setattr(db, 'table_names', lambda: ['ticks', 'target'])
+        monkeypatch.setattr(
+            source, '_relation_exists', lambda name: name in {'ticks', 'target'},
+        )
+        monkeypatch.setattr(
+            source, '_native_partition_child_renames', lambda old, new: [],
+        )
+
+        assert db.rename_table('ticks', 'target', overwrite=True) is source
+        assert db.table('target') is source
+        assert db.table('ticks') is not source
+        assert replaced is not source
+        assert 'ALTER TABLE "ticks" RENAME TO "target"' in render_all(fake_pg.cursor_obj)
+        db.close()
+
     def test_failure_rolls_back_and_keeps_old_name(self, fake_pg, monkeypatch):
         table = _make_table(fake_pg)
         fake_pg.cursor_obj.executed.clear()

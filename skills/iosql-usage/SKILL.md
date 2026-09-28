@@ -225,6 +225,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 - `repartition_to()`/`migrate_to()` 只写新库，不修改源库。
 - 缓冲写入异常退出会发未 flush 行数的 RuntimeWarning——不要吞掉（意味着数据未落库）。
 - `upsert`/`replace` 模式当前不支持 `Segment.rows` 表。
+- SQLite 分区表使用 `upsert`/`replace` 时，分区列必须在主键中；否则没有跨文件全局主键索引，入口会拒绝写入。`append`/`ignore` 的唯一性只在物理文件内保证。
+- 同机多进程常规写入由表级文件锁串行化；跨分区读取没有统一快照。`rename`、`restore`、备份和重分区应先停写并关闭其他连接；多机共享 WAL 目录不在保证范围内。
 - `query(..., order_by=...).iter_rows()` / `.iter_batches()` 保持惰性有序流式读取，不先调用 `select()` 全量物化；跨分区归并受 `max_ordered_read_connections` 和进程连接预算约束，超限抛 `BadArgument`。
 
 ## 报错先查
