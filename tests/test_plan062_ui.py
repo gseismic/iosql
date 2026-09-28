@@ -225,7 +225,7 @@ class TestNullKeysetPagination:
         assert len(collected) == len(set(collected))
 
     def test_frontend_disables_bad_sort_column(self):
-        text = (STATIC_DIR / "js" / "tab-browse.js").read_text(encoding="utf-8")
+        text = (STATIC_DIR / "js" / "tab-data.js").read_text(encoding="utf-8")
         assert "badCols" in text
         assert "sort-bad" in text
         assert "排序列" in text
@@ -272,7 +272,7 @@ class TestResponseEnvelopes:
         assert "IU.unwrap(resp, 'validation')" in maintain
         assert "IU.unwrap(resp, 'result')" in maintain
 
-        query = (STATIC_DIR / "js" / "tab-query.js").read_text(encoding="utf-8")
+        query = (STATIC_DIR / "js" / "tab-data.js").read_text(encoding="utf-8")
         assert "IU.unwrap(resp, 'plan')" in query
 
 
@@ -452,7 +452,7 @@ class TestRowsLimitAndPaging:
         assert payload["next_cursor"] == [3]
 
     def test_frontend_prev_page_and_seq(self):
-        text = (STATIC_DIR / "js" / "tab-browse.js").read_text(encoding="utf-8")
+        text = (STATIC_DIR / "js" / "tab-data.js").read_text(encoding="utf-8")
         assert "s.pos--" in text
         assert "pageSeq" in text
         assert "spec.primary_key" in text and "spec.pk" not in text

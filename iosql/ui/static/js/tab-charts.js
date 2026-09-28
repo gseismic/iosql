@@ -12,17 +12,33 @@
   var OHLC_LONG = ['open', 'high', 'low', 'close'];
   var OHLC_SHORT = ['o', 'h', 'l', 'c'];
   var SERIES_COLORS = { open: '#9aa4ba', high: '#46c982', low: '#ff6b6b', close: '#ffb454' };
+  /* 时间列名启发式：与 tab-data.js 一致；时间列不该当数值列画（PLAN-064 D7） */
+  var TS_NAME_RE = /^(ts|time|timestamp|datetime)$|(_ts|_time|_at)$/i;
 
   var st = null;
   var chart = null; // uPlot 实例（单例，重绘前销毁）
   var resizeHandler = null; // resize 监听引用：重渲染前移除，避免监听器累积
+
+  function resolveTimeCol(spec) {
+    var t = spec && spec.time;
+    if (!t) return null;
+    if (typeof t === 'string') return t;
+    if (typeof t === 'object') return IU.pick(t, 'column', 'col', 'field', 'name') || null;
+    return null;
+  }
+
+  function isTimeLikeCol(c, colTypes, spec) {
+    if (resolveTimeCol(spec) === c) return true;
+    var ty = String(colTypes[c] || '').toLowerCase();
+    return ty.indexOf('int') >= 0 && TS_NAME_RE.test(c);
+  }
 
   function ensureState(ctx) {
     if (st && st.table === ctx.table) return st;
     var spec = ctx.spec || {};
     var colTypes = (spec.columns && typeof spec.columns === 'object') ? spec.columns : {};
     var numericCols = Object.keys(colTypes).filter(function (c) {
-      return IU.fmt.NUMERIC_RE.test(String(colTypes[c]));
+      return IU.fmt.NUMERIC_RE.test(String(colTypes[c])) && !isTimeLikeCol(c, colTypes, spec);
     });
     st = {
       table: ctx.table,
@@ -31,7 +47,7 @@
         ? OHLC_LONG
         : (OHLC_SHORT.filter(function (c) { return colTypes[c]; }).length === 4 ? OHLC_SHORT : null),
       kind: 'line',
-      col: numericCols[0] || '',
+      col: numericCols[0] || '',   // 默认第一个非时间数值列（D7 修正）
       symbol: '', start: '', end: '', buckets: '2000', log: false
     };
     return st;
@@ -80,10 +96,16 @@
       var symbolIn = h('input', { class: 'input mono', placeholder: 'symbol（可选）', value: s.symbol, autocomplete: 'off' });
       symbolIn.addEventListener('input', function (e) { s.symbol = e.target.value; });
 
-      var startIn = h('input', { class: 'input mono', placeholder: 'start（可选）', value: s.start, autocomplete: 'off' });
+      var startIn = h('input', {
+        class: 'input mono', placeholder: 'start（2025-01-01 或毫秒）', value: s.start, autocomplete: 'off',
+        title: '支持 2025-01-01 / 2025-01-01 10:30 / 毫秒时间戳（PLAN-064 D3）'
+      });
       startIn.addEventListener('input', function (e) { s.start = e.target.value; });
 
-      var endIn = h('input', { class: 'input mono', placeholder: 'end（可选）', value: s.end, autocomplete: 'off' });
+      var endIn = h('input', {
+        class: 'input mono', placeholder: 'end（2025-04-30 或毫秒）', value: s.end, autocomplete: 'off',
+        title: '支持 2025-04-30 / 2025-04-30 16:00 / 毫秒时间戳'
+      });
       endIn.addEventListener('input', function (e) { s.end = e.target.value; });
 
       var bucketsIn = h('input', { class: 'input mono', type: 'text', value: s.buckets, style: { width: '90px' } });
@@ -136,10 +158,18 @@
         } else {
           fetchSeries(base, s.col).then(function (pts) {
             renderLine([{ label: s.col, color: '#45c6ff', pts: pts }], false);
-          }).catch(function () {
-            renderEmpty('图表数据加载失败');
+          }).catch(function (err) {
+            renderEmpty(chartErrText(err));
           });
         }
+      }
+
+      /* 错误盒透出服务端 hint（如扫描预算超限的"缩小时间窗"指引） */
+      function chartErrText(err) {
+        var msg = '图表数据加载失败';
+        if (err && err.hint) msg += '：' + err.hint;
+        else if (err && err.message) msg += '：' + err.message;
+        return msg;
       }
 
       /* candle：对 o/h/l/c（或 open/high/low/close）四列各拉一条序列叠加 */
@@ -148,7 +178,7 @@
           IU.toast('契约未识别 OHLC 四列，退化为所选列折线', 'warn');
           fetchSeries(base, s.col).then(function (pts) {
             renderLine([{ label: s.col, color: '#45c6ff', pts: pts }], false);
-          }).catch(function () { renderEmpty('图表数据加载失败'); });
+          }).catch(function (err) { renderEmpty(chartErrText(err)); });
           return;
         }
         Promise.all(s.ohlcCols.map(function (c) { return fetchSeries(base, c); }))
@@ -160,14 +190,22 @@
               { label: 'close (' + s.ohlcCols[3] + ')', color: SERIES_COLORS.close, pts: r[3] }
             ], true);
           })
-          .catch(function () { renderEmpty('K线数据加载失败'); });
+          .catch(function (err) { renderEmpty(chartErrText(err)); });
       }
 
       function fetchSeries(base, col) {
         var qs = '?col=' + encodeURIComponent(col);
         if (String(s.symbol).trim() !== '') qs += '&symbol=' + encodeURIComponent(s.symbol.trim());
-        if (String(s.start).trim() !== '') qs += '&start=' + encodeURIComponent(s.start.trim());
-        if (String(s.end).trim() !== '') qs += '&end=' + encodeURIComponent(s.end.trim());
+        var startMs = IU.parseTimeInput(s.start);
+        var endMs = IU.parseTimeInput(s.end);
+        if (String(s.start).trim() !== '') {
+          if (!startMs.ok) { IU.toast('start 无法解析：试试 2025-01-01 或毫秒时间戳', 'warn'); return Promise.reject(new Error('bad start')); }
+          qs += '&start=' + encodeURIComponent(String(startMs.ms));
+        }
+        if (String(s.end).trim() !== '') {
+          if (!endMs.ok) { IU.toast('end 无法解析：试试 2025-04-30 或毫秒时间戳', 'warn'); return Promise.reject(new Error('bad end')); }
+          qs += '&end=' + encodeURIComponent(String(endMs.ms));
+        }
         var b = parseInt(s.buckets, 10);
         qs += '&buckets=' + (Number.isFinite(b) && b > 0 ? b : 2000);
         return IU.api(base + qs).then(function (resp) { return normalizePoints(resp); });
@@ -251,6 +289,16 @@
         }
 
         try {
+          // 时间轴交给 uPlot 原生渲染（可读日期）；仅非时间横轴才自定义整数刻度
+          // （PLAN-064 Q3：原先强制 Math.round 覆盖导致 X 轴显示原始毫秒）。
+          // 注意：isTime 时不传 space/values 键——旧版 uPlot 对 null 轴参数处理不佳
+          var xAxis = { stroke: '#5f6a82', grid: { stroke: 'rgba(255,255,255,.06)' } };
+          if (!isTime) {
+            xAxis.space = 80;
+            xAxis.values = function (u, ticks) {
+              return ticks.map(function (v) { return v == null ? '' : String(Math.round(v)); });
+            };
+          }
           chart = new uPlot({
             width: Math.max(chartBox.clientWidth - 24, 320),
             height: 360,
@@ -261,11 +309,7 @@
             series: [{}].concat(seriesDefs),
             legend: { show: true },
             axes: [
-              { stroke: '#5f6a82', grid: { stroke: 'rgba(255,255,255,.06)' },
-                space: 80,
-                values: function (u, ticks) {
-                  return ticks.map(function (v) { return v == null ? '' : String(Math.round(v)); });
-                } },
+              xAxis,
               { stroke: '#5f6a82', grid: { stroke: 'rgba(255,255,255,.06)' },
                 values: function (u, ticks) {
                   return ticks.map(function (v) { return v == null ? '' : Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 }); });

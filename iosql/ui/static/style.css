@@ -527,3 +527,131 @@ details.stats-details pre {
 /* 快捷查询区 */
 .quick-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--sp-2) var(--sp-3); }
 .section-gap { margin-top: var(--sp-4); }
+
+/* =====================================================================
+ * PLAN-064 重构新增组件（设计：docs/design/ui-20260928-redesign.md）
+ * ===================================================================== */
+
+/* ---------------- 底部状态栏（P10：吸收快捷键提示） ---------------- */
+#statusbar {
+  height: 28px; flex: none; display: flex; align-items: center; gap: var(--sp-4);
+  padding: 0 var(--sp-5); border-top: 1px solid var(--line);
+  background: var(--bg1); font-size: 11px; color: var(--tx2);
+}
+#statusbar .mono { color: var(--tx1); }
+#statusbar .spacer { flex: 1; }
+#statusbar kbd { font-size: 9.5px; padding: 0 4px; }
+
+/* ---------------- Overview 表卡片（D2 驾驶舱） ---------------- */
+.lib-strip {
+  display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-4); margin-bottom: var(--sp-4);
+  background: var(--bg1); border: 1px solid var(--line); border-radius: var(--r-md);
+  font-size: 12.5px; color: var(--tx1);
+}
+.lib-strip b { font-family: var(--font-mono); color: var(--tx0); font-weight: 700; }
+.table-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--sp-4); }
+.table-card {
+  background: linear-gradient(160deg, var(--bg2), var(--bg1) 65%);
+  border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-4);
+  cursor: pointer; transition: border-color .12s ease, transform .12s ease;
+}
+.table-card:hover { border-color: var(--acc-dim); transform: translateY(-1px); }
+.tc-head { display: flex; align-items: center; gap: var(--sp-2); }
+.tc-name { font-weight: 700; font-size: 14px; font-family: var(--font-mono); }
+.tc-rows {
+  font-family: var(--font-mono); font-size: 24px; font-weight: 700;
+  margin-top: var(--sp-2); font-variant-numeric: tabular-nums;
+}
+.tc-rows small { font-size: 12px; color: var(--tx2); font-weight: 400; margin-left: 4px; }
+.tc-meta { display: flex; flex-direction: column; gap: 3px; margin-top: var(--sp-2); font-size: 11.5px; color: var(--tx1); }
+.tc-meta .k { color: var(--tx2); margin-right: 6px; }
+.tc-meta .v { font-family: var(--font-mono); word-break: break-all; }
+.tc-signal { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px dashed var(--line); }
+.tc-signal-row { display: flex; align-items: center; gap: var(--sp-2); font-size: 11.5px; color: var(--tx1); }
+.mini-bars { display: flex; align-items: flex-end; gap: 2px; height: 22px; flex: 1; }
+.mini-bars .mb { flex: 1; min-width: 3px; border-radius: 1px 1px 0 0; background: var(--acc-dim); opacity: .85; }
+.mini-bars .mb.hot { background: var(--amber); }
+.tc-hint { font-size: 11px; margin-top: 4px; color: var(--tx2); }
+
+/* ---------------- 分段控件（D1：浏览|时序|截面） ---------------- */
+.seg-control {
+  display: inline-flex; border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); overflow: hidden;
+}
+.seg-control button {
+  appearance: none; border: none; background: transparent; cursor: pointer;
+  color: var(--tx1); font: inherit; font-size: 12.5px; padding: 5px 16px;
+}
+.seg-control button + button { border-left: 1px solid var(--line); }
+.seg-control button.active { background: var(--acc-dim); color: #fff; font-weight: 600; }
+.seg-control button:hover:not(.active) { background: var(--bg2); color: var(--tx0); }
+
+/* ---------------- where 预览条（D5：两入口一个真相） ---------------- */
+.where-preview {
+  display: flex; align-items: center; gap: var(--sp-2);
+  background: var(--bg0); border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 6px var(--sp-3); margin-top: var(--sp-3); font-size: 12px;
+}
+.where-preview .wp-expr {
+  font-family: var(--font-mono); color: var(--tx1);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.where-preview .wp-expr .op { color: var(--amber); }
+.where-preview .wp-empty { color: var(--tx2); }
+
+/* ---------------- Explain Dock（D9：学 Plot Dock 的附属面板） ---------------- */
+.dock {
+  margin-top: var(--sp-3); border: 1px solid var(--acc-dim); border-radius: var(--r-md);
+  background: linear-gradient(180deg, rgba(69,198,255,.05), transparent 55%), var(--bg1);
+  padding: var(--sp-3) var(--sp-4);
+}
+.dock-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+
+/* ---------------- 列选择器（D12：几百列场景） ---------------- */
+.menu { position: relative; }
+.col-picker {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 50;
+  width: 320px; background: var(--bg3); border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); box-shadow: var(--shadow-pop); padding: var(--sp-3);
+}
+.cp-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.cp-search { width: 100%; box-sizing: border-box; margin-bottom: var(--sp-2); }
+.cp-quick { display: flex; gap: 6px; margin-bottom: var(--sp-2); flex-wrap: wrap; }
+.cp-list {
+  max-height: 300px; overflow: auto; display: flex; flex-direction: column;
+  border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg0); padding: 3px;
+}
+.cp-list label {
+  display: flex; align-items: center; gap: 8px; padding: 3px 6px;
+  font-family: var(--font-mono); font-size: 12px; color: var(--tx1);
+  cursor: pointer; border-radius: var(--r-sm);
+}
+.cp-list label:hover { background: var(--bg2); color: var(--tx0); }
+.cp-list input { accent-color: var(--acc); }
+.cp-list .cp-type { margin-left: auto; font-size: 10px; color: var(--tx2); font-family: var(--font-ui); }
+.cp-foot {
+  margin-top: var(--sp-2); font-size: 11px; color: var(--tx2);
+  display: flex; justify-content: space-between; gap: var(--sp-2);
+}
+
+/* ---------------- 时间输入组件（D3：自然日期 / 毫秒双格式） ---------------- */
+.time-field { display: inline-flex; flex-direction: column; gap: 3px; }
+.time-field .tf-parsed { font-size: 10.5px; min-height: 14px; font-family: var(--font-mono); }
+.time-field .tf-parsed.ok { color: var(--ok); }
+.time-field .tf-parsed.bad { color: var(--amber); }
+
+/* ---------------- Structure 分区条形图增强（D4） ---------------- */
+.bar-line { cursor: default; }
+.bar-line.part-link { cursor: pointer; }
+.bar-line.part-link:hover .bar-key { color: var(--acc); }
+.bar-key .raw { color: var(--tx2); font-size: 10px; margin-left: 6px; }
+.bar-fill.hot { background: linear-gradient(90deg, #8a5a1e, var(--amber)); }
+
+/* Maintain 锁态命令提示（P9） */
+.cmd-hint {
+  display: inline-flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3);
+  font-family: var(--font-mono); font-size: 12px; color: var(--tx1);
+  background: var(--bg0); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: 6px 12px;
+}

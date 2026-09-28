@@ -1,0 +1,1287 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>iosql UI · 重构原型 v0.2</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2345c6ff'/%3E%3Cpath d='M4 4h8v3H7v2h5v3H4V9h5V7H4z' fill='%230a0d13'/%3E%3C/svg%3E">
+<style>
+/* =====================================================================
+ * iosql UI 重构原型 · 高保真
+ * 设计规范: docs/design/ui-20260928-redesign.md (v0.2, 结构已定案)
+ * tokens 全部沿用现有 style.css 体系；新增组件语汇见规范 §6
+ * ===================================================================== */
+:root {
+  --bg0: #0a0d13; --bg1: #10141d; --bg2: #161c28; --bg3: #1d2433;
+  --line: #232b3b; --line-strong: #33405a;
+  --tx0: #e8edf6; --tx1: #9aa4ba; --tx2: #5f6a82;
+  --acc: #45c6ff; --acc-dim: #1e5f80;
+  --amber: #ffb454; --ok: #46c982; --err: #ff6b6b;
+  --font-ui: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sp-1: 4px; --sp-2: 8px; --sp-3: 12px; --sp-4: 16px; --sp-5: 24px; --sp-6: 32px; --sp-7: 48px;
+  --r-sm: 4px; --r-md: 8px;
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, .55);
+  --topbar-h: 52px; --sidebar-w: 252px; --status-h: 28px;
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; font-family: var(--font-ui); font-size: 13.5px; line-height: 1.55;
+  color: var(--tx0);
+  background:
+    radial-gradient(1100px 500px at 78% -10%, rgba(69, 198, 255, .06), transparent 60%),
+    var(--bg0);
+}
+::selection { background: rgba(69, 198, 255, .28); }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: #2a3448; border-radius: 5px; border: 2px solid var(--bg0); }
+*::-webkit-scrollbar-track { background: transparent; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.dim { color: var(--tx1); } .faint { color: var(--tx2); }
+.micro-label {
+  font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--tx2); font-weight: 600;
+}
+.hidden { display: none !important; }
+
+/* ---------------- 顶栏 ---------------- */
+#topbar {
+  position: fixed; inset: 0 0 auto 0; height: var(--topbar-h);
+  display: flex; align-items: center; gap: var(--sp-4); padding: 0 var(--sp-5);
+  background: linear-gradient(180deg, #121722, #0e121b);
+  border-bottom: 1px solid var(--line); z-index: 40;
+}
+.brand { display: flex; align-items: center; gap: var(--sp-2); user-select: none; }
+.brand-mark {
+  width: 22px; height: 22px; border-radius: var(--r-sm);
+  background: conic-gradient(from 210deg at 50% 50%, var(--acc), #2b7bd4 55%, var(--acc));
+  box-shadow: 0 0 14px rgba(69, 198, 255, .35); position: relative;
+}
+.brand-mark::after {
+  content: ""; position: absolute; inset: 6px 6px 4px 4px;
+  background: var(--bg0); border-radius: 2px;
+  clip-path: polygon(0 0, 100% 0, 100% 40%, 40% 40%, 40% 100%, 0 100%);
+}
+.brand-name { font-weight: 700; letter-spacing: .02em; font-size: 15px; }
+.brand-name em { font-style: normal; color: var(--acc); margin-left: 2px; }
+.proto-badge {
+  font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: .1em;
+  color: var(--amber); border: 1px dashed rgba(255, 180, 84, .55);
+  padding: 1px 7px; border-radius: 999px;
+}
+#db-uri {
+  font-family: var(--font-mono); font-size: 12px; color: var(--tx1);
+  max-width: 34vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  padding: 3px 10px; border: 1px solid var(--line); border-radius: 999px; background: var(--bg1);
+}
+.topbar-right { margin-left: auto; display: flex; align-items: center; gap: var(--sp-3); }
+.mode-badge {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+  letter-spacing: .08em; padding: 3px 10px; border-radius: 999px; border: 1px solid;
+}
+.mode-badge .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.mode-badge.readonly { color: var(--ok); border-color: rgba(70, 201, 130, .45); background: rgba(70, 201, 130, .08); }
+.mode-badge.write { color: var(--amber); border-color: rgba(255, 180, 84, .5); background: rgba(255, 180, 84, .09); }
+.mode-badge.write .dot { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .25; } }
+kbd {
+  font-family: var(--font-mono); font-size: 10.5px; padding: 1px 5px;
+  border-radius: var(--r-sm); border: 1px solid var(--line-strong);
+  border-bottom-width: 2px; background: var(--bg2); color: var(--tx1);
+}
+
+/* ---------------- 骨架 ---------------- */
+#layout { display: flex; padding-top: var(--topbar-h); height: 100vh; }
+#sidebar {
+  width: var(--sidebar-w); flex: none; border-right: 1px solid var(--line);
+  background: linear-gradient(180deg, #0d1119, #0b0e15);
+  overflow-y: auto; padding: var(--sp-3) var(--sp-2) var(--sp-6);
+}
+.side-item {
+  display: block; padding: 7px 10px; border-radius: var(--r-md); cursor: pointer;
+  color: inherit; text-decoration: none; border-left: 2px solid transparent;
+  transition: background .12s ease;
+}
+.side-item:hover { background: var(--bg2); }
+.side-item.active { background: var(--bg2); border-left-color: var(--acc); }
+.side-item.overview-item { margin-bottom: var(--sp-2); }
+.side-name { font-weight: 600; font-size: 13px; display: flex; align-items: center; gap: 6px; }
+.side-name .glyph { color: var(--acc); opacity: .8; font-size: 11px; }
+.side-meta { display: flex; gap: var(--sp-2); align-items: baseline; font-size: 11px; margin-top: 1px; }
+.side-rows { font-family: var(--font-mono); color: var(--tx1); font-variant-numeric: tabular-nums; }
+.side-part {
+  font-family: var(--font-mono); color: var(--tx2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px;
+}
+.side-section-label { padding: var(--sp-3) 10px var(--sp-1); }
+#main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+#tabbar {
+  display: flex; gap: 2px; padding: var(--sp-2) var(--sp-5) 0;
+  border-bottom: 1px solid var(--line); background: rgba(13, 17, 25, .6);
+}
+.tab-btn {
+  appearance: none; border: none; background: none; cursor: pointer; font: inherit;
+  color: var(--tx1); padding: 8px 14px 9px; position: relative;
+  border-radius: var(--r-sm) var(--r-sm) 0 0;
+}
+.tab-btn:hover { color: var(--tx0); background: var(--bg2); }
+.tab-btn.active { color: var(--acc); font-weight: 600; }
+.tab-btn.active::after {
+  content: ""; position: absolute; left: 8px; right: 8px; bottom: -1px; height: 2px;
+  background: var(--acc); border-radius: 2px; box-shadow: 0 0 10px rgba(69, 198, 255, .6);
+}
+.tab-btn[disabled] { color: var(--tx2); cursor: not-allowed; opacity: .55; }
+.tab-btn .tab-num { font-family: var(--font-mono); font-size: 10px; color: var(--tx2); margin-right: 5px; }
+#content { flex: 1; overflow: auto; padding: var(--sp-4) var(--sp-5) var(--sp-6); }
+
+/* ---------------- 底部状态栏（吸收快捷键提示，DB Browser 心智） ---------------- */
+#statusbar {
+  height: var(--status-h); flex: none; display: flex; align-items: center; gap: var(--sp-4);
+  padding: 0 var(--sp-5); border-top: 1px solid var(--line);
+  background: var(--bg1); font-size: 11px; color: var(--tx2);
+}
+#statusbar .mono { color: var(--tx1); }
+#statusbar .spacer { flex: 1; }
+#statusbar kbd { font-size: 9.5px; padding: 0 4px; }
+
+/* ---------------- 通用组件 ---------------- */
+.btn {
+  appearance: none; font: inherit; cursor: pointer; color: var(--tx0); background: var(--bg2);
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  padding: 5px 12px; transition: all .12s ease; white-space: nowrap;
+}
+.btn:hover { border-color: var(--acc-dim); background: var(--bg3); }
+.btn:focus-visible { outline: 2px solid var(--acc); outline-offset: 1px; }
+.btn.primary { color: #04121c; background: var(--acc); border-color: var(--acc); font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.1); }
+.btn.ghost { background: transparent; }
+.btn.sm { padding: 2px 8px; font-size: 12px; }
+.input, select.input, textarea.input {
+  font: inherit; color: var(--tx0); background: var(--bg1);
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm);
+  padding: 5px 9px; min-width: 0;
+}
+.input:focus { outline: none; border-color: var(--acc-dim); box-shadow: 0 0 0 2px rgba(69, 198, 255, .18); }
+.input.mono { font-family: var(--font-mono); font-size: 12.5px; }
+select.input { cursor: pointer; }
+.badge {
+  display: inline-block; font-family: var(--font-mono); font-size: 10.5px; font-weight: 700;
+  letter-spacing: .06em; padding: 1px 7px; border-radius: 999px; border: 1px solid;
+}
+.badge.ok   { color: var(--ok);    border-color: rgba(70,201,130,.5);  background: rgba(70,201,130,.08); }
+.badge.info { color: var(--acc);   border-color: rgba(69,198,255,.45); background: rgba(69,198,255,.08); }
+.badge.warn { color: var(--amber); border-color: rgba(255,180,84,.5);  background: rgba(255,180,84,.09); }
+.badge.err  { color: var(--err);   border-color: rgba(255,107,107,.5); background: rgba(255,107,107,.09); }
+.badge.gray { color: var(--tx1);   border-color: var(--line-strong);   background: var(--bg2); }
+.card {
+  background: var(--bg1); border: 1px solid var(--line);
+  border-radius: var(--r-md); padding: var(--sp-4);
+}
+.card + .card { margin-top: var(--sp-4); }
+.card-title { display: flex; align-items: baseline; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+
+/* 时间输入组件（规范 D3：三格式，回显解析） */
+.time-input { position: relative; display: inline-flex; flex-direction: column; gap: 3px; }
+.time-input label { font-size: 11px; color: var(--tx2); }
+.time-input .parsed {
+  font-size: 10.5px; color: var(--ok); font-family: var(--font-mono); min-height: 14px;
+}
+
+/* 分段控件（规范 Q1 定案：浏览|时序|截面 三视图可见可切） */
+.seg-control { display: inline-flex; border: 1px solid var(--line-strong); border-radius: var(--r-md); overflow: hidden; }
+.seg-control button {
+  appearance: none; border: none; background: transparent; cursor: pointer;
+  color: var(--tx1); font: inherit; font-size: 12.5px; padding: 5px 16px;
+}
+.seg-control button + button { border-left: 1px solid var(--line); }
+.seg-control button.active { background: var(--acc-dim); color: #fff; font-weight: 600; }
+.seg-control button:hover:not(.active) { background: var(--bg2); color: var(--tx0); }
+
+/* where 预览条（规范 D5：两入口一个真相） */
+.where-preview {
+  display: flex; align-items: center; gap: var(--sp-2);
+  background: var(--bg0); border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: 6px var(--sp-3); margin-top: var(--sp-2); font-size: 12px;
+}
+.where-preview .wp-expr { font-family: var(--font-mono); color: var(--tx1); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.where-preview .wp-expr b { color: var(--acc); font-weight: 600; }
+.where-preview .wp-expr .op { color: var(--amber); }
+
+/* ---------------- P1 Overview 驾驶舱 ---------------- */
+.lib-strip {
+  display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap;
+  padding: var(--sp-2) var(--sp-4); margin-bottom: var(--sp-4);
+  background: var(--bg1); border: 1px solid var(--line); border-radius: var(--r-md);
+  font-size: 12.5px; color: var(--tx1);
+}
+.lib-strip b { font-family: var(--font-mono); color: var(--tx0); font-weight: 700; }
+.table-card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: var(--sp-4); }
+.table-card {
+  background: linear-gradient(160deg, var(--bg2), var(--bg1) 65%);
+  border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-4);
+  cursor: pointer; transition: border-color .12s ease, transform .12s ease;
+}
+.table-card:hover { border-color: var(--acc-dim); transform: translateY(-1px); }
+.tc-head { display: flex; align-items: center; gap: var(--sp-2); }
+.tc-name { font-weight: 700; font-size: 14px; font-family: var(--font-mono); }
+.tc-rows { font-family: var(--font-mono); font-size: 24px; font-weight: 700; margin-top: var(--sp-2); font-variant-numeric: tabular-nums; }
+.tc-rows small { font-size: 12px; color: var(--tx2); font-weight: 400; margin-left: 4px; }
+.tc-meta { display: flex; flex-direction: column; gap: 3px; margin-top: var(--sp-2); font-size: 11.5px; color: var(--tx1); }
+.tc-meta .k { color: var(--tx2); margin-right: 6px; }
+.tc-meta .v { font-family: var(--font-mono); }
+.tc-signal { margin-top: var(--sp-3); padding-top: var(--sp-3); border-top: 1px dashed var(--line); }
+.tc-signal-row { display: flex; align-items: center; gap: var(--sp-2); font-size: 11.5px; color: var(--tx1); }
+.mini-bars { display: flex; align-items: flex-end; gap: 2px; height: 22px; flex: 1; }
+.mini-bars .mb {
+  flex: 1; min-width: 3px; border-radius: 1px 1px 0 0;
+  background: var(--acc-dim); opacity: .85;
+}
+.mini-bars .mb.hot { background: var(--amber); }
+.mini-bars .mb.zero { background: var(--err); opacity: .7; }
+
+/* 骨架屏 */
+.sk { position: relative; overflow: hidden; background: var(--bg2); border-radius: var(--r-sm); }
+.sk::after {
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255,255,255,.05), transparent);
+  animation: shimmer 1.2s infinite;
+}
+@keyframes shimmer { from { transform: translateX(-100%); } to { transform: translateX(100%); } }
+
+/* ---------------- P2 Data 数据工作台 ---------------- */
+.data-head { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.data-head .table-name { font-family: var(--font-mono); font-weight: 700; font-size: 15px; }
+.toolbar { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); flex-wrap: wrap; }
+.toolbar .spacer { flex: 1; }
+/* 列选择器（D12：几百列场景） */
+.menu { position: relative; display: inline-block; }
+.col-picker {
+  position: absolute; top: calc(100% + 6px); right: 0; z-index: 50;
+  width: 320px; background: var(--bg3); border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); box-shadow: var(--shadow-pop); padding: var(--sp-3);
+}
+.cp-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-2); }
+.cp-search { width: 100%; box-sizing: border-box; margin-bottom: var(--sp-2); }
+.cp-quick { display: flex; gap: 6px; margin-bottom: var(--sp-2); flex-wrap: wrap; }
+.cp-list { max-height: 300px; overflow: auto; display: flex; flex-direction: column; border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg0); padding: 3px; }
+.cp-list label {
+  display: flex; align-items: center; gap: 8px; padding: 3px 6px;
+  font-family: var(--font-mono); font-size: 12px; color: var(--tx1);
+  cursor: pointer; border-radius: var(--r-sm);
+}
+.cp-list label:hover { background: var(--bg2); color: var(--tx0); }
+.cp-list input { accent-color: var(--acc); }
+.cp-list .cp-type { margin-left: auto; font-size: 10px; color: var(--tx2); font-family: var(--font-ui); }
+.cp-foot { margin-top: var(--sp-2); font-size: 11px; color: var(--tx2); display: flex; justify-content: space-between; gap: var(--sp-2); }
+.count-chip { font-size: 12px; color: var(--tx1); }
+.count-chip b { font-family: var(--font-mono); color: var(--tx0); }
+.view-panels { margin-top: var(--sp-3); }
+.qform { display: flex; align-items: flex-end; gap: var(--sp-3); flex-wrap: wrap; padding: var(--sp-3); border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg0); }
+.qform label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--tx2); }
+.qform .sym-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip {
+  font-family: var(--font-mono); font-size: 11.5px; color: var(--tx1);
+  border: 1px solid var(--line-strong); background: var(--bg2);
+  border-radius: 999px; padding: 2px 10px; cursor: pointer;
+}
+.chip.on { color: #04121c; background: var(--acc); border-color: var(--acc); font-weight: 700; }
+
+/* 数据表格 */
+.table-wrap {
+  overflow: auto; border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--bg1); margin-top: var(--sp-3);
+  max-height: calc(100vh - var(--topbar-h) - var(--status-h) - 320px);
+}
+table.data-table { border-collapse: separate; border-spacing: 0; width: 100%; font-size: 12.5px; }
+.data-table thead th {
+  position: sticky; top: 0; z-index: 2; background: var(--bg2); color: var(--tx1);
+  font-weight: 600; text-align: left; padding: 7px 10px; white-space: nowrap;
+  border-bottom: 1px solid var(--line-strong); user-select: none;
+}
+.data-table th.sortable { cursor: pointer; }
+.data-table th.sorted { color: var(--acc); }
+.data-table td {
+  padding: 5px 10px; border-bottom: 1px solid rgba(35, 43, 59, .55);
+  font-family: var(--font-mono); font-size: 12px;
+  max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.data-table tbody tr:nth-child(even) { background: rgba(255, 255, 255, .018); }
+.data-table tbody tr:hover { background: rgba(69, 198, 255, .07); }
+.data-table tbody tr.clickable { cursor: zoom-in; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+th.num { text-align: right; }
+.ts-cell { color: var(--acc); }
+.browse-table thead tr.filter-row th { top: 31px; z-index: 2; padding: 4px 6px; background: var(--bg1); border-bottom: 1px solid var(--line-strong); }
+.browse-table thead th.filtered { color: var(--acc); box-shadow: inset 0 -2px 0 var(--acc); }
+.filter-input {
+  width: 100%; min-width: 72px; box-sizing: border-box;
+  padding: 3px 6px; font-size: 11px;
+  background: var(--bg0); border: 1px solid var(--line); border-radius: var(--r-sm);
+  color: var(--tx0); font-family: var(--font-mono);
+}
+.filter-input:focus { outline: none; border-color: var(--acc); }
+.filter-input::placeholder { color: var(--tx2); opacity: .75; }
+.pager-bar {
+  display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+  margin-top: var(--sp-3); color: var(--tx1); font-size: 12.5px;
+}
+.pager-bar .mono { color: var(--tx0); }
+.loading-cell, .empty-cell { text-align: center; padding: var(--sp-6) !important; color: var(--tx2); }
+
+/* Explain Dock（规范 D9：学 Plot Dock 的附属面板） */
+.dock {
+  margin-top: var(--sp-3); border: 1px solid var(--acc-dim); border-radius: var(--r-md);
+  background: linear-gradient(180deg, rgba(69,198,255,.05), transparent 55%), var(--bg1);
+  padding: var(--sp-4);
+}
+.dock-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-3); }
+.plan-counts { display: flex; gap: var(--sp-5); margin: var(--sp-2) 0; }
+.plan-count .n { font-family: var(--font-mono); font-size: 20px; font-weight: 700; }
+.plan-count .n.c-cand { color: var(--acc); }
+.plan-count .n.c-scan { color: var(--amber); }
+.plan-count .n.c-skip { color: var(--ok); }
+.skip-reasons { margin: 0; padding-left: 18px; color: var(--tx1); font-size: 12px; }
+.skip-reasons li { margin: 2px 0; font-family: var(--font-mono); word-break: break-all; }
+
+/* 单元格详情侧滑 */
+#detail-mask { position: fixed; inset: 0; background: rgba(4, 6, 10, .5); opacity: 0; pointer-events: none; transition: opacity .18s ease; z-index: 59; }
+body.detail-open #detail-mask { opacity: 1; pointer-events: auto; }
+#detail-panel {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 92vw);
+  background: var(--bg1); border-left: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-pop); z-index: 60;
+  transform: translateX(102%); transition: transform .2s ease; display: flex; flex-direction: column;
+}
+body.detail-open #detail-panel { transform: translateX(0); }
+.detail-head { display: flex; align-items: center; justify-content: space-between; padding: var(--sp-3) var(--sp-4); border-bottom: 1px solid var(--line); }
+.detail-colname { font-family: var(--font-mono); font-weight: 700; color: var(--acc); }
+.detail-body { flex: 1; overflow: auto; padding: var(--sp-4); }
+.detail-body pre {
+  margin: 0; font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  background: var(--bg0); border: 1px solid var(--line); border-radius: var(--r-md);
+  padding: var(--sp-3); white-space: pre-wrap; word-break: break-all; color: var(--tx0);
+}
+
+/* ---------------- P3 Structure ---------------- */
+.kv-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: var(--sp-2) var(--sp-4); }
+.kv-item { border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px 10px; background: var(--bg0); min-width: 0; }
+.kv-key { font-size: 11px; color: var(--tx2); letter-spacing: .08em; text-transform: uppercase; }
+.kv-val { font-family: var(--font-mono); font-size: 12.5px; word-break: break-all; margin-top: 1px; }
+.part-bars { display: flex; flex-direction: column; gap: 5px; }
+.part-line { display: grid; grid-template-columns: minmax(110px, 180px) 90px 1fr 90px; gap: var(--sp-2); align-items: center; }
+.part-key { font-family: var(--font-mono); font-size: 12px; color: var(--tx0); }
+.part-key .readable { color: var(--acc); }
+.part-key .raw { color: var(--tx2); font-size: 10.5px; margin-left: 6px; }
+.part-rows { font-family: var(--font-mono); font-size: 12px; text-align: right; color: var(--tx1); font-variant-numeric: tabular-nums; }
+.bar-track { height: 14px; background: var(--bg0); border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+.bar-fill { height: 100%; background: linear-gradient(90deg, var(--acc-dim), var(--acc)); border-radius: 999px; min-width: 2px; }
+.bar-fill.hot { background: linear-gradient(90deg, #8a5a1e, var(--amber)); }
+.bar-segs { font-family: var(--font-mono); font-size: 11px; color: var(--tx2); text-align: right; }
+
+/* ---------------- P4 Charts ---------------- */
+.chart-config { display: flex; align-items: flex-end; gap: var(--sp-3); flex-wrap: wrap; }
+.chart-config label { display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: var(--tx2); }
+.chart-box {
+  margin-top: var(--sp-4); background: var(--bg1); border: 1px solid var(--line);
+  border-radius: var(--r-md); padding: var(--sp-3); min-height: 380px;
+}
+.chart-legend { display: flex; gap: var(--sp-4); padding: 0 var(--sp-2) var(--sp-2); font-size: 11.5px; color: var(--tx1); }
+.chart-legend .sw { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+
+/* ---------------- P5 Maintain ---------------- */
+.locked-tip {
+  border: 1px dashed var(--line-strong); border-radius: var(--r-md);
+  padding: var(--sp-6); text-align: center; color: var(--tx2);
+}
+.cmd-hint {
+  display: inline-flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3);
+  font-family: var(--font-mono); font-size: 12px; color: var(--tx1);
+  background: var(--bg0); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 6px 12px;
+}
+.step-card { position: relative; border-left: 3px solid var(--acc-dim); }
+.step-card.done { border-left-color: var(--ok); }
+.step-card.current { border-left-color: var(--acc); box-shadow: 0 0 0 1px rgba(69,198,255,.15); }
+.card-desc { color: var(--tx1); font-size: 12.5px; margin: calc(-1 * var(--sp-2)) 0 var(--sp-3); }
+.result-kv { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.result-pill {
+  font-family: var(--font-mono); font-size: 12px; background: var(--bg0);
+  border: 1px solid var(--line-strong); border-radius: var(--r-sm); padding: 4px 10px;
+}
+.result-pill b { color: var(--acc); font-weight: 700; }
+.reco-highlight {
+  border: 1px solid rgba(255, 180, 84, .5); border-left: 3px solid var(--amber);
+  background: rgba(255, 180, 84, .07); color: var(--tx0);
+  border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+  font-size: 13px; margin-top: var(--sp-2);
+}
+
+/* ---------------- 空态/加载/错误 ---------------- */
+.empty-state { text-align: center; color: var(--tx2); padding: var(--sp-7) 0; }
+.empty-state .es-title { font-size: 14px; color: var(--tx1); margin-bottom: var(--sp-2); }
+.spinner {
+  display: inline-block; width: 14px; height: 14px; vertical-align: -2px;
+  border: 2px solid var(--line-strong); border-top-color: var(--acc);
+  border-radius: 50%; animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.error-inline {
+  border: 1px solid rgba(255,107,107,.4); border-left: 3px solid var(--err);
+  background: rgba(255,107,107,.06); color: var(--tx1);
+  border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3); font-size: 12.5px;
+  display: flex; align-items: center; gap: var(--sp-3);
+}
+
+/* ---------------- 状态切换器（原型演示器，非产品功能） ---------------- */
+#state-switcher {
+  position: fixed; left: var(--sp-4); bottom: calc(var(--status-h) + var(--sp-4));
+  z-index: 200; background: rgba(13, 17, 25, .92); border: 1px solid var(--line-strong);
+  border-radius: var(--r-md); padding: var(--sp-3); box-shadow: var(--shadow-pop);
+  font-size: 11.5px; color: var(--tx1); backdrop-filter: blur(4px);
+}
+#state-switcher .sw-title { margin-bottom: var(--sp-2); }
+#state-switcher .sw-row { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-1); flex-wrap: wrap; }
+#state-switcher button {
+  appearance: none; cursor: pointer; font: inherit; font-size: 11px;
+  color: var(--tx1); background: var(--bg2); border: 1px solid var(--line);
+  border-radius: var(--r-sm); padding: 2px 8px;
+}
+#state-switcher button.on { color: #04121c; background: var(--acc); border-color: var(--acc); font-weight: 700; }
+</style>
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <div class="brand-mark"></div>
+    <span class="brand-name">iosql<em>UI</em></span>
+    <span class="proto-badge">原型 v0.2</span>
+  </div>
+  <span id="db-uri" title="sqlite:///tmp/iosql-ui-demo.iosql">sqlite:///tmp/iosql-ui-demo.iosql</span>
+  <div class="topbar-right">
+    <span id="mode-badge-slot"></span>
+  </div>
+</header>
+
+<div id="layout">
+  <nav id="sidebar" aria-label="表列表"></nav>
+  <main id="main">
+    <div id="tabbar" role="tablist"></div>
+    <div id="content"></div>
+    <div id="statusbar">
+      <span id="status-left" class="mono">4 张表 · 10,719 行</span>
+      <span class="spacer"></span>
+      <span><kbd>1</kbd>–<kbd>5</kbd> 切 Tab</span>
+      <span><kbd>←</kbd><kbd>→</kbd> 翻页</span>
+      <span><kbd>R</kbd> 刷新</span>
+    </div>
+  </main>
+</div>
+
+<div id="detail-mask"></div>
+<aside id="detail-panel" aria-label="单元格详情">
+  <div class="detail-head">
+    <span class="micro-label">单元格详情 · <span class="detail-colname" id="detail-colname"></span></span>
+    <button class="btn sm ghost" id="detail-copy">复制值</button>
+    <button class="btn sm ghost" id="detail-close">✕</button>
+  </div>
+  <div class="detail-body"><pre id="detail-pre"></pre></div>
+</aside>
+
+<div id="state-switcher">
+  <div class="sw-title micro-label">原型状态切换器</div>
+  <div class="sw-row">页面状态：<span id="sw-states"></span></div>
+  <div class="sw-row">数据模式：<span id="sw-modes"></span></div>
+</div>
+
+<script>
+/* =====================================================================
+ * 原型脚本：hash 路由 + URL 参数深链（?state=empty|loading|error&mode=write&view=timeseries）
+ * ===================================================================== */
+'use strict';
+var h = function (tag, attrs) {
+  var el = document.createElement(tag);
+  if (attrs) Object.keys(attrs).forEach(function (k) {
+    if (k === 'class') el.className = attrs[k];
+    else if (k === 'text') el.textContent = attrs[k];
+    else if (k === 'html') el.innerHTML = attrs[k];
+    else if (typeof attrs[k] === 'function') el[k] = attrs[k]; // onclick 等事件处理器必须直接赋值，setAttribute 会把函数转成字符串
+    else el.setAttribute(k, attrs[k]);
+  });
+  for (var i = 2; i < arguments.length; i++) {
+    var c = arguments[i];
+    if (c == null) continue;
+    if (Array.isArray(c)) {
+      c.forEach(function (x) { if (x != null) el.append(x.nodeType ? x : document.createTextNode(String(x))); });
+      continue;
+    }
+    el.append(c.nodeType ? c : document.createTextNode(String(c)));
+  }
+  return el;
+};
+var clear = function (el) { while (el.firstChild) el.removeChild(el.firstChild); return el; };
+var fmtInt = function (n) { return Number(n).toLocaleString('en-US'); };
+
+/* ---------------- mock 数据 ---------------- */
+var DAY = 86400000, BASE = 1735689600000; // 2025-01-01
+var DB = {
+  tables: [
+    { name: 'daily_bars', rows: 600, parts: 5, segs: 5, ts: true, pstr: 'duration(date,every=1month)',
+      tmin: '2025-01-01', tmax: '2025-04-30', health: 'ok',
+      partRows: [120, 150, 150, 150, 30],
+      cols: ['symbol', 'date', 'open', 'high', 'low', 'close', 'volume'],
+      colTypes: { symbol: 'text', date: 'ms', open: 'num', high: 'num', low: 'num', close: 'num', volume: 'num' },
+      symbols: ['AAPL', 'MSFT', 'NVDA', 'TSLA', '600519'] },
+    { name: 'events', rows: 59, parts: 1, segs: 1, ts: false, pstr: null,
+      tmin: null, tmax: null, health: 'ok',
+      cols: ['id', 'name', 'ts', 'level', 'detail'],
+      colTypes: { id: 'num', name: 'text', ts: 'ms', level: 'text', detail: 'text' } },
+    { name: 'ticks', rows: 1460, parts: 10, segs: 10, ts: true, pstr: 'duration(ts,every=1day)',
+      tmin: '2025-01-01', tmax: '2025-01-10', health: 'skew',   // 后 4 个分区偏肥
+      partRows: [40, 52, 64, 76, 88, 100, 260, 260, 260, 260],
+      cols: ['symbol', 'ts', 'price', 'volume', 'bid', 'ask'],
+      colTypes: { symbol: 'text', ts: 'ms', price: 'num', volume: 'num', bid: 'num', ask: 'num' },
+      symbols: ['AAPL', 'MSFT', 'NVDA', 'TSLA', '600519'] }
+  ]
+};
+var CUR = { page: 'overview', state: 'default', mode: 'readonly', view: 'browse', explainOpen: false, chartReady: false,
+  colPickerOpen: false, colSearch: '', hiddenCols: {} };
+
+/* 宽表演示：几百列场景（用户真实诉求：只看特定若干列） */
+(function () {
+  var cols = ['symbol', 'ts'], types = { symbol: 'text', ts: 'ms' };
+  for (var i = 1; i <= 120; i++) {
+    var c = 'f' + String(i).padStart(2, '0');
+    cols.push(c); types[c] = 'num';
+  }
+  DB.tables.push({ name: 'factors_wide', rows: 8600, parts: 3, segs: 3, ts: true,
+    pstr: 'duration(ts,every=1day)', tmin: '2025-01-01', tmax: '2025-01-03',
+    health: 'ok', partRows: [2800, 2900, 2900],
+    cols: cols, colTypes: types, symbols: ['AAPL', 'MSFT', 'NVDA'],
+    defaultCols: ['symbol', 'ts', 'f01', 'f07', 'f12', 'f33', 'f57', 'f88'] });
+})();
+
+/* ---------------- 布局渲染 ---------------- */
+var TABS = [
+  { id: 'overview', label: 'Overview' },
+  { id: 'data', label: 'Data' },
+  { id: 'structure', label: 'Structure' },
+  { id: 'charts', label: 'Charts' },
+  { id: 'maintain', label: 'Maintain' }
+];
+
+function renderTopbar() {
+  var slot = document.getElementById('mode-badge-slot');
+  clear(slot).append(CUR.mode === 'write'
+    ? h('span', { class: 'mode-badge write', title: '可修改模式' }, h('span', { class: 'dot' }), 'WRITABLE')
+    : h('span', { class: 'mode-badge readonly', title: '只读模式' }, h('span', { class: 'dot' }), 'READ-ONLY'));
+}
+
+function renderSidebar() {
+  var nav = clear(document.getElementById('sidebar'));
+  nav.append(h('a', { class: 'side-item overview-item' + (CUR.page === 'overview' ? ' active' : ''), href: '#/overview' },
+    h('div', { class: 'side-name' }, h('span', { class: 'glyph' }, '▦'), '总览'),
+    h('div', { class: 'side-meta' }, h('span', { class: 'side-part' }, '库级概览'))));
+  nav.append(h('div', { class: 'side-section-label micro-label' }, '表 (' + DB.tables.length + ')'));
+  DB.tables.forEach(function (t) {
+    nav.append(h('a', {
+      class: 'side-item' + (CUR.page !== 'overview' && pageTable() === t.name ? ' active' : ''),
+      href: '#/data/' + t.name
+    },
+      h('div', { class: 'side-name' }, h('span', { class: 'glyph' }, '▸'), t.name),
+      h('div', { class: 'side-meta' },
+        h('span', { class: 'side-rows' }, fmtInt(t.rows) + ' 行'),
+        t.pstr ? h('span', { class: 'side-part', title: t.pstr }, t.pstr) : null)));
+  });
+}
+
+function pageTable() {
+  var m = location.hash.match(/^#\/\w+\/([^/?]+)/);
+  if (m) return decodeURIComponent(m[1]);
+  return CUR.page === 'overview' ? null : 'daily_bars';
+}
+
+function renderTabbar() {
+  var bar = clear(document.getElementById('tabbar'));
+  TABS.forEach(function (t, i) {
+    var locked = t.id === 'maintain' && CUR.mode !== 'write';
+    var tbl = pageTable();
+    bar.append(h('button', {
+      class: 'tab-btn' + (CUR.page === t.id ? ' active' : ''),
+      onclick: function () {
+        if (t.id === 'overview') location.hash = '#/overview';
+        else location.hash = '#/' + t.id + '/' + (tbl || 'daily_bars');
+      }
+    },
+      h('span', { class: 'tab-num' }, String(i + 1)),
+      t.label,
+      locked ? ' 🔒' : ''));
+  });
+}
+
+/* ---------------- P1 Overview ---------------- */
+function renderOverview(root) {
+  if (CUR.state === 'loading') {
+    clear(root).append(h('div', { class: 'lib-strip' }, '库级统计加载中…'));
+    var grid = h('div', { class: 'table-card-grid' });
+    for (var i = 0; i < 3; i++) {
+      grid.append(h('div', { class: 'card' },
+        h('div', { class: 'sk', style: 'height:16px;width:40%' }),
+        h('div', { class: 'sk', style: 'height:28px;width:60%;margin-top:12px' }),
+        h('div', { class: 'sk', style: 'height:12px;width:80%;margin-top:12px' }),
+        h('div', { class: 'sk', style: 'height:12px;width:70%;margin-top:6px' })));
+    }
+    root.append(grid);
+    return;
+  }
+  var strip = CUR.state === 'empty'
+    ? h('div', { class: 'lib-strip' }, h('span', { class: 'faint' }, '空库 · 状态切换器演示"空"形态，侧栏仍为默认演示数据'))
+    : h('div', { class: 'lib-strip' },
+        h('span', {}, h('b', {}, String(DB.tables.length)), ' 张表'),
+        h('span', {}, h('b', {}, fmtInt(DB.tables.reduce(function (s, t) { return s + t.rows; }, 0))), ' 行合计'),
+        h('span', {}, h('b', {}, '16'), ' 个分区'),
+        h('span', { class: 'dim' }, '·'),
+        h('span', { class: 'faint mono' }, '行数渐进加载，偏斜 = 最大分区/中位数 > 4'));
+  var grid = h('div', { class: 'table-card-grid' });
+  DB.tables.forEach(function (t, idx) {
+    if (CUR.state === 'empty') {
+      return;
+    }
+    var maxR = Math.max.apply(null, t.partRows || [1]);
+    var signal;
+    if (CUR.state === 'error' && idx === 2) {
+      signal = h('div', { class: 'tc-signal' },
+        h('div', { class: 'error-inline' },
+          h('span', {}, '统计失败'),
+          h('span', { class: 'spacer', style: 'flex:1' }),
+          h('button', { class: 'btn sm', onclick: function () { setQuery({ state: 'default' }); } }, '重试')));
+    } else if (t.health === 'skew') {
+      var bars = h('div', { class: 'mini-bars' });
+      t.partRows.forEach(function (r) {
+        bars.append(h('div', { class: 'mb' + (r === maxR ? ' hot' : ''), style: 'height:' + Math.max(8, r / maxR * 100) + '%' }));
+      });
+      signal = h('div', { class: 'tc-signal' },
+        h('div', { class: 'tc-signal-row' },
+          h('span', { class: 'badge warn', title: '最大分区 260 行 / 中位数 94 行 ≈ 2.8 倍' }, '⚠ 偏斜'),
+          bars),
+        h('div', { class: 'faint', style: 'font-size:11px;margin-top:4px' }, '尾部 4 个分区偏肥 · 点击查看 Structure'));
+    } else if (t.parts > 1) {
+      var bars2 = h('div', { class: 'mini-bars' });
+      t.partRows.forEach(function (r) { bars2.append(h('div', { class: 'mb', style: 'height:' + Math.max(8, r / maxR * 100) + '%' })); });
+      signal = h('div', { class: 'tc-signal' },
+        h('div', { class: 'tc-signal-row' }, h('span', { class: 'badge ok' }, '健康'), bars2));
+    } else {
+      signal = h('div', { class: 'tc-signal' },
+        h('div', { class: 'tc-signal-row' }, h('span', { class: 'badge gray' }, '无分区'), h('span', { class: 'faint' }, '普通表')));
+    }
+    grid.append(h('div', { class: 'table-card', onclick: function () { location.hash = '#/data/' + t.name; } },
+      h('div', { class: 'tc-head' },
+        h('span', { class: 'tc-name' }, t.name),
+        t.ts ? h('span', { class: 'badge info' }, '时序') : null,
+        CUR.state === 'error' && idx === 2 ? h('span', { class: 'badge err' }, '统计失败') : null),
+      h('div', { class: 'tc-rows' }, fmtInt(t.rows), h('small', {}, '行')),
+      h('div', { class: 'tc-meta' },
+        h('div', {}, h('span', { class: 'k' }, '分区'), h('span', { class: 'v' }, t.parts + ' 分区 · ' + t.segs + ' segments')),
+        h('div', {}, h('span', { class: 'k' }, '范围'), t.tmin ? h('span', { class: 'v' }, t.tmin + ' ~ ' + t.tmax) : h('span', { class: 'faint' }, '—')),
+        h('div', {}, h('span', { class: 'k' }, '策略'), t.pstr ? h('span', { class: 'v' }, t.pstr) : h('span', { class: 'faint' }, '—'))),
+      signal));
+  });
+  clear(root).append(strip);
+  if (CUR.state === 'empty') {
+    root.append(h('div', { class: 'empty-state' },
+      h('div', { style: 'font-size:30px;margin-bottom:8px' }, '▦'),
+      h('div', { class: 'es-title' }, '这个库还没有表'),
+      h('div', {}, '用 Python API 或 CLI 建第一张表后，这里会出现表卡片与健康度信号'),
+      h('div', { class: 'cmd-hint', style: 'margin-top:12px' }, 'iosql create-table -s <库> …  或  db.timeseries("ticks", …)')));
+    return;
+  }
+  root.append(grid);
+}
+
+/* ---------------- P2 Data ---------------- */
+/* 列显隐（D12：几百列场景）——默认只显示缺省列集，勾选即改，搜索就地过滤 */
+function hiddenSet(t) {
+  if (!CUR.hiddenCols[t.name]) {
+    var hidden = {};
+    if (t.defaultCols) {
+      t.cols.forEach(function (c) { if (t.defaultCols.indexOf(c) < 0) hidden[c] = 1; });
+    }
+    CUR.hiddenCols[t.name] = hidden;
+  }
+  return CUR.hiddenCols[t.name];
+}
+function vCols(t) {
+  var hidden = hiddenSet(t);
+  return t.cols.filter(function (c) { return !hidden[c]; });
+}
+function setHidden(t, col, wantShow) {
+  var hidden = hiddenSet(t);
+  if (!wantShow && vCols(t).length <= 1) { toast('至少保留一列', 'warn'); return; }
+  if (wantShow) delete hidden[col]; else hidden[col] = 1;
+}
+function applyCpFilter(listEl, inputEl) {
+  var q = (inputEl.value || '').toLowerCase();
+  CUR.colSearch = q;
+  Array.prototype.forEach.call(listEl.querySelectorAll('label'), function (lb) {
+    lb.style.display = lb.getAttribute('data-col').toLowerCase().indexOf(q) >= 0 ? '' : 'none';
+  });
+}
+function colMenu(t) {
+  var menu = h('div', { class: 'menu' });
+  var visN = vCols(t).length, totalN = t.cols.length;
+  var btn = h('button', { class: 'btn ghost' }, '⚙ 列 ' + visN + '/' + totalN);
+  btn.onclick = function () { CUR.colPickerOpen = !CUR.colPickerOpen; render(); };
+  menu.append(btn);
+  if (!CUR.colPickerOpen) return menu;
+
+  var list = h('div', { class: 'cp-list' });
+  t.cols.forEach(function (c) {
+    var on = !hiddenSet(t)[c];
+    var lb = h('label', { 'data-col': c },
+      h('input', { type: 'checkbox' }),
+      h('span', {}, c),
+      h('span', { class: 'cp-type' }, t.colTypes[c] === 'ms' ? '时间' : (t.colTypes[c] === 'num' ? '数值' : '文本')));
+    var cb = lb.querySelector('input');
+    cb.checked = on;
+    cb.addEventListener('change', function () {
+      setHidden(t, c, cb.checked);
+      render();  // 重建表格与计数；CUR.colSearch 会回填
+    });
+    list.append(lb);
+  });
+
+  var search = h('input', { class: 'input mono cp-search', placeholder: '搜索列名，如 f1、symbol…' });
+  var picker = h('div', { class: 'col-picker' },
+    h('div', { class: 'cp-head' },
+      h('span', { class: 'micro-label' }, '显示列 ' + visN + '/' + totalN),
+      h('span', { class: 'spacer', style: 'flex:1' }),
+      h('button', { class: 'btn sm ghost', onclick: function () { CUR.colPickerOpen = false; render(); } }, '完成')),
+    search,
+    h('div', { class: 'cp-quick' },
+      h('button', { class: 'btn sm', onclick: function () { CUR.hiddenCols[t.name] = {}; render(); } }, '全部显示'),
+      h('button', { class: 'btn sm', onclick: function () { delete CUR.hiddenCols[t.name]; render(); } }, '恢复默认'),
+      h('button', { class: 'btn sm', onclick: function () {
+        var h2 = {}; t.cols.forEach(function (c) {
+          if (['symbol', 'ts', 'date', 'id'].indexOf(c) >= 0) return;
+          h2[c] = 1;
+        });
+        CUR.hiddenCols[t.name] = h2; render();
+      } }, '仅键与时间列')),
+    list,
+    h('div', { class: 'cp-foot' },
+      h('span', {}, '勾选即改，实时生效'),
+      h('span', {}, t.defaultCols ? '宽表默认只显示 ' + t.defaultCols.length + ' 列' : '')));
+  menu.append(picker);
+  search.value = CUR.colSearch || '';
+  applyCpFilter(list, search);           // 重建后回填搜索状态
+  search.addEventListener('input', function () { applyCpFilter(list, search); });
+  return menu;
+}
+
+function mockRows(t, n) {
+  var rows = [];
+  for (var i = 0; i < n; i++) {
+    var d = BASE + (11 - Math.floor(i / 5)) * DAY;
+    var sym = t.symbols ? t.symbols[i % t.symbols.length] : ('item-' + (i + 1));
+    var px = 100 + ((i * 37) % 320) + (i % 5) * 0.5;
+    var r = {};
+    t.cols.forEach(function (c) {
+      if (c === 'symbol') r[c] = sym;
+      else if (t.colTypes[c] === 'ms') r[c] = d;
+      else if (c === 'volume') r[c] = 800000 + (i * 9187) % 6000000;
+      else if (c === 'level') r[c] = ['info', 'warn', 'error'][i % 3];
+      else if (c === 'detail') r[c] = 'some detail text ' + (i + 1);
+      else if (c === 'name') r[c] = 'event-' + (i + 1);
+      else if (c === 'id') r[c] = i + 1;
+      else r[c] = Math.round(px * 100) / 100;
+    });
+    rows.push(r);
+  }
+  return rows;
+}
+function fmtMs(ms, withTime) {
+  var d = new Date(Number(ms));
+  var p = function (x) { return String(x).padStart(2, '0'); };
+  return d.getFullYear() + '/' + (d.getMonth() + 1) + '/' + d.getDate() + (withTime ? ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds()) : '');
+}
+
+function renderData(root) {
+  var tname = pageTable();
+  var t = DB.tables.filter(function (x) { return x.name === tname; })[0] || DB.tables[0];
+  CUR.view = t.ts ? CUR.view : 'browse';
+
+  var head = h('div', { class: 'data-head' },
+    h('span', { class: 'table-name' }, t.name),
+    t.ts ? h('span', { class: 'badge info' }, '时序') : null,
+    h('span', { class: 'faint' }, t.pstr || '无分区'));
+  if (t.ts) {
+    var seg = h('div', { class: 'seg-control' });
+    [['browse', '浏览'], ['timeseries', '时序'], ['latest', '截面']].forEach(function (v) {
+      seg.append(h('button', {
+        class: CUR.view === v[0] ? 'active' : '',
+        onclick: function () { CUR.view = v[0]; render(); }
+      }, v[1]));
+    });
+    head.append(seg);
+  }
+  var wrap = h('div', {});
+  wrap.append(head);
+
+  /* 视图面板 */
+  var panel = h('div', { class: 'view-panels' });
+  if (CUR.view === 'browse' || !t.ts) {
+    /* where 预览条：两入口一个真相 */
+    wrap.append(h('div', { class: 'where-preview' },
+      h('span', { class: 'micro-label' }, 'WHERE'),
+      h('span', { class: 'wp-expr', },
+        'date ', h('span', { class: 'op' }, 'BETWEEN'), ' ', h('b', {}, '1735689600000'), ' (2025-01-01) ', h('span', { class: 'op' }, 'AND'), ' ', h('b', {}, '1738329600000'), ' (2025-05-01)'),
+      h('span', { style: 'flex:1' }),
+      h('button', { class: 'btn sm ghost', onclick: function () { toast('where JSON 已复制', 'ok'); } }, '复制'),
+      h('button', { class: 'btn sm ghost' }, '清空')));
+    var tb = h('div', { class: 'toolbar' },
+      h('button', { class: 'btn', onclick: function () { toast('高级条件（and/or 组合构造器）在实现稿中展开', ''); } }, '⊕ 高级条件'),
+      h('button', { class: 'btn primary', onclick: function () { CUR.explainOpen = !CUR.explainOpen; render(); } }, 'Explain'),
+      h('span', { class: 'count-chip' }, '命中 ', h('b', {}, fmtInt(t.rows)), ' 行'),
+      h('span', { class: 'spacer' }),
+      h('button', { class: 'btn' }, '导出 CSV ▾'),
+      h('button', { class: 'btn' }, '导出 JSONL ▾'),
+      colMenu(t));
+    panel.append(tb);
+
+    /* Explain Dock */
+    if (CUR.explainOpen) {
+      panel.append(h('div', { class: 'dock' },
+        h('div', { class: 'dock-head' },
+          h('span', { class: 'micro-label' }, '查询计划 · explain_select'),
+          h('span', { class: 'faint', style: 'font-size:11px' }, '一级分区裁剪 → 二级 segment 裁剪'),
+          h('span', { style: 'flex:1' }),
+          h('button', { class: 'btn sm ghost', onclick: function () { CUR.explainOpen = false; render(); } }, '收起 ▴')),
+        h('div', { class: 'plan-counts' },
+          h('div', { class: 'plan-count' }, h('div', { class: 'n c-cand' }, '5'), h('div', { class: 'faint', style: 'font-size:11px' }, '候选分区')),
+          h('div', { class: 'plan-count' }, h('div', { class: 'n c-scan' }, '1'), h('div', { class: 'faint', style: 'font-size:11px' }, '实际扫描')),
+          h('div', { class: 'plan-count' }, h('div', { class: 'n c-skip' }, '4'), h('div', { class: 'faint', style: 'font-size:11px' }, '裁剪跳过'))),
+        h('div', { class: 'micro-label', style: 'margin-bottom:4px' }, '跳过原因'),
+        h('ul', { class: 'skip-reasons' },
+          h('li', {}, '1735689600000: ts_max < 1736035200000 (窗口下界)'),
+          h('li', {}, '1735776000000: ts_max < 窗口下界'),
+          h('li', {}, '1735862400000: ts_max < 窗口下界'),
+          h('li', {}, '1735948800000: ts_max < 窗口下界'))));
+    }
+  } else if (CUR.view === 'timeseries') {
+    var qf = h('div', { class: 'qform' },
+      timeInput('开始', '2025-01-01'),
+      timeInput('结束', '2025-01-10'),
+      h('label', {}, 'session', h('input', { class: 'input mono', style: 'width:130px', placeholder: '交易日，如 2025-01-06' })),
+      h('div', { class: 'time-input' },
+        h('label', {}, 'symbols'),
+        (function () {
+          var chips = h('div', { class: 'sym-chips' });
+          t.symbols.forEach(function (s, i) {
+            chips.append(h('span', { class: 'chip' + (i === 0 ? ' on' : '') }, s));
+          });
+          return chips;
+        })()),
+      h('button', { class: 'btn primary' }, '查时间窗'));
+    panel.append(qf);
+    panel.append(h('div', { class: 'faint', style: 'font-size:12px;margin-top:8px' },
+      '· 时间输入支持 2025-01-01 / 2025-01-01 10:30 / 毫秒时间戳三种格式，下方绿色为解析回显'));
+  } else if (CUR.view === 'latest') {
+    panel.append(h('div', { class: 'qform' },
+      timeInput('as_of', '2025-01-10 15:00'),
+      h('label', {}, 'by（分组列）', h('input', { class: 'input mono', style: 'width:110px', value: 'symbol' })),
+      h('label', {}, 'columns（可空）', h('input', { class: 'input mono', style: 'width:220px', placeholder: '返回列，逗号分隔' })),
+      h('button', { class: 'btn primary' }, '查最新截面')));
+  }
+  wrap.append(panel);
+
+  /* 表格 */
+  if (CUR.state === 'empty') {
+    wrap.append(h('div', { class: 'table-wrap', style: 'margin-top:16px' },
+      h('div', { class: 'empty-state' },
+        h('div', { class: 'es-title' }, '当前筛选没有命中任何行'),
+        h('div', {}, '放宽列头筛选，或清空 where 条件重试'),
+        h('button', { class: 'btn', style: 'margin-top:12px' }, '清空筛选'))));
+  } else {
+    var cols = vCols(t);   // 只渲染可见列（D12）
+    var thead = h('thead', null,
+      (function () {
+        var tr = h('tr');
+        cols.forEach(function (c, ci) {
+          tr.append(h('th', {
+            class: 'sortable' + (c === 'date' || c === 'ts' ? ' sorted num' : (t.colTypes[c] === 'num' ? ' num' : ''))
+          }, c + (c === 'date' || c === 'ts' ? ' ↓' : '')));
+        });
+        return tr;
+      })(),
+      (function () {
+        var fr = h('tr', { class: 'filter-row' });
+        cols.forEach(function (c) {
+          fr.append(h('th', {},
+            h('input', {
+              class: 'filter-input', placeholder: t.colTypes[c] === 'num' ? '>100 · 1~5 · a,b' : (t.colTypes[c] === 'ms' ? '2025-01-01~' : '如 a% · =ab'),
+              title: '微语法：> < >= <= = <>、1~5 范围、a,b 多值、% 通配符（auto-apply 300ms）'
+            })));
+        });
+        return fr;
+      })());
+    var tbody = h('tbody');
+    if (CUR.state === 'loading') {
+      tbody.append(h('tr', null, h('td', { class: 'loading-cell', colspan: String(cols.length) },
+        h('span', { class: 'spinner' }), ' 查询中…（keyset 分页 200 行/页）')));
+    } else if (CUR.state === 'error') {
+      tbody.append(h('tr', null, h('td', { class: 'loading-cell', colspan: String(cols.length) },
+        h('div', { class: 'error-inline', style: 'display:inline-flex' },
+          h('span', {}, '查询失败：排序列含 NULL，keyset 分页不可用（422）'),
+          h('button', { class: 'btn sm' }, '换排序列')))));
+    } else {
+      mockRows(t, 10).forEach(function (r) {
+        var tr = h('tr', { class: 'clickable' });
+        cols.forEach(function (c) {
+          var v = r[c];
+          var isTs = t.colTypes[c] === 'ms';
+          tr.append(h('td', {
+            class: (t.colTypes[c] === 'num' ? 'num' : '') + (isTs ? ' ts-cell' : ''),
+            onclick: (function (col, val, human) {
+              return function () { openDetail(col, val, human); };
+            })(c, isTs ? String(v) : String(v), isTs ? fmtMs(v, true) + '\n(原始: ' + v + ')' : String(v))
+          }, isTs ? fmtMs(v, false) : fmtCell(v)));
+        });
+        tbody.append(tr);
+      });
+    }
+    wrap.append(h('div', { class: 'table-wrap' },
+      h('table', { class: 'data-table browse-table' }, thead, tbody)));
+    wrap.append(h('div', { class: 'pager-bar' },
+      h('button', { class: 'btn sm' }, '‹'),
+      h('span', { class: 'mono' }, '1–200'),
+      h('button', { class: 'btn sm' }, '›'),
+      h('span', {}, '· 共 ', h('span', { class: 'mono' }, fmtInt(t.rows)), ' 行'),
+      h('span', { class: 'faint', style: 'font-size:11px' }, '←/→ 翻页 · 排序列含 NULL 时该列禁用排序（keyset 限制）')));
+  }
+  clear(root).append(wrap);
+}
+function fmtCell(v) {
+  if (typeof v === 'number' && v > 10000) return fmtInt(v);
+  return String(v);
+}
+function timeInput(labelText, demoVal) {
+  return h('div', { class: 'time-input' },
+    h('label', {}, labelText),
+    h('input', { class: 'input mono', style: 'width:150px', value: demoVal }),
+    h('span', { class: 'parsed' }, '✓ 解析为 ' + demoVal + ' → ' + (Date.parse(demoVal) || BASE)));
+}
+
+/* ---------------- P3 Structure ---------------- */
+function renderStructure(root) {
+  var tname = pageTable();
+  var t = DB.tables.filter(function (x) { return x.name === tname; })[0] || DB.tables[0];
+  var wrap = h('div', {});
+
+  /* 契约卡 */
+  wrap.append(h('div', { class: 'card' },
+    h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '契约 · SPEC'), h('span', { class: 'badge gray' }, t.name)),
+    h('div', { class: 'kv-grid' },
+      kv('PK 主键', t.name === 'events' ? 'id' : 'symbol, ' + (t.name === 'daily_bars' ? 'date' : 'ts')),
+      kv('PARTITION 分区策略', t.pstr || '—'),
+      kv('TIME 时间契约', t.ts ? (t.name === 'daily_bars' ? 'date (ms)' : 'ts (ms)') : '—'),
+      kv('SYMBOL_COLUMN', t.ts ? 'symbol' : '—'),
+      kv('ORDER_KEY', t.ts ? (t.name === 'daily_bars' ? 'date' : 'ts') : '—'),
+      kv('CONFLICT 冲突策略', 'append'))));
+
+  /* 分区偏斜可视化（规范 D4：兑现 v1 承诺） */
+  if (t.partRows) {
+    var maxR = Math.max.apply(null, t.partRows);
+    var lines = h('div', { class: 'part-bars' });
+    t.partRows.forEach(function (r, i) {
+      var ms = BASE + i * (t.name === 'daily_bars' ? 30 : 1) * DAY;
+      var hot = r === maxR && t.health === 'skew' && r > 200;
+      lines.append(h('div', { class: 'part-line' },
+        h('span', { class: 'part-key' },
+          h('span', { class: 'readable' }, fmtMs(ms, false).replace(/\//g, '-')),
+          h('span', { class: 'raw' }, String(ms))),
+        h('span', { class: 'part-rows' }, fmtInt(r) + ' 行'),
+        h('div', { class: 'bar-track' }, h('div', { class: 'bar-fill' + (hot ? ' hot' : ''), style: 'width:' + (r / maxR * 100) + '%' })),
+        h('span', { class: 'bar-segs' }, '1 seg')));
+    });
+    wrap.append(h('div', { class: 'card' },
+      h('div', { class: 'card-title' },
+        h('span', { class: 'micro-label' }, '逻辑分区 · PARTS (' + t.partRows.length + ')'),
+        h('span', { class: 'spacer', style: 'flex:1' }),
+        h('span', { class: 'faint', style: 'font-size:11px' }, '行数条形图：琥珀 = 偏斜热点，点击分区行 → 带 partition 筛选跳转 Data')),
+      lines));
+  } else {
+    wrap.append(h('div', { class: 'card' },
+      h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '逻辑分区 · PARTS')),
+      h('div', { class: 'faint' }, '该表无分区（普通表）')));
+  }
+
+  /* 物理段 */
+  var segTbody = h('tbody');
+  (t.partRows || [t.rows]).slice(0, 5).forEach(function (r, i) {
+    var ms = BASE + i * (t.name === 'daily_bars' ? 30 : 1) * DAY;
+    segTbody.append(h('tr', null,
+      h('td', {}, ms + '.sqlite3'),
+      h('td', {}, fmtMs(ms, false).replace(/\//g, '-')),
+      h('td', { class: 'num' }, fmtInt(r)),
+      h('td', null, h('span', { class: 'badge ok' }, 'sealed')),
+      h('td', {}, fmtMs(ms, false) + ' ~ ' + fmtMs(ms + DAY - 1, false)),
+      h('td', { class: 'faint' }, '▸ 列统计 (7)')));
+  });
+  wrap.append(h('div', { class: 'card' },
+    h('div', { class: 'card-title' },
+      h('span', { class: 'micro-label' }, '物理 SEGMENTS'),
+      h('span', { class: 'spacer', style: 'flex:1' }),
+      h('label', { class: 'faint', style: 'font-size:12px;display:flex;gap:6px;align-items:center' },
+        h('input', { type: 'checkbox' }), '包含 obsolete')),
+    h('div', { class: 'table-wrap', style: 'margin-top:0;max-height:280px' },
+      h('table', { class: 'data-table' },
+        h('thead', null, h('tr', null,
+          th('file_key'), th('逻辑分区'), th('rows', true), th('state'), th('时间范围'), th('stats'))),
+        segTbody))));
+  clear(root).append(wrap);
+
+  function kv(k, v) { return h('div', { class: 'kv-item' }, h('div', { class: 'kv-key' }, k), h('div', { class: 'kv-val' }, v)); }
+  function th(txt, num) { return h('th', { class: num ? 'num' : '' }, txt); }
+}
+
+/* ---------------- P4 Charts ---------------- */
+function renderCharts(root) {
+  var t = DB.tables[0]; // daily_bars
+  if (CUR.state === 'empty') {
+    clear(root).append(h('div', { class: 'card' },
+      h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '图表配置')),
+      h('div', { class: 'empty-state' },
+        h('div', { class: 'es-title' }, '该表没有可绘制的数值列'),
+        h('div', {}, '图表快览至少需要一列数值（float/integer）'))));
+    return;
+  }
+  var config = h('div', { class: 'card' },
+    h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '图表配置'),
+      h('span', { class: 'faint', style: 'font-size:11px' }, '默认值：第一个非时间数值列 × 第一个 symbol')),
+    h('div', { class: 'chart-config' },
+      h('label', {}, '图型',
+        h('select', { class: 'input' }, h('option', {}, 'line 折线'), h('option', {}, 'candle K线(近似)'))),
+      h('label', {}, '数值列',
+        h('select', { class: 'input' },
+          ['close', 'open', 'high', 'low', 'volume'].map(function (c) { return h('option', c === 'close' ? { selected: '' } : {}, c); }))),
+      h('label', {}, 'symbol',
+        h('select', { class: 'input' },
+          t.symbols.map(function (s, i) { return h('option', i === 0 ? { selected: '' } : {}, s); }))),
+      h('div', { class: 'time-input' }, h('label', {}, '范围'),
+        h('div', { style: 'display:flex;gap:6px;align-items:center' },
+          h('input', { class: 'input mono', style: 'width:120px', value: '2025-01-01' }),
+          h('span', { class: 'faint' }, '~'),
+          h('input', { class: 'input mono', style: 'width:120px', value: '2025-04-30' }))),
+      h('label', {}, '桶数', h('input', { class: 'input mono', style: 'width:70px', value: '2000' })),
+      h('label', { style: 'flex-direction:row;align-items:center;gap:6px' }, h('input', { type: 'checkbox' }), '对数轴'),
+      h('button', { class: 'btn primary' }, '绘制')));
+  var box = h('div', { class: 'chart-box' });
+  if (CUR.state === 'loading') {
+    box.append(h('div', { style: 'display:flex;align-items:center;justify-content:center;height:340px;color:var(--tx1)' },
+      h('span', { class: 'spinner' }), ' 服务端降采样中…（≤4000 桶）'));
+  } else if (CUR.state === 'error') {
+    box.append(h('div', { style: 'display:flex;align-items:center;justify-content:center;height:340px' },
+      h('div', { class: 'error-inline' }, h('span', {}, '取数失败：symbol 列不存在'), h('button', { class: 'btn sm' }, '重选列'))));
+  } else {
+    box.append(svgChart());
+    box.append(h('div', { class: 'chart-legend' },
+      h('span', {}, h('span', { class: 'sw', style: 'background:var(--acc)' }), 'AAPL · close'),
+      h('span', { class: 'faint' }, 'X 轴原生时间轴（uPlot），悬停显示 2025/1/15 12:00:00')));
+  }
+  clear(root).append(config, h('div', { class: 'card', style: 'padding:0;overflow:hidden' }, box));
+}
+function svgChart() {
+  /* 原型用内联 SVG 演示"时间轴可读 + 默认列有意义"；实现稿用 uPlot */
+  var W = 920, Hh = 340, padL = 56, padB = 30, padT = 14;
+  var n = 120, pts = [];
+  var v = 180, seed = 7;
+  for (var i = 0; i < n; i++) {
+    seed = (seed * 16807) % 2147483647;
+    var noise = (seed / 2147483647 - 0.48) * 9;   // 伪随机游走，模拟价格序列
+    v = Math.max(60, Math.min(300, v + noise + Math.sin(i / 18) * 1.6));
+    pts.push(v);
+  }
+  var min = Math.min.apply(null, pts) - 10, max = Math.max.apply(null, pts) + 10;
+  var x = function (i) { return padL + i / (n - 1) * (W - padL - 34); };
+  var y = function (val) { return padT + (1 - (val - min) / (max - min)) * (Hh - padT - padB); };
+  var NS = 'http://www.w3.org/2000/svg';
+  var svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + Hh);
+  svg.setAttribute('style', 'width:100%;height:auto;display:block');
+  for (var g = 0; g <= 4; g++) {
+    var gy = padT + g / 4 * (Hh - padT - padB);
+    var line = document.createElementNS(NS, 'line');
+    line.setAttribute('x1', padL); line.setAttribute('x2', W - 34);
+    line.setAttribute('y1', gy); line.setAttribute('y2', gy);
+    line.setAttribute('stroke', 'rgba(255,255,255,.06)');
+    svg.append(line);
+    var lbl = document.createElementNS(NS, 'text');
+    lbl.setAttribute('x', padL - 8); lbl.setAttribute('y', gy + 4);
+    lbl.setAttribute('fill', '#5f6a82'); lbl.setAttribute('font-size', '10.5');
+    lbl.setAttribute('text-anchor', 'end');
+    lbl.setAttribute('font-family', 'var(--font-mono)');
+    lbl.textContent = fmtInt(Math.round(max - g / 4 * (max - min)));
+    svg.append(lbl);
+  }
+  for (var m = 0; m < 4; m++) {
+    var mx = padL + m / 3 * (W - padL - 34);
+    var ml = document.createElementNS(NS, 'text');
+    ml.setAttribute('x', mx); ml.setAttribute('y', Hh - 8);
+    ml.setAttribute('fill', '#5f6a82'); ml.setAttribute('font-size', '10.5');
+    ml.setAttribute('text-anchor', m === 0 ? 'start' : (m === 3 ? 'end' : 'middle'));
+    ml.setAttribute('font-family', 'var(--font-mono)');
+    ml.textContent = ['2025/1/1', '2025/2/1', '2025/3/1', '2025/4/30'][m];
+    svg.append(ml);
+  }
+  var path = '';
+  pts.forEach(function (p, i) { path += (i ? 'L' : 'M') + x(i).toFixed(1) + ',' + y(p).toFixed(1); });
+  var area = path + 'L' + x(n - 1).toFixed(1) + ',' + (Hh - padB) + 'L' + x(0).toFixed(1) + ',' + (Hh - padB) + 'Z';
+  var defs = document.createElementNS(NS, 'defs');
+  defs.innerHTML = '<linearGradient id="ga" x1="0" y1="0" x2="0" y2="1">' +
+    '<stop offset="0" stop-color="rgba(69,198,255,.22)"/><stop offset="1" stop-color="rgba(69,198,255,0)"/></linearGradient>';
+  svg.append(defs);
+  var ap = document.createElementNS(NS, 'path');
+  ap.setAttribute('d', area); ap.setAttribute('fill', 'url(#ga)');
+  svg.append(ap);
+  var pl = document.createElementNS(NS, 'path');
+  pl.setAttribute('d', path); pl.setAttribute('fill', 'none');
+  pl.setAttribute('stroke', '#45c6ff'); pl.setAttribute('stroke-width', '1.6');
+  svg.append(pl);
+  return svg;
+}
+
+/* ---------------- P5 Maintain ---------------- */
+function renderMaintain(root) {
+  if (CUR.mode !== 'write') {
+    clear(root).append(h('div', { class: 'locked-tip' },
+      h('div', { style: 'font-size:26px;margin-bottom:8px' }, '🔒'),
+      h('div', { style: 'color:var(--tx1);font-size:14px' }, '维护台在只读模式下不可用'),
+      h('div', { style: 'margin-top:4px' }, 'compact / cleanup_obsolete / repartition / delete / truncate 仅在 --write 模式下开放；'),
+      h('div', {}, '只读模式下服务端不注册任何写端点（404，而非 403）。'),
+      h('div', { class: 'cmd-hint' },
+        h('span', {}, 'iosql ui -s <库路径> --write'),
+        h('button', { class: 'btn sm', onclick: function () { toast('命令已复制', 'ok'); } }, '复制'))));
+    return;
+  }
+  var wrap = h('div', {});
+  var stepDefs = [
+    ['1', 'layout_report · 布局报告', '只读诊断：分区行数分布 + 官方 recommendation', 'done',
+      [h('div', { class: 'result-kv' },
+        h('span', { class: 'result-pill' }, '分区数 ', h('b', {}, '10')),
+        h('span', { class: 'result-pill' }, 'recommendation ', h('b', {}, 'compact 尾部 4 分区'))),
+      h('div', { class: 'reco-highlight' }, '官方建议：2025-01-07 ~ 2025-01-10 四个分区行数偏肥，建议 compact')]],
+    ['2', 'compact · 整理 segment', '预览 → 执行；展示 rows_read / written / new_segments', 'current', []],
+    ['3', 'validate(deep) · 深度体检', '错误列表可视化；cleanup 前会自动执行', null, []],
+    ['4', 'cleanup_obsolete · 清理废弃段', '强制两步：dry-run 预览 bytes_reclaimable → 显式确认删除', null, []]
+  ];
+  stepDefs.forEach(function (s) {
+    var card = h('div', { class: 'card step-card ' + (s[3] || '') },
+      h('div', { class: 'card-title' },
+        h('span', { class: 'badge info' }, '步骤 ' + s[0]),
+        h('span', { class: 'micro-label' }, s[1]),
+        s[3] === 'done' ? h('span', { class: 'badge ok' }, '已完成') : (s[3] === 'current' ? h('span', { class: 'badge info' }, '进行中') : null)),
+      h('div', { class: 'card-desc' }, s[2]));
+    (s[4] || []).forEach(function (r) { card.append(r); });
+    if (s[3] === 'current') {
+      card.append(h('button', { class: 'btn primary', style: 'margin-top:8px' }, '执行 compact'));
+    }
+    wrap.append(card);
+  });
+  wrap.append(h('div', { class: 'card', style: 'border-left:3px solid var(--err)' },
+    h('div', { class: 'card-title' }, h('span', { class: 'badge err' }, '危险区'), h('span', { class: 'micro-label' }, 'delete / truncate')),
+    h('div', { class: 'card-desc' }, '必填 where + 先 count 预览命中行数 + 手输表名确认；truncate 二次弹窗')));
+  clear(root).append(wrap);
+}
+
+/* ---------------- 详情侧滑 / toast ---------------- */
+function openDetail(col, val, human) {
+  document.getElementById('detail-colname').textContent = col;
+  document.getElementById('detail-pre').textContent = human;
+  document.body.classList.add('detail-open');
+}
+document.getElementById('detail-close').onclick = function () { document.body.classList.remove('detail-open'); };
+document.getElementById('detail-mask').onclick = document.getElementById('detail-close').onclick;
+document.getElementById('detail-copy').onclick = function () { toast('已复制', 'ok'); };
+function toast(msg, kind) {
+  var t = h('div', { class: 'toast ' + (kind || '') , style:
+    'position:fixed;right:16px;bottom:44px;z-index:220;background:var(--bg3);border:1px solid var(--line-strong);border-left:3px solid var(--acc);border-radius:4px;padding:9px 12px;font-size:12.5px;box-shadow:var(--shadow-pop)' },
+    msg);
+  document.body.append(t);
+  setTimeout(function () { t.remove(); }, 1600);
+}
+
+/* ---------------- 状态切换器 ---------------- */
+function renderSwitcher() {
+  var sw = clear(document.getElementById('sw-states'));
+  [['default', '默认'], ['empty', '空'], ['loading', '加载'], ['error', '错误']].forEach(function (s) {
+    sw.append(h('button', {
+      class: CUR.state === s[0] ? 'on' : '',
+      onclick: function () { setQuery({ state: s[0] }); }
+    }, s[1]));
+  });
+  var mw = clear(document.getElementById('sw-modes'));
+  [['readonly', '只读'], ['write', '可写']].forEach(function (m) {
+    mw.append(h('button', {
+      class: CUR.mode === m[0] ? 'on' : '',
+      onclick: function () { CUR.mode = m[0]; render(); }
+    }, m[1]));
+  });
+}
+
+/* ---------------- 路由 ---------------- */
+function setQuery(patch) {
+  var params = new URLSearchParams(location.search);
+  Object.keys(patch).forEach(function (k) {
+    if (patch[k] === 'default' && (k === 'state' || k === 'mode' || k === 'view')) params.delete(k);
+    else params.set(k, patch[k]);
+  });
+  var qs = params.toString();
+  location.hash = '#/' + (CUR.page === 'overview' ? 'overview' : CUR.page + '/' + pageTable()) + (qs ? '?' + qs : '');
+  /* hashchange 不触发同 hash 时手动 render */
+  if (('#/' + (CUR.page === 'overview' ? 'overview' : CUR.page + '/' + pageTable()) + (qs ? '?' + qs : '')) === location.hash) render();
+}
+function parseRoute() {
+  var hash = location.hash || '#/overview';
+  var qm = hash.indexOf('?');
+  var path = qm >= 0 ? hash.slice(0, qm) : hash;
+  var params = new URLSearchParams(qm >= 0 ? hash.slice(qm + 1) : '');
+  var m = path.match(/^#\/(\w+)(?:\/([^/]+))?/);
+  CUR.page = m ? m[1] : 'overview';
+  if (TABS.map(function (t) { return t.id; }).indexOf(CUR.page) < 0) CUR.page = 'overview';
+  var st = params.get('state');
+  CUR.state = ['default', 'empty', 'loading', 'error'].indexOf(st) >= 0 ? st : 'default';
+  var md = params.get('mode');
+  CUR.mode = md === 'write' ? 'write' : 'readonly';
+  var vw = params.get('view');
+  CUR.view = ['browse', 'timeseries', 'latest'].indexOf(vw) >= 0 ? vw : 'browse';
+}
+function render() {
+  parseRoute();
+  renderTopbar();
+  renderSidebar();
+  renderTabbar();
+  renderSwitcher();
+  var content = clear(document.getElementById('content'));
+  if (CUR.page === 'overview') renderOverview(content);
+  else if (CUR.page === 'data') renderData(content);
+  else if (CUR.page === 'structure') renderStructure(content);
+  else if (CUR.page === 'charts') renderCharts(content);
+  else if (CUR.page === 'maintain') renderMaintain(content);
+  var sl = document.getElementById('status-left');
+  sl.textContent = CUR.page === 'overview'
+    ? DB.tables.length + ' 张表 · ' + fmtInt(DB.tables.reduce(function (s, t) { return s + t.rows; }, 0)) + ' 行 · sqlite:///tmp/iosql-ui-demo.iosql'
+    : pageTable() + ' · ' + fmtInt((DB.tables.filter(function (x) { return x.name === pageTable(); })[0] || {}).rows || 0) + ' 行 · keyset 分页 200 行/页';
+}
+window.addEventListener('hashchange', render);
+document.addEventListener('keydown', function (e) {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  var i = Number(e.key);
+  if (i >= 1 && i <= 5) {
+    var t = TABS[i - 1];
+    location.hash = t.id === 'overview' ? '#/overview' : '#/' + t.id + '/' + pageTable();
+  }
+});
+render();
+</script>
+</body>
+</html>

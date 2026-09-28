@@ -300,4 +300,65 @@
     });
   }
   IU.globalKeys = globalKeys;
+
+  /* ---------- 时间语义统一（PLAN-064 D3） ----------
+   * 毫秒时间戳是存储细节，不该要求用户输入。接受三种写法：
+   *   2025-01-05 / 2025-01-05 10:30 / 1735689600000（≥12 位纯数字按毫秒）
+   * 返回 {ok, ms, text}；解析失败 ok=false，调用方自行提示。 */
+  function parseTimeInput(raw) {
+    var s = String(raw == null ? '' : raw).trim();
+    if (!s) return { ok: false, ms: null, text: s };
+    if (/^-?\d+$/.test(s) && s.replace('-', '').length >= 12) {
+      var n = Number(s);
+      return { ok: Number.isFinite(n), ms: n, text: s };
+    }
+    var iso = s.replace(' ', 'T');
+    var t = Date.parse(iso);
+    if (Number.isNaN(t)) return { ok: false, ms: null, text: s };
+    return { ok: true, ms: t, text: s };
+  }
+  IU.parseTimeInput = parseTimeInput;
+
+  /* 毫秒 → 本地 YYYY-MM-DD（ Overview 卡片/分区 key 可读化用）；非毫秒原样返回 null */
+  function fmtDate(v) {
+    var n = Number(v);
+    if (!Number.isFinite(n) || n < 1e12) return null;
+    var d = new Date(n);
+    var p = function (x) { return String(x).padStart(2, '0'); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+  IU.fmt.date = fmtDate;
+
+  /* 时间输入框组件：label + input + 解析回显行（绿 ✓ / 琥珀提示）。
+   * 返回 {node, input, value()}；value() 给出毫秒数或 null（空值/非法）。 */
+  function timeField(labelText, placeholder, initial) {
+    var parsed = h('span', { class: 'tf-parsed' });
+    var input = h('input', {
+      class: 'input mono', placeholder: placeholder || '2025-01-01 或 毫秒时间戳',
+      autocomplete: 'off', spellcheck: 'false', value: initial || ''
+    });
+    function sync() {
+      var s = input.value.trim();
+      if (!s) { parsed.textContent = ''; parsed.className = 'tf-parsed'; return; }
+      var r = parseTimeInput(s);
+      if (r.ok) {
+        parsed.textContent = '✓ ' + fmtTs(r.ms);
+        parsed.className = 'tf-parsed ok';
+      } else {
+        parsed.textContent = '无法解析，试试 2025-01-05 或毫秒时间戳';
+        parsed.className = 'tf-parsed bad';
+      }
+    }
+    input.addEventListener('input', sync);
+    sync();
+    return {
+      node: h('label', { class: 'time-field' }, labelText, input, parsed),
+      input: input,
+      value: function () {
+        var r = parseTimeInput(input.value);
+        return r.ok ? r.ms : null;
+      }
+    };
+  }
+  IU.timeField = timeField;
 })();

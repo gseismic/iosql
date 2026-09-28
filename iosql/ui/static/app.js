@@ -1,7 +1,13 @@
 /* =====================================================================
  * iosql UI · app.js
  * SPA 外壳：启动引导（/api/db + /api/tables）→ 顶栏（URI/模式徽章）
- * → 左侧栏（总览 + 表列表）→ Tab 栏与 hash 路由 → 全局快捷键。
+ * → 左侧栏（总览 + 表列表）→ Tab 栏与 hash 路由 → 全局快捷键 → 状态栏。
+ *
+ * PLAN-064 重构（设计：docs/design/ui-20260928-redesign.md）：
+ * - 6 Tab → 5 Tab：Overview | Data | Structure | Charts | Maintain
+ *   （Browse Data 与 Query 合并为 Data，旧 hash 路由 browse/query 兼容映射）
+ * - Overview 升级为驾驶舱：表卡片 + 健康信号（分区偏斜由 /segments 聚合）
+ * - 快捷键提示从顶栏移至底部状态栏
  * ===================================================================== */
 (function () {
   'use strict';
@@ -10,19 +16,21 @@
 
   var TABS = [
     { id: 'overview', label: 'Overview' },
-    { id: 'browse', label: 'Browse Data' },
+    { id: 'data', label: 'Data' },
     { id: 'structure', label: 'Structure' },
-    { id: 'query', label: 'Query' },
     { id: 'charts', label: 'Charts' },
     { id: 'maintain', label: 'Maintain' }
   ];
   var TAB_IDS = TABS.map(function (t) { return t.id; });
   var LAST_TAB_KEY = 'iosql_ui_last_tab';
+  /* 旧版 hash 兼容：browse/query 已合并为 data */
+  var LEGACY_TAB = { browse: 'data', query: 'data' };
 
   var state = {
     db: null,          // GET /api/db 结果
     tables: [],        // GET /api/tables 数组（轻量契约，无统计字段）
     stats: {},         // 表名 → /stats 结果（渐进拉取，PLAN-060）
+    parts: {},         // 表名 → /segments 按分区聚合的行数分布（PLAN-064 D2）
     mode: 'readonly',  // 'readonly' | 'write'
     table: null,       // 当前表名；null = 总览
     tab: 'overview',
@@ -70,6 +78,7 @@
         function (resp) {
           state.stats[name] = resp || {};
           refreshStatsViews();
+          pumpParts(name); // 统计到达后再拉分区分布（Overview 偏斜信号）
           worker();
         },
         function () {
@@ -81,7 +90,35 @@
     for (var i = 0; i < 4 && i < pending.length; i++) worker();
   }
 
-  /* stats 到达后就地更新所有标注单元格（侧栏 + Overview），不整页重渲染 */
+  /* ---------------- 分区行数分布泵（PLAN-064 D2/D4） ----------------
+   * /parts 只有 key 没有行数；/segments 带 row_count + part_key，
+   * 客户端按分区聚合一次即可得到偏斜信号、迷你条形图与每分区 segment 数。 */
+  function pumpParts(name) {
+    if (state.parts[name]) return;
+    IU.api('/api/table/' + encodeURIComponent(name) + '/segments').then(function (resp) {
+      var arr = IU.toArray(resp);
+      var byPart = {};
+      var segCount = {};
+      var order = [];
+      arr.forEach(function (sg) {
+        if (!sg || typeof sg !== 'object') return;
+        var key = IU.pick(sg, 'partition', 'partition_key', 'logical_part', 'part_key', 'logical');
+        if (key === undefined || key === null) return;
+        key = String(key);
+        var rows = Number(IU.pick(sg, 'rows', 'row_count'));
+        if (!Number.isFinite(rows)) rows = 0;
+        if (byPart[key] === undefined) { byPart[key] = 0; order.push(key); }
+        byPart[key] += rows;
+        segCount[key] = (segCount[key] || 0) + 1;
+      });
+      state.parts[name] = { byPart: byPart, order: order, segCount: segCount };
+      refreshStatsViews();
+    }).catch(function () {
+      state.parts[name] = { error: true };
+    });
+  }
+
+  /* stats/parts 到达后就地更新所有标注单元格（侧栏 + Overview），不整页重渲染 */
   function refreshStatsViews() {
     document.querySelectorAll('[data-stats-for]').forEach(function (el) {
       var s = state.stats[el.dataset.statsFor];
@@ -103,6 +140,28 @@
       var hint = document.getElementById('stat-total-hint');
       if (hint) hint.textContent = done < state.tables.length ? '统计中…' : '';
     }
+    /* Overview 卡片的分区分布信号（data-part-signal 标注） */
+    document.querySelectorAll('[data-part-signal]').forEach(function (el) {
+      var name = el.dataset.partSignal;
+      var dist = state.parts[name];
+      if (!dist || dist.error) return;
+      var fresh = IU.overviewPartSignal ? IU.overviewPartSignal(name, dist) : null;
+      if (fresh) { IU.clear(el); el.append(fresh); }
+    });
+    /* Overview 卡片的时间范围（由分区 key 推导，parts 到达后填充） */
+    document.querySelectorAll('[data-part-range]').forEach(function (el) {
+      var dist = state.parts[el.dataset.partRange];
+      if (!dist || dist.error) return;
+      var keys = (dist.order || []).map(Number).filter(function (n) {
+        return Number.isFinite(n) && n >= 1e12;
+      });
+      if (!keys.length) return;
+      var lo = IU.fmt.date(Math.min.apply(null, keys));
+      var hi = IU.fmt.date(Math.max.apply(null, keys));
+      el.textContent = lo ? lo + ' ~ ' + (hi || '') : '—';
+      el.className = 'v';
+    });
+    renderStatusbar();
   }
 
   /* ---------------- 顶栏 ---------------- */
@@ -121,11 +180,31 @@
           h('span', { class: 'dot' }), 'READ-ONLY'));
   }
 
+  /* ---------------- 底部状态栏（PLAN-064 P10） ---------------- */
+  function renderStatusbar() {
+    var el = document.getElementById('status-left');
+    if (!el) return;
+    var sum = 0, done = 0;
+    state.tables.forEach(function (t) {
+      var s2 = state.stats[String(IU.pick(t, 'name', 'table'))];
+      if (s2 && typeof s2.row_count === 'number') { sum += s2.row_count; done++; }
+    });
+    var left = state.tables.length + ' 张表 · ' + IU.fmt.int(sum) + ' 行';
+    if (done < state.tables.length && state.tables.length) left += '（统计中…）';
+    if (state.table) {
+      var s3 = state.stats[state.table];
+      left = state.table + ' · ' +
+        (s3 && typeof s3.row_count === 'number' ? IU.fmt.int(s3.row_count) + ' 行' : '') +
+        ' · ' + left;
+    }
+    el.textContent = left;
+  }
+
   /* ---------------- 左侧栏 ---------------- */
   function lastTableTab() {
     var v = '';
     try { v = localStorage.getItem(LAST_TAB_KEY) || ''; } catch (e) { /* 隐私模式等 */ }
-    return TAB_IDS.indexOf(v) > 0 ? v : 'browse'; // 下标 0 是 overview，不算表级 Tab
+    return TAB_IDS.indexOf(v) > 0 ? v : 'data'; // 下标 0 是 overview，不算表级 Tab
   }
 
   function renderSidebar() {
@@ -220,7 +299,9 @@
     var hash = location.hash || '#/overview';
     var m = hash.match(/^#\/table\/([^/]+)(?:\/([A-Za-z]+))?/);
     if (m) {
-      return { table: decodeURIComponent(m[1]), tab: m[2] || lastTableTab() };
+      var tab = m[2] || lastTableTab();
+      if (LEGACY_TAB[tab]) tab = LEGACY_TAB[tab]; // 旧书签 browse/query → data
+      return { table: decodeURIComponent(m[1]), tab: tab };
     }
     return { table: null, tab: 'overview' };
   }
@@ -235,6 +316,7 @@
     }
     updateActiveUi();
     renderContent();
+    renderStatusbar();
   }
 
   /* ---------------- 工作区渲染 ---------------- */
@@ -246,7 +328,7 @@
     if (state.tab === 'overview') {
       safeRender(IU.tabs.overview, content, {
         mode: state.mode, tables: state.tables, table: null, spec: null,
-        stats: state.stats
+        stats: state.stats, parts: state.parts
       });
       return;
     }
@@ -273,7 +355,7 @@
     });
 
     function ctxOf(spec) {
-      return { mode: state.mode, tables: state.tables, table: state.table, spec: spec };
+      return { mode: state.mode, tables: state.tables, table: state.table, spec: spec, stats: state.stats, parts: state.parts };
     }
   }
 
@@ -291,8 +373,8 @@
 
   /* ---------------- 全局快捷键 ---------------- */
   IU.globalKeys(function (e) {
-    // 数字 1-6 切 Tab
-    if (e.key >= '1' && e.key <= '6') {
+    // 数字 1-5 切 Tab
+    if (e.key >= '1' && e.key <= '5') {
       switchTab(TABS[Number(e.key) - 1].id);
       return;
     }
@@ -301,8 +383,8 @@
       renderContent();
       return;
     }
-    // ←/→ 仅在 Browse Data 生效
-    if (state.tab === 'browse' && typeof IU.browseNav === 'function') {
+    // ←/→ 仅在 Data 浏览视图生效
+    if (state.tab === 'data' && typeof IU.browseNav === 'function') {
       if (e.key === 'ArrowRight') { IU.browseNav(1); e.preventDefault(); }
       else if (e.key === 'ArrowLeft') { IU.browseNav(-1); e.preventDefault(); }
     }

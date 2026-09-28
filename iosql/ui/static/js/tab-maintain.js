@@ -25,7 +25,18 @@
           h('div', { style: { fontWeight: 700, marginTop: '8px' } }, '维护台在只读模式下不可用'),
           h('div', { style: { marginTop: '4px' } },
             'compact / cleanup_obsolete / repartition / delete / truncate 仅在 --write 模式下开放，'),
-          h('div', null, '且只读模式下服务端不注册任何写端点。')));
+          h('div', null, '且只读模式下服务端不注册任何写端点。'),
+          h('div', { class: 'cmd-hint' },
+            h('span', null, 'iosql ui -s <库路径> --write'),
+            h('button', {
+              class: 'btn sm', title: '复制开启命令',
+              onclick: function () {
+                if (navigator.clipboard && navigator.clipboard.writeText) {
+                  navigator.clipboard.writeText('iosql ui -s <库路径> --write')
+                    .then(function () { IU.toast('开启命令已复制', 'ok'); });
+                }
+              }
+            }, '复制'))));
         return;
       }
 
