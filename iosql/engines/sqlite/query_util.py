@@ -239,3 +239,80 @@ def build_delete_query(part_table_name, cases, column_types):
     if where.sql:
         sql += f' where {where.sql}'
     return SqlQuery(sql + ';', where.params)
+
+
+def _bucket_require_column(column_types, col):
+    """分桶聚合列存在性校验：与 where 条件同级的 Unknown field 语义。"""
+    if not column_types or col in column_types:
+        return
+    raise BadArgument(f'Unknown field `{col}`')
+
+
+def build_bucket_stats_query(part_table_name, x_col, value_cols,
+                             or_and_cases, column_types):
+    """分桶聚合的探测查询（PLAN-070）：x 列空值数/范围/类型分布 + 数值列脏数据计数。
+
+    与 build_select_count_query 同一信任级别：列名经存在性校验后加引号，
+    聚合表达式为固定字面量，不经过用户 fields 白名单路径。
+    or_and_cases 统一走 build_or_cases_subquery：单 AND 组/多 OR 组/空条件
+    三种形态与 select 路径语义一致。
+    """
+    _bucket_require_column(column_types, x_col)
+    x_sql = _quote_sql_identifier(x_col)
+    select_items = [
+        f'COUNT({x_sql})',
+        f'MIN({x_sql})',
+        f'MAX({x_sql})',
+        # 数值行数 / 纯数字文本行数：无约束类型下的 x 模式分类依据
+        f"SUM(CASE WHEN typeof({x_sql}) IN ('integer','real')"
+        f' THEN 1 ELSE 0 END)',
+        f"SUM(CASE WHEN typeof({x_sql})='text' AND TRIM({x_sql}) <> ''"
+        f" AND TRIM({x_sql}) NOT GLOB '*[^0-9]*' THEN 1 ELSE 0 END)",
+    ]
+    for col in value_cols:
+        _bucket_require_column(column_types, col)
+        c_sql = _quote_sql_identifier(col)
+        # 数值列非空但非数值的行数：SUM 会把脏值静默强转 0，靠计数透出
+        select_items.append(
+            f"SUM(CASE WHEN {c_sql} IS NOT NULL"
+            f" AND typeof({c_sql}) NOT IN ('integer','real')"
+            f' THEN 1 ELSE 0 END)'
+        )
+    where = build_or_cases_subquery(or_and_cases, column_types)
+    sql = f'select {", ".join(select_items)} from {part_table_name}'
+    if where.sql:
+        sql += f' where {where.sql}'
+    return SqlQuery(sql + ';', list(where.params))
+
+
+def build_bucket_agg_query(part_table_name, x_col, value_cols,
+                           or_and_cases, column_types,
+                           x_text_mode, x_min, width):
+    """分桶聚合查询（PLAN-070）：GROUP BY 桶下标，返回每桶 SUM/COUNT。
+
+    桶下标 = floor((x - x_min) / width)：CAST 向零截断，非负值域上与
+    Python floor 一致；text 模式先 CAST 成整数（YYYYMMDD 等纯数字文本）。
+    结果行形如 (bucket_idx, sum1, count1, sum2, count2, ...)。
+    """
+    _bucket_require_column(column_types, x_col)
+    x_sql = _quote_sql_identifier(x_col)
+    if x_text_mode:
+        params = [int(str(x_min).strip()), width]
+        bucket_expr = f'(CAST({x_sql} AS INTEGER) - ?) / ?'
+    else:
+        params = [x_min, width]
+        bucket_expr = f'({x_sql} - ?) / ?'
+    select_items = [f'CAST({bucket_expr} AS INTEGER)']
+    for col in value_cols:
+        _bucket_require_column(column_types, col)
+        c_sql = _quote_sql_identifier(col)
+        select_items.append(f'SUM({c_sql})')
+        select_items.append(f'COUNT({c_sql})')
+    where = build_or_cases_subquery(or_and_cases, column_types)
+    sql = f'select {", ".join(select_items)} from {part_table_name}'
+    if where.sql:
+        sql += f' where {where.sql} and {x_sql} IS NOT NULL'
+    else:
+        sql += f' where {x_sql} IS NOT NULL'
+    sql += ' group by 1'
+    return SqlQuery(sql + ';', params + list(where.params))

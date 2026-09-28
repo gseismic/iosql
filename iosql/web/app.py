@@ -909,6 +909,13 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
 
     n_buckets = max(1, min(int(buckets), MAX_CHART_BUCKETS))
 
+    if kind == "line":
+        # PLAN-070：line 路径走 SQL 分桶聚合下推，大表不再有扫描行数上限
+        return _chart_line_result(
+            table, x_col, col, symbol, n_buckets, comps,
+        )
+
+    # candle 保留流式实现（API 专用；前端 candle 经 4 次 line 请求受益下推）。
     # 两遍流式扫描：第一遍只读 x 列求范围（内存 O(1)），第二遍分桶聚合。
     # first_is_str 兜底无契约表（spec.columns 缺失时 x_is_text 未判定）的文本 x 轴
     x_min: Optional[Any] = None
@@ -941,14 +948,9 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
             if x_max is None or value > x_max:
                 x_max = value
 
-    result: dict[str, Any]
     if scanned == 0 or x_min is None or x_max is None:
-        base: dict[str, Any] = {"kind": kind}
-        if kind == "line":
-            base.update({"x": [], "y": [], "col": col, "symbol": symbol or None})
-        else:
-            base.update({"x": [], "open": [], "high": [], "low": [], "close": []})
-        return base
+        return {"kind": kind, "x": [], "open": [], "high": [], "low": [],
+                "close": []}
 
     # x 轴数值化：数字直接用；calendar 的 YYYYMMDD 等纯数字字符串转 int；
     # 其他文本无法分桶，明确报错而非让减法运算 500。
@@ -980,43 +982,10 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
         idx = int((to_num(xv) - x_num_min) // width)
         return min(max(idx, 0), n_buckets - 1)
 
-    if kind == "line":
-        sums = [0.0] * n_buckets
-        counts = [0] * n_buckets
-        mids: list[Any] = []
-        ys: list[float] = []
-        try:
-            for batch in table.iter_select_batches(
-                "*", where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
-            ):
-                for row in batch:
-                    xv = row.get(x_col)
-                    yv = row.get(col)
-                    if xv is None:
-                        continue
-                    idx = bucket_index(xv)
-                    if yv is not None:
-                        sums[idx] += float(yv)
-                        counts[idx] += 1
-        except (TypeError, ValueError) as exc:
-            raise _bad_request(
-                f"列 `{col}` 含非数值数据，无法聚合",
-                hint="chart 仅支持数值列；请换一列或检查数据质量",
-            ) from exc
-        for i in range(n_buckets):
-            if counts[i]:
-                mids.append(x_num_min + i * width + width // 2)
-                ys.append(sums[i] / counts[i])
-        result = {
-            "kind": "line",
-            "x": mids,
-            "y": ys,
-            "col": col,
-            "symbol": symbol or None,
-        }
-    else:
+    if kind == "candle":
         assert ohlc is not None
         o_col, h_col, l_col, c_col = ohlc
+        # 只投影 OHLC 五列：宽表（几十个因子列）下扫描成本从 24 列降到 5 列
         opens: list[Any] = [None] * n_buckets
         closes: list[Any] = [None] * n_buckets
         has_data = [False] * n_buckets
@@ -1024,7 +993,8 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
         low_map: dict[int, float] = {}
         try:
             for batch in table.iter_select_batches(
-                "*", where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
+                [x_col, o_col, h_col, l_col, c_col],
+                where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
             ):
                 for row in batch:
                     xv = row.get(x_col)
@@ -1064,7 +1034,7 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
             fallback_low = opens[i] if opens[i] is not None else closes[i]
             highs.append(high_map.get(i, float(fallback_high or 0.0)))
             lows.append(low_map.get(i, float(fallback_low or 0.0)))
-        result = {
+        return {
             "kind": "candle",
             "x": mids,
             "open": kept_opens,
@@ -1072,7 +1042,58 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
             "low": lows,
             "close": kept_closes,
         }
-    return result
+    raise _bad_request(
+        f"非法图型 `{kind}`",
+        hint="kind 仅支持 line（折线）或 candle（K线，需表含 OHLC 列）",
+    )
+
+
+def _chart_line_result(table: Any, x_col: str, col: str, symbol: str,
+                       n_buckets: int, comps: list[dict[str, Any]]) -> dict:
+    """line 路径：SQL 分桶聚合下推（PLAN-070）。
+
+    聚合在引擎内以 GROUP BY 完成，任意表规模内存有界且不再有扫描行数
+    上限；x 列模式分类沿用旧流式路径语义，422 文案与 hint 逐字保留。
+    """
+    agg = table.aggregate_by_bucket(x_col, [col], n_buckets, where=comps or None)
+    mode = agg["x_mode"]
+    if mode == "mixed":
+        raise _bad_request(
+            f"x 轴列 `{x_col}` 含混合类型数据",
+            hint="同一列内文本与数值混存无法分桶，请先清洗该列",
+        )
+    if mode == "non_numeric":
+        raise _bad_request(
+            f"x 轴列 `{x_col}` 是非数字文本，无法分桶绘图",
+            hint="支持整数/浮点与 YYYYMMDD 等纯数字日期字符串；"
+                 "ISO 日期请改用 duration 毫秒时间戳分区表",
+        )
+    if agg["value_bad_rows"].get(col):
+        raise _bad_request(
+            f"列 `{col}` 含非数值数据，无法聚合",
+            hint="chart 仅支持数值列；请换一列或检查数据质量",
+        )
+    if mode == "empty":
+        return {"kind": "line", "x": [], "y": [], "col": col,
+                "symbol": symbol or None}
+
+    grid_min = agg["bucket_min"]
+    width = agg["bucket_width"]
+    sums = agg["sums"][col]
+    counts = agg["counts"][col]
+    mids: list[Any] = []
+    ys: list[float] = []
+    for i in range(n_buckets):
+        if counts[i]:
+            mids.append(grid_min + i * width + width // 2)
+            ys.append(sums[i] / counts[i])
+    return {
+        "kind": "line",
+        "x": mids,
+        "y": ys,
+        "col": col,
+        "symbol": symbol or None,
+    }
 
 
 # ---------------------------------------------------------------- export 实现

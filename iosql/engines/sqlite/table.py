@@ -78,6 +78,8 @@ from .const import (
     _TABLE_PARTS_SUBDIR,
 )
 from .query_util import (
+    build_bucket_agg_query,
+    build_bucket_stats_query,
     build_delete_query,
     build_select_cases_query,
     build_select_count_query,
@@ -3344,6 +3346,208 @@ class Table(BaseTable):
                 break
         if pending:
             yield pending
+
+    def aggregate_by_bucket(self, x_col, value_cols, n_buckets, where=None):
+        """SQL 端等宽分桶聚合（PLAN-070，web chart 大表加速路径）。
+
+        把"逐行拉回 Python 再分桶平均"下推为每分区一条 GROUP BY，
+        返回行数 ≤ n_buckets，任意表规模下内存有界、耗时线性于行数。
+        where 语义与 select() 一致（dict/list/Case/文本），并保留分区裁剪。
+
+        桶网格与旧 Python 路径逐位一致：width = (x_max - x_min) // n + 1，
+        idx = floor((x - x_min) / width)（非负值域上 CAST 截断等价 floor）。
+        x 列模式按数据探测分类（SQLite 无约束类型）：
+        - numeric：全数值；
+        - text：全纯数字文本（YYYYMMDD 等，CAST 后按整数分桶）；
+        - mixed：数值与文本混存；non_numeric：含非数字文本；
+        - empty：无 x 非空行。
+        mixed/non_numeric/empty 时 sums/counts 为 None，由调用方决定报错
+        或返回空结果（422 文案归 web 层，保持既有 hint 不变）。
+        """
+        x_col = str(x_col)
+        value_cols = [str(c) for c in (value_cols or [])]
+        n_buckets = int(n_buckets)
+        if n_buckets <= 0:
+            raise BadArgument('n_buckets 必须为正整数')
+
+        def _empty_result():
+            return {
+                'scanned': 0,
+                'x_min': None,
+                'x_max': None,
+                'x_numeric_rows': 0,
+                'x_digit_text_rows': 0,
+                'value_bad_rows': {c: 0 for c in value_cols},
+                'bucket_min': None,
+                'bucket_width': None,
+                'x_mode': 'empty',
+                'sums': None,
+                'counts': None,
+            }
+
+        meta = self.get_table_meta()
+        if not meta:
+            return _empty_result()
+        column_types = {
+            key: item["type"] for key, item in meta["column_info"].items()
+        }
+        where_obj = self._build_where(where)
+        or_and_cases = where_obj.or_and_cases
+
+        # 分区裁剪与 _select_queries_for_where 同构：无条件/单 AND/多 OR 三态
+        if not or_and_cases:
+            refs = self._get_select_part_refs(None)
+        elif len(or_and_cases) > 1:
+            refs_by_key = OrderedDict()
+            for cases in or_and_cases:
+                for ref in self._get_select_part_refs(cases):
+                    refs_by_key[self._segment_lookup_key(ref)] = ref
+            refs = list(refs_by_key.values())
+        else:
+            refs = self._get_select_part_refs(or_and_cases[0])
+
+        # ---- 第一遍：探测查询求全局范围与类型分布 ----
+        scanned = 0
+        numeric_rows = 0
+        digit_text_rows = 0
+        num_min = num_max = None   # 纯数值分区的 min/max（类型安全合并）
+        txt_min = txt_max = None   # 纯数字文本分区的 min/max
+        value_bad = [0] * len(value_cols)
+        query = build_bucket_stats_query(
+            _PART_DATA_TABLE_NAME, x_col, value_cols,
+            or_and_cases, column_types,
+        )
+        reduced_query = build_bucket_stats_query(
+            _PART_DATA_TABLE_NAME, x_col, [], or_and_cases, column_types,
+        ) if value_cols else None
+        for ref in refs:
+            self._ensure_ref_file_present(ref)
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            with self._part_db(part_dbfile, auto_commit=False) as part_db:
+                try:
+                    rows = part_db[_PART_DATA_TABLE_NAME].query(
+                        query.sql, params=query.params,
+                    )
+                except NoSuchTable:
+                    continue
+                except sqlite3.OperationalError:
+                    # 旧 segment 缺列（schema-on-write 演进）：退化为仅 x 探测，
+                    # y 列视为该 segment 全缺（与旧 select(*) 流式路径等价）；
+                    # x 列也缺则整个 segment 跳过
+                    if reduced_query is None:
+                        continue
+                    try:
+                        rows = part_db[_PART_DATA_TABLE_NAME].query(
+                            reduced_query.sql, params=reduced_query.params,
+                        )
+                    except (NoSuchTable, sqlite3.OperationalError):
+                        continue
+            if not rows or rows[0] is None:
+                continue
+            row = rows[0]
+            cnt = int(row[0] or 0)
+            scanned += cnt
+            numeric_rows += int(row[3] or 0)
+            digit_text_rows += int(row[4] or 0)
+            for i, bad in enumerate(row[5:]):
+                value_bad[i] += int(bad or 0)
+            p_min, p_max = row[1], row[2]
+            if cnt == 0 or p_min is None or p_max is None:
+                continue
+            if int(row[3] or 0) == cnt:
+                # 纯数值分区：min/max 都是数值，可安全跨分区比较
+                if num_min is None or p_min < num_min:
+                    num_min = p_min
+                if num_max is None or p_max > num_max:
+                    num_max = p_max
+            elif int(row[4] or 0) == cnt:
+                if txt_min is None or p_min < txt_min:
+                    txt_min = p_min
+                if txt_max is None or p_max > txt_max:
+                    txt_max = p_max
+            # 混合类型分区的 min/max 存储类不定，跳过合并——
+            # 全局计数已能识别 mixed，范围值不会被后续消费
+
+        if scanned == 0:
+            return _empty_result()
+
+        # ---- x 模式分类（与旧全表扫描语义逐条对齐）----
+        if numeric_rows == scanned:
+            x_mode = 'numeric'
+            x_min, x_max = num_min, num_max
+        elif numeric_rows > 0:
+            x_mode = 'mixed'      # 有数值也有文本
+            x_min = x_max = None
+        elif digit_text_rows == scanned:
+            x_mode = 'text'
+            x_min, x_max = txt_min, txt_max
+        else:
+            x_mode = 'non_numeric'
+            x_min = x_max = None
+
+        result = {
+            'scanned': scanned,
+            'x_min': x_min,
+            'x_max': x_max,
+            'x_numeric_rows': numeric_rows,
+            'x_digit_text_rows': digit_text_rows,
+            'value_bad_rows': dict(zip(value_cols, value_bad)),
+            'bucket_min': None,
+            'bucket_width': None,
+            'x_mode': x_mode,
+            'sums': None,
+            'counts': None,
+        }
+        if x_mode not in ('numeric', 'text'):
+            return result
+
+        # ---- 第二遍：GROUP BY 分桶聚合 ----
+        # 网格公式与旧 Python 路径一致：width = span // n + 1
+        if x_mode == 'text':
+            grid_min = int(str(x_min).strip())
+            grid_max = int(str(x_max).strip())
+        else:
+            grid_min = x_min
+            grid_max = x_max
+        span = grid_max - grid_min
+        width = span // n_buckets + 1 if span >= 0 else 1
+        sums = {c: [0.0] * n_buckets for c in value_cols}
+        counts = {c: [0] * n_buckets for c in value_cols}
+        agg_query = build_bucket_agg_query(
+            _PART_DATA_TABLE_NAME, x_col, value_cols,
+            or_and_cases, column_types,
+            x_text_mode=(x_mode == 'text'), x_min=grid_min, width=width,
+        )
+        for ref in refs:
+            self._ensure_ref_file_present(ref)
+            part_dbfile = self._get_part_dbfile(ref.part_key)
+            with self._part_db(part_dbfile, auto_commit=False) as part_db:
+                try:
+                    rows = part_db[_PART_DATA_TABLE_NAME].query(
+                        agg_query.sql, params=agg_query.params,
+                    )
+                except NoSuchTable:
+                    continue
+                except sqlite3.OperationalError:
+                    # 旧 segment 缺 y/x 列：该 segment 不参与聚合（贡献为 0），
+                    # 与旧 select(*) + row.get(col)→None 的容错等价
+                    continue
+            for row in rows or []:
+                idx = row[0]
+                if idx is None or idx < 0 or idx >= n_buckets:
+                    continue  # 防御：越界桶不参与聚合
+                for i, c in enumerate(value_cols):
+                    s = row[1 + i * 2]
+                    n = row[2 + i * 2]
+                    if s is not None:
+                        sums[c][idx] += float(s)
+                    if n is not None:
+                        counts[c][idx] += int(n)
+        result['bucket_min'] = grid_min
+        result['bucket_width'] = width
+        result['sums'] = sums
+        result['counts'] = counts
+        return result
 
     def select(self, fields='*', where=None, limit=None, order_by=None,
                to_dict=True, columns=None, **kwargs):

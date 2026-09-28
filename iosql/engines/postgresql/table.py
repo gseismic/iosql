@@ -1058,6 +1058,157 @@ class Table(BaseTable):
             row = rows[0] if rows else None
         return int(row[0]) if row else 0
 
+    def aggregate_by_bucket(self, x_col, value_cols, n_buckets, where=None):
+        """SQL 端等宽分桶聚合（PLAN-070，与 sqlite 引擎同名方法语义一致）。
+
+        PG 为强类型存储：x 列模式由列类型决定（numeric 列恒为 numeric 模式；
+        text 列用正则探测纯数字文本行数，非全纯数字时按 mixed/non_numeric
+        交由调用方报错）。数值列不可能存文本，value_bad_rows 恒 0。
+        返回结构与 sqlite 引擎完全一致，桶网格公式相同。
+        """
+        x_col = str(x_col)
+        value_cols = [str(c) for c in (value_cols or [])]
+        n_buckets = int(n_buckets)
+        if n_buckets <= 0:
+            raise BadArgument('n_buckets 必须为正整数')
+
+        def _empty_result():
+            return {
+                'scanned': 0,
+                'x_min': None,
+                'x_max': None,
+                'x_numeric_rows': 0,
+                'x_digit_text_rows': 0,
+                'value_bad_rows': {c: 0 for c in value_cols},
+                'bucket_min': None,
+                'bucket_width': None,
+                'x_mode': 'empty',
+                'sums': None,
+                'counts': None,
+            }
+
+        column_types = self._column_types()
+        if not column_types:
+            return _empty_result()
+        for col in [x_col] + value_cols:
+            if col not in column_types:
+                raise BadArgument(f'Unknown field `{col}`')
+
+        x_sql = _pg_identifier(x_col)
+        # 契约声明类型（text/str/string）与 information_schema 类型
+        # （text/character varying）都归为文本列
+        x_type = str(column_types.get(x_col, '')).lower()
+        x_is_text = any(t in x_type for t in ('text', 'char', 'str'))
+
+        for col in value_cols:
+            col_type = str(column_types.get(col, '')).lower()
+            if any(t in col_type for t in ('text', 'char', 'str', 'bytea')):
+                raise BadArgument(
+                    f'数值列 `{col}` 是文本类型，无法聚合'
+                )
+
+        where_sql, where_params = self._where_sql(where, column_types)
+
+        # ---- 探测：空值数/范围 + text 列的纯数字行数 ----
+        if x_is_text:
+            digit_expr = f"SUM(CASE WHEN TRIM({x_sql}::text) ~ '^[0-9]+$'"\
+                ' THEN 1 ELSE 0 END)'
+        else:
+            digit_expr = '0'
+        stats_sql = (
+            f'SELECT COUNT({x_sql}), MIN({x_sql}), MAX({x_sql}),'
+            f' {digit_expr} FROM {_pg_identifier(self._table_name)}'
+        )
+        if where_sql:
+            stats_sql += f' WHERE {where_sql}'
+        conn = self.connect()
+        cursor = conn.cursor()
+        cursor.execute(stats_sql, list(where_params))
+        stats = cursor.fetchone()
+        scanned = int(stats[0] or 0)
+        if scanned == 0:
+            return _empty_result()
+
+        if not x_is_text:
+            x_mode = 'numeric'
+            x_min, x_max = stats[1], stats[2]
+            digit_rows = 0
+        else:
+            digit_rows = int(stats[3] or 0)
+            if digit_rows == scanned:
+                x_mode = 'text'
+                x_min, x_max = stats[1], stats[2]
+            elif digit_rows == 0:
+                x_mode = 'non_numeric'
+                x_min = x_max = None
+            else:
+                x_mode = 'mixed'
+                x_min = x_max = None
+
+        result = {
+            'scanned': scanned,
+            'x_min': x_min,
+            'x_max': x_max,
+            'x_numeric_rows': 0 if x_is_text else scanned,
+            'x_digit_text_rows': digit_rows,
+            'value_bad_rows': {c: 0 for c in value_cols},
+            'bucket_min': None,
+            'bucket_width': None,
+            'x_mode': x_mode,
+            'sums': None,
+            'counts': None,
+        }
+        if x_mode not in ('numeric', 'text'):
+            return result
+
+        # ---- 分桶聚合：桶下标 = floor((x - min) / width)，网格与 sqlite 一致 ----
+        if x_mode == 'text':
+            grid_min = int(str(x_min).strip())
+            grid_max = int(str(x_max).strip())
+            bucket_expr = f'FLOOR((CAST({x_sql} AS bigint) - %s) / %s)'
+        else:
+            grid_min = x_min
+            grid_max = x_max
+            bucket_expr = f'FLOOR(({x_sql} - %s) / %s)'
+        span = grid_max - grid_min
+        width = span // n_buckets + 1 if span >= 0 else 1
+        select_items = [bucket_expr]
+        for col in value_cols:
+            c_sql = _pg_identifier(col)
+            select_items.append(f'SUM({c_sql})')
+            select_items.append(f'COUNT({c_sql})')
+        agg_sql = (
+            f'SELECT {", ".join(select_items)}'
+            f' FROM {_pg_identifier(self._table_name)}'
+        )
+        if where_sql:
+            agg_sql += f' WHERE {where_sql} AND {x_sql} IS NOT NULL'
+        else:
+            agg_sql += f' WHERE {x_sql} IS NOT NULL'
+        agg_sql += ' GROUP BY 1'
+        cursor.execute(agg_sql, [grid_min, width] + list(where_params))
+        sums = {c: [0.0] * n_buckets for c in value_cols}
+        counts = {c: [0] * n_buckets for c in value_cols}
+        for row in cursor.fetchall():
+            idx = row[0]
+            if idx is None:
+                continue
+            idx = int(idx)
+            if idx < 0 or idx >= n_buckets:
+                continue  # 防御：越界桶不参与聚合
+            for i, c in enumerate(value_cols):
+                s = row[1 + i * 2]
+                n = row[2 + i * 2]
+                if s is not None:
+                    sums[c][idx] += float(s)
+                if n is not None:
+                    counts[c][idx] += int(n)
+        result['bucket_min'] = grid_min
+        result['bucket_width'] = width
+        result['sums'] = sums
+        result['counts'] = counts
+        return result
+
     def _reject_unknown_kwargs(self, func_name, kwargs):
         if kwargs:
             names = ', '.join(sorted(kwargs))
