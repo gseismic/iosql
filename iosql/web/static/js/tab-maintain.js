@@ -207,7 +207,7 @@
     return stepCard(3, '一致性校验 · validate',
       'deep 校验会逐 segment 检查 SQLite integrity / row_count / manifest stats。',
       h('div', { class: 'inline-form' },
-        h('label', { for: 'val-deep', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '12px', color: 'var(--tx1)' } },
+        h('label', { for: 'val-deep', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '13px', color: 'var(--tx1)' } },
           deepChk, 'deep 深度校验'),
         btn),
       box);
@@ -264,7 +264,7 @@
         rawDetails(resp),
         h('div', { class: 'inline-form', style: { marginTop: '10px' } },
           confirmInput, deleteBtn,
-          h('span', { class: 'faint', style: { fontSize: '11px' } }, '删除前服务端会先做深度校验，失败即拒绝')));
+          h('span', { class: 'faint', style: { fontSize: '12px' } }, '删除前服务端会先做深度校验，失败即拒绝')));
     }
 
     function doDelete() {

@@ -39,7 +39,7 @@
     var colTypes = (spec.columns && typeof spec.columns === 'object') ? spec.columns : {};
     var colListNode = Object.keys(colTypes).length
       ? h('div', null, Object.keys(colTypes).map(function (c) {
-        return h('div', { class: 'mono', style: { fontSize: '12px' } },
+        return h('div', { class: 'mono', style: { fontSize: '13px' } },
           c, h('span', { class: 'faint' }, ' : ' + colTypes[c]));
       }))
       : null;
@@ -95,7 +95,7 @@
         IU.clear(box);
         box.append(h('div', { class: 'card-title' },
           h('span', { class: 'micro-label' }, '逻辑分区 · Parts'),
-          h('span', { class: 'faint mono', style: { fontSize: '11px' } }, keys.length + ' 个')));
+          h('span', { class: 'faint mono', style: { fontSize: '12px' } }, keys.length + ' 个')));
 
         if (!keys.length) {
           box.append(h('div', { class: 'empty-state' }, '无分区信息'));
@@ -105,12 +105,12 @@
         if (!hasDist) {
           box.append(h('div', { class: 'chips' }, keys.map(partChip)));
           if (!dist) {
-            box.append(h('div', { class: 'faint', style: { fontSize: '11px', marginTop: '6px' } },
+            box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } },
               h('span', { class: 'spinner', style: { width: '11px', height: '11px' } }),
               ' 行数分布统计中…'));
             scheduleRedraw();
           } else if (dist.error) {
-            box.append(h('div', { class: 'faint', style: { fontSize: '11px', marginTop: '6px' } },
+            box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } },
               '分区行数分布不可用（聚合失败）'));
           }
           return;
@@ -159,7 +159,7 @@
           chart.append(line);
         });
         box.append(chart);
-        box.append(h('div', { class: 'faint', style: { fontSize: '11px', marginTop: '6px' } },
+        box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } },
           (skew ? '琥珀 = 偏斜热点（最大/中位数 > 3）。' : '')
           + (allMs ? '点击分区行 → Data 页按该时间范围过滤（URL 可分享）。' : '')));
       }
@@ -185,7 +185,7 @@
       var readable = IU.fmt.date(key);
       return h('span', { class: 'chip' },
         readable ? h('span', { style: { color: 'var(--acc)' } }, readable) : key,
-        readable ? h('span', { style: { color: 'var(--tx2)', marginLeft: '6px', fontSize: '10px' } }, key) : null);
+        readable ? h('span', { style: { color: 'var(--tx2)', marginLeft: '6px', fontSize: '10.5px' } }, key) : null);
     }
   }
 
@@ -232,7 +232,7 @@
         h('div', { class: 'card-title' },
           h('span', { class: 'micro-label' }, '物理 Segment'),
           h('span', { class: 'spacer' }),
-          h('label', { for: 'inc-obs', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '12px', color: 'var(--tx1)' } },
+          h('label', { for: 'inc-obs', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '13px', color: 'var(--tx1)' } },
             toggle, '包含 obsolete')),
         tableWrap);
       if (!tableWrap.contains(tbodySlot.parentNode)) {
@@ -338,7 +338,7 @@
         var n = Number(v);
         return Number.isFinite(n) && n > 1e12 ? IU.fmt.ts(n) : String(v);
       };
-      return h('span', { class: 'mono', style: { fontSize: '11.5px' } }, fmtOne(lo) + ' ~ ' + fmtOne(hi));
+      return h('span', { class: 'mono', style: { fontSize: '12.5px' } }, fmtOne(lo) + ' ~ ' + fmtOne(hi));
     }
 
     draw();

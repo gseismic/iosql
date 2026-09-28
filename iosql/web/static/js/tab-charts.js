@@ -61,7 +61,7 @@
   }
 
   function cfgField(labelText, control) {
-    return h('label', { style: { display: 'flex', flexDirection: 'column', gap: '3px', fontSize: '11px', color: 'var(--tx2)' } },
+    return h('label', { style: { display: 'flex', flexDirection: 'column', gap: '3px', fontSize: '12px', color: 'var(--tx2)' } },
       labelText, control);
   }
 
@@ -124,7 +124,7 @@
           cfgField('start', startIn),
           cfgField('end', endIn),
           cfgField('buckets', bucketsIn),
-          h('label', { for: 'chart-log', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '12px', color: 'var(--tx1)', paddingBottom: '6px' } },
+          h('label', { for: 'chart-log', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '13px', color: 'var(--tx1)', paddingBottom: '6px' } },
             logChk, '对数轴'),
           h('button', { class: 'btn primary', onclick: draw }, '绘制'))));
 

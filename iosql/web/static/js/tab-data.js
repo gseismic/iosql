@@ -301,9 +301,9 @@
 
     /* --- 页头：表名 + 分段控件（D1，仅时序表） --- */
     var head = h('div', { class: 'data-head' },
-      h('span', { class: 'table-name', style: { fontWeight: 700, fontFamily: 'var(--font-mono)', fontSize: '15px' } }, ctx.table),
+      h('span', { class: 'table-name', style: { fontWeight: 700, fontFamily: 'var(--font-mono)', fontSize: '16px' } }, ctx.table),
       spec.time ? IU.badge('时序', 'info') : null,
-      h('span', { class: 'faint mono', style: { fontSize: '11.5px' } },
+      h('span', { class: 'faint mono', style: { fontSize: '12.5px' } },
         String(IU.pick(spec.partition && spec.partition.str ? spec.partition : null, 'str') || '无分区')));
     if (spec.time) {
       var seg = h('div', { class: 'seg-control' });
@@ -361,7 +361,7 @@
     dock.append(
       h('div', { class: 'dock-head' },
         h('span', { class: 'micro-label' }, '查询计划 · explain_select'),
-        h('span', { class: 'faint', style: { fontSize: '11px' } }, '一级分区裁剪 → 二级 segment 裁剪'),
+        h('span', { class: 'faint', style: { fontSize: '12px' } }, '一级分区裁剪 → 二级 segment 裁剪'),
         h('span', { class: 'spacer', style: { flex: '1' } }),
         h('button', {
           class: 'btn sm ghost',
@@ -418,7 +418,7 @@
     }
 
     function pageSizeEl() {
-      var sel = h('select', { class: 'input', style: { fontSize: '11px', padding: '2px 4px' } },
+      var sel = h('select', { class: 'input', style: { fontSize: '12px', padding: '2px 4px' } },
         PAGE_SIZES.map(function (n) {
           return h('option', { value: String(n), selected: n === s.pageSize }, String(n));
         }));
@@ -771,7 +771,7 @@
       picker.append(
         h('div', { class: 'cp-head' },
           h('span', { class: 'micro-label' }, '显示列'),
-          h('span', { class: 'faint mono', style: { fontSize: '11px' } },
+          h('span', { class: 'faint mono', style: { fontSize: '12px' } },
             visibleCols(s).length + '/' + s.columns.length),
           h('span', { class: 'spacer', style: { flex: '1' } }),
           h('button', {
@@ -947,7 +947,7 @@
         h('span', { class: 'faint' }, '·'),
         h('span', null, 'order_by: ', h('span', { class: 'mono' }, s.appliedOrderBy || orderByStr(s))),
         h('span', { class: 'faint' }, '·'),
-        h('span', { class: 'faint mono', style: { fontSize: '11px' } },
+        h('span', { class: 'faint mono', style: { fontSize: '12px' } },
           '每页 ' + s.pageSize + ' 行 · keyset: ' + (s.nextCursor ? '有下一页游标' : '无下一页')));
     }
 
@@ -1024,7 +1024,7 @@
     root.append(h('div', { class: 'card section-gap' },
       h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '时序快捷查询'),
         IU.badge('timeseries', 'info'),
-        h('span', { class: 'faint', style: { fontSize: '11px' } }, '时间支持 2025-01-01 / 2025-01-01 10:30 / 毫秒时间戳')),
+        h('span', { class: 'faint', style: { fontSize: '12px' } }, '时间支持 2025-01-01 / 2025-01-01 10:30 / 毫秒时间戳')),
       h('div', { class: 'quick-grid' },
         fStart.node, fEnd.node, fDate.node, fSession.node, fSymbols.node),
       h('div', { class: 'toolbar' }, btn),
@@ -1069,7 +1069,7 @@
     root.append(h('div', { class: 'card section-gap' },
       h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, 'Latest 最新截面'),
         IU.badge('as-of', 'info'),
-        h('span', { class: 'faint', style: { fontSize: '11px' } }, '所有 symbol 截至某时刻的最新一行')),
+        h('span', { class: 'faint', style: { fontSize: '12px' } }, '所有 symbol 截至某时刻的最新一行')),
       h('div', { class: 'quick-grid' },
         fSymbols.node, fAsOf.node, fBy.node, fCols.node),
       h('div', { class: 'toolbar' }, btn),
@@ -1083,7 +1083,7 @@
       autocomplete: 'off', spellcheck: 'false'
     });
     return {
-      node: h('label', { style: { display: 'flex', flexDirection: 'column', gap: '3px', fontSize: '11px', color: 'var(--tx2)' } },
+      node: h('label', { style: { display: 'flex', flexDirection: 'column', gap: '3px', fontSize: '12px', color: 'var(--tx2)' } },
         labelText, input),
       input: input
     };
@@ -1104,7 +1104,7 @@
     box.append(h('div', { class: 'card' },
       h('div', { class: 'card-title' },
         h('span', { class: 'micro-label' }, title),
-        h('span', { class: 'faint mono', style: { fontSize: '11px' } }, norm.rows.length + ' 行')),
+        h('span', { class: 'faint mono', style: { fontSize: '12px' } }, norm.rows.length + ' 行')),
       h('div', null)));
     var slot = box.lastChild.lastChild;
     IU.renderResultTable(slot, {

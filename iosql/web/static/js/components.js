@@ -83,7 +83,7 @@
       var joiner = h('span', { class: 'joiner' + (i === 0 ? ' first' : '') });
       if (i > 0) {
         joiner.append(h('select', {
-          class: 'input', style: { fontSize: '11px', padding: '2px 4px' },
+          class: 'input', style: { fontSize: '12px', padding: '2px 4px' },
           onchange: function (e) { row.join = e.target.value; }
         },
           h('option', { value: 'AND', selected: row.join !== 'OR' }, 'AND'),
@@ -287,7 +287,7 @@
 
     container.append(
       h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '查询计划'),
-        h('span', { class: 'faint mono', style: { fontSize: '11px' } }, explainSummary(plan))),
+        h('span', { class: 'faint mono', style: { fontSize: '12px' } }, explainSummary(plan))),
       any ? blocks : h('div', { class: 'empty-state' }, '计划未包含 partitions/segments 结构（契约外形态），原始输出见下'),
       !any ? h('details', { class: 'stats-details' }, h('summary', null, '原始 JSON'), h('pre', null, JSON.stringify(plan, null, 2))) : null);
 
@@ -342,7 +342,7 @@
           return h('li', null, typeof r === 'string' ? r : JSON.stringify(r));
         }));
     } else if (reasons && typeof reasons === 'object') {
-      reasonsEl = h('pre', { style: { fontSize: '11px', color: 'var(--tx1)', margin: '4px 0 0' } },
+      reasonsEl = h('pre', { style: { fontSize: '12px', color: 'var(--tx1)', margin: '4px 0 0' } },
         JSON.stringify(reasons, null, 2));
     }
 

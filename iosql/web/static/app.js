@@ -47,6 +47,7 @@
       state.db = results[0] || {};
       state.tables = IU.toArray(results[1]);
       state.mode = String(IU.pick(state.db, 'mode') || 'readonly').toLowerCase() === 'write' ? 'write' : 'readonly';
+      applyFontScale(loadFontScale());
       renderTopbar();
       renderSidebar();
       renderTabbar();
@@ -164,7 +165,49 @@
     renderStatusbar();
   }
 
-  /* ---------------- 顶栏 ---------------- */
+  /* ---------------- 字号缩放（PLAN-068 P2） ----------------
+ * 三档 body zoom：1 / 1.1 / 1.2；localStorage 持久化，boot 时应用。 */
+var FS_KEY = 'iosql_web_font_scale';
+var FS_LEVELS = [
+  { label: 'A−', zoom: 1 },
+  { label: '标准', zoom: 1.1 },
+  { label: 'A+', zoom: 1.2 }
+];
+
+function loadFontScale() {
+  try {
+    var v = parseFloat(localStorage.getItem(FS_KEY));
+    if (v === 1 || v === 1.1 || v === 1.2) return v;
+  } catch (e) { /* 隐私模式等 */ }
+  return 1.1; // 默认档：比初版大一号
+}
+
+function applyFontScale(zoom) {
+  // 经 CSS 变量作用于 body zoom；#layout/#table-wrap 的 vh 高度按变量
+  // 除回原始值，避免 zoom 放大 100vh 把状态栏挤出视口
+  document.documentElement.style.setProperty('--fs-zoom', String(zoom));
+}
+
+function renderFontScale() {
+  var slot = document.getElementById('font-scale-slot');
+  if (!slot) return;
+  var current = loadFontScale();
+  IU.clear(slot);
+  slot.append(h('span', { class: 'faint' }, '字号'));
+  FS_LEVELS.forEach(function (lv) {
+    slot.append(h('button', {
+      class: current === lv.zoom ? 'on' : '',
+      title: '界面缩放 ' + Math.round(lv.zoom * 100) + '%',
+      onclick: function () {
+        try { localStorage.setItem(FS_KEY, String(lv.zoom)); } catch (e) { /* 忽略 */ }
+        applyFontScale(lv.zoom);
+        renderFontScale();
+      }
+    }, lv.label));
+  });
+}
+
+/* ---------------- 顶栏 ---------------- */
   function renderTopbar() {
     var uri = String(IU.pick(state.db, 'uri', 'database_uri', 'source', 'path') || '(未知)');
     var uriEl = document.getElementById('db-uri');
@@ -198,6 +241,7 @@
         ' · ' + left;
     }
     el.textContent = left;
+    renderFontScale();
   }
 
   /* ---------------- 左侧栏 ---------------- */
@@ -220,7 +264,7 @@
     nav.append(h('div', { class: 'side-section-label micro-label' }, '表 (' + state.tables.length + ')'));
 
     if (!state.tables.length) {
-      nav.append(h('div', { style: { padding: '8px 10px', color: 'var(--tx2)', fontSize: '12px' } }, '暂无表'));
+      nav.append(h('div', { style: { padding: '8px 10px', color: 'var(--tx2)', fontSize: '13px' } }, '暂无表'));
     }
     state.tables.forEach(function (t) {
       var name = String(IU.pick(t, 'name', 'table'));

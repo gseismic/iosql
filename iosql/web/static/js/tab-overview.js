@@ -49,10 +49,10 @@
         h('span', null,
           h('b', { id: 'stat-total-rows' }, IU.fmt.int(sum)),
           ' 行合计',
-          h('span', { id: 'stat-total-hint', class: 'faint', style: { fontSize: '11px', marginLeft: '6px' } }, '')),
+          h('span', { id: 'stat-total-hint', class: 'faint', style: { fontSize: '12px', marginLeft: '6px' } }, '')),
         ctx.mode === 'write' ? IU.badge('WRITABLE', 'warn') : IU.badge('READ-ONLY', 'ok'),
         h('span', { class: 'faint' }, '·'),
-        h('span', { class: 'faint mono', style: { fontSize: '11px' } },
+        h('span', { class: 'faint mono', style: { fontSize: '12px' } },
           '行数渐进加载 · 偏斜 = 最大分区/中位数 > 4')));
 
       if (!tables.length) {
@@ -242,7 +242,7 @@
     return h('div', { class: 'card' },
       h('div', { class: 'card-title' },
         h('span', { class: 'micro-label' }, '表清单（' + tables.length + ' 张，紧凑视图）'),
-        h('span', { class: 'faint', style: { fontSize: '11px' } }, '点击行进入该表 Data')),
+        h('span', { class: 'faint', style: { fontSize: '12px' } }, '点击行进入该表 Data')),
       wrap);
 
     function statsTd(n, kind, statsMap) {
