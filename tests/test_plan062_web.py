@@ -15,15 +15,15 @@ import pytest
 pytest.importorskip("fastapi")
 
 from iosql import Database, Segment
-from iosql.ui import create_app
+from iosql.web import create_app
 from fastapi.testclient import TestClient
 
-import iosql.ui.app as ui_app
+import iosql.web.app as web_app
 
 DAY_MS = 86_400_000
 BASE_TS = 1735689600000
 
-STATIC_DIR = Path(ui_app.__file__).parent / "static"
+STATIC_DIR = Path(web_app.__file__).parent / "static"
 
 
 def _build_db(db_dir: Path) -> None:
@@ -387,7 +387,7 @@ class TestValidation422:
         def _boom(table):
             raise RuntimeError("secret-path-/tmp/private")
 
-        monkeypatch.setattr(ui_app, "fast_row_count", _boom)
+        monkeypatch.setattr(web_app, "fast_row_count", _boom)
         with _client(demo_uri, raise_server_exceptions=False) as client:
             resp = client.post("/api/table/prices/count", json={})
         assert resp.status_code == 500
@@ -421,7 +421,7 @@ class TestCountBudget:
     """P2：/count 过滤统计扫描超预算 422；无筛选走 manifest 不受限。"""
 
     def test_filtered_count_budget(self, demo_uri, monkeypatch):
-        monkeypatch.setattr(ui_app, "MAX_COUNT_SCAN_ROWS", 2)
+        monkeypatch.setattr(web_app, "MAX_COUNT_SCAN_ROWS", 2)
         with _client(demo_uri) as client:
             resp = client.post("/api/table/prices/count", json={
                 "where": [{"field": "id", "op": ">=", "value": 0}],
@@ -430,7 +430,7 @@ class TestCountBudget:
         assert "缩小" in resp.json()["hint"]
 
     def test_unfiltered_count_unaffected(self, demo_uri, monkeypatch):
-        monkeypatch.setattr(ui_app, "MAX_COUNT_SCAN_ROWS", 0)
+        monkeypatch.setattr(web_app, "MAX_COUNT_SCAN_ROWS", 0)
         with _client(demo_uri) as client:
             resp = client.post("/api/table/prices/count", json={})
         assert resp.status_code == 200

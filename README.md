@@ -11,7 +11,7 @@
 - **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`buffered_writer()` 缓冲批量写入。
 - **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
 - **时序语法糖**：`Database.timeseries()` 是 `table()` 的薄封装（duration/calendar 分区 + order_key + time），适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
-- **可视化管理台**：`iosql ui -s <db>` 启动本地 Web 管理台（默认只读，`--write` 开启维护），支持数据浏览、契约/分区/segment 透视、explain 裁剪可视化与时序快览图表。
+- **可视化管理台**：`iosql web -s <db>` 启动本地 Web 管理台（默认只读，`--write` 开启维护），支持数据浏览、契约/分区/segment 透视、explain 裁剪可视化与时序快览图表。
 
 ## Partition 与 Segment 的关系
 
@@ -762,7 +762,7 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 
 低层 SQLite 工具示例位于 `examples/mysqlite/`，用于 `iosql.utils.mysqlite` 的 schema-on-write、批量写入、冲突处理和连接池清理。它们不是新的主 API 入口。
 
-## 可视化管理台（UI）
+## 可视化管理台（Web）
 
 iosql 自带一个本地 Web 管理台（只读浏览 + 受控维护），无需写代码即可查看表契约、分区布局、物理 segment 和数据样本。
 
@@ -775,14 +775,14 @@ python -m pip install -e ".[ui]"
 启动（默认**只读模式**）：
 
 ```bash
-iosql ui -s database/market.iosql
-# iosql UI: http://127.0.0.1:8686 (READ-ONLY)
+iosql web -s database/market.iosql
+# iosql Web: http://127.0.0.1:8686 (READ-ONLY)
 ```
 
 开启可修改模式（写入与布局维护操作）：
 
 ```bash
-iosql ui -s database/market.iosql --write
+iosql web -s database/market.iosql --write
 ```
 
 其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`（不自动打开浏览器）。绑定非 loopback 的 `--host` 时会打印暴露警告；服务端只信任 `localhost`/`127.0.0.1`/`[::1]` 的 Host 头。

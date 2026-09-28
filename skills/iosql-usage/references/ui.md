@@ -1,11 +1,11 @@
-# iosql 可视化管理台（iosql ui）
+# iosql 可视化管理台（iosql web）
 
 本地 Web 管理台：只读浏览 + 受控维护，无需写代码即可查看表契约、分区布局、物理 segment 和数据样本。
 
 ```bash
 python -m pip install -e ".[ui]"   # fastapi + uvicorn（可选 extra）
-iosql ui -s database/market.iosql              # 默认只读，http://127.0.0.1:8686
-iosql ui -s database/market.iosql --write      # 开启维护操作
+iosql web -s database/market.iosql              # 默认只读，http://127.0.0.1:8686
+iosql web -s database/market.iosql --write      # 开启维护操作
 ```
 
 其他参数：`--host`（默认 127.0.0.1）、`--port`（默认 8686）、`--no-browser`。

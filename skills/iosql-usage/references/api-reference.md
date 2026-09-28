@@ -638,13 +638,13 @@ python -m pip install -e ".[ui]"
 CLI 入口：
 
 ```bash
-iosql ui -s database/market.iosql [--write] [--host 127.0.0.1] [--port 8686] [--no-browser]
+iosql web -s database/market.iosql [--write] [--host 127.0.0.1] [--port 8686] [--no-browser]
 ```
 
 Python 入口（惰性导入，未装 fastapi 时抛带安装指引的 `ImportError`）：
 
 ```python
-from iosql.ui import create_app
+from iosql.web import create_app
 app = create_app("sqlite://database/market.iosql", mode="readonly")  # 或 "write"
 ```
 

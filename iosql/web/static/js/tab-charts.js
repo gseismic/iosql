@@ -1,5 +1,5 @@
 /* =====================================================================
- * iosql UI · tab-charts.js
+ * iosql Web · tab-charts.js
  * Charts：kind(line|candle) + 数值列 + symbol/start/end/buckets/对数轴
  * → GET /chart → uPlot 渲染。
  * candle 为 v1 近似方案：OHLC 四线叠加（uPlot 无内置蜡烛图），图下标注。

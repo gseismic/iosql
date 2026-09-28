@@ -2077,7 +2077,7 @@ def restore(
 
 
 @app.command()
-def ui(
+def web(
     source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
     write: bool = typer.Option(False, "--write", help="开启可修改模式（默认只读）"),
     host: str = typer.Option("127.0.0.1", "--host", help="服务绑定地址"),
@@ -2090,18 +2090,18 @@ def ui(
     if not source_path.exists():
         raise typer.BadParameter(f"数据库不存在: {source_path}")
 
-    # 惰性导入：UI 依赖属于 [ui] extra，未安装时给出安装指引
+    # 惰性导入：Web 依赖属于 [web] extra（旧名 [ui] 仍可用），未安装时给出安装指引
     try:
-        from iosql.ui import create_app
+        from iosql.web import create_app
         import uvicorn
     except ImportError:
-        _fail('UI 依赖未安装，请先执行: pip install "iosql[ui]"')
+        _fail('Web 依赖未安装，请先执行: pip install "iosql[web]"')
 
     mode = "write" if write else "readonly"
     web_app = create_app(source_uri, mode=mode)
     url = f"http://{host}:{port}"
     mode_label = "WRITABLE" if write else "READ-ONLY"
-    typer.secho(f"iosql UI: {url} ({mode_label})", fg=typer.colors.GREEN)
+    typer.secho(f"iosql Web: {url} ({mode_label})", fg=typer.colors.GREEN)
     if host not in ("127.0.0.1", "localhost", "::1", "[::1]"):
         typer.secho(
             f"警告: 绑定 {host} 会暴露到网络；UI 定位为本机 localhost 工具，"
@@ -2112,6 +2112,24 @@ def ui(
         # 延迟打开浏览器，等 uvicorn 完成监听
         threading.Timer(1.0, webbrowser.open, args=(url,)).start()
     uvicorn.run(web_app, host=host, port=port)
+
+
+@app.command("ui", deprecated=True)
+def ui(
+    source: str = typer.Option(..., "--source", "-s", help="数据库 URI 或本地路径"),
+    write: bool = typer.Option(False, "--write", help="开启可修改模式（默认只读）"),
+    host: str = typer.Option("127.0.0.1", "--host", help="服务绑定地址"),
+    port: int = typer.Option(8686, "--port", help="服务端口"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="启动后不自动打开浏览器"),
+):
+    """[已更名] 旧入口，等价于 iosql web。"""
+    typer.secho(
+        "提示: `iosql ui` 已更名为 `iosql web`，本别名将在未来版本移除。",
+        fg=typer.colors.YELLOW,
+    )
+    web(
+        source=source, write=write, host=host, port=port, no_browser=no_browser,
+    )
 
 
 @index_app.command("list")

@@ -146,7 +146,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | 主题 | 链接 |
 |------|------|
 | CLI 全部命令 + 安全规则（doctor/compact/import/export/backup/restore/rename/migrate/index） | [references/cli.md](references/cli.md) |
-| 可视化管理台 `iosql ui` 工作区/安全模型 | [references/ui.md](references/ui.md) |
+| 可视化管理台 `iosql web` 工作区/安全模型 | [references/ui.md](references/ui.md) |
 | compact / cleanup_obsolete / validate / segments 维护流 | [references/usage-patterns.md](references/usage-patterns.md) #布局和重分区；错误对照 [references/troubleshooting.md](references/troubleshooting.md) #分区维护 |
 | 流式查询 iter_select_batches / iter_batches / 大结果导出 | [references/usage-patterns.md](references/usage-patterns.md) #流式查询和导出 |
 | upsert_all 字段级合并、delete/truncate、create_index/drop_index、rename | [references/usage-patterns.md](references/usage-patterns.md) |
@@ -238,7 +238,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 - [references/troubleshooting.md](references/troubleshooting.md) —— 错误排查对照表
 - [references/write-performance.md](references/write-performance.md) —— 大批量写入性能（回灌/orderbook/PRAGMA/FD/HDD）
 - [references/cli.md](references/cli.md) —— CLI 命令与安全规则
-- [references/ui.md](references/ui.md) —— 可视化管理台 iosql ui
+- [references/ui.md](references/ui.md) —— 可视化管理台 iosql web（旧名 iosql ui）
 - [references/design-contract.md](references/design-contract.md) —— 接口契约、设计偏好与开发守则（本仓库开发必读）
 - [examples/README.md](examples/README.md) —— 主线 `01~13` 示例索引，每个示例对应一个常见问题；
   `examples/13_streaming_ordered_query.py` 专门覆盖有序大结果集的惰性读取。

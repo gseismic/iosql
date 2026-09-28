@@ -21,6 +21,11 @@ dependencies = [
 postgresql = [
     "psycopg2-binary>=2.9",
 ]
+web = [
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+# 兼容别名：iosql[ui] 曾是唯一 extra 名，内容与 [web] 相同
 ui = [
     "fastapi>=0.110",
     "uvicorn>=0.29",

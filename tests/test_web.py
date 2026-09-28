@@ -1,6 +1,6 @@
-"""iosql UI 后端契约测试（PLAN-055 Phase D）。
+"""iosql Web 后端契约测试（PLAN-055 Phase D）。
 
-后端 iosql.ui 由并行团队开发中；本文件基于冻结契约编写，
+后端 iosql.web 由并行团队开发中；本文件基于冻结契约编写，
 未集成时整个模块自动 skip，集成后无需改动即可运行。
 """
 
@@ -21,7 +21,7 @@ from iosql import Database, Segment
 from iosql.cli import app as cli_app
 
 try:
-    from iosql.ui import create_app
+    from iosql.web import create_app
 except ImportError:
     pytest.skip("backend not integrated yet", allow_module_level=True)
 

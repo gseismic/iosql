@@ -1,4 +1,4 @@
-"""iosql UI 后端服务层：FastAPI app 工厂与全部 REST 端点。
+"""iosql Web 后端服务层：FastAPI app 工厂与全部 REST 端点。
 
 职责：把 iosql Python API 包装为前端契约（设计文档第 7 节冻结版）可用的
 本地 HTTP 服务；Database 实例为进程单例，lifespan 中创建、shutdown 时 close。
@@ -1349,7 +1349,7 @@ def _register_api_fallback(app: FastAPI) -> None:
 
 
 def create_app(db_uri: str, mode: str = "readonly") -> FastAPI:
-    """创建 iosql UI 的 FastAPI 应用。
+    """创建 iosql Web 的 FastAPI 应用。
 
     - mode="readonly"（默认）：只注册读路由，写端点不存在（404）。
     - mode="write"：额外注册写路由（均挂 require_write_mode 守卫）。
@@ -1361,7 +1361,7 @@ def create_app(db_uri: str, mode: str = "readonly") -> FastAPI:
             f"非法 mode `{mode}`，仅支持: {', '.join(MODES)}"
         )
 
-    app = FastAPI(title="iosql UI", lifespan=_lifespan)
+    app = FastAPI(title="iosql Web", lifespan=_lifespan)
     app.state.db_uri = db_uri
     app.state.mode = mode
     app.state.db = None

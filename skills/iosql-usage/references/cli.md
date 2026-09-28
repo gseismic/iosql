@@ -16,7 +16,7 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 | 类别 | 命令 | 说明 |
 |------|------|------|
 | **发现** | `iosql tables -s DB` | 列出逻辑表 |
-| | `iosql ui -s DB [--write] [--host] [--port] [--no-browser]` | 启动本地 Web 管理台（默认只读，详见 [ui.md](ui.md)） |
+| | `iosql web -s DB [--write] [--host] [--port] [--no-browser]` | 启动本地 Web 管理台（旧名 `iosql ui` 仍可用）（默认只读，详见 [ui.md](ui.md)） |
 | | `iosql rename-database -s DB --target NEW_DB` | 重命名 SQLite 目录库；覆盖目标需 `--overwrite --yes`，目标须为 iosql 库且非根/家目录/符号链接，失败可回滚 |
 | | `iosql rename-table -s DB -t OLD --new-table NEW` | 重命名逻辑表；覆盖目标需 `--overwrite --yes` |
 | | `iosql spec -s DB -t TABLE` | 输出表契约 JSON |

@@ -1,5 +1,5 @@
 /* =====================================================================
- * iosql UI · tab-maintain.js
+ * iosql Web · tab-maintain.js
  * Maintain 维护台（仅 --write 模式可用）：
  * 步骤流 layout_report → compact → validate → cleanup_obsolete(两步)
  * → repartition；危险区 delete / truncate 均需手输表名确认。

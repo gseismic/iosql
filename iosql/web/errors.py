@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""iosql UI 统一异常体系。
+"""iosql Web 统一异常体系。
 
 安全模型：所有错误响应统一为 ``{"detail": str, "hint": str|null}``，
 detail 面向用户描述发生了什么，hint 给出可执行的修复指引。

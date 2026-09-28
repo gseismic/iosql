@@ -1,5 +1,5 @@
 /* =====================================================================
- * iosql UI · tab-structure.js
+ * iosql Web · tab-structure.js
  * Structure 三区块：契约卡（spec）→ 逻辑分区表（parts，chips 或条形图）
  * → 物理 segment 表（include_obsolete 开关重拉）。
  * ===================================================================== */

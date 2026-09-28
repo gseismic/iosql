@@ -1,5 +1,5 @@
 /* =====================================================================
- * iosql UI · util.js
+ * iosql Web · util.js
  * 核心工具层：DOM 构造辅助 h()、fetch 统一封装、toast、格式化、弹窗。
  * 安全约定：接口数据一律经 textContent 渲染（h() 的字符串子节点走
  * createTextNode），全站禁止用 innerHTML 插值任何动态数据。
