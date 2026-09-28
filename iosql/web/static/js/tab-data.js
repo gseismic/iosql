@@ -492,16 +492,38 @@
 
     /* 请求序号：快速切表/翻页时丢弃过期响应，防止旧数据覆盖新页 */
     var pageSeq = 0;
+    /* aborter：新请求自动取消上一个（PLAN-069 P4），大表排序不必干等 */
+    var aborter = null;
+    var loadTicker = null;
+
+    function stopLoadTicker() {
+      if (loadTicker) { clearInterval(loadTicker); loadTicker = null; }
+    }
+
+    function startLoadTicker() {
+      stopLoadTicker();
+      var start = Date.now();
+      loadTicker = setInterval(function () {
+        var el = tableBox.querySelector('.load-elapsed');
+        if (el) el.textContent = ((Date.now() - start) / 1000).toFixed(1) + 's';
+      }, 100);
+    }
+
     function fetchPage(where) {
       var seq = ++pageSeq;
+      if (aborter) aborter.abort();
+      aborter = ('AbortController' in window) ? new AbortController() : null;
+      var signal = aborter ? aborter.signal : undefined;
       renderBodyLoading();
+      startLoadTicker();
       refreshWherePreview();
       var body = { where: where || [], order_by: orderByStr(s), limit: s.pageSize };
       var cursor = s.chain[s.pos];
       if (cursor !== null && cursor !== undefined) body.cursor = cursor;
 
-      IU.api(base + '/rows', { method: 'POST', body: body }).then(function (resp) {
+      IU.api(base + '/rows', { method: 'POST', body: body, signal: signal }).then(function (resp) {
         if (seq !== pageSeq) return; // 过期响应：丢弃
+        stopLoadTicker();
         var norm = IU.normalizeRows(resp);
         s.nextCursor = IU.pick(resp || {}, 'next_cursor', 'nextCursor') || null;
         s.appliedOrderBy = String(IU.pick(resp || {}, 'order_by', 'orderBy') || body.order_by);
@@ -513,6 +535,12 @@
         fetchCount(where);
       }).catch(function (err) {
         if (seq !== pageSeq) return;
+        stopLoadTicker();
+        if (err && err.aborted) {
+          renderBodyCurrent(); // 已被更新请求取代：回退到上一份数据
+          renderPager();
+          return;
+        }
         handlePageError(err);
         renderPager();
       });
@@ -598,7 +626,7 @@
             ? ' 统计中…'
             : (failed ? ' ' + (s.countHint[sig] || '统计失败') : '')),
           bigUnfiltered
-            ? h('span', { class: 'faint' }, ' · 大表未过滤：首页排序可能较慢，建议加表头过滤')
+            ? h('span', { class: 'faint' }, ' · 大表未过滤：如需更快可加表头过滤缩小扫描范围')
             : null,
           activeFilterHint()));
     }
@@ -919,9 +947,15 @@
     function renderBodyLoading() {
       var shell = ensureShell();
       IU.clear(shell.tbody);
+      var elapsed = h('span', { class: 'load-elapsed mono' }, '0.0s');
       shell.tbody.append(h('tr', null,
         h('td', { class: 'loading-cell', colspan: String(Math.max(visibleCols(s).length, 1)) },
-          h('span', { class: 'spinner' }), ' 加载中…')));
+          h('span', { class: 'spinner' }), ' 加载中 ',
+          elapsed,
+          h('button', {
+            class: 'btn sm', style: { marginLeft: '12px' },
+            onclick: function () { if (aborter) aborter.abort(); }
+          }, '取消'))));
     }
 
     function renderBodyError(msg) {

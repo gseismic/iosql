@@ -49,6 +49,7 @@
       init.headers['Content-Type'] = 'application/json';
       init.body = JSON.stringify(opts.body);
     }
+    if (opts.signal) init.signal = opts.signal; // 请求取消（PLAN-069 P4）
     return fetch(path, init).then(function (resp) {
       return resp.text().then(function (text) {
         var data = null;
@@ -64,7 +65,12 @@
         }
         return data;
       });
-    }, function () {
+    }, function (e) {
+      if (e && e.name === 'AbortError') {
+        var aborted = new Error('aborted');
+        aborted.aborted = true;
+        throw aborted; // 主动取消：不弹错误提示
+      }
       toast('网络请求失败', 'err', path + ' 无法访问，请确认服务是否在线');
       throw new Error('network error: ' + path);
     });

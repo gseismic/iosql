@@ -2694,7 +2694,14 @@ class Table(BaseTable):
         row = rows[0]
         return row.get('session_min'), row.get('session_max')
 
+    _column_stats_cache = {}
+    _column_stats_cache_hits = 0
+    _column_stats_cache_misses = 0
+
     def _data_file_column_stats(self, part_key):
+        """按 segment 数据文件缓存列 MIN/MAX 统计（键含 mtime+size，
+        任何写入都会改变键从而自动失效）。有 where 的重复查询不再
+        每次全段重扫。PLAN-069 P3。"""
         meta = self.get_table_meta()
         columns = list((meta or {}).get('column_info') or {})
         if not columns:
@@ -2703,6 +2710,20 @@ class Table(BaseTable):
         part_dbfile = self._get_part_dbfile(part_key)
         if not os.path.isfile(part_dbfile):
             return {}
+        def _stat_key():
+            try:
+                st = os.stat(part_dbfile)
+                return (part_dbfile, st.st_mtime_ns, st.st_size)
+            except OSError:
+                return None
+
+        # 查询本身开/关连接可能触发 WAL checkpoint 改写文件 mtime，
+        # 因此存储键在查询后取：首次写入的是查询后状态，后续查询即可命中
+        cache_key = _stat_key()
+        if cache_key is not None and cache_key in self._column_stats_cache:
+            type(self)._column_stats_cache_hits += 1
+            return dict(self._column_stats_cache[cache_key])
+        type(self)._column_stats_cache_misses += 1
 
         projections = []
         for column in columns:
@@ -2729,6 +2750,9 @@ class Table(BaseTable):
                 'min': row.get(f'{column}__min'),
                 'max': row.get(f'{column}__max'),
             }
+        cache_key = _stat_key()
+        if cache_key is not None:
+            self._column_stats_cache[cache_key] = stats
         return stats
 
     def _refresh_segment_info(self, logical_part, segment_id, part_key, layout):
@@ -3033,10 +3057,25 @@ class Table(BaseTable):
             row_count=0,
         )
 
-    def _legacy_segment_info(self, logical_part):
+    def _legacy_segment_info(self, logical_part, lightweight=False):
+        """构建 legacy 分区的 segment 信息。
+
+        lightweight=True 供纯查询路径（无 where，裁剪统计不会被消费）使用：
+        跳过列统计/时间/session/COUNT 四项数据文件扫描（每项都是全段扫描，
+        24 列大表上 13 段合计 4s+），只保留查询寻址必需字段。PLAN-069 P1。
+        """
         path = self._get_part_dbfile(logical_part)
         if not os.path.isfile(path):
             return None
+        if lightweight:
+            return SegmentInfo(
+                logical_part=logical_part,
+                segment_id=-1,
+                part_key=logical_part,
+                path=path,
+                sealed=True,
+                state='sealed',
+            )
         time_min, time_max = self._data_file_time_range(logical_part)
         session_min, session_max = self._data_file_session_range(logical_part)
         stats = self._data_file_column_stats(logical_part)
@@ -3055,11 +3094,12 @@ class Table(BaseTable):
             state='sealed',
         )
 
-    def _physical_part_refs(self, logical_parts=None, include_obsolete=False):
+    def _physical_part_refs(self, logical_parts=None, include_obsolete=False,
+                            lightweight=False):
         parts = self.table_parts() if logical_parts is None else list(logical_parts)
         refs = []
         for part in parts:
-            legacy = self._legacy_segment_info(part)
+            legacy = self._legacy_segment_info(part, lightweight=lightweight)
             if legacy is not None:
                 refs.append(legacy)
         refs.extend(
@@ -3170,7 +3210,8 @@ class Table(BaseTable):
 
     def _get_select_part_refs(self, cases):
         need_parts = self._get_select_parts(cases)
-        refs = self._physical_part_refs(need_parts)
+        # 无 where 时裁剪统计不会被消费，轻量构建引用（PLAN-069 P2）
+        refs = self._physical_part_refs(need_parts, lightweight=not cases)
         if not cases:
             return refs
 
