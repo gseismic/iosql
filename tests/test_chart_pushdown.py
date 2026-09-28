@@ -23,6 +23,10 @@ except ImportError:
 
 from fastapi.testclient import TestClient
 
+from iosql.web import app as web_app
+
+STATIC_DIR = Path(web_app.__file__).parent / "static"
+
 DAY_MS = 86_400_000
 BASE_TS = 1735689600000  # 2025-01-01 00:00:00 UTC
 
@@ -303,8 +307,6 @@ class TestChartEndpointPushdown:
 
     def test_line_ignores_scan_cap(self, chart_db_dir, monkeypatch):
         """line 路径不受扫描行数上限约束（上限仅保留给 candle 流式路径）。"""
-        from iosql.web import app as web_app
-
         monkeypatch.setattr(web_app, "MAX_CHART_SCAN_ROWS", 10)
         with _client(chart_db_dir) as client:
             resp = client.get(
@@ -388,3 +390,43 @@ class TestChartEndpointPushdown:
         assert payload["col"] == "price"
         assert payload["symbol"] == "AAPL"
         assert len(payload["x"]) == len(payload["y"]) > 0
+
+
+class TestFrontendViewportLoading:
+    """PLAN-071 可视区按需加载：前端静态契约（与 test_plan062_web 同风格）。"""
+
+    def test_scale_hook_wired_for_viewport_refetch(self):
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "setScale" in text
+        assert "scheduleViewFetch" in text
+        assert "fetchView" in text
+
+    def test_viewport_fetch_debounced_and_deduped(self):
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "clearTimeout" in text          # 防抖
+        assert "closeWindow" in text           # 视口去重
+        assert "viewSeq" in text               # 过期响应守卫
+
+    def test_setdata_does_not_retrigger_fetch(self):
+        """setData 内部 setScale 必须被抑制，否则缩放重查会无限回环。"""
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "suppressScale" in text
+        assert "chart.setData(buildUData(seriesList), true)" in text
+        assert text.index("suppressScale = true") < text.index("chart.setData")
+
+    def test_dblclick_reset_refetches_full_range(self):
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "fullScale" in text             # 初始全范围基准
+        assert "isFullReset" in text           # 复位 → 无窗口参数重查
+        # uPlot v1.6 无内置缩放复位：dblclick 由前端手动 setScale 回初始范围
+        assert "addEventListener('dblclick'" in text
+        assert "chart.setScale('x'" in text
+
+    def test_viewport_params_sent_as_start_end(self):
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "winMs" in text                 # 视口毫秒窗口参数
+
+    def test_loading_state_and_invalidation(self):
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "resetViewState" in text        # 重绘时作废在途请求
+        assert "可视区加载中" in text           # 加载态提示

@@ -3,6 +3,9 @@
  * Charts：kind(line|candle) + 数值列 + symbol/start/end/buckets/对数轴
  * → GET /chart → uPlot 渲染。
  * candle 为 v1 近似方案：OHLC 四线叠加（uPlot 无内置蜡烛图），图下标注。
+ * PLAN-071 可视区按需加载：拖拽缩放/双击复位 → setScale hook → 防抖后
+ * 仅按可视区 start/end 重查（buckets 不变，放大即局部高分辨率），
+ * setData 原地更新不重建实例；双击复位判定为全范围重查。
  * ===================================================================== */
 (function () {
   'use strict';
@@ -131,6 +134,130 @@
       var chartBox = h('div', { class: 'chart-box' });
       root.append(chartBox);
 
+      /* ---- 可视区按需加载状态（PLAN-071，render 作用域）----
+       * active：当前图序列配置（重查时按它决定拉哪几列）；
+       * viewXTime：当前图 x 是否毫秒时间轴（视口秒值 → 毫秒换算）；
+       * viewApplied：已加载数据对应的视口（去重防回环）；
+       * fullScale：初始全范围（双击复位判定）；viewSeq：过期响应守卫；
+       * suppressScale：setData 内部 setScale 抑制标志。 */
+      var active = null;
+      var viewXTime = false;
+      var viewApplied = null;
+      var fullScale = null;
+      var viewTimer = null;
+      var viewSeq = 0;
+      var suppressScale = false;
+      var viewNote = h('div', { class: 'chart-note' });
+
+      function bucketCount() {
+        var b = parseInt(s.buckets, 10);
+        return Number.isFinite(b) && b > 0 ? b : 2000;
+      }
+
+      function validWindow(w) {
+        return !!(w && Number.isFinite(w.min) && Number.isFinite(w.max));
+      }
+
+      function closeWindow(a, b) {
+        if (!validWindow(a) || !validWindow(b)) return false;
+        var span = Math.max(Math.abs(a.max - a.min), Math.abs(b.max - b.min), 1e-9);
+        // 容差取约 2.5 个桶宽：setData(resetScales) 后 uPlot 重定刻度会使
+        // 数据范围相对请求窗口内缩约一个桶宽，容差小于桶宽会形成
+        // "重查→内缩→再重查"的回环；小于 0.1% 视口的缩放无意义
+        var tol = span * 2.5 / bucketCount();
+        return Math.abs(a.min - b.min) <= tol &&
+               Math.abs(a.max - b.max) <= tol;
+      }
+
+      function noteText(txt) {
+        IU.clear(viewNote);
+        if (txt) viewNote.append(String(txt));
+      }
+
+      function noteLoading() {
+        IU.clear(viewNote);
+        viewNote.append(h('span', { class: 'spinner' }), ' 可视区加载中…');
+      }
+
+      function noteRange(startMs, endMs, count, isFull) {
+        var fmt = viewXTime ? function (v) { return IU.fmt.ts(v); } : String;
+        noteText((isFull ? '全范围' : '可视区 ') + fmt(startMs) + ' ~ ' +
+          fmt(endMs) + ' · ' + count + ' 点' +
+          (isFull ? '（拖拽缩放 · 双击复位）' : ''));
+      }
+
+      function resetViewState() {
+        if (viewTimer) { clearTimeout(viewTimer); viewTimer = null; }
+        viewSeq += 1;           // 使在途视口请求全部过期
+        viewApplied = null;
+        fullScale = null;
+        active = null;
+      }
+
+      /* 由序列点集构建 uPlot data：第一序列 x 为主轴，其余按 x 对齐；
+       * 对数轴下非正值断开为 null。初始渲染与视口重查共用（PLAN-071）。 */
+      function buildUData(list) {
+        var f = list[0];
+        var raw = f.pts.map(function (p) { return Number(p.x); });
+        var sx = viewXTime ? raw.map(function (v) { return v / 1000; }) : raw;
+        return [sx].concat(list.map(function (sl) {
+          var byX = new Map();
+          sl.pts.forEach(function (p) { byX.set(Number(p.x), p.y); });
+          return sx.map(function (x) {
+            var v = byX.get(viewXTime ? x * 1000 : x);
+            if (v === undefined) return null;
+            var n = Number(v);
+            if (!Number.isFinite(n)) return null;
+            if (s.log && n <= 0) return null;
+            return n;
+          });
+        }));
+      }
+
+      function scheduleViewFetch(min, max) {
+        if (viewTimer) clearTimeout(viewTimer);
+        viewTimer = setTimeout(function () {
+          viewTimer = null;
+          fetchView(min, max);
+        }, 250);
+      }
+
+      function fetchView(min, max) {
+        if (!chart || !chartBox.isConnected || !active || !validWindow(viewApplied)) return;
+        var win = { min: min, max: max };
+        if (closeWindow(win, viewApplied)) return;      // 视口未实质变化
+        var isFullReset = closeWindow(win, fullScale);  // 双击复位 → 全范围重查
+        var startMs = viewXTime ? Math.floor(min * 1000) : Math.floor(min);
+        var endMs = viewXTime ? Math.ceil(max * 1000) : Math.ceil(max);
+        var winMs = isFullReset ? null : [startMs, endMs];
+        var seq = ++viewSeq;
+        var base = '/api/table/' + encodeURIComponent(ctx.table) + '/chart';
+        noteLoading();
+        Promise.all(active.map(function (sr) {
+          return fetchSeries(base, sr.col, winMs);
+        })).then(function (lists) {
+          if (seq !== viewSeq || !chart || !chartBox.isConnected) return;
+          var seriesList = active.map(function (sr, i) {
+            return { label: sr.label, color: sr.color, pts: lists[i] };
+          });
+          if (!seriesList[0].pts.length) { noteText('可视区无数据'); return; }
+          suppressScale = true;
+          try {
+            chart.setData(buildUData(seriesList), true);
+            // 记录"请求窗口"而非 chart.scales：resetScales 的刻度提交可能
+            // 滞后于 setData 返回，用滞后的 scale 做去重会形成回环
+            viewApplied = { min: win.min, max: win.max };
+          } finally {
+            suppressScale = false;
+          }
+          noteRange(startMs, endMs, seriesList[0].pts.length, isFullReset);
+        }).catch(function (err) {
+          if (seq !== viewSeq) return;
+          noteText('可视区加载失败：' +
+            (err && err.hint ? err.hint : (err && err.message) || ''));
+        });
+      }
+
       // 先清理上一次渲染留下的 resize 监听，再挂新的（防止反复切换 Tab 累积）
       if (resizeHandler) { window.removeEventListener('resize', resizeHandler); }
       resizeHandler = onResize;
@@ -149,6 +276,7 @@
       function draw() {
         destroyChart();
         IU.clear(chartBox);
+        resetViewState();
         chartBox.append(h('div', { class: 'chart-empty' }, h('span', { class: 'spinner' }), ' 拉取数据…'));
 
         var base = '/api/table/' + encodeURIComponent(ctx.table) + '/chart';
@@ -156,7 +284,8 @@
         if (s.kind === 'candle') {
           drawCandle(base);
         } else {
-          fetchSeries(base, s.col).then(function (pts) {
+          active = [{ label: s.col, color: '#45c6ff', col: s.col }];
+          fetchSeries(base, s.col, null).then(function (pts) {
             renderLine([{ label: s.col, color: '#45c6ff', pts: pts }], false);
           }).catch(function (err) {
             renderEmpty(chartErrText(err));
@@ -176,35 +305,52 @@
       function drawCandle(base) {
         if (!s.ohlcCols) {
           IU.toast('契约未识别 OHLC 四列，退化为所选列折线', 'warn');
-          fetchSeries(base, s.col).then(function (pts) {
+          active = [{ label: s.col, color: '#45c6ff', col: s.col }];
+          fetchSeries(base, s.col, null).then(function (pts) {
             renderLine([{ label: s.col, color: '#45c6ff', pts: pts }], false);
           }).catch(function (err) { renderEmpty(chartErrText(err)); });
           return;
         }
-        Promise.all(s.ohlcCols.map(function (c) { return fetchSeries(base, c); }))
+        var longNames = { o: 'open', h: 'high', l: 'low', c: 'close' };
+        active = s.ohlcCols.map(function (c) {
+          return {
+            label: longNames[c] + ' (' + c + ')',
+            color: SERIES_COLORS[longNames[c]],
+            col: c,
+          };
+        });
+        Promise.all(active.map(function (sr) {
+          return fetchSeries(base, sr.col, null);
+        }))
           .then(function (r) {
-            renderLine([
-              { label: 'open (' + s.ohlcCols[0] + ')', color: SERIES_COLORS.open, pts: r[0] },
-              { label: 'high (' + s.ohlcCols[1] + ')', color: SERIES_COLORS.high, pts: r[1] },
-              { label: 'low (' + s.ohlcCols[2] + ')', color: SERIES_COLORS.low, pts: r[2] },
-              { label: 'close (' + s.ohlcCols[3] + ')', color: SERIES_COLORS.close, pts: r[3] }
-            ], true);
+            renderLine(active.map(function (sr, i) {
+              return { label: sr.label, color: sr.color, pts: r[i] };
+            }), true);
           })
           .catch(function (err) { renderEmpty(chartErrText(err)); });
       }
 
-      function fetchSeries(base, col) {
+      /* 拉取一条序列：winMs 为 null 时用配置输入的 start/end，
+       * 否则用可视区毫秒窗口（PLAN-071，缩放重查走此参数） */
+      function fetchSeries(base, col, winMs) {
         var qs = '?col=' + encodeURIComponent(col);
         if (String(s.symbol).trim() !== '') qs += '&symbol=' + encodeURIComponent(s.symbol.trim());
-        var startMs = IU.parseTimeInput(s.start);
-        var endMs = IU.parseTimeInput(s.end);
-        if (String(s.start).trim() !== '') {
-          if (!startMs.ok) { IU.toast('start 无法解析：试试 2025-01-01 或毫秒时间戳', 'warn'); return Promise.reject(new Error('bad start')); }
-          qs += '&start=' + encodeURIComponent(String(startMs.ms));
-        }
-        if (String(s.end).trim() !== '') {
-          if (!endMs.ok) { IU.toast('end 无法解析：试试 2025-04-30 或毫秒时间戳', 'warn'); return Promise.reject(new Error('bad end')); }
-          qs += '&end=' + encodeURIComponent(String(endMs.ms));
+        if (winMs) {
+          qs += '&start=' + encodeURIComponent(String(winMs[0]));
+          qs += '&end=' + encodeURIComponent(String(winMs[1]));
+        } else {
+          var startStr = String(s.start).trim();
+          var endStr = String(s.end).trim();
+          if (startStr !== '') {
+            var startMs = IU.parseTimeInput(s.start);
+            if (!startMs.ok) { IU.toast('start 无法解析：试试 2025-01-01 或毫秒时间戳', 'warn'); return Promise.reject(new Error('bad start')); }
+            qs += '&start=' + encodeURIComponent(String(startMs.ms));
+          }
+          if (endStr !== '') {
+            var endMs = IU.parseTimeInput(s.end);
+            if (!endMs.ok) { IU.toast('end 无法解析：试试 2025-04-30 或毫秒时间戳', 'warn'); return Promise.reject(new Error('bad end')); }
+            qs += '&end=' + encodeURIComponent(String(endMs.ms));
+          }
         }
         var b = parseInt(s.buckets, 10);
         qs += '&buckets=' + (Number.isFinite(b) && b > 0 ? b : 2000);
@@ -258,26 +404,11 @@
 
         var xsRaw = first.pts.map(function (p) { return Number(p.x); });
         var maxAbs = xsRaw.reduce(function (m, v) { return Math.max(m, Math.abs(v)); }, 0);
-        var isTime = maxAbs > 1e11; // 秒级 epoch ≈1e9，毫秒级 ≈1e12
-        var xs = isTime ? xsRaw.map(function (v) { return v / 1000; }) : xsRaw;
+        viewXTime = maxAbs > 1e11; // 秒级 epoch ≈1e9，毫秒级 ≈1e12
 
         var seriesDefs = seriesList.map(function (sl) {
           return { label: sl.label, stroke: sl.color, width: 1.5, points: { show: sl.pts.length < 40 } };
         });
-
-        // 各序列按 x 对齐到第一序列横轴；对数轴下非正值断开为 null
-        var data = [xs].concat(seriesList.map(function (sl) {
-          var byX = new Map();
-          sl.pts.forEach(function (p) { byX.set(Number(p.x), p.y); });
-          return xs.map(function (x) {
-            var v = byX.get(isTime ? x * 1000 : x);
-            if (v === undefined) return null;
-            var n = Number(v);
-            if (!Number.isFinite(n)) return null;
-            if (s.log && n <= 0) return null;
-            return n;
-          });
-        }));
 
         destroyChart();
         IU.clear(chartBox);
@@ -287,13 +418,14 @@
           chartBox.append(h('div', { class: 'chart-note' },
             '⚠ K线为 v1 近似渲染：uPlot 无内置蜡烛图，此处以 open/high/low/close 四条线叠加显示。'));
         }
+        chartBox.append(viewNote);
 
         try {
           // 时间轴交给 uPlot 原生渲染（可读日期）；仅非时间横轴才自定义整数刻度
           // （PLAN-064 Q3：原先强制 Math.round 覆盖导致 X 轴显示原始毫秒）。
           // 注意：isTime 时不传 space/values 键——旧版 uPlot 对 null 轴参数处理不佳
           var xAxis = { stroke: '#5f6a82', grid: { stroke: 'rgba(255,255,255,.06)' } };
-          if (!isTime) {
+          if (!viewXTime) {
             xAxis.space = 80;
             xAxis.values = function (u, ticks) {
               return ticks.map(function (v) { return v == null ? '' : String(Math.round(v)); });
@@ -303,7 +435,7 @@
             width: Math.max(chartBox.clientWidth - 24, 320),
             height: 360,
             scales: {
-              x: { time: isTime },
+              x: { time: viewXTime },
               y: s.log ? { distr: 3 } : {}
             },
             series: [{}].concat(seriesDefs),
@@ -314,8 +446,32 @@
                 values: function (u, ticks) {
                   return ticks.map(function (v) { return v == null ? '' : Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 }); });
                 } }
-            ]
-          }, data, mount);
+            ],
+            hooks: {
+              // 拖拽缩放/双击复位后 x 刻度变化 → 防抖重查可视区（PLAN-071）。
+              // 首个 setScale（构造期，数据范围）只初始化基准窗口不查询：
+              // 此刻 chart.scales.x.min/max 尚未提交（null），不能事后读取
+              setScale: [function (u, key) {
+                if (key !== 'x' || suppressScale) return;
+                var win = { min: u.scales.x.min, max: u.scales.x.max };
+                if (!validWindow(viewApplied)) {
+                  viewApplied = win;
+                  fullScale = win;
+                  return;
+                }
+                scheduleViewFetch(win.min, win.max);
+              }]
+            }
+          }, buildUData(seriesList), mount);
+          // 双击复位：uPlot v1.6 无内置缩放复位，手动回到初始全范围，
+          // setScale 触发 setScale hook → closeWindow(fullScale) → 全量重查
+          mount.addEventListener('dblclick', function () {
+            if (chart && validWindow(fullScale)) {
+              chart.setScale('x', { min: fullScale.min, max: fullScale.max });
+            }
+          });
+          // 初始"全范围"提示：直接取数据首末点（毫秒），不依赖未提交的 scale
+          noteRange(xsRaw[0], xsRaw[xsRaw.length - 1], xsRaw.length, true);
         } catch (e) {
           IU.clear(chartBox);
           chartBox.append(h('div', { class: 'chart-empty' }, '渲染失败：' + e.message));
