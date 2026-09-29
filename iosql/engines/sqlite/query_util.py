@@ -301,12 +301,12 @@ def build_bucket_stats_query(part_table_name, x_col, value_cols,
 
 def build_bucket_agg_query(part_table_name, x_col, value_cols,
                            or_and_cases, column_types,
-                           x_text_mode, x_min, width):
+                           x_text_mode, x_min, width, group_col=None):
     """分桶聚合查询（PLAN-070）：GROUP BY 桶下标，返回每桶 SUM/COUNT。
 
     桶下标 = floor((x - x_min) / width)：CAST 向零截断，非负值域上与
     Python floor 一致；text 模式先 CAST 成整数（YYYYMMDD 等纯数字文本）。
-    结果行形如 (bucket_idx, sum1, count1, sum2, count2, ...)。
+    group_col 非空时按 (bucket_idx, group_col) 分组；否则只按 bucket_idx 分组。
     """
     _bucket_require_column(column_types, x_col)
     x_sql = _quote_sql_identifier(x_col)
@@ -317,6 +317,9 @@ def build_bucket_agg_query(part_table_name, x_col, value_cols,
         params = [x_min, width]
         bucket_expr = f'({x_sql} - ?) / ?'
     select_items = [f'CAST({bucket_expr} AS INTEGER)']
+    if group_col is not None:
+        _bucket_require_column(column_types, group_col)
+        select_items.append(_quote_sql_identifier(group_col))
     for col in value_cols:
         _bucket_require_column(column_types, col)
         c_sql = _quote_sql_identifier(col)
@@ -328,5 +331,5 @@ def build_bucket_agg_query(part_table_name, x_col, value_cols,
         sql += f' where {where.sql} and {x_sql} IS NOT NULL'
     else:
         sql += f' where {x_sql} IS NOT NULL'
-    sql += ' group by 1'
+    sql += ' group by 1,2' if group_col is not None else ' group by 1'
     return SqlQuery(sql + ';', params + list(where.params))

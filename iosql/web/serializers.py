@@ -28,7 +28,8 @@ def to_jsonable(value: Any) -> Any:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     if isinstance(value, decimal.Decimal):
-        return float(value)
+        converted = float(value)
+        return converted if math.isfinite(converted) else None
     if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
         return value.isoformat()
     if isinstance(value, dict):

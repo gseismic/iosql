@@ -28,6 +28,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
@@ -58,6 +59,7 @@ from iosql.spec import parse_partition_spec
 from .deps import require_write_mode
 from .errors import AppError
 from .serializers import (
+    to_jsonable,
     serialize_contract,
     serialize_layout_report,
     serialize_partition,
@@ -83,20 +85,18 @@ WRITE_MODES = ("append", "upsert", "replace", "ignore")
 MAX_PAGE_LIMIT = 5000
 MAX_QUERY_LIMIT = 50_000
 
-# 过滤统计（/count 带 where）的扫描行软预算：超出返回 422 提示缩小筛选；
-# 无筛选统计走 manifest 求和，不受此限制。
-MAX_COUNT_SCAN_ROWS = 5_000_000
+# 过滤统计（/count 带 where）的查询执行时间预算；无筛选统计走 manifest 求和，
+# 不读取数据行，因此不受此限制。
+MAX_COUNT_QUERY_MS = 5_000
 
 # 大表告警阈值：未过滤首页仅记录服务端日志，不改变响应契约
 BIG_TABLE_WARN_ROWS = 1_000_000
 
-# chart 流式扫描行数上限：超出直接 422，提示缩小时间窗
-MAX_CHART_SCAN_ROWS = 500_000
+# chart 数据以 NDJSON 按批传输；每批最多 2048 个原始记录。
+CHART_STREAM_BATCH_ROWS = 2048
 
-# chart 分桶上限（设计文档第 6 节 Charts Tab：≤4000 点渲染 <100ms）
-MAX_CHART_BUCKETS = 4000
-
-DEFAULT_CHART_BUCKETS = 600
+# 最多同时绘制 32 个 symbol；超限时显式报错，不静默截断。
+MAX_CHART_SYMBOLS = 32
 
 EXPORT_BATCH_SIZE = 5000
 
@@ -729,8 +729,9 @@ def _register_read_routes(app: FastAPI) -> None:
     def post_explain(name: str, body: RowsBody, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
         comps = normalize_where(body.where)
+        limit = max(1, min(int(body.limit), MAX_PAGE_LIMIT))
         plan = table.explain_select("*", where=build_case(comps),
-                                    order_by=body.order_by)
+                                    order_by=body.order_by, limit=limit)
         return {"plan": serialize_plan(plan)}
 
     @app.post("/api/table/{name}/count")
@@ -738,18 +739,20 @@ def _register_read_routes(app: FastAPI) -> None:
         table = get_table(request.app.state.db, name)
         comps = build_case(normalize_where(body.where))
         if comps is not None:
-            # 有筛选时 iosql 没有 SQL 级 count(where)，流式累计避免整表载入内存；
-            # 扫描行数超软预算时明确 422，请用户缩小筛选范围
-            total = 0
-            for batch in table.iter_select_batches(
-                "*", where=comps, to_dict=True, batch_size=EXPORT_BATCH_SIZE
-            ):
-                total += len(batch)
-                if total > MAX_COUNT_SCAN_ROWS:
-                    raise _bad_request(
-                        f"筛选统计扫描行数超过预算 {MAX_COUNT_SCAN_ROWS}",
-                        hint="请缩小筛选范围后重试；无筛选统计走 manifest 求和不受此限制",
+            try:
+                total = sum(
+                    len(batch)
+                    for batch in table.iter_select_batches(
+                        "*", where=comps, to_dict=True,
+                        batch_size=EXPORT_BATCH_SIZE,
+                        timeout_ms=MAX_COUNT_QUERY_MS,
                     )
+                )
+            except TimeoutError as exc:
+                raise _bad_request(
+                    f"筛选统计超过查询时间预算 {MAX_COUNT_QUERY_MS} ms",
+                    hint="请缩小筛选范围或添加分区/时间条件后重试；无筛选统计走 manifest 求和",
+                ) from exc
             return {"count": total}
         return {"count": fast_row_count(table)}
 
@@ -811,9 +814,9 @@ def _register_read_routes(app: FastAPI) -> None:
                   symbol: str = Query(""),
                   start: Optional[str] = Query(None),
                   end: Optional[str] = Query(None),
-                  buckets: int = Query(DEFAULT_CHART_BUCKETS),
-                  kind: str = Query("line")) -> dict:
-        return _chart_endpoint(name, request, col, symbol, start, end, buckets, kind)
+                  kind: str = Query("line")) -> StreamingResponse:
+        # 兼容旧客户端传入 buckets 参数，但 Charts 始终返回范围内全部原始行。
+        return _chart_endpoint(name, request, col, symbol, start, end, kind)
 
     @app.get("/api/table/{name}/export")
     def get_export(name: str, request: Request,
@@ -849,12 +852,12 @@ def _detect_ohlc(columns: list[str]) -> Optional[tuple[str, str, str, str]]:
 
 
 def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
-                    start: Optional[str], end: Optional[str],
-                    buckets: int, kind: str) -> dict:
+                    start: Optional[str], end: Optional[str], kind: str
+                    ) -> StreamingResponse:
     if kind not in ("line", "candle"):
         raise _bad_request(
             f"非法图型 `{kind}`",
-            hint="kind 仅支持 line（折线）或 candle（K线，需表含 OHLC 列）",
+            hint="kind 仅支持 line（折线）或 candle（OHLC 四线近似显示）",
         )
     db = request.app.state.db
     table = get_table(db, name)
@@ -866,21 +869,14 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
             hint=f"可用列: {', '.join(columns)}",
         )
 
-    ohlc: Optional[tuple[str, str, str, str]] = None
-    if kind == "candle":
-        ohlc = _detect_ohlc(columns)
-        if ohlc is None:
-            # 契约行为（GOAL 冻结）：缺 OHLC 而 kind=candle 必须 422，
-            # 不做静默降级——前端需要明确的错误提示来切换图型
-            raise _bad_request(
-                "该表缺少 OHLC 列，无法绘制 K 线",
-                hint="candle 需要 open/high/low/close（或 o/h/l/c）四列齐全；"
-                     "请改用 kind=line",
-            )
+    ohlc = _detect_ohlc(columns) if kind == "candle" else None
+    if kind == "candle" and ohlc is None:
+        raise _bad_request(
+            "该表缺少 OHLC 列，无法绘制 K 线",
+            hint="candle 需要 open/high/low/close（或 o/h/l/c）四列齐全；请改用 kind=line",
+        )
 
     x_col, _, _ = resolve_sort_col(table, spec, None)
-    # chart 的数值列（y 值）不允许文本；x 轴列允许数字或纯数字字符串
-    # （calendar 分区的 YYYYMMDD 日期字符串），其余文本在分桶前给出明确错误
     x_is_text = False
     if spec is not None and spec.columns:
         col_type = str(spec.columns.get(col, "")).lower()
@@ -892,11 +888,22 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
         x_type = str(spec.columns.get(x_col, "")).lower()
         x_is_text = any(t in x_type for t in ("text", "char", "blob"))
 
-    comps: list[dict[str, Any]] = []
-
     sym_col = (spec.symbol_column if spec is not None else None) or "symbol"
+    group_by_symbol = bool(spec and spec.symbol_column and sym_col in columns)
+    symbols: list[str] = []
+    comps: list[dict[str, Any]] = []
     if symbol:
-        symbols = [s.strip() for s in symbol.split(",") if s.strip()]
+        symbols = list(dict.fromkeys(s.strip() for s in symbol.split(",") if s.strip()))
+        if len(symbols) > MAX_CHART_SYMBOLS:
+            raise _bad_request(
+                f"symbol 数量超过上限 {MAX_CHART_SYMBOLS}",
+                hint=f"请一次绘制不超过 {MAX_CHART_SYMBOLS} 个 symbol",
+            )
+        if not group_by_symbol:
+            raise _bad_request(
+                "该表没有 symbol 契约，无法按 symbol 筛选或分线",
+                hint="清空 symbol 输入后按单序列绘图",
+            )
         if len(symbols) == 1:
             comps.append({"field": sym_col, "op": "==", "value": symbols[0]})
         elif symbols:
@@ -904,8 +911,6 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
 
     start_val = _parse_int_param(start, "start")
     end_val = _parse_int_param(end, "end")
-    # 文本列与整数在 SQLite 比较时恒为 TEXT > INTEGER，整数条件会静默失效，
-    # 因此文本 x 列的边界值必须以字符串下发
     if start_val is not None:
         comps.append({
             "field": x_col, "op": ">=",
@@ -917,202 +922,211 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
             "value": str(end_val) if x_is_text else end_val,
         })
 
-    n_buckets = max(1, min(int(buckets), MAX_CHART_BUCKETS))
-
-    if kind == "line":
-        # PLAN-070：line 路径走 SQL 分桶聚合下推，大表不再有扫描行数上限
-        return _chart_line_result(
-            table, x_col, col, symbol, n_buckets, comps,
-        )
-
-    # candle 保留流式实现（API 专用；前端 candle 经 4 次 line 请求受益下推）。
-    # 两遍流式扫描：第一遍只读 x 列求范围（内存 O(1)），第二遍分桶聚合。
-    # first_is_str 兜底无契约表（spec.columns 缺失时 x_is_text 未判定）的文本 x 轴
-    x_min: Optional[Any] = None
-    x_max: Optional[Any] = None
-    scanned = 0
-    first_is_str: Optional[bool] = None
-    for batch in table.iter_select_batches(
-        [x_col], where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
-    ):
-        for row in batch:
-            value = row.get(x_col)
-            if value is None:
-                continue
-            scanned += 1
-            if scanned > MAX_CHART_SCAN_ROWS:
-                raise _bad_request(
-                    f"扫描行数超过上限 {MAX_CHART_SCAN_ROWS}",
-                    hint="请缩小时间窗（start/end）或增大分区粒度后再绘图",
-                )
-            is_str = isinstance(value, str)
-            if first_is_str is None:
-                first_is_str = is_str
-            elif is_str != first_is_str:
-                raise _bad_request(
-                    f"x 轴列 `{x_col}` 含混合类型数据",
-                    hint="同一列内文本与数值混存无法分桶，请先清洗该列",
-                )
-            comparison_value = value
-            if is_str:
-                stripped = value.strip()
-                if not stripped.lstrip('-').isdigit() or stripped in ('', '-'):
-                    raise _bad_request(
-                        f"x 轴列 `{x_col}` 是非数字文本，无法分桶绘图",
-                        hint="请使用整数/浮点或纯数字日期文本",
-                    )
-                comparison_value = int(stripped)
-            if x_min is None or comparison_value < x_min:
-                x_min = comparison_value
-            if x_max is None or comparison_value > x_max:
-                x_max = comparison_value
-
-    if scanned == 0 or x_min is None or x_max is None:
-        return {"kind": kind, "x": [], "open": [], "high": [], "low": [],
-                "close": []}
-
-    # x 轴数值化：数字直接用；calendar 的 YYYYMMDD 等纯数字字符串转 int；
-    # 其他文本无法分桶，明确报错而非让减法运算 500。
-    # spec 缺失时以扫描期类型探测兜底（Oracle M4）
-    x_text_mode = x_is_text or bool(first_is_str)
-    if x_text_mode:
-        x_num_min: Any = int(x_min)
-        x_num_max: Any = int(x_max)
-    else:
-        x_num_min = x_min
-        x_num_max = x_max
-
-    def to_num(value: Any) -> Any:
-        if x_text_mode:
-            return int(str(value).strip())
-        return value
-
-    span = x_num_max - x_num_min
-    width = span // n_buckets + 1 if span >= 0 else 1
-
-    def bucket_index(xv: Any) -> int:
-        idx = int((to_num(xv) - x_num_min) // width)
-        return min(max(idx, 0), n_buckets - 1)
-
     if kind == "candle":
         assert ohlc is not None
-        o_col, h_col, l_col, c_col = ohlc
-        # 只投影 OHLC 五列：宽表（几十个因子列）下扫描成本从 24 列降到 5 列
-        opens: list[Any] = [None] * n_buckets
-        closes: list[Any] = [None] * n_buckets
-        open_x: list[Any] = [None] * n_buckets
-        close_x: list[Any] = [None] * n_buckets
-        has_data = [False] * n_buckets
-        high_map: dict[int, float] = {}
-        low_map: dict[int, float] = {}
-        try:
-            for batch in table.iter_select_batches(
-                [x_col, o_col, h_col, l_col, c_col],
-                where=comps or None, to_dict=True, batch_size=EXPORT_BATCH_SIZE
-            ):
-                for row in batch:
-                    xv = row.get(x_col)
-                    if xv is None:
-                        continue
-                    idx = bucket_index(xv)
-                    numeric_x = to_num(xv)
-                    if not has_data[idx]:
-                        has_data[idx] = True
-                    # 同一时间戳：open 保留首次扫描行，close 采用末次非空值。
-                    if open_x[idx] is None or numeric_x < open_x[idx]:
-                        open_x[idx] = numeric_x
-                        opens[idx] = row.get(o_col)
-                    cv = row.get(c_col)
-                    if cv is not None and (close_x[idx] is None or numeric_x >= close_x[idx]):
-                        close_x[idx] = numeric_x
-                        closes[idx] = cv
-                    hv = row.get(h_col)
-                    if hv is not None:
-                        high_map[idx] = max(high_map.get(idx, float(hv)), float(hv))
-                    lv = row.get(l_col)
-                    if lv is not None:
-                        low_map[idx] = min(low_map.get(idx, float(lv)), float(lv))
-        except (TypeError, ValueError) as exc:
+        if spec is not None and spec.columns:
+            for ohlc_col in ohlc:
+                col_type = str(spec.columns.get(ohlc_col, "")).lower()
+                if any(t in col_type for t in ("text", "char", "blob")):
+                    raise _bad_request(
+                        f"OHLC 列 `{ohlc_col}` 是文本类型，无法绘图",
+                        hint="candle 要求 open/high/low/close 列均为数值类型",
+                    )
+        return _chart_candle_stream(
+            table, x_col, ohlc, sym_col, group_by_symbol, comps,
+            time_col=spec.time.name if spec and spec.time else None,
+        )
+
+    # text x 只允许 YYYYMMDD 等纯数字日期字符串。探测仅在文本轴启用，
+    # 继续在响应开始前给 ISO 日期与混合类型返回标准 HTTP 422。
+    if x_is_text:
+        probe = table.aggregate_by_bucket(
+            x_col, [col], 1, where=comps or None,
+        )
+        if probe["x_mode"] == "mixed":
             raise _bad_request(
-                "OHLC 列含非数值数据，无法聚合",
-                hint="candle 要求 open/high/low/close 列均为数值类型；请检查数据质量",
-            ) from exc
-        mids = []
-        highs: list[float] = []
-        lows: list[float] = []
-        kept_opens: list[Any] = []
-        kept_closes: list[Any] = []
-        for i in range(n_buckets):
-            if not has_data[i]:
-                continue
-            mids.append(x_num_min + i * width + width // 2)
-            kept_opens.append(opens[i])
-            kept_closes.append(closes[i])
-            # high/low 缺失时以 close/open 兜底，保证输出恒为合法数值（JSON 不允许 NaN）
-            fallback_high = closes[i] if closes[i] is not None else opens[i]
-            fallback_low = opens[i] if opens[i] is not None else closes[i]
-            highs.append(high_map.get(i, float(fallback_high or 0.0)))
-            lows.append(low_map.get(i, float(fallback_low or 0.0)))
-        return {
-            "kind": "candle",
-            "x": mids,
-            "open": kept_opens,
-            "high": highs,
-            "low": lows,
-            "close": kept_closes,
-        }
-    raise _bad_request(
-        f"非法图型 `{kind}`",
-        hint="kind 仅支持 line（折线）或 candle（K线，需表含 OHLC 列）",
+                f"x 轴列 `{x_col}` 含混合类型数据",
+                hint="同一列内文本与数值混存无法绘图，请先清洗该列",
+            )
+        if probe["x_mode"] == "non_numeric":
+            raise _bad_request(
+                f"x 轴列 `{x_col}` 是非数字文本，无法绘图",
+                hint="支持整数/浮点与 YYYYMMDD 等纯数字日期字符串；ISO 日期请改用 duration 毫秒时间戳分区表",
+            )
+        if probe["value_bad_rows"].get(col):
+            raise _bad_request(
+                f"列 `{col}` 含非数值数据，无法绘图",
+                hint="chart 仅支持数值列；请换一列或检查数据质量",
+            )
+
+    return _chart_line_stream(
+        table, x_col, col, sym_col, group_by_symbol, comps,
+        time_col=spec.time.name if spec and spec.time else None,
     )
 
 
-def _chart_line_result(table: Any, x_col: str, col: str, symbol: str,
-                       n_buckets: int, comps: list[dict[str, Any]]) -> dict:
-    """line 路径：SQL 分桶聚合下推（PLAN-070）。
+def _chart_stream_response(events: Iterator[str]) -> StreamingResponse:
+    return StreamingResponse(
+        events,
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
-    聚合在引擎内以 GROUP BY 完成，任意表规模内存有界且不再有扫描行数
-    上限；x 列模式分类沿用旧流式路径语义，422 文案与 hint 逐字保留。
-    """
-    agg = table.aggregate_by_bucket(x_col, [col], n_buckets, where=comps or None)
-    mode = agg["x_mode"]
-    if mode == "mixed":
-        raise _bad_request(
-            f"x 轴列 `{x_col}` 含混合类型数据",
-            hint="同一列内文本与数值混存无法分桶，请先清洗该列",
-        )
-    if mode == "non_numeric":
-        raise _bad_request(
-            f"x 轴列 `{x_col}` 是非数字文本，无法分桶绘图",
-            hint="支持整数/浮点与 YYYYMMDD 等纯数字日期字符串；"
-                 "ISO 日期请改用 duration 毫秒时间戳分区表",
-        )
-    if agg["value_bad_rows"].get(col):
-        raise _bad_request(
-            f"列 `{col}` 含非数值数据，无法聚合",
-            hint="chart 仅支持数值列；请换一列或检查数据质量",
-        )
-    if mode == "empty":
-        return {"kind": "line", "x": [], "y": [], "col": col,
-                "symbol": symbol or None}
 
-    grid_min = agg["bucket_min"]
-    width = agg["bucket_width"]
-    sums = agg["sums"][col]
-    counts = agg["counts"][col]
-    mids: list[Any] = []
-    ys: list[float] = []
-    for i in range(n_buckets):
-        if counts[i]:
-            mids.append(grid_min + i * width + width // 2)
-            ys.append(sums[i] / counts[i])
-    return {
-        "kind": "line",
-        "x": mids,
-        "y": ys,
-        "col": col,
-        "symbol": symbol or None,
+def _chart_event(payload: dict[str, Any]) -> str:
+    return json.dumps(
+        to_jsonable(payload), ensure_ascii=False, allow_nan=False,
+        separators=(",", ":"),
+    ) + "\n"
+
+
+def _chart_stream_x(value: Any, x_col: str) -> int | float:
+    if isinstance(value, bool) or value is None:
+        raise _bad_request(
+            f"x 轴列 `{x_col}` 含空值或非数值数据",
+            hint="图表要求每条记录都有数值型 x；请先检查时间列",
+        )
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped.lstrip("-").isdigit() or stripped in ("", "-"):
+            raise _bad_request(
+                f"x 轴列 `{x_col}` 是非数字文本，无法绘图",
+                hint="支持整数/浮点与 YYYYMMDD 等纯数字日期字符串",
+            )
+        return int(stripped)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _bad_request(
+            f"x 轴列 `{x_col}` 含非数值数据",
+            hint="图表要求整数、浮点或纯数字日期字符串",
+        ) from exc
+    if not math.isfinite(numeric):
+        raise _bad_request(
+            f"x 轴列 `{x_col}` 含非有限数值",
+            hint="请检查时间列中的 NaN/Infinity 数据",
+        )
+    if isinstance(value, int):
+        return value
+    return numeric
+
+
+def _chart_stream_y(value: Any, col: str) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise _bad_request(
+            f"列 `{col}` 含非数值数据，无法绘图",
+            hint="chart 仅支持数值列；请检查数据质量",
+        )
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise _bad_request(
+            f"列 `{col}` 含非数值数据，无法绘图",
+            hint="chart 仅支持数值列；请检查数据质量",
+        ) from exc
+    return numeric if math.isfinite(numeric) else None
+
+
+def _chart_raw_stream(table: Any, x_col: str, value_cols: tuple[str, ...],
+                      symbol_col: str, group_by_symbol: bool,
+                      comps: list[dict[str, Any]],
+                      time_col: Optional[str], kind: str
+                      ) -> Iterator[str]:
+    fields = list(dict.fromkeys(
+        ([symbol_col] if group_by_symbol else []) + [x_col] + list(value_cols)
+    ))
+    header: dict[str, Any] = {
+        "type": "meta", "kind": kind, "x_col": x_col,
+        "time_col": time_col,
+        "value_cols": list(value_cols),
+        "group_by_symbol": group_by_symbol,
     }
+    yield _chart_event(header)
+
+    pending: dict[Optional[str], list[list[Any]]] = {}
+    counts: dict[Optional[str], int] = {}
+    last_x: dict[Optional[str], int | float] = {}
+    total_rows = 0
+    # 明确按 symbol 和 x 排序，避免不同物理文件/写入批次顺序影响折线走势。
+    order_by = [(symbol_col, "asc"), (x_col, "asc")] if group_by_symbol else [(x_col, "asc")]
+
+    try:
+        for batch in table.iter_select_batches(
+            fields, where=comps or None, order_by=order_by,
+            to_dict=True, batch_size=EXPORT_BATCH_SIZE,
+        ):
+            for row in batch:
+                raw_symbol = row.get(symbol_col) if group_by_symbol else None
+                label = None if raw_symbol is None else str(raw_symbol)
+                if label not in counts and len(counts) >= MAX_CHART_SYMBOLS:
+                    raise _bad_request(
+                        f"查询结果超过 {MAX_CHART_SYMBOLS} 个 symbol",
+                        hint=f"请指定不超过 {MAX_CHART_SYMBOLS} 个 symbol 后绘图",
+                    )
+                x_value = _chart_stream_x(row.get(x_col), x_col)
+                previous = last_x.get(label)
+                if previous is not None and x_value < previous:
+                    raise _bad_request(
+                        f"symbol `{label or ''}` 的 x 值不是递增顺序",
+                        hint="请检查时间列或排序契约；为避免误导，本次绘图已中止",
+                    )
+                last_x[label] = x_value
+                points = pending.setdefault(label, [])
+                point = [x_value]
+                point.extend(_chart_stream_y(row.get(col), col) for col in value_cols)
+                points.append(point)
+                counts[label] = counts.get(label, 0) + 1
+                total_rows += 1
+                if len(points) >= CHART_STREAM_BATCH_ROWS:
+                    yield _chart_event({
+                        "type": "data", "symbol": label, "points": points,
+                    })
+                    pending[label] = []
+
+        for label, points in pending.items():
+            if points:
+                yield _chart_event({
+                    "type": "data", "symbol": label, "points": points,
+                })
+        yield _chart_event({
+            "type": "done", "rows": total_rows,
+            "series": [
+                {"symbol": label, "rows": count}
+                for label, count in counts.items()
+            ],
+        })
+    except Exception as exc:
+        if isinstance(exc, AppError):
+            detail, hint = exc.detail, exc.hint
+        elif isinstance(exc, BadArgument):
+            detail, hint = str(exc), "请检查筛选条件、时间列和图表数据类型"
+        else:
+            logger.exception("chart raw stream failed")
+            detail, hint = "图表数据读取失败", "请检查服务端日志和表数据后重试"
+        yield _chart_event({"type": "error", "detail": detail, "hint": hint})
+
+
+def _chart_line_stream(table: Any, x_col: str, col: str, symbol_col: str,
+                       group_by_symbol: bool, comps: list[dict[str, Any]],
+                       time_col: Optional[str]
+                       ) -> StreamingResponse:
+    return _chart_stream_response(_chart_raw_stream(
+        table, x_col, (col,), symbol_col, group_by_symbol, comps,
+        time_col, "line",
+    ))
+
+
+def _chart_candle_stream(table: Any, x_col: str,
+                         ohlc: tuple[str, str, str, str], symbol_col: str,
+                         group_by_symbol: bool, comps: list[dict[str, Any]],
+                         time_col: Optional[str]
+                         ) -> StreamingResponse:
+    return _chart_stream_response(_chart_raw_stream(
+        table, x_col, ohlc, symbol_col, group_by_symbol, comps,
+        time_col, "candle",
+    ))
 
 
 # ---------------------------------------------------------------- export 实现
@@ -1215,7 +1229,9 @@ def _export_stream(batch_iter: Iterator[list[dict[str, Any]]],
                 writer.writerow([_csv_safe(row.get(c)) for c in csv_columns])
         else:
             for row in batch:
-                buffer.write(json.dumps(row, ensure_ascii=False, default=str))
+                buffer.write(json.dumps(
+                    to_jsonable(row), ensure_ascii=False, allow_nan=False,
+                ))
                 buffer.write("\n")
         yield buffer.getvalue()
     # 空结果集也必须输出表头（零批次时此前无表头，导出文件不可直接用）

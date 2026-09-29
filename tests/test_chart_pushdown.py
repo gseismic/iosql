@@ -1,11 +1,12 @@
-"""PLAN-070 chart 大表分桶聚合下推测试。
+"""Charts 原始点流与引擎分桶原语测试。
 
 覆盖：
 - sqlite 引擎 aggregate_by_bucket 的正确性（与 Python 逐步计算对拍）；
-- web /chart line 路径接下推后的契约、错误语义与"大表不再受扫描行数
-  上限"回归（PLAN-069 报告的 chart 绘制曲线失败根因）。
+- web /chart line 与 candle 路径逐行输出、不跨 symbol 聚合、窗口过滤和 null gap。
 """
+import json
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -44,6 +45,19 @@ def make_tick_rows(symbols=("AAPL", "MSFT"), days=3, per_day=12):
                     "volume": 1000 + i,
                 })
     return rows
+
+
+def chart_events(response):
+    return [json.loads(line) for line in response.text.splitlines() if line.strip()]
+
+
+def chart_series(response):
+    events = chart_events(response)
+    result = {}
+    for event in events:
+        if event.get("type") == "data":
+            result.setdefault(event.get("symbol"), []).extend(event["points"])
+    return events, result
 
 
 def expected_buckets(rows, x_col, y_col, n_buckets, predicate=None):
@@ -153,6 +167,26 @@ class TestSqliteAggregateByBucket:
             ticks_db.aggregate_by_bucket("ts", ["nope"], 3)
         with pytest.raises(BadArgument):
             ticks_db.aggregate_by_bucket("ts", ["price"], 0)
+
+    def test_ordered_stream_can_close_on_another_thread(self, ticks_db):
+        """ASGI 客户端取消流时，迭代器清理由不同工作线程执行。"""
+        stream = ticks_db.iter_select_batches(
+            ["symbol", "ts", "price"],
+            order_by=[("symbol", "asc"), ("ts", "asc")],
+            batch_size=1,
+        )
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first_batch = executor.submit(next, stream).result()
+
+        assert len(first_batch) == 1
+        # 有序归并已打开 SQLite 只读连接；跨线程 close 必须完成且释放资源。
+        stream.close()
+        remaining = list(ticks_db.iter_select_batches(
+            ["symbol", "ts"],
+            order_by=[("symbol", "asc"), ("ts", "asc")],
+            batch_size=50,
+        ))
+        assert sum(map(len, remaining)) == len(make_tick_rows())
 
     def test_empty_table(self, tmp_path):
         db = Database(f"sqlite://{tmp_path}/empty.iosql")
@@ -271,6 +305,16 @@ def chart_db_dir(tmp_path_factory) -> Path:
          "open": 1.0 + i, "high": 2.0 + i, "low": 0.5 + i, "close": 1.5 + i}
         for i in range(10)
     ])
+    gaps = db.timeseries(
+        "gaps", time="ts", pk=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "value": "float"},
+        partition_every="1day",
+    )
+    gaps.write([
+        {"symbol": "AAPL", "ts": BASE_TS + i * 60_000,
+         "value": None if i == 1 else float(i)}
+        for i in range(3)
+    ])
     # ISO 文本 x + 数值 y：非数字文本 422 回归
     iso = db.table(
         "iso", pk=["d", "k"],
@@ -294,45 +338,44 @@ def _client(db_dir: Path) -> TestClient:
 
 class TestChartEndpointPushdown:
     def test_line_contract_no_filter(self, chart_db_dir):
-        """无任何筛选全范围绘图 200：PLAN-069 报告的失败场景基线。"""
+        """全范围返回原始行，空 symbol 按标的分线。"""
         with _client(chart_db_dir) as client:
             resp = client.get(
                 "/api/table/ticks/chart", params={"col": "price", "buckets": 5},
             )
         assert resp.status_code == 200
-        payload = resp.json()
-        assert payload["kind"] == "line"
-        assert {"x", "y", "col", "symbol"} <= set(payload)
-        assert len(payload["x"]) == len(payload["y"]) > 0
+        events, groups = chart_series(resp)
+        assert events[0]["kind"] == "line"
+        assert events[-1]["type"] == "done"
+        assert events[-1]["rows"] == len(make_tick_rows())
+        assert set(groups) == {"AAPL", "MSFT"}
+        assert len(groups["AAPL"]) == len(groups["MSFT"]) == 36
 
-    def test_line_ignores_scan_cap(self, chart_db_dir, monkeypatch):
-        """line 路径不受扫描行数上限约束（上限仅保留给 candle 流式路径）。"""
-        monkeypatch.setattr(web_app, "MAX_CHART_SCAN_ROWS", 10)
+    def test_buckets_parameter_does_not_drop_rows(self, chart_db_dir):
+        """兼容旧 buckets 参数，但其值不会影响原始点数量。"""
         with _client(chart_db_dir) as client:
             resp = client.get(
                 "/api/table/ticks/chart", params={"col": "price", "buckets": 3},
             )
         assert resp.status_code == 200
-        assert len(resp.json()["x"]) > 0
+        events, groups = chart_series(resp)
+        assert events[-1]["rows"] == len(make_tick_rows())
+        assert sum(map(len, groups.values())) == len(make_tick_rows())
 
     def test_line_values_match_python(self, chart_db_dir):
         rows = make_tick_rows()
-        n = 5
-        _, width, sums, counts = expected_buckets(rows, "ts", "price", n)
-        x_min = min(r["ts"] for r in rows)
         with _client(chart_db_dir) as client:
             resp = client.get(
-                "/api/table/ticks/chart",
-                params={"col": "price", "buckets": n},
+                "/api/table/ticks/chart", params={"col": "price"},
             )
-        payload = resp.json()
-        expect_mids = [
-            x_min + i * width + width // 2
-            for i in range(n) if counts[i]
-        ]
-        expect_ys = [sums[i] / counts[i] for i in range(n) if counts[i]]
-        assert payload["x"] == expect_mids
-        assert payload["y"] == pytest.approx(expect_ys)
+        _, groups = chart_series(resp)
+        for symbol in ("AAPL", "MSFT"):
+            expected = [
+                [row["ts"], row["price"]]
+                for row in sorted(rows, key=lambda item: item["ts"])
+                if row["symbol"] == symbol
+            ]
+            assert groups[symbol] == expected
 
     def test_line_symbol_filter(self, chart_db_dir):
         with _client(chart_db_dir) as client:
@@ -341,19 +384,37 @@ class TestChartEndpointPushdown:
                 params={"col": "price", "symbol": "AAPL", "buckets": 4},
             )
         assert resp.status_code == 200
-        assert resp.json()["symbol"] == "AAPL"
-        assert len(resp.json()["x"]) > 0
+        events, groups = chart_series(resp)
+        assert set(groups) == {"AAPL"}
+        assert events[-1]["rows"] == len(groups["AAPL"]) == 36
 
-    def test_candle_still_works(self, chart_db_dir):
+    def test_candle_preserves_each_ohlc_row(self, chart_db_dir):
         with _client(chart_db_dir) as client:
             resp = client.get(
                 "/api/table/bars/chart",
                 params={"col": "close", "kind": "candle", "buckets": 3},
             )
         assert resp.status_code == 200
-        payload = resp.json()
-        assert {"x", "open", "high", "low", "close"} <= set(payload)
-        assert payload["x"]
+        events, groups = chart_series(resp)
+        assert events[0]["kind"] == "candle"
+        assert events[-1]["rows"] == 10
+        assert groups["AAPL"] == [
+            [BASE_TS + i * 60_000, 1.0 + i, 2.0 + i, 0.5 + i, 1.5 + i]
+            for i in range(10)
+        ]
+
+    def test_null_y_is_kept_as_a_gap(self, chart_db_dir):
+        with _client(chart_db_dir) as client:
+            resp = client.get(
+                "/api/table/gaps/chart", params={"col": "value", "symbol": "AAPL"},
+            )
+        assert resp.status_code == 200
+        _, groups = chart_series(resp)
+        assert groups["AAPL"] == [
+            [BASE_TS, 0.0],
+            [BASE_TS + 60_000, None],
+            [BASE_TS + 120_000, 2.0],
+        ]
 
     def test_iso_text_x_rejected_with_hint(self, chart_db_dir):
         with _client(chart_db_dir) as client:
@@ -385,11 +446,12 @@ class TestChartEndpointPushdown:
                 },
             )
         assert resp.status_code == 200
-        payload = resp.json()
-        assert payload["kind"] == "line"
-        assert payload["col"] == "price"
-        assert payload["symbol"] == "AAPL"
-        assert len(payload["x"]) == len(payload["y"]) > 0
+        events, groups = chart_series(resp)
+        assert events[0]["kind"] == "line"
+        assert events[-1]["rows"] == 13
+        assert len(groups["AAPL"]) == 13
+        assert groups["AAPL"][0][0] == BASE_TS
+        assert groups["AAPL"][-1][0] == BASE_TS + DAY_MS
 
 
 class TestFrontendViewportLoading:
@@ -430,3 +492,12 @@ class TestFrontendViewportLoading:
         text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
         assert "resetViewState" in text        # 重绘时作废在途请求
         assert "可视区加载中" in text           # 加载态提示
+
+    def test_raw_stream_has_no_sampling_control_and_preserves_nulls(self):
+        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
+        assert "readChartStream" in text
+        assert "无抽样" in text
+        assert "bucketsIn" not in text
+        assert "value == null ? NaN" in text   # null 不能被 Number(null) 转成 0
+        assert "maxMultiplicity" in text      # 重复 x 也不能在多序列对齐时被去重
+        assert "expectedBySymbol" in text      # 流内逐 symbol 点数与服务端终值对账

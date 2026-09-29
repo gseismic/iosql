@@ -769,11 +769,13 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 
 iosql 自带一个本地 Web 管理台（只读浏览 + 受控维护），无需写代码即可查看表契约、分区布局、物理 segment 和数据样本。
 
-安装 UI 可选依赖：
+安装 Web 可选依赖：
 
 ```bash
-python -m pip install -e ".[ui]"
+python -m pip install -e ".[web]"
 ```
+
+`.[ui]` 仍是兼容安装别名。
 
 启动（默认**只读模式**）：
 
@@ -795,13 +797,12 @@ iosql web -s database/market.iosql --write
 | 工作区 | 只读模式 | 可修改模式 | 说明 |
 | --- | :-: | :-: | --- |
 | Overview | ✅ | ✅ | 全库概览：表清单、行数、分区数、segment 数、partition 策略 |
-| Browse Data | ✅ | ✅ | 条件构造器筛选、keyset 翻页、排序、单元格详情、CSV/JSONL 导出 |
+| Data | ✅ | ✅ | Browse 与 Query 合并后的工作区：条件构造器筛选、keyset 翻页、排序、Explain 裁剪可视化、时序查询、单元格详情、CSV/JSONL 导出 |
 | Structure | ✅ | ✅ | 表契约 / 逻辑分区 / 物理 segment 三层透视 |
-| Query | ✅ | ✅ | where 查询 + explain 裁剪可视化；时序表支持 start/end/date/session/latest 截面 |
-| Charts | ✅ | ✅ | 时序快览折线图（服务端降采样） |
+| Charts | ✅ | ✅ | 时序折线逐行流式绘制，不抽样；空 symbol 时每个标的分别成线，最多 32 个 symbol |
 | Maintain | ❌ | ✅ | layout_report → compact → validate → cleanup_obsolete 步骤流；重分区 |
 
-安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝），并只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认（重分区无 dry-run 预览，确认后直接写入新库）。Browse 的 keyset 分页在排序列含 NULL 时返回 422 并禁用该列排序，避免静默漏行。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
+安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝），并只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认（重分区无 dry-run 预览，确认后直接写入新库）。Data 的 keyset 分页在排序列含 NULL 时返回 422 并禁用该列排序，避免静默漏行。过滤计数的流式查询预算为 5000ms，超时返回 422；无筛选计数仍走 manifest 求和。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
 
 ## 存储结构
 

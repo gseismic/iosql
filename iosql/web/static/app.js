@@ -384,16 +384,19 @@ function renderFontScale() {
       return;
     }
     content.append(h('div', { class: 'boot-screen' }, h('span', { class: 'spinner' }), '加载表契约…'));
-    IU.api('/api/table/' + encodeURIComponent(state.table) + '/spec').then(function (specResp) {
-      state.specCache[state.table] = (specResp && specResp.spec) || {};
-      if (parseHash().table === state.table) { // 防止用户已切走
+    var requestedTable = state.table;
+    IU.api('/api/table/' + encodeURIComponent(requestedTable) + '/spec').then(function (specResp) {
+      var requestedSpec = (specResp && specResp.spec) || {};
+      state.specCache[requestedTable] = requestedSpec;
+      if (state.table === requestedTable && parseHash().table === requestedTable) {
         IU.clear(content);
-        safeRender(IU.tabs[state.tab], content, ctxOf(state.specCache[state.table]));
+        safeRender(IU.tabs[state.tab], content, ctxOf(requestedSpec));
       }
     }).catch(function () {
+      if (state.table !== requestedTable || parseHash().table !== requestedTable) return;
       IU.clear(content);
       content.append(h('div', { class: 'empty-state' },
-        '表契约加载失败：', h('span', { class: 'mono' }, state.table),
+        '表契约加载失败：', h('span', { class: 'mono' }, requestedTable),
         h('div', { style: { marginTop: '10px' } },
           h('button', { class: 'btn', onclick: renderContent }, '重试'))));
     });

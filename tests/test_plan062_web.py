@@ -418,10 +418,10 @@ class TestHostHeader:
 
 
 class TestCountBudget:
-    """P2：/count 过滤统计扫描超预算 422；无筛选走 manifest 不受限。"""
+    """P2：/count 过滤统计超查询时间预算 422；无筛选走 manifest 不受限。"""
 
     def test_filtered_count_budget(self, demo_uri, monkeypatch):
-        monkeypatch.setattr(web_app, "MAX_COUNT_SCAN_ROWS", 2)
+        monkeypatch.setattr(web_app, "MAX_COUNT_QUERY_MS", 1)
         with _client(demo_uri) as client:
             resp = client.post("/api/table/prices/count", json={
                 "where": [{"field": "id", "op": ">=", "value": 0}],
@@ -430,7 +430,7 @@ class TestCountBudget:
         assert "缩小" in resp.json()["hint"]
 
     def test_unfiltered_count_unaffected(self, demo_uri, monkeypatch):
-        monkeypatch.setattr(web_app, "MAX_COUNT_SCAN_ROWS", 0)
+        monkeypatch.setattr(web_app, "MAX_COUNT_QUERY_MS", 1)
         with _client(demo_uri) as client:
             resp = client.post("/api/table/prices/count", json={})
         assert resp.status_code == 200

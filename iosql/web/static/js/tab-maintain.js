@@ -217,6 +217,8 @@
   function stepCleanup(base, ctx) {
     var box = resultBoxEl();
     var preview = null; // dry-run 结果缓存
+    var previewPartition = null;
+    var previewScopeNote = null;
     var partitionIn = h('input', { class: 'input mono', placeholder: 'partition 键（可选）', autocomplete: 'off' });
 
     var confirmInput = h('input', {
@@ -225,25 +227,49 @@
     });
     var deleteBtn = h('button', { class: 'btn danger', disabled: true, onclick: doDelete }, '确认删除');
     confirmInput.addEventListener('input', function () {
-      deleteBtn.disabled = confirmInput.value.trim() !== ctx.table;
+      updateDeleteAvailability();
     });
+    partitionIn.addEventListener('input', updateDeleteAvailability);
 
     var previewBtn = h('button', {
       class: 'btn primary',
       onclick: function () {
+        var requestedPartition = currentPartition();
         busy(previewBtn, true);
-        IU.api(base + '/cleanup_obsolete', { method: 'POST', body: cleanupBody(true) }).then(function (resp) {
+        IU.api(base + '/cleanup_obsolete', {
+          method: 'POST', body: cleanupBody(true, requestedPartition)
+        }).then(function (resp) {
           busy(previewBtn, false);
           preview = IU.unwrap(resp, 'result') || {};
+          previewPartition = requestedPartition;
           renderPreview(preview);
+          updateDeleteAvailability();
         }).catch(function () { busy(previewBtn, false); });
       }
     }, '① 预览可回收空间');
 
-    function cleanupBody(dryRun) {
+    function currentPartition() {
+      var value = partitionIn.value.trim();
+      return value === '' ? null : value;
+    }
+
+    function cleanupBody(dryRun, partition) {
       var body = { dry_run: dryRun };
-      if (partitionIn.value.trim() !== '') body.partition = partitionIn.value.trim();
+      if (partition !== null) body.partition = partition;
       return body;
+    }
+
+    function updateDeleteAvailability() {
+      var scopeChanged = currentPartition() !== previewPartition;
+      deleteBtn.disabled = !preview ||
+        confirmInput.value.trim() !== ctx.table || scopeChanged;
+      if (previewScopeNote) {
+        IU.clear(previewScopeNote);
+        previewScopeNote.append(
+          '预览分区：', previewPartition === null ? '全部分区' : previewPartition,
+          scopeChanged ? '（输入已变化，请重新预览）' : ''
+        );
+      }
     }
 
     function renderPreview(resp) {
@@ -251,8 +277,12 @@
       var bytes = IU.pick(resp || {}, 'bytes_reclaimable', 'bytes');
       var files = IU.pick(resp || {}, 'files', 'candidates') ;
       var fileCount = Array.isArray(files) ? files.length : (typeof files === 'number' ? files : undefined);
+      previewScopeNote = h('div', {
+        class: 'faint', style: { marginBottom: '8px', fontSize: '12px' }
+      });
 
       box.append(
+        previewScopeNote,
         pills([
           { k: 'bytes_reclaimable', v: bytes === undefined ? undefined : IU.fmt.bytes(bytes) },
           { k: 'files', v: fileCount }
@@ -269,6 +299,11 @@
 
     function doDelete() {
       if (!preview) return;
+      if (currentPartition() !== previewPartition) {
+        updateDeleteAvailability();
+        IU.toast('分区范围已变化，请重新预览后再删除', 'warn');
+        return;
+      }
       IU.confirmModal({
         title: '物理删除 obsolete segment？',
         message: '此操作将永久删除预览列出的旧文件，不可撤销。',
@@ -277,10 +312,18 @@
         typeName: ctx.table
       }).then(function (ok) {
         if (!ok) return;
+        if (currentPartition() !== previewPartition) {
+          updateDeleteAvailability();
+          IU.toast('分区范围已变化，请重新预览后再删除', 'warn');
+          return;
+        }
         busy(deleteBtn, true);
-        IU.api(base + '/cleanup_obsolete', { method: 'POST', body: cleanupBody(false) }).then(function (resp) {
+        IU.api(base + '/cleanup_obsolete', {
+          method: 'POST', body: cleanupBody(false, previewPartition)
+        }).then(function (resp) {
           busy(deleteBtn, false);
           preview = null;
+          previewPartition = null;
           IU.clear(box);
           var r = IU.unwrap(resp, 'result') || {};
           box.append(pills([

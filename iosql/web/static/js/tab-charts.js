@@ -1,10 +1,10 @@
 /* =====================================================================
  * iosql Web · tab-charts.js
- * Charts：kind(line|candle) + 数值列 + symbol/start/end/buckets/对数轴
- * → GET /chart → uPlot 渲染。
+ * Charts：kind(line|candle) + 数值列 + symbol/start/end/对数轴
+ * → /chart NDJSON 全量原始点 → uPlot 渲染。
  * candle 为 v1 近似方案：OHLC 四线叠加（uPlot 无内置蜡烛图），图下标注。
  * PLAN-071 可视区按需加载：拖拽缩放/双击复位 → setScale hook → 防抖后
- * 仅按可视区 start/end 重查（buckets 不变，放大即局部高分辨率），
+ * 仅按可视区 start/end 重查（可视区内不抽样），
  * setData 原地更新不重建实例；双击复位判定为全范围重查。
  * ===================================================================== */
 (function () {
@@ -36,6 +36,10 @@
     return ty.indexOf('int') >= 0 && TS_NAME_RE.test(c);
   }
 
+  function symbolColor(index) {
+    return 'hsl(' + Math.round((index * 137.508) % 360) + ', 72%, 62%)';
+  }
+
   function ensureState(ctx) {
     if (st && st.table === ctx.table) return st;
     var spec = ctx.spec || {};
@@ -51,7 +55,7 @@
         : (OHLC_SHORT.filter(function (c) { return colTypes[c]; }).length === 4 ? OHLC_SHORT : null),
       kind: 'line',
       col: numericCols[0] || '',   // 默认第一个非时间数值列（D7 修正）
-      symbol: '', start: '', end: '', buckets: '2000', log: false
+      symbol: '', start: '', end: '', log: false
     };
     return st;
   }
@@ -88,7 +92,9 @@
       /* --- 配置行 --- */
       var kindSel = h('select', { class: 'input' },
         h('option', { value: 'line', selected: s.kind === 'line' }, 'line 折线'),
-        h('option', { value: 'candle', selected: s.kind === 'candle' }, 'candle K线(近似)'));
+        h('option', {
+          value: 'candle', disabled: !s.ohlcCols, selected: s.kind === 'candle'
+        }, s.ohlcCols ? 'OHLC 四线（无蜡烛实体）' : 'OHLC 四线（该表无 OHLC）'));
       kindSel.addEventListener('change', function (e) { s.kind = e.target.value; });
 
       var colSel = h('select', { class: 'input' }, s.numericCols.map(function (c) {
@@ -96,7 +102,10 @@
       }));
       colSel.addEventListener('change', function (e) { s.col = e.target.value; });
 
-      var symbolIn = h('input', { class: 'input mono', placeholder: 'symbol（可选）', value: s.symbol, autocomplete: 'off' });
+      var symbolIn = h('input', {
+        class: 'input mono', placeholder: '留空=全部标的分别成线；多个用逗号分隔',
+        value: s.symbol, autocomplete: 'off'
+      });
       symbolIn.addEventListener('input', function (e) { s.symbol = e.target.value; });
 
       var startIn = h('input', {
@@ -111,9 +120,6 @@
       });
       endIn.addEventListener('input', function (e) { s.end = e.target.value; });
 
-      var bucketsIn = h('input', { class: 'input mono', type: 'text', value: s.buckets, style: { width: '90px' } });
-      bucketsIn.addEventListener('input', function (e) { s.buckets = e.target.value; });
-
       var logChk = h('input', { type: 'checkbox', id: 'chart-log' });
       logChk.checked = s.log;
       logChk.addEventListener('change', function () { s.log = logChk.checked; });
@@ -126,7 +132,6 @@
           cfgField('symbol', symbolIn),
           cfgField('start', startIn),
           cfgField('end', endIn),
-          cfgField('buckets', bucketsIn),
           h('label', { for: 'chart-log', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '13px', color: 'var(--tx1)', paddingBottom: '6px' } },
             logChk, '对数轴'),
           h('button', { class: 'btn primary', onclick: draw }, '绘制'))));
@@ -148,11 +153,9 @@
       var viewSeq = 0;
       var suppressScale = false;
       var viewNote = h('div', { class: 'chart-note' });
-
-      function bucketCount() {
-        var b = parseInt(s.buckets, 10);
-        return Number.isFinite(b) && b > 0 ? b : 2000;
-      }
+      var requestControllers = [];
+      var loadingStatus = null;
+      var drawVersion = 0;
 
       function validWindow(w) {
         return !!(w && Number.isFinite(w.min) && Number.isFinite(w.max));
@@ -161,10 +164,8 @@
       function closeWindow(a, b) {
         if (!validWindow(a) || !validWindow(b)) return false;
         var span = Math.max(Math.abs(a.max - a.min), Math.abs(b.max - b.min), 1e-9);
-        // 容差取约 2.5 个桶宽：setData(resetScales) 后 uPlot 重定刻度会使
-        // 数据范围相对请求窗口内缩约一个桶宽，容差小于桶宽会形成
-        // "重查→内缩→再重查"的回环；小于 0.1% 视口的缩放无意义
-        var tol = span * 2.5 / bucketCount();
+        // 忽略不到 0.1% 视口的变化；原始点没有桶宽，不按采样密度放宽容差。
+        var tol = span * 0.001;
         return Math.abs(a.min - b.min) <= tol &&
                Math.abs(a.max - b.max) <= tol;
       }
@@ -179,39 +180,99 @@
         viewNote.append(h('span', { class: 'spinner' }), ' 可视区加载中…');
       }
 
-      function noteRange(startMs, endMs, count, isFull) {
+      function noteRange(startMs, endMs, count, seriesList, isFull) {
         var fmt = viewXTime ? function (v) { return IU.fmt.ts(v); } : String;
+        var seen = new Set();
+        var seriesCounts = [];
+        (seriesList || []).forEach(function (sl) {
+          var symbol = sl.label.indexOf(' · ') >= 0 ? sl.label.split(' · ')[0] : sl.label;
+          if (seen.has(symbol)) return;
+          seen.add(symbol);
+          seriesCounts.push(symbol + ' ' + Number(sl.xs.length).toLocaleString('zh-CN'));
+        });
         noteText((isFull ? '全范围' : '可视区 ') + fmt(startMs) + ' ~ ' +
-          fmt(endMs) + ' · ' + count + ' 点' +
+          fmt(endMs) + ' · ' + Number(count || 0).toLocaleString('zh-CN') +
+          ' 条原始记录 · ' + (seriesList || []).length + ' 条序列（无抽样）' +
+          (seriesCounts.length ? ' · 各线 ' + seriesCounts.join('，') : '') +
           (isFull ? '（拖拽缩放 · 双击复位）' : ''));
       }
 
       function resetViewState() {
         if (viewTimer) { clearTimeout(viewTimer); viewTimer = null; }
+        requestControllers.forEach(function (controller) { controller.abort(); });
+        requestControllers = [];
         viewSeq += 1;           // 使在途视口请求全部过期
         viewApplied = null;
         fullScale = null;
         active = null;
       }
 
-      /* 由序列点集构建 uPlot data：第一序列 x 为主轴，其余按 x 对齐；
-       * 对数轴下非正值断开为 null。初始渲染与视口重查共用（PLAN-071）。 */
-      function buildUData(list) {
-        var f = list[0];
-        var raw = f.pts.map(function (p) { return Number(p.x); });
-        var sx = viewXTime ? raw.map(function (v) { return v / 1000; }) : raw;
-        return [sx].concat(list.map(function (sl) {
-          var byX = new Map();
-          sl.pts.forEach(function (p) { byX.set(Number(p.x), p.y); });
-          return sx.map(function (x) {
-            var v = byX.get(viewXTime ? x * 1000 : x);
-            if (v === undefined) return null;
-            var n = Number(v);
-            if (!Number.isFinite(n)) return null;
-            if (s.log && n <= 0) return null;
-            return n;
+      /* 合并各 symbol 的 x 序列；union 保留每条序列的所有时间点，其他序列缺值填 null。 */
+      function mergeXs(list) {
+        var first = list.find(function (sl) { return sl.xs.length > 0; }) || list[0];
+        if (!first) return [];
+        var same = list.every(function (sl) {
+          if (sl.xs.length !== first.xs.length) return false;
+          for (var i = 0; i < first.xs.length; i++) {
+            if (Number(sl.xs[i]) !== Number(first.xs[i])) return false;
+          }
+          return true;
+        });
+        if (same) return first.xs.map(Number);
+
+        var at = list.map(function () { return 0; });
+        var union = [];
+        while (true) {
+          var next = Infinity;
+          for (var j = 0; j < list.length; j++) {
+            while (at[j] < list[j].xs.length && !Number.isFinite(Number(list[j].xs[at[j]]))) at[j]++;
+            if (at[j] < list[j].xs.length) next = Math.min(next, Number(list[j].xs[at[j]]));
+          }
+          if (next === Infinity) break;
+          var maxMultiplicity = 0;
+          for (var m = 0; m < list.length; m++) {
+            var countAtX = 0;
+            while (at[m] + countAtX < list[m].xs.length &&
+                   Number(list[m].xs[at[m] + countAtX]) === next) countAtX++;
+            maxMultiplicity = Math.max(maxMultiplicity, countAtX);
+          }
+          for (var repeat = 0; repeat < maxMultiplicity; repeat++) union.push(next);
+          for (var k = 0; k < list.length; k++) {
+            while (at[k] < list[k].xs.length && Number(list[k].xs[at[k]]) === next) at[k]++;
+          }
+        }
+        return union;
+      }
+
+      function alignY(xs, sl) {
+        if (xs.length === sl.xs.length && xs.every(function (x, i) { return x === Number(sl.xs[i]); })) {
+          if (!s.log) return sl.ys;
+          return sl.ys.map(function (v) {
+            var n = v == null ? NaN : Number(v);
+            return Number.isFinite(n) && n > 0 ? n : null;
           });
-        }));
+        }
+        var out = new Array(xs.length).fill(null);
+        var i = 0;
+        var j = 0;
+        while (i < xs.length && j < sl.xs.length) {
+          var x = Number(sl.xs[j]);
+          if (x < xs[i]) { j++; continue; }
+          if (x > xs[i]) { i++; continue; }
+          var value = sl.ys[j];
+          var n = value == null ? NaN : Number(value);
+          out[i] = Number.isFinite(n) && (!s.log || n > 0) ? n : null;
+          i++;
+          j++;
+        }
+        return out;
+      }
+
+      /* 原始平行数组直接进入 uPlot；避免每个点分配对象，null 指标值保持断线。 */
+      function buildUData(list) {
+        var raw = mergeXs(list);
+        var sx = viewXTime ? raw.map(function (v) { return v / 1000; }) : raw;
+        return [sx].concat(list.map(function (sl) { return alignY(raw, sl); }));
       }
 
       function scheduleViewFetch(min, max) {
@@ -232,15 +293,17 @@
         var winMs = isFullReset ? null : [startMs, endMs];
         var seq = ++viewSeq;
         var base = '/api/table/' + encodeURIComponent(ctx.table) + '/chart';
+        requestControllers.forEach(function (controller) { controller.abort(); });
+        requestControllers = [];
         noteLoading();
         Promise.all(active.map(function (sr) {
-          return fetchSeries(base, sr.col, winMs);
+          return fetchSeries(base, sr, winMs);
         })).then(function (lists) {
           if (seq !== viewSeq || !chart || !chartBox.isConnected) return;
-          var seriesList = active.map(function (sr, i) {
-            return { label: sr.label, color: sr.color, pts: lists[i] };
-          });
-          if (!seriesList[0].pts.length) { noteText('可视区无数据'); return; }
+          var seriesList = [].concat.apply([], lists);
+          seriesList.rowCount = lists.reduce(function (sum, list) { return sum + (list.rowCount || 0); }, 0);
+          var firstWithPoints = seriesList.find(function (sr) { return sr.xs.length > 0; });
+          if (!firstWithPoints) { noteText('可视区无数据 · 无抽样'); return; }
           suppressScale = true;
           try {
             chart.setData(buildUData(seriesList), true);
@@ -250,7 +313,7 @@
           } finally {
             suppressScale = false;
           }
-          noteRange(startMs, endMs, seriesList[0].pts.length, isFullReset);
+          noteRange(startMs, endMs, seriesList.rowCount, seriesList, isFullReset);
         }).catch(function (err) {
           if (seq !== viewSeq) return;
           noteText('可视区加载失败：' +
@@ -274,20 +337,27 @@
 
       /* --- 拉取并渲染 --- */
       function draw() {
+        drawVersion += 1;
+        var thisDraw = drawVersion;
         destroyChart();
         IU.clear(chartBox);
         resetViewState();
-        chartBox.append(h('div', { class: 'chart-empty' }, h('span', { class: 'spinner' }), ' 拉取数据…'));
+        loadingStatus = h('div', { class: 'chart-empty' }, h('span', { class: 'spinner' }), ' 流式读取全部数据…');
+        chartBox.append(loadingStatus);
 
         var base = '/api/table/' + encodeURIComponent(ctx.table) + '/chart';
 
         if (s.kind === 'candle') {
-          drawCandle(base);
+          drawCandle(base, thisDraw);
         } else {
           active = [{ label: s.col, color: '#45c6ff', col: s.col }];
-          fetchSeries(base, s.col, null).then(function (pts) {
-            renderLine([{ label: s.col, color: '#45c6ff', pts: pts }], false);
+          fetchSeries(base, active[0], null, function (count) {
+            if (loadingStatus && loadingStatus.isConnected) loadingStatus.textContent = '流式读取全部数据… ' + Number(count).toLocaleString('zh-CN') + ' 条';
+          }).then(function (seriesList) {
+            if (thisDraw !== drawVersion) return;
+            renderLine(seriesList, false);
           }).catch(function (err) {
+            if (thisDraw !== drawVersion || err.name === 'AbortError') return;
             renderEmpty(chartErrText(err));
           });
         }
@@ -301,39 +371,29 @@
         return msg;
       }
 
-      /* candle：对 o/h/l/c（或 open/high/low/close）四列各拉一条序列叠加 */
-      function drawCandle(base) {
+      /* candle：单次流式请求拉取所有原始 OHLC 记录，避免四次重复扫描。 */
+      function drawCandle(base, thisDraw) {
         if (!s.ohlcCols) {
-          IU.toast('契约未识别 OHLC 四列，退化为所选列折线', 'warn');
-          active = [{ label: s.col, color: '#45c6ff', col: s.col }];
-          fetchSeries(base, s.col, null).then(function (pts) {
-            renderLine([{ label: s.col, color: '#45c6ff', pts: pts }], false);
-          }).catch(function (err) { renderEmpty(chartErrText(err)); });
+          renderEmpty('当前表没有完整 OHLC 四列，无法绘制 OHLC 线');
           return;
         }
-        var longNames = { o: 'open', h: 'high', l: 'low', c: 'close' };
-        active = s.ohlcCols.map(function (c) {
-          return {
-            label: longNames[c] + ' (' + c + ')',
-            color: SERIES_COLORS[longNames[c]],
-            col: c,
-          };
+        active = [{ kind: 'candle', columns: s.ohlcCols }];
+        fetchSeries(base, active[0], null, function (count) {
+          if (loadingStatus && loadingStatus.isConnected) loadingStatus.textContent = '流式读取全部 OHLC… ' + Number(count).toLocaleString('zh-CN') + ' 条';
+        }).then(function (seriesList) {
+          if (thisDraw !== drawVersion) return;
+          renderLine(seriesList, true);
+        }).catch(function (err) {
+          if (thisDraw !== drawVersion || err.name === 'AbortError') return;
+          renderEmpty(chartErrText(err));
         });
-        Promise.all(active.map(function (sr) {
-          return fetchSeries(base, sr.col, null);
-        }))
-          .then(function (r) {
-            renderLine(active.map(function (sr, i) {
-              return { label: sr.label, color: sr.color, pts: r[i] };
-            }), true);
-          })
-          .catch(function (err) { renderEmpty(chartErrText(err)); });
       }
 
-      /* 拉取一条序列：winMs 为 null 时用配置输入的 start/end，
-       * 否则用可视区毫秒窗口（PLAN-071，缩放重查走此参数） */
-      function fetchSeries(base, col, winMs) {
+      /* 拉取一个图表来源。流式响应只包含窗口内的原始行，不做抽样。 */
+      function fetchSeries(base, source, winMs, onProgress) {
+        var col = source.kind === 'candle' ? source.columns[3] : source.col;
         var qs = '?col=' + encodeURIComponent(col);
+        if (source.kind === 'candle') qs += '&kind=candle';
         if (String(s.symbol).trim() !== '') qs += '&symbol=' + encodeURIComponent(s.symbol.trim());
         if (winMs) {
           qs += '&start=' + encodeURIComponent(String(winMs[0]));
@@ -352,43 +412,141 @@
             qs += '&end=' + encodeURIComponent(String(endMs.ms));
           }
         }
-        var b = parseInt(s.buckets, 10);
-        qs += '&buckets=' + (Number.isFinite(b) && b > 0 ? b : 2000);
-        return IU.api(base + qs).then(function (resp) { return normalizePoints(resp); });
+        var controller = new AbortController();
+        requestControllers.push(controller);
+        return readChartStream(base + qs, source, controller.signal, onProgress)
+          .finally(function () {
+            requestControllers = requestControllers.filter(function (item) { return item !== controller; });
+          });
       }
 
-      /* 响应防御式归一化：容忍 points/series/data/buckets 键名；
-       * 点形态容忍 {x,y} / [x,y] / {t|ts|time, v|value}；
-       * data 为 [xs, ys] 双数组时按 uPlot 原生形态 zip。 */
-      function normalizePoints(resp) {
-        var raw = resp;
-        if (resp && typeof resp === 'object' && !Array.isArray(resp)) {
-          /* 契约形态优先：{kind:'line', x:[], y[]} 平行双数组 */
-          if (Array.isArray(resp.x) && Array.isArray(resp.y)) {
-            return zipXY(resp.x, resp.y);
-          }
-          raw = IU.pick(resp, 'points', 'series', 'data', 'buckets', 'items') || [];
-          if (Array.isArray(raw) && raw.length === 2 && Array.isArray(raw[0]) && Array.isArray(raw[1])) {
-            return zipXY(raw[0], raw[1]);
-          }
+      async function readChartStream(url, source, signal, onProgress) {
+        var response = await fetch(url, { signal: signal });
+        if (!response.ok) {
+          var body = null;
+          try { body = await response.json(); } catch (e) { /* 错误响应可能不是 JSON */ }
+          var err = new Error((body && body.detail) || ('HTTP ' + response.status));
+          err.hint = body && body.hint;
+          throw err;
         }
-        if (!Array.isArray(raw)) return [];
-        return raw.map(function (p) {
-          if (Array.isArray(p)) return { x: p[0], y: p[1] };
-          if (p && typeof p === 'object') {
-            return {
-              x: IU.pick(p, 'x', 't', 'ts', 'time', 'bucket'),
-              y: IU.pick(p, 'y', 'v', 'value', 'avg', 'mean')
-            };
-          }
-          return null;
-        }).filter(function (p) { return p && p.x !== undefined && p.y !== undefined; });
-      }
+        if (!response.body || !response.body.getReader) {
+          throw new Error('当前浏览器不支持流式图表数据读取');
+        }
 
-      function zipXY(xs, ys) {
-        var out = [];
-        for (var i = 0; i < Math.min(xs.length, ys.length); i++) out.push({ x: xs[i], y: ys[i] });
-        return out;
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        var meta = null;
+        var doneEvent = null;
+        var received = 0;
+        var seriesMap = new Map();
+        var symbolIndices = new Map();
+        var longNames = { o: 'open', h: 'high', l: 'low', c: 'close' };
+        var candleNames = source.kind === 'candle'
+          ? source.columns.map(function (column) {
+              var shortName = column.toLowerCase();
+              return longNames[shortName] || column.toLowerCase();
+            })
+          : null;
+
+        function getSeries(symbolValue, suffix, color, index) {
+          var symbol = symbolValue == null ? '' : String(symbolValue);
+          var key = symbol + '\u0000' + (suffix || '');
+          var item = seriesMap.get(key);
+          if (!item) {
+            var label = symbol ? symbol + ' · ' + suffix : (suffix || source.label);
+            item = {
+              label: label,
+              color: source.kind === 'candle' ? (color || source.color) :
+                (symbol ? symbolColor(index) : (color || source.color)),
+              xs: [], ys: []
+            };
+            seriesMap.set(key, item);
+          }
+          return item;
+        }
+
+        function getSymbolIndex(symbolValue) {
+          var symbol = symbolValue == null ? '' : String(symbolValue);
+          if (!symbolIndices.has(symbol)) symbolIndices.set(symbol, symbolIndices.size);
+          return symbolIndices.get(symbol);
+        }
+
+        function consumeLine(line) {
+          if (!line) return;
+          var event = JSON.parse(line);
+          if (event.type === 'meta') {
+            meta = event;
+            return;
+          }
+          if (event.type === 'error') {
+            var streamError = new Error(event.detail || '图表数据读取失败');
+            streamError.hint = event.hint;
+            throw streamError;
+          }
+          if (event.type === 'done') {
+            doneEvent = event;
+            return;
+          }
+          if (event.type !== 'data' || !Array.isArray(event.points)) return;
+          var symbolIndex = getSymbolIndex(event.symbol);
+          event.points.forEach(function (point) {
+            if (!Array.isArray(point) || point.length < 2) return;
+            var x = Number(point[0]);
+            if (!Number.isFinite(x)) throw new Error('图表响应包含无效时间点');
+            if (source.kind === 'candle') {
+              for (var i = 0; i < 4; i++) {
+                var name = candleNames[i];
+                var line = getSeries(event.symbol, name + ' (' + source.columns[i] + ')', SERIES_COLORS[name], symbolIndex);
+                var y = point[i + 1] == null ? null : Number(point[i + 1]);
+                line.xs.push(x);
+                line.ys.push(Number.isFinite(y) ? y : null);
+              }
+            } else {
+              var lineSeries = getSeries(event.symbol, source.label, source.color, symbolIndex);
+              var value = point[1] == null ? null : Number(point[1]);
+              lineSeries.xs.push(x);
+              lineSeries.ys.push(Number.isFinite(value) ? value : null);
+            }
+            received++;
+          });
+          if (onProgress) onProgress(received);
+        }
+
+        while (true) {
+          var read = await reader.read();
+          buffer += decoder.decode(read.value || new Uint8Array(), { stream: !read.done });
+          var newline;
+          while ((newline = buffer.indexOf('\n')) >= 0) {
+            consumeLine(buffer.slice(0, newline));
+            buffer = buffer.slice(newline + 1);
+          }
+          if (read.done) break;
+        }
+        if (buffer) consumeLine(buffer);
+        if (!meta || !doneEvent) throw new Error('图表数据流未正常结束');
+        if (received !== doneEvent.rows) throw new Error('图表点数校验失败：接收 ' + received + '，服务端 ' + doneEvent.rows);
+
+        var seriesList = Array.from(seriesMap.values());
+        var expectedBySymbol = new Map((doneEvent.series || []).map(function (item) {
+          return [item.symbol == null ? '' : String(item.symbol), Number(item.rows)];
+        }));
+        var actualBySymbol = new Map();
+        seriesMap.forEach(function (item, key) {
+          var symbol = key.slice(0, key.indexOf('\u0000'));
+          if (!actualBySymbol.has(symbol)) actualBySymbol.set(symbol, []);
+          actualBySymbol.get(symbol).push(item);
+        });
+        if (actualBySymbol.size !== expectedBySymbol.size) throw new Error('图表分线校验失败：symbol 数量不一致');
+        expectedBySymbol.forEach(function (expected, symbol) {
+          var actual = actualBySymbol.get(symbol) || [];
+          if (!actual.length || actual.some(function (item) { return item.xs.length !== expected; })) {
+            throw new Error('图表分线校验失败：' + (symbol || '单序列') + ' 点数与服务端不一致');
+          }
+        });
+        seriesList.rowCount = doneEvent.rows;
+        seriesList.forEach(function (item) { item.observations = item.xs.length; });
+        return seriesList;
       }
 
       function renderEmpty(msg) {
@@ -397,17 +555,17 @@
         chartBox.append(h('div', { class: 'chart-empty' }, msg || '暂无数据（调整筛选或确认表内有数据）'));
       }
 
-      /* uPlot 渲染：多序列共用第一序列横轴；毫秒时间戳自动转秒启用时间轴 */
+      /* uPlot 渲染：多序列使用 x union；毫秒时间戳自动转秒启用时间轴。 */
       function renderLine(seriesList, isCandle) {
-        var first = seriesList[0];
-        if (!first || !first.pts.length) { renderEmpty(); return; }
+        var first = seriesList.find(function (sl) { return sl.xs.length > 0; }) || seriesList[0];
+        if (!first || !first.xs.length) { renderEmpty(); return; }
 
-        var xsRaw = first.pts.map(function (p) { return Number(p.x); });
+        var xsRaw = mergeXs(seriesList);
         var maxAbs = xsRaw.reduce(function (m, v) { return Math.max(m, Math.abs(v)); }, 0);
         viewXTime = maxAbs > 1e11; // 秒级 epoch ≈1e9，毫秒级 ≈1e12
 
         var seriesDefs = seriesList.map(function (sl) {
-          return { label: sl.label, stroke: sl.color, width: 1.5, points: { show: sl.pts.length < 40 } };
+          return { label: sl.label, stroke: sl.color, width: 1.5, points: { show: sl.xs.length < 40 } };
         });
 
         destroyChart();
@@ -416,7 +574,10 @@
         chartBox.append(mount);
         if (isCandle) {
           chartBox.append(h('div', { class: 'chart-note' },
-            '⚠ K线为 v1 近似渲染：uPlot 无内置蜡烛图，此处以 open/high/low/close 四条线叠加显示。'));
+            'OHLC 四线近似显示：当前没有蜡烛实体；每条原始记录均保留。'));
+        } else if (new Set(seriesList.map(function (sl) { return sl.label.split(' · ')[0]; })).size > 1) {
+          chartBox.append(h('div', { class: 'chart-note' },
+            '多 symbol 共用 Y 轴；SMA/EMA/ATR 等币价量纲不同的指标可能压扁低价币线。绘制这类指标时可筛选单个 symbol；RSI 等归一化指标适合并列查看。'));
         }
         chartBox.append(viewNote);
 
@@ -471,7 +632,8 @@
             }
           });
           // 初始"全范围"提示：直接取数据首末点（毫秒），不依赖未提交的 scale
-          noteRange(xsRaw[0], xsRaw[xsRaw.length - 1], xsRaw.length, true);
+          var rowCount = seriesList.rowCount || seriesList.reduce(function (sum, sl) { return sum + sl.xs.length; }, 0);
+          noteRange(xsRaw[0], xsRaw[xsRaw.length - 1], rowCount, seriesList, true);
         } catch (e) {
           IU.clear(chartBox);
           chartBox.append(h('div', { class: 'chart-empty' }, '渲染失败：' + e.message));

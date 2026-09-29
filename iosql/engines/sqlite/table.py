@@ -3346,11 +3346,14 @@ class Table(BaseTable):
             return 'pruned_by_segment_session_range'
         return 'pruned_by_segment_stats'
 
-    def _get_select_part_refs(self, cases):
+    def _get_select_part_refs(self, cases, skip_segment_stats=False):
         need_parts = self._get_select_parts(cases)
-        # 无 where 时裁剪统计不会被消费，轻量构建引用（PLAN-069 P2）
-        refs = self._physical_part_refs(need_parts, lightweight=not cases)
-        if not cases:
+        # 无 where 或有界执行预算路径跳过裁剪统计，避免为计算裁剪信息
+        # 预先扫描 legacy 文件；where 仍由实际查询执行，结果语义不变。
+        refs = self._physical_part_refs(
+            need_parts, lightweight=(not cases or skip_segment_stats),
+        )
+        if not cases or skip_segment_stats:
             return refs
 
         excluded = self._excluded_segments_by_cases(refs, cases)
@@ -3395,6 +3398,7 @@ class Table(BaseTable):
         to_dict=True,
         batch_size=10_000,
         columns=None,
+        timeout_ms=None,
         **kwargs,
     ):
         fields = resolve_select_fields(fields, columns, 'iter_select')
@@ -3406,6 +3410,7 @@ class Table(BaseTable):
             order_by=order_by,
             to_dict=to_dict,
             batch_size=batch_size,
+            timeout_ms=timeout_ms,
             **kwargs,
         ):
             for row in batch:
@@ -3420,12 +3425,24 @@ class Table(BaseTable):
         to_dict=True,
         batch_size=10_000,
         columns=None,
+        timeout_ms=None,
         **kwargs,
     ):
+        """批量流式查询。
+
+        timeout_ms 为可选正整数迭代期限；None 表示不设期限。期限从首次
+        迭代开始计时，包含调用方处理已产出批次的时间；超时中止查询并抛
+        TimeoutError。
+        """
         fields = resolve_select_fields(fields, columns, 'iter_select_batches')
         self._reject_unknown_select_kwargs(kwargs, 'iter_select_batches')
         batch_size = self._normalize_batch_size(batch_size)
         limit = self._normalize_limit(limit)
+        timeout_ms = self._normalize_timeout_ms(timeout_ms)
+        deadline = (
+            time.monotonic() + timeout_ms / 1000
+            if timeout_ms is not None else None
+        )
         if limit == 0:
             return
 
@@ -3437,6 +3454,7 @@ class Table(BaseTable):
                 order_by,
                 to_dict,
                 batch_size,
+                deadline,
             )
             return
 
@@ -3460,6 +3478,7 @@ class Table(BaseTable):
             w,
             column_types,
             batch_size,
+            deadline,
         ):
             if not rows:
                 continue
@@ -3478,12 +3497,19 @@ class Table(BaseTable):
                 if len(pending) >= batch_size:
                     yield pending
                     pending = []
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'SQLite query exceeded timeout_ms budget'
+                        )
             if limit is not None and emitted >= limit:
                 break
         if pending:
             yield pending
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('SQLite query exceeded timeout_ms budget')
 
-    def aggregate_by_bucket(self, x_col, value_cols, n_buckets, where=None):
+    def aggregate_by_bucket(self, x_col, value_cols, n_buckets, where=None,
+                            group_col=None):
         """SQL 端等宽分桶聚合（PLAN-070，web chart 大表加速路径）。
 
         把"逐行拉回 Python 再分桶平均"下推为每分区一条 GROUP BY，
@@ -3660,7 +3686,9 @@ class Table(BaseTable):
             _PART_DATA_TABLE_NAME, x_col, value_cols,
             or_and_cases, column_types,
             x_text_mode=(x_mode == 'text'), x_min=grid_min, width=width,
+            group_col=group_col,
         )
+        grouped = {}
         for ref in refs:
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
@@ -3679,17 +3707,32 @@ class Table(BaseTable):
                 idx = row[0]
                 if idx is None or idx < 0 or idx >= n_buckets:
                     continue  # 防御：越界桶不参与聚合
+                if group_col is None:
+                    sums_for_group = sums
+                    counts_for_group = counts
+                    value_offset = 1
+                else:
+                    group_key = row[1]
+                    group = grouped.setdefault(group_key, {
+                        'sums': {c: [0.0] * n_buckets for c in value_cols},
+                        'counts': {c: [0] * n_buckets for c in value_cols},
+                    })
+                    sums_for_group = group['sums']
+                    counts_for_group = group['counts']
+                    value_offset = 2
                 for i, c in enumerate(value_cols):
-                    s = row[1 + i * 2]
-                    n = row[2 + i * 2]
+                    s = row[value_offset + i * 2]
+                    n = row[value_offset + i * 2 + 1]
                     if s is not None:
-                        sums[c][idx] += float(s)
+                        sums_for_group[c][idx] += float(s)
                     if n is not None:
-                        counts[c][idx] += int(n)
+                        counts_for_group[c][idx] += int(n)
         result['bucket_min'] = grid_min
         result['bucket_width'] = width
         result['sums'] = sums
         result['counts'] = counts
+        if group_col is not None:
+            result['groups'] = grouped
         return result
 
     def select(self, fields='*', where=None, limit=None, order_by=None,
@@ -3802,6 +3845,20 @@ class Table(BaseTable):
         if batch_size <= 0:
             raise BadArgument('batch_size must be a positive integer')
         return batch_size
+
+    @staticmethod
+    def _normalize_timeout_ms(timeout_ms):
+        if timeout_ms is None:
+            return None
+        if isinstance(timeout_ms, bool):
+            raise BadArgument('timeout_ms must be a positive integer')
+        try:
+            normalized = int(timeout_ms)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise BadArgument('timeout_ms must be a positive integer') from exc
+        if normalized <= 0 or normalized != timeout_ms:
+            raise BadArgument('timeout_ms must be a positive integer')
+        return normalized
 
     def _select_fields_with_order(self, fields, order_by, column_types):
         project_fields = self._plain_select_fields(fields)
@@ -4124,11 +4181,13 @@ class Table(BaseTable):
 
         return data
 
-    def _iter_select_raw_batches(self, fields, where_obj, column_types, batch_size):
+    def _iter_select_raw_batches(self, fields, where_obj, column_types,
+                                 batch_size, deadline=None):
         for ref, query in self._select_queries_for_where(
             fields,
             where_obj,
             column_types,
+            skip_segment_stats=deadline is not None,
         ):
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
@@ -4140,12 +4199,16 @@ class Table(BaseTable):
                 part_dbfile,
                 query,
                 batch_size,
+                deadline,
             )
 
     def _select_queries_for_where(self, fields, where_obj, column_types,
-                                  order_by_sql=None, limit=None):
+                                  order_by_sql=None, limit=None,
+                                  skip_segment_stats=False):
         if not where_obj.or_and_cases:
-            for ref in self._get_select_part_refs(None):
+            for ref in self._get_select_part_refs(
+                None, skip_segment_stats=skip_segment_stats,
+            ):
                 yield (
                     ref,
                     build_select_cases_query(
@@ -4162,7 +4225,9 @@ class Table(BaseTable):
         if len(where_obj.or_and_cases) > 1:
             refs_by_key = OrderedDict()
             for cases in where_obj.or_and_cases:
-                for ref in self._get_select_part_refs(cases):
+                for ref in self._get_select_part_refs(
+                    cases, skip_segment_stats=skip_segment_stats,
+                ):
                     refs_by_key[self._segment_lookup_key(ref)] = ref
             query = build_select_or_cases_query(
                 _PART_DATA_TABLE_NAME,
@@ -4185,21 +4250,45 @@ class Table(BaseTable):
             order_by_sql=order_by_sql,
             limit=limit,
         )
-        for ref in self._get_select_part_refs(cases):
+        for ref in self._get_select_part_refs(
+            cases, skip_segment_stats=skip_segment_stats,
+        ):
             yield ref, query
 
-    def _iter_part_query_batches(self, part_dbfile, query, batch_size):
+    def _iter_part_query_batches(self, part_dbfile, query, batch_size,
+                                 deadline=None):
         offset = 0
         base_sql = query.sql.rstrip().rstrip(';')
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('SQLite query exceeded timeout_ms budget')
             sql = f'{base_sql} limit ? offset ?'
             params = list(query.params) + [batch_size, offset]
             with self._part_db(part_dbfile, auto_commit=False) as db:
                 try:
-                    rows = db[_PART_DATA_TABLE_NAME].query(
-                        sql,
-                        params=params,
-                    )
+                    if deadline is None:
+                        rows = db[_PART_DATA_TABLE_NAME].query(sql, params=params)
+                    else:
+                        with db.transaction(immediate=False) as conn:
+                            conn.set_progress_handler(
+                                lambda: int(time.monotonic() >= deadline), 1000,
+                            )
+                            try:
+                                rows = db[_PART_DATA_TABLE_NAME].query(
+                                    sql, params=params,
+                                )
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError(
+                                        'SQLite query exceeded timeout_ms budget'
+                                    )
+                            except sqlite3.OperationalError as exc:
+                                if time.monotonic() >= deadline:
+                                    raise TimeoutError(
+                                        'SQLite query exceeded timeout_ms budget'
+                                    ) from exc
+                                raise
+                            finally:
+                                conn.set_progress_handler(None, 0)
                 except NoSuchTable:
                     rows = []
             if not rows:
@@ -4218,6 +4307,8 @@ class Table(BaseTable):
         - temp_store=FILE：ORDER BY 的临时 B 树/排序器可落盘，RAM 有界
           （连接池默认 temp_store=memory，大 segment 排序会占 O(segment) 内存）；
         - 只读扫描不经过 _db_parts 池，不受 max_open_partitions 约束；
+        - 允许同一串行读取器在不同工作线程恢复或关闭（Web 流断开时，
+          ASGI 清理线程可能不同于推进迭代器的线程）；
           归并期间文件被 compact/repartition 替换时，游标继续读旧快照（一致性读）。
         """
         if not os.path.isfile(part_dbfile):
@@ -4226,7 +4317,10 @@ class Table(BaseTable):
             )
         try:
             uri = pathlib.Path(os.path.abspath(part_dbfile)).as_uri()
-            conn = sqlite3.connect(f'{uri}?mode=ro', uri=True, timeout=30.0)
+            conn = sqlite3.connect(
+                f'{uri}?mode=ro', uri=True, timeout=30.0,
+                check_same_thread=False,
+            )
         except (sqlite3.Error, ValueError) as exc:
             raise UnsafeOperation(
                 f'ordered stream open part failed: {part_dbfile}: {exc}'
@@ -4243,7 +4337,8 @@ class Table(BaseTable):
             ) from exc
         return conn
 
-    def _part_ordered_rows(self, part_dbfile, query, chunk_size):
+    def _part_ordered_rows(self, part_dbfile, query, chunk_size,
+                           deadline=None):
         """单游标流式读取一个 part 的有序行（无 OFFSET）。
 
         一条 SQL 一个游标：每 part 只排序一次；游标存活期间 SQLite 保持
@@ -4254,16 +4349,32 @@ class Table(BaseTable):
         """
         conn = self._open_part_read_conn(part_dbfile)
         try:
+            if deadline is not None:
+                conn.set_progress_handler(
+                    lambda: int(time.monotonic() >= deadline), 1000,
+                )
             cursor = conn.execute(query.sql, query.params)
             try:
                 while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'SQLite query exceeded timeout_ms budget'
+                        )
                     rows = cursor.fetchmany(chunk_size)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'SQLite query exceeded timeout_ms budget'
+                        )
                     if not rows:
                         return
                     yield from rows
             finally:
                 cursor.close()
         except sqlite3.DatabaseError as exc:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(
+                    'SQLite query exceeded timeout_ms budget'
+                ) from exc
             raise UnsafeOperation(
                 f'ordered stream query part failed: {part_dbfile}: {exc}'
             ) from exc
@@ -4283,7 +4394,8 @@ class Table(BaseTable):
         return max(1, min(batch_size, 100_000 // part_count))
 
     def _iter_select_ordered_batches(
-        self, fields, where, limit, order_by, to_dict, batch_size
+        self, fields, where, limit, order_by, to_dict, batch_size,
+        deadline=None,
     ):
         """带 order_by 的流式条件查询：跨 part k 路归并，内存有界。
 
@@ -4320,6 +4432,7 @@ class Table(BaseTable):
             column_types,
             order_by_sql=order_by_sql,
             limit=limit,
+            skip_segment_stats=deadline is not None,
         ):
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
@@ -4360,7 +4473,9 @@ class Table(BaseTable):
         merged_stream = None
         try:
             part_streams = [
-                self._part_ordered_rows(part_dbfile, query, chunk_size)
+                self._part_ordered_rows(
+                    part_dbfile, query, chunk_size, deadline,
+                )
                 for part_dbfile, query in stream_specs
             ]
 
@@ -4368,6 +4483,10 @@ class Table(BaseTable):
             pending = []
             merged_stream = heapq.merge(*part_streams, key=sort_key)
             for row in merged_stream:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        'SQLite query exceeded timeout_ms budget'
+                    )
                 if limit is not None and emitted >= limit:
                     break
                 if project_fields is not None:
@@ -4379,8 +4498,14 @@ class Table(BaseTable):
                 if len(pending) >= batch_size:
                     yield pending
                     pending = []
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'SQLite query exceeded timeout_ms budget'
+                        )
             if pending:
                 yield pending
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError('SQLite query exceeded timeout_ms budget')
         finally:
             try:
                 if merged_stream is not None:

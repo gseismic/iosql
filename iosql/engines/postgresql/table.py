@@ -6,6 +6,7 @@ import uuid
 import hashlib
 import warnings
 import itertools
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, List
 import arrow
@@ -985,7 +986,8 @@ class Table(BaseTable):
         return [dict(zip(columns_, row)) for row in rows]
 
     def iter_select(self, fields='*', where=None, limit=None, order_by=None,
-                    to_dict=True, batch_size=10_000, columns=None, **kwargs):
+                    to_dict=True, batch_size=10_000, columns=None,
+                    timeout_ms=None, **kwargs):
         self._reject_unknown_kwargs('iter_select', kwargs)
         fields = resolve_select_fields(fields, columns, 'iter_select')
         for batch in self.iter_select_batches(
@@ -995,18 +997,35 @@ class Table(BaseTable):
             order_by=order_by,
             to_dict=to_dict,
             batch_size=batch_size,
+            timeout_ms=timeout_ms,
         ):
             for row in batch:
                 yield row
 
     def iter_select_batches(self, fields='*', where=None, limit=None, order_by=None,
-                            to_dict=True, batch_size=10_000, columns=None, **kwargs):
+                            to_dict=True, batch_size=10_000, columns=None,
+                            timeout_ms=None, **kwargs):
+        """批量流式查询。
+
+        timeout_ms 为可选正整数迭代期限；None 表示不设期限。期限从首次
+        迭代开始计时，包含调用方处理已产出批次的时间；超时回滚该读取事务
+        并抛 TimeoutError。显式事务中不能传 timeout_ms。
+        """
         self._reject_unknown_kwargs('iter_select_batches', kwargs)
         fields = resolve_select_fields(fields, columns, 'iter_select_batches')
         batch_size = self._normalize_batch_size(batch_size)
         limit = self._normalize_limit(limit)
+        timeout_ms = self._normalize_timeout_ms(timeout_ms)
+        deadline = (
+            time.monotonic() + timeout_ms / 1000
+            if timeout_ms is not None else None
+        )
         if limit == 0:
             return
+        if timeout_ms is not None and self._in_explicit_tx:
+            raise BadArgument(
+                'timeout_ms is not supported inside an explicit transaction'
+            )
 
         query, params = self._select_query(
             fields,
@@ -1016,16 +1035,38 @@ class Table(BaseTable):
         )
         conn = self.connect()
 
+        def _apply_statement_timeout():
+            if deadline is None:
+                return
+            remaining_ms = math.ceil((deadline - time.monotonic()) * 1000)
+            if remaining_ms <= 0:
+                raise TimeoutError('PostgreSQL query exceeded timeout_ms budget')
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT set_config('statement_timeout', %s, true)",
+                    (f'{remaining_ms}ms',),
+                )
+            finally:
+                cursor.close()
+
         def _iterate():
             # 非 WITH HOLD 游标：服务端边取边发，避免服务端物化全量结果
             cursor_name = f'iosql_iter_select_{next(_cursor_seq)}'
-            with conn.cursor(name=cursor_name) as cursor:
+            cursor = conn.cursor(name=cursor_name)
+            try:
                 cursor.itersize = batch_size
+                _apply_statement_timeout()
                 cursor.execute(query, params)
                 # psycopg2 命名游标在首批 FETCH 前 description 为 None。
                 column_names = None
                 while True:
+                    _apply_statement_timeout()
                     rows = cursor.fetchmany(batch_size)
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            'PostgreSQL query exceeded timeout_ms budget'
+                        )
                     if not rows:
                         break
                     if to_dict:
@@ -1033,6 +1074,14 @@ class Table(BaseTable):
                             column_names = [desc[0] for desc in cursor.description]
                         rows = [dict(zip(column_names, row)) for row in rows]
                     yield rows
+            finally:
+                try:
+                    cursor.close()
+                except Exception:
+                    # statement_timeout 会回滚整笔只读迭代事务，事务回滚时
+                    # PostgreSQL 已销毁 portal；不要让 CLOSE 的次生错误覆盖超时。
+                    if deadline is None or time.monotonic() < deadline:
+                        raise
 
         if self._in_explicit_tx:
             # 复用调用方未提交事务，不擅自结束
@@ -1043,8 +1092,12 @@ class Table(BaseTable):
         self._set_autocommit(conn, False)
         try:
             yield from _iterate()
-        except BaseException:
+        except BaseException as exc:
             conn.rollback()
+            if timeout_ms is not None and getattr(exc, 'pgcode', None) == '57014':
+                raise TimeoutError(
+                    'PostgreSQL query exceeded timeout_ms budget'
+                ) from exc
             raise
         else:
             conn.commit()
@@ -1063,7 +1116,8 @@ class Table(BaseTable):
             row = rows[0] if rows else None
         return int(row[0]) if row else 0
 
-    def aggregate_by_bucket(self, x_col, value_cols, n_buckets, where=None):
+    def aggregate_by_bucket(self, x_col, value_cols, n_buckets, where=None,
+                            group_col=None):
         """SQL 端等宽分桶聚合（PLAN-070，与 sqlite 引擎同名方法语义一致）。
 
         PG 为强类型存储：x 列模式由列类型决定（numeric 列恒为 numeric 模式；
@@ -1078,7 +1132,7 @@ class Table(BaseTable):
             raise BadArgument('n_buckets 必须为正整数')
 
         def _empty_result():
-            return {
+            result = {
                 'scanned': 0,
                 'x_min': None,
                 'x_max': None,
@@ -1091,11 +1145,18 @@ class Table(BaseTable):
                 'sums': None,
                 'counts': None,
             }
+            if group_col is not None:
+                result['groups'] = {}
+            return result
 
         column_types = self._column_types()
         if not column_types:
             return _empty_result()
-        for col in [x_col] + value_cols:
+        required_cols = [x_col] + value_cols
+        if group_col is not None:
+            group_col = str(group_col)
+            required_cols.append(group_col)
+        for col in required_cols:
             if col not in column_types:
                 raise BadArgument(f'Unknown field `{col}`')
 
@@ -1190,6 +1251,8 @@ class Table(BaseTable):
             raise BadArgument('数字文本横轴跨度超出 PostgreSQL bigint 范围')
         width = span // n_buckets + 1 if span >= 0 else 1
         select_items = [bucket_expr]
+        if group_col is not None:
+            select_items.append(_pg_identifier(group_col))
         for col in value_cols:
             c_sql = _pg_identifier(col)
             select_items.append(f'SUM({c_sql})')
@@ -1202,10 +1265,11 @@ class Table(BaseTable):
             agg_sql += f' WHERE {where_sql} AND {x_sql} IS NOT NULL'
         else:
             agg_sql += f' WHERE {x_sql} IS NOT NULL'
-        agg_sql += ' GROUP BY 1'
+        agg_sql += ' GROUP BY 1, 2' if group_col is not None else ' GROUP BY 1'
         cursor.execute(agg_sql, [grid_min, width] + list(where_params))
         sums = {c: [0.0] * n_buckets for c in value_cols}
         counts = {c: [0] * n_buckets for c in value_cols}
+        grouped = {}
         for row in cursor.fetchall():
             idx = row[0]
             if idx is None:
@@ -1213,17 +1277,32 @@ class Table(BaseTable):
             idx = int(idx)
             if idx < 0 or idx >= n_buckets:
                 continue  # 防御：越界桶不参与聚合
+            if group_col is None:
+                sums_for_group = sums
+                counts_for_group = counts
+                value_offset = 1
+            else:
+                group_key = row[1]
+                group = grouped.setdefault(group_key, {
+                    'sums': {c: [0.0] * n_buckets for c in value_cols},
+                    'counts': {c: [0] * n_buckets for c in value_cols},
+                })
+                sums_for_group = group['sums']
+                counts_for_group = group['counts']
+                value_offset = 2
             for i, c in enumerate(value_cols):
-                s = row[1 + i * 2]
-                n = row[2 + i * 2]
+                s = row[value_offset + i * 2]
+                n = row[value_offset + i * 2 + 1]
                 if s is not None:
-                    sums[c][idx] += float(s)
+                    sums_for_group[c][idx] += float(s)
                 if n is not None:
-                    counts[c][idx] += int(n)
+                    counts_for_group[c][idx] += int(n)
         result['bucket_min'] = grid_min
         result['bucket_width'] = width
         result['sums'] = sums
         result['counts'] = counts
+        if group_col is not None:
+            result['groups'] = grouped
         return result
 
     def _reject_unknown_kwargs(self, func_name, kwargs):
@@ -1440,6 +1519,20 @@ class Table(BaseTable):
         if batch_size <= 0:
             raise BadArgument('batch_size must be a positive integer')
         return batch_size
+
+    @staticmethod
+    def _normalize_timeout_ms(timeout_ms):
+        if timeout_ms is None:
+            return None
+        if isinstance(timeout_ms, bool):
+            raise BadArgument('timeout_ms must be a positive integer')
+        try:
+            normalized = int(timeout_ms)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise BadArgument('timeout_ms must be a positive integer') from exc
+        if normalized <= 0 or normalized != timeout_ms:
+            raise BadArgument('timeout_ms must be a positive integer')
+        return normalized
 
     def _parse_order_by(self, order_by):
         if not order_by:
