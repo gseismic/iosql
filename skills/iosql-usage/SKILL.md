@@ -204,6 +204,12 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 `python -m pip install -e ".[parquet]"`。脚本默认把可重复生成的数据库放在各自
 `examples/runtime/` 下。未设置 `POSTGRES_DSN` 时，11 和 12 只执行 SQLite 准备与 dry-run。
 
+本机 PostgreSQL 查询示例 15 可先执行 `bash examples/start_postgresql_test.sh`，
+再直接运行 `python3 examples/15_postgresql_timeseries_query.py`。启动脚本复用已安装的
+PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用 POSTGRES_DSN，
+未设置时读取本地连接文件。其他 PG 示例/基准可先 source
+`examples/runtime/postgresql-test.env`；重启电脑后重新运行启动脚本。
+
 ## 常用 API 速查
 
 | 类别 | API | 要点 |

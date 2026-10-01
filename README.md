@@ -926,6 +926,8 @@ bars.create_index(columns=['symbol', 'ts'])  # 等价主键索引会被复用
 
 运行示例：`POSTGRES_DSN=... uv run --extra postgresql examples/15_postgresql_timeseries_query.py`。查询基准：`POSTGRES_DSN=... uv run --extra postgresql benchmarks/benchmark_postgresql_query.py`，默认覆盖百万/千万行。结果和环境见 [基准报告](benchmarks/results/postgresql-query-20261002.md)。
 
+本机已有 PostgreSQL 程序时，可先执行 `bash examples/start_postgresql_test.sh`，再直接运行 `p3 examples/15_postgresql_timeseries_query.py`（p3 是本机 python3 别名）。示例会自动读取本地测试连接文件，显式 POSTGRES_DSN 优先；重启电脑后重新执行启动脚本即可。详细配置、其他脚本的环境文件和停止命令见 [示例运行说明](examples/README.md#postgresql-本机查询示例)。
+
 ### 动态扩列（schema_policy='evolve'）语义
 
 默认策略 `evolve` 允许写入时动态加列（`ALTER TABLE ADD COLUMN`，O(1)），语义契约如下：

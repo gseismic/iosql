@@ -3,6 +3,7 @@
 import json
 import os
 import uuid
+from pathlib import Path
 
 import psycopg2
 from psycopg2 import sql
@@ -12,9 +13,16 @@ from iosql import Database
 
 def run():
     dsn = os.environ.get('POSTGRES_DSN')
+    # 环境变量优先；本机启动脚本保存的配置让直接运行示例无需逐次 export。
     if not dsn:
-        print('请设置测试数据库 POSTGRES_DSN；需要 PostgreSQL 14+ 与 iosql[postgresql]。')
-        return
+        dsn_file = Path(__file__).resolve().parent / 'runtime' / 'postgresql-test.dsn'
+        if dsn_file.is_file():
+            dsn = dsn_file.read_text().strip()
+    if not dsn:
+        raise SystemExit(
+            '请在示例目录先运行 bash start_postgresql_test.sh，或设置 POSTGRES_DSN；'
+            '需要 PostgreSQL 14+ 与 iosql[postgresql]。'
+        )
     name = 'iosql_example_query_' + uuid.uuid4().hex[:12]
     base = 1735689600000
     try:

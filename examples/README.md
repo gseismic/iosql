@@ -87,4 +87,31 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 
 `examples/mysqlite-scenarios/` 按运维场景速查 mysqlite 完整能力面（增删改查、加列/删列、各类查询、表重命名与表信息、索引操作、在线备份），每个脚本独立可运行，详见该目录 README。
 
-`15_postgresql_timeseries_query.py` 需要 `POSTGRES_DSN` 与 `iosql[postgresql]`，使用随机表名并在结束时清理，可独立重复运行。
+### PostgreSQL 本机查询示例
+
+`15_postgresql_timeseries_query.py` 需要 PostgreSQL 14+ 与 `iosql[postgresql]`，使用随机表名并在结束时清理，可独立重复运行。
+
+本机已安装 PostgreSQL 时，在示例目录执行：
+
+```bash
+bash start_postgresql_test.sh
+p3 15_postgresql_timeseries_query.py
+```
+
+`p3` 是本机 `python3` 的别名；也可使用 `python3` 或 `uv run --extra postgresql`。启动脚本复用已安装程序，在 `runtime/postgresql-test/data` 保留独立测试库，监听 `127.0.0.1:55478`，使用无密码的本机测试身份 iosql。它不会修改系统数据库；重启电脑后重新运行启动脚本即可。其他安装位置可传 `POSTGRES_BIN=/path/to/bin`。
+
+示例优先使用 `POSTGRES_DSN`，未设置时读取启动脚本生成的 `runtime/postgresql-test.dsn`。从仓库根目录运行 `p3 examples/15_postgresql_timeseries_query.py` 也会读取同一文件。其他 PG 示例和基准可先执行：
+
+```bash
+source runtime/postgresql-test.env
+```
+
+使用已有测试数据库时直接设置 `POSTGRES_DSN` 即可，例如 `POSTGRES_DSN='postgresql://user:password@host:5432/testdb' p3 15_postgresql_timeseries_query.py`；不需要本机启动脚本。
+
+停止本机测试库：
+
+```bash
+/usr/lib/postgresql/14/bin/pg_ctl -D runtime/postgresql-test/data -m fast -w stop
+```
+
+使用其他版本或安装位置时替换为对应的 pg_ctl 路径。
