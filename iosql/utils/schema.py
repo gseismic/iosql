@@ -114,9 +114,10 @@ def parse_db_schema(uri: str) -> Tuple[str, Dict[str, Union[str, int, bool, None
         _raise_if_not(host is not None and port is not None and db is not None, schema, uri)
         options.update({'host': host, 'port': port, 'db': int(db)})
         
-    elif schema in ('sqlite', 'sqlite3'):
+    elif schema in ('sqlite', 'sqlite3', 'parquet'):
         # 兼容 sqlite3://:memory:、sqlite3:///:memory:（标准形式）与 sqlite3://:memory
         if detail.lstrip('/') in (':memory', ':memory:'):
+            _raise_if_not(schema != 'parquet', schema, uri)
             options['memory'] = True
         else:
             options['memory'] = False

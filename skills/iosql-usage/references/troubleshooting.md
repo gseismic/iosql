@@ -295,6 +295,23 @@ db = Database("mysql://localhost/db")  # EngineNotExist
 3. 首次使用需要 `db.timeseries("name", ...)` 或 `db.table("name", pk=..., ...)` 创建表。
 4. 使用 `Database.table_names()` 查看数据库中已存在的表。
 
+## Parquet 后端
+
+### 缺少 DuckDB
+
+**症状**：打开 `parquet://...` 数据库时报错，提示 Parquet 后端需要 DuckDB。
+
+**原因**：Parquet 是可选后端，默认安装 iosql 时不会安装 DuckDB。
+
+**修复**：
+
+```bash
+python -m pip install "iosql[parquet]"
+```
+
+仓库开发环境可用 `python -m pip install -e ".[parquet]"`。其他 Parquet 使用差异见
+[Parquet 使用指南](parquet.md)。
+
 ## SQLite 到 PostgreSQL 迁移
 
 ### 缺少 psycopg2

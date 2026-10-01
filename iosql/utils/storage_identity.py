@@ -1,4 +1,4 @@
-"""只读识别 SQLite 目录库，供枚举和破坏性操作共用。"""
+"""只读识别目录库的存储后端，供枚举和破坏性操作共用。"""
 
 import json
 import sqlite3
@@ -6,7 +6,7 @@ from contextlib import closing
 from pathlib import Path
 
 
-def is_iosql_table(path, *, deep=False):
+def is_iosql_table(path, *, deep=False, backend='sqlite'):
     """检查表级 manifest；deep 时还检查引用的数据文件。"""
     table_path = Path(path)
     meta_path = table_path / "meta.sqlite3"
@@ -29,6 +29,8 @@ def is_iosql_table(path, *, deep=False):
                 manifest.get("column_info"), (dict, list)
             ) or not isinstance(manifest.get("pk"), list):
                 return False
+            if manifest.get('storage_engine', 'sqlite') != backend:
+                return False
             if deep:
                 data_dir = table_path / "data"
                 if not data_dir.is_dir() or data_dir.is_symlink():
@@ -48,25 +50,37 @@ def is_iosql_table(path, *, deep=False):
                         'WHERE table_name = ?', (table_path.name,)
                     ):
                         segmented_parts.add(str(part))
-                        candidate = data_dir / f"{part_key}.sqlite3"
+                        suffix = '.parquet' if backend == 'parquet' else '.sqlite3'
+                        candidate = data_dir / f"{part_key}{suffix}"
                         if not part_key or candidate.parent != data_dir or not _valid_data_file(
-                            candidate, expected_rows=row_count,
+                            candidate, expected_rows=row_count, backend=backend,
                         ):
                             return False
                 for (part,) in parts:
                     if str(part) not in segmented_parts:
-                        candidate = data_dir / f"{part}.sqlite3"
-                        if candidate.parent != data_dir or not _valid_data_file(candidate):
+                        suffix = '.parquet' if backend == 'parquet' else '.sqlite3'
+                        candidate = data_dir / f"{part}{suffix}"
+                        if candidate.parent != data_dir or not _valid_data_file(candidate, backend=backend):
                             return False
         return True
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         return False
 
 
-def _valid_data_file(path, *, expected_rows=None):
+def _valid_data_file(path, *, expected_rows=None, backend='sqlite'):
     path = Path(path)
     if path.is_symlink() or not path.is_file():
         return False
+    if backend == 'parquet':
+        try:
+            import duckdb
+            with closing(duckdb.connect(config={'threads': 1})) as conn:
+                actual = conn.read_parquet(str(path)).count('*').fetchone()[0]
+                return expected_rows is None or actual == int(expected_rows)
+        except (ImportError, OSError, ValueError):
+            return False
+        except duckdb.Error:
+            return False
     try:
         with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
             if conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
@@ -84,7 +98,7 @@ def _valid_data_file(path, *, expected_rows=None):
         return False
 
 
-def iosql_table_names(path):
+def iosql_table_names(path, *, backend='sqlite'):
     """仅列出有真实表级 manifest 的子目录。"""
     db_path = Path(path)
     if not db_path.is_dir():
@@ -92,7 +106,7 @@ def iosql_table_names(path):
     return sorted(
         child.name for child in db_path.iterdir()
         if child.is_dir() and not child.name.startswith("__")
-        and is_iosql_table(child)
+        and is_iosql_table(child, backend=backend)
     )
 
 

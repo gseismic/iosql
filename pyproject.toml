@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "iosql"
 dynamic = ["version"]
-description = "Partitioned SQLite storage for time-series data"
+description = "Partitioned SQLite, Parquet and PostgreSQL storage for time-series data"
 readme = "README.md"
 requires-python = ">=3.9"
 authors = [
@@ -18,6 +18,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+parquet = [
+    "duckdb>=1.1",
+]
 postgresql = [
     "psycopg2-binary>=2.9",
 ]

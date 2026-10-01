@@ -1,12 +1,11 @@
 ---
 name: iosql-usage
-description: This skill should be used when the user asks to "use iosql", "设计 iosql 分区表", "写入时序数据", "查询 iosql", "诊断查询计划", "重分区", "迁移到 PostgreSQL", "操作 mysqlite", or mentions Database.table, Database.timeseries, Partition, Segment, iter_rows, repartition_to, or the iosql CLI.
-version: 0.3.0
+description: This skill should be used when the user asks to use iosql, design partitioned tables, write or query time-series data, diagnose query plans, repartition, migrate SQLite and Parquet data, use the Parquet backend, operate mysqlite, or mentions Database.table, Database.timeseries, Partition, Segment, iter_rows, repartition_to, or the iosql CLI.
 ---
 
 # iosql 使用指南
 
-iosql：本地 SQLite（可迁 PostgreSQL）时序数据存储库。版本契约 v0.3.x，接口已定稿冻结（长期稳定），本文件与该契约同步。
+iosql：支持本地 SQLite、Parquet 与 PostgreSQL 的时序数据存储库。版本契约 v0.3.x，接口已定稿冻结（长期稳定），本文件与该契约同步。
 
 ## 30 秒上手（80% 的场景就这一段）
 
@@ -31,6 +30,11 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 ```
 
 ## 决策树：选对入口
+
+批量归档或列式分析可使用 `Database("parquet://db/archive.iosql")`，先安装
+`iosql[parquet]`。建表、查询和迁移沿用 iosql 主 API；Parquet 会重写受影响的数据文件，
+适合批量写入。先看 [Parquet 使用指南](references/parquet.md) 了解性能和接口边界，再运行
+[Parquet 示例](examples/14_parquet_backend.py)。CLI 目前只有 `migrate` 支持 Parquet URI。
 
 ```
 带时间戳/日期的数据（K线、tick、orderbook、财报、新闻）
@@ -66,7 +70,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
    单 SQLite 文件时才进入 mysqlite 示例，不要把低层 API 当作主库契约 API。
 
 这条工作流对应主线示例的递进关系：01/02 解决建模入口，03 解决批量写入和计划确认，
-04～08 解决布局与运维，09/10 解决已有库，11/12 解决迁移，13 解决大结果集的有序流式读取。
+04～08 解决布局与运维，09/10 解决已有库，11/12 解决迁移，13 解决大结果集的有序流式读取，
+14 展示 Parquet 归档和 SQLite 往返迁移。
 
 ## 参数怎么设：先估算数据量，再定分区
 
@@ -91,9 +96,9 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 - `calendar` 的 `timezone` 决定日期边界，跨时区市场必须显式传
 - `range` 的 `width` 直接就是每分区行数，如 `width=100_000`
 
-### 第 3 步：segment（单个 SQLite 文件大小）
+### 第 3 步：segment（单个物理文件大小）
 
-- `segment=Segment.rows(max_rows=…)` 控制分区内物理文件滚动；不设则单分区单文件无限增长。
+- `segment=Segment.rows(max_rows=…)` 控制分区内物理文件滚动；不设则单分区单文件持续增长。
 - 从 `max_rows=1_000_000` 开始测；宽表降到 20 万~50 万，窄表可提高。
 - `target_rows`/`min_rows` 是 compact 的目标/合并下限，一般不用动。
 - 高频宽表传 `stats_columns=["ts","sequence"]`，只对裁剪关键列维护 min/max（未统计列仍可查，但计划保守扫描）。
@@ -127,6 +132,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | 查询裁剪诊断 | `table.explain_select(where=..., order_by=...)` 或 `query(...).explain()` | [examples/03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
 | 期货/夜盘交易日 session | 建表传 `session_column="trading_date"`，查询 `query(session="2026-01-06")` | [references/usage-patterns.md](references/usage-patterns.md) #交易日session |
 | 打开已有库继续写 | `db.table("name")` 不重新声明契约；`write(mode="ignore")` 跳过重复主键 | [examples/09_existing_database_append.py](examples/09_existing_database_append.py) |
+| Parquet 批量归档/分析 | `Database("parquet://...")` 配合分区、segment 和流式有序查询 | [references/parquet.md](references/parquet.md)、[examples/14_parquet_backend.py](examples/14_parquet_backend.py) |
 
 ### 进阶（偶尔需要）
 
@@ -138,6 +144,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | CLI 重分区 | `iosql repartition -s ... -t ... --partition 'duration(ts,every=1hour)' --target 新库` | [examples/07_partition_string_repartition_cli.py](examples/07_partition_string_repartition_cli.py) |
 | SQLite → PostgreSQL 迁移 | 先 `to_postgresql(..., dry_run=True)` 预览，再 `verify="row-count"` 正式迁移 | [examples/11_sqlite_to_postgresql_migration.py](examples/11_sqlite_to_postgresql_migration.py) |
 | SQLite ⇄ PostgreSQL 双向 | PG 侧重开逻辑表需 `db.table(名字, spec=同一份契约)` | [examples/12_sqlite_postgresql_roundtrip.py](examples/12_sqlite_postgresql_roundtrip.py) |
+| SQLite ⇄ Parquet 迁移 | `db.migrate_to("parquet://...")` 或反向迁移；正式迁移可启用 `verify="row-count"` | [references/parquet.md](references/parquet.md) |
 | 逻辑分区 + 物理 segment 组合 | partition 与 segment 同时配置，explain 看两级裁剪 | [examples/05_partition_segments_smoke.py](examples/05_partition_segments_smoke.py) |
 | 已有库整体重分区 | 读 `spec()` 构造新 spec → `repartition_to(..., batch_size=50_000)` | [examples/10_existing_database_repartition.py](examples/10_existing_database_repartition.py) |
 
@@ -146,6 +153,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | 主题 | 链接 |
 |------|------|
 | CLI 全部命令 + 安全规则（doctor/compact/import/export/backup/restore/rename/migrate/index） | [references/cli.md](references/cli.md) |
+| Parquet 存储、写入成本、查询、迁移和能力边界 | [references/parquet.md](references/parquet.md) |
 | 可视化管理台 `iosql web` 工作区/安全模型 | [references/ui.md](references/ui.md) |
 | compact / cleanup_obsolete / validate / segments 维护流 | [references/usage-patterns.md](references/usage-patterns.md) #布局和重分区；错误对照 [references/troubleshooting.md](references/troubleshooting.md) #分区维护 |
 | 流式查询 iter_select_batches / iter_batches / 大结果导出 | [references/usage-patterns.md](references/usage-patterns.md) #流式查询和导出 |
@@ -177,6 +185,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | `11_sqlite_to_postgresql_migration.py` | 先 dry-run，再迁移到 PostgreSQL 并做行数校验。 |
 | `12_sqlite_postgresql_roundtrip.py` | 演示 SQLite → PostgreSQL → SQLite 双向转换。 |
 | `13_streaming_ordered_query.py` | 对跨分区结果全局排序，并用 `query().iter_rows()` 惰性消费大结果集。 |
+| `14_parquet_backend.py` | 演示 Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
 
 金融示例位于 `examples/finance/`：`01_kline_bars.py` 解决 K 线 OHLCV，
 `02_orderbook_snapshots.py` 解决高频 orderbook 快照，`03_financial_reports.py` 解决财报
@@ -190,14 +199,15 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 单文件运维问题。进入低层示例前，先确认需求不是普通 `Database.table()` /
 `Database.timeseries()` 能解决的主 API 场景。
 
-运行示例前先执行 `python -m pip install -e .`；脚本默认把可重复生成的数据库放在各自
+运行示例前先执行 `python -m pip install -e .`；Parquet 示例还需安装
+`python -m pip install -e ".[parquet]"`。脚本默认把可重复生成的数据库放在各自
 `examples/runtime/` 下。未设置 `POSTGRES_DSN` 时，11 和 12 只执行 SQLite 准备与 dry-run。
 
 ## 常用 API 速查
 
 | 类别 | API | 要点 |
 |------|-----|------|
-| 入口 | `Database(uri)` | `sqlite://` 或 `postgresql://` 前缀必带 |
+| 入口 | `Database(uri)` | `sqlite://`、`parquet://` 或 `postgresql://` 前缀必带 |
 | | `db.table(name, pk, columns, partition=, segment=, order_key=, symbol_column=, session_column=)` | 核心建表入口 |
 | | `db.timeseries(name, time=, pk=, partition_every=)` | 时序语法糖（table 的薄封装） |
 | | `db.table_names()` / `db.close()` | 列表 / 关闭 |
@@ -214,7 +224,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 
 ## 关键规则（违反即抛异常）
 
-- URI 必须 `sqlite://` / `postgresql://` 前缀，直接传文件路径报 `InvalidUriSchema`。
+- URI 必须 `sqlite://` / `parquet://` / `postgresql://` 前缀，直接传文件路径报 `InvalidUriSchema`。
+- Parquet 写入成本、读取流生命周期、支持的维护操作和后端差异见 [Parquet 使用指南](references/parquet.md)。
 - 每行必须含完整 pk 字段，缺列抛 `BadArgument`（不会退回 rowid 自增）。
 - 已存在的表用 `db.table("name")` 获取引用；重新声明不同契约抛 `TableSpecConflict`。
 - `select()`/`iter_select*()` 不接受 `symbols/start/end/date/session`（抛 BadArgument）；业务过滤用 `query()`。
@@ -225,7 +236,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 - `repartition_to()`/`migrate_to()` 只写新库，不修改源库。
 - 缓冲写入异常退出会发未 flush 行数的 RuntimeWarning——不要吞掉（意味着数据未落库）。
 - `upsert`/`replace` 模式当前不支持 `Segment.rows` 表。
-- SQLite 分区表使用 `upsert`/`replace` 时，分区列必须在主键中；否则没有跨文件全局主键索引，入口会拒绝写入。`append`/`ignore` 的唯一性只在物理文件内保证。
+- SQLite/Parquet 目录分区表使用 `upsert`/`replace` 时，分区列必须在主键中；否则没有跨文件全局主键索引，入口会拒绝写入。`append`/`ignore` 的唯一性只在物理文件内保证。
 - 同机多进程常规写入由表级文件锁串行化；跨分区读取没有统一快照。`rename`、`restore`、备份和重分区应先停写并关闭其他连接；多机共享 WAL 目录不在保证范围内。
 - `query(..., order_by=...).iter_rows()` / `.iter_batches()` 保持惰性有序流式读取，不先调用 `select()` 全量物化；跨分区归并受 `max_ordered_read_connections` 和进程连接预算约束，超限抛 `BadArgument`。
 
@@ -236,13 +247,14 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 ## 详细资料（按需打开）
 
 - [references/usage-patterns.md](references/usage-patterns.md) —— 全量代码模式（四种组合、写入模式、where 构造、布局维护、迁移、PG 引擎、mysqlite、测试建议）
+- [references/parquet.md](references/parquet.md) —— Parquet 后端安装、存储方式、写入/读取语义、迁移和能力边界
 - [references/api-reference.md](references/api-reference.md) —— 全部 API 签名、结果/查询/异常类型、常量、mysqlite 完整契约
 - [references/troubleshooting.md](references/troubleshooting.md) —— 错误排查对照表
 - [references/write-performance.md](references/write-performance.md) —— 大批量写入性能（回灌/orderbook/PRAGMA/FD/HDD）
 - [references/cli.md](references/cli.md) —— CLI 命令与安全规则
 - [references/ui.md](references/ui.md) —— 可视化管理台 iosql web（旧名 iosql ui）
 - [references/design-contract.md](references/design-contract.md) —— 接口契约、设计偏好与开发守则（本仓库开发必读）
-- [examples/README.md](examples/README.md) —— 主线 `01~13` 示例索引，每个示例对应一个常见问题；
+- [examples/README.md](examples/README.md) —— 主线 `01~14` 示例索引，每个示例对应一个常见问题；
   `examples/13_streaming_ordered_query.py` 专门覆盖有序大结果集的惰性读取。
 - [examples/finance/README.md](examples/finance/README.md) —— K线、orderbook、财报、新闻四类金融场景。
 - [examples/mysqlite/README.md](examples/mysqlite/README.md) 和

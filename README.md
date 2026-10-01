@@ -2,9 +2,12 @@
 
 `iosql` 是一个接近原生 SQLite 的自动分区存储库。它把同一张逻辑表拆到多个 SQLite 分区文件中，保留 SQLite 的简单部署方式，同时提供逻辑分区、物理 row segment、查询裁剪、批量写入和布局诊断能力。时间序列只是普通分区表的一种 helper 用法。
 
+支持可选的 Parquet 和 PostgreSQL 后端；同一套表契约与读写接口可用于不同后端。
+
 ## 特性
 
 - **普通 Table 主入口**：用 `Database.table(..., pk=..., partition=..., segment=..., time=...)` 声明主键、列类型、逻辑分区和物理分段；`time=` / `session_column=` 让契约感知查询直达普通分区表。
+- **Parquet 后端**：`Database("parquet://...")` 把业务数据保存为 ZSTD 压缩的 Parquet 文件，使用 DuckDB 查询，支持分区、segment、流式排序和 SQLite 双向迁移。
 - **任意可排序字段分区**：`Partition.range(...)`、`Partition.duration(...)`、`Partition.calendar(...)` 都是普通分区策略；duration/calendar 分区未声明 time 时会自动反推。
 - **物理 row segment**：同一 logical partition 可按行数自动拆成多个 SQLite 文件，也可以不配置 logical partition，仅用 `__all__` + row segment 控制文件大小。
 - **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
@@ -84,6 +87,49 @@ python -m pip install -e .
 ```bash
 python -m pip install -e ".[postgresql]"
 ```
+
+需要 Parquet 后端时安装：
+
+```bash
+python -m pip install -e ".[parquet]"
+```
+
+### Parquet 后端
+
+```python
+from iosql import Database, Segment
+
+with Database("parquet://db/archive.iosql") as db:
+    bars = db.timeseries(
+        "bars", time="ts", pk=["symbol", "ts"],
+        columns={"symbol": "text", "ts": "integer", "close": "float"},
+        partition_every="1day", segment=Segment.rows(max_rows=500_000),
+    )
+    bars.write([{"symbol": "AAPL", "ts": 1735689600000, "close": 187.4}])
+    rows = bars.query(symbols="AAPL", order_by="ts").to_list()
+```
+
+表契约与 manifest 仍保存在 `meta.sqlite3`，业务数据位于 `data/*.parquet`。
+已有库可通过 `db.table("bars")` 直接重开，新增列在旧文件中读为 NULL。
+SQLite 与 Parquet 之间可用 `db.migrate_to(target_uri, verify="row-count")`
+转换，CLI 同样支持：
+
+```bash
+iosql migrate -s sqlite://db/market.iosql --target parquet://db/archive.iosql --verify row-count
+iosql migrate -s parquet://db/archive.iosql --target sqlite://db/restored.iosql --verify row-count
+```
+
+Parquet 的追加、修改和删除会重写受影响的物理文件，适合批量归档与分析读取。
+建议使用 `buffered_writer()` 和 `Segment.rows` 限制写入次数与单文件大小；
+segment 表沿用现有 upsert/replace 限制。读取流存活期间，同表写入会等待；
+同一线程写入前应先耗尽或关闭读取流。数据文件原子替换，跨文件写入没有统一事务。
+
+支持 Python 数据与维护接口、表重命名和 CLI `migrate`。其余 CLI 命令、Web
+工作区发现、数据库目录重命名、SQLite PRAGMA、持久化索引、`commit=False`
+与 `aggregate_by_bucket()` 暂不支持 Parquet。只接管 iosql 创建的目录库，
+不会自动注册任意已有 Parquet 文件。
+
+完整示例：[14_parquet_backend.py](examples/14_parquet_backend.py)。
 
 构建 wheel：
 

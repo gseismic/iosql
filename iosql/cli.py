@@ -110,10 +110,10 @@ def _parse_migration_target_uri(raw: str) -> str:
     value = str(raw or "").strip()
     if not value:
         _fail("目标 URI 不能为空")
-    if value.startswith(("sqlite://", "sqlite3://", "postgresql://")):
+    if value.startswith(("sqlite://", "sqlite3://", "postgresql://", "parquet://")):
         return value
     if "://" in value:
-        _fail("migrate 目标只支持 sqlite://、sqlite3:// 或 postgresql://")
+        _fail("migrate 目标只支持 sqlite://、sqlite3://、postgresql:// 或 parquet://")
     return f"sqlite://{value}"
 
 
@@ -1394,11 +1394,11 @@ def cleanup_obsolete(
 
 @app.command()
 def migrate(
-    source: str = typer.Option(..., "--source", "-s", help="SQLite 源库 URI 或路径"),
+    source: str = typer.Option(..., "--source", "-s", help="SQLite/Parquet 源库 URI，或 SQLite 路径"),
     target: str = typer.Option(
         ...,
         "--target",
-        help="目标库 URI，支持 postgresql:// 或 sqlite://",
+        help="目标库 URI，支持 postgresql://、sqlite:// 或 parquet://",
     ),
     table: List[str] = typer.Option(
         None,
@@ -1415,8 +1415,14 @@ def migrate(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只预览迁移计划，不连接目标库"),
 ):
-    """把 SQLite iosql 库迁移到 PostgreSQL 或另一个 iosql 目标库。"""
-    source_uri, source_path = _require_source(source)
+    """在 SQLite、Parquet 目录库与 PostgreSQL 目标库之间迁移数据。"""
+    if str(source).startswith('parquet://'):
+        source_uri = str(source).strip()
+        source_path = Path(source_uri[len('parquet://'):])
+        if not source_path.is_dir():
+            _fail(f'Parquet 源库目录不存在: {source_path}')
+    else:
+        source_uri, source_path = _require_source(source)
     target_uri = _parse_migration_target_uri(target)
     write_mode = _normalize_write_mode(mode)
     verify_mode = _normalize_verify_mode(verify)
@@ -1426,8 +1432,9 @@ def migrate(
 
     db = Database(source_uri)
     try:
-        if target_uri.startswith(("sqlite://", "sqlite3://")):
-            target_path = _uri_to_path(target_uri)
+        if target_uri.startswith(("sqlite://", "sqlite3://", "parquet://")):
+            target_path = (Path(target_uri[len('parquet://'):])
+                           if target_uri.startswith('parquet://') else _uri_to_path(target_uri))
             source_real = _real_path(source_path)
             target_real = _real_path(target_path)
             # 同库/嵌套目标会把行数翻倍或生成嵌套库，直接拒绝（L1-1）

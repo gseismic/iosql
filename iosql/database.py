@@ -119,9 +119,10 @@ class Database(object):
         uri_schema, _ = parse_db_schema(uri)
         self._uri_schema = uri_schema
         sqlite_engine = uri_schema in ["sqlite", "sqlite3"]
+        directory_engine = sqlite_engine or uri_schema == 'parquet'
         if pragma_dict is not None and not sqlite_engine:
             raise BadArgument("pragma_dict is only supported by the SQLite engine")
-        if not sqlite_engine and (
+        if not directory_engine and (
             max_open_partitions != _DEFAULT_MAX_OPEN_PARTITIONS
             or max_connections_per_file != _DEFAULT_MAX_CONNECTIONS_PER_FILE
             or max_process_connections != _DEFAULT_MAX_PROCESS_CONNECTIONS
@@ -129,7 +130,7 @@ class Database(object):
             != _DEFAULT_MAX_ORDERED_READ_CONNECTIONS
         ):
             raise BadArgument(
-                "SQLite file limits are only supported by the SQLite engine"
+                "File limits are only supported by the SQLite and Parquet engines"
             )
         self._max_open_partitions = self._positive_int(
             "max_open_partitions",
@@ -161,6 +162,8 @@ class Database(object):
 
     def __getitem__(self, table_name):
         with self._tables_lock:
+            if self._uri_schema in ["sqlite", "sqlite3", "parquet"]:
+                table_name = self._table_cls._validate_table_name(table_name)
             table = self._tables.get(table_name)
             if table is not None:
                 return table
@@ -168,17 +171,25 @@ class Database(object):
                 "table_name": table_name,
                 "verbose": self.verbose,
             }
-            if self._uri_schema in ["sqlite", "sqlite3"]:
-                table_path = os.path.join(_sqlite_path_from_uri(self._uri), str(table_name))
+            if self._uri_schema in ["sqlite", "sqlite3", "parquet"]:
+                _, options = parse_db_schema(self._uri)
+                db_path = (
+                    _sqlite_path_from_uri(self._uri)
+                    if self._uri_schema in ['sqlite', 'sqlite3']
+                    else os.path.join(options.get('path') or '', options.get('db') or '')
+                )
+                table_path = os.path.join(db_path, table_name)
+                backend = 'parquet' if self._uri_schema == 'parquet' else 'sqlite'
                 if os.path.lexists(table_path):
                     if os.path.islink(table_path) or not os.path.isdir(table_path):
                         raise UnsafeOperation(f"表路径不是普通目录: {table_path}")
                     if os.listdir(table_path) and not (
-                        is_iosql_table(table_path) or is_iosql_scaffold(table_path)
+                        is_iosql_table(table_path, backend=backend) or is_iosql_scaffold(table_path)
                     ):
                         raise UnsafeOperation(
                             f"目录不是有效 iosql 表，拒绝在其中创建元数据: {table_path}"
                         )
+            if self._uri_schema in ["sqlite", "sqlite3", "parquet"]:
                 table_options.update({
                     "max_open_partitions": self._max_open_partitions,
                     "max_connections_per_file": self._max_connections_per_file,
@@ -599,7 +610,9 @@ class Database(object):
         db_path = os.path.join(options.get('path') or '', options.get('db') or '')
         if not os.path.isdir(db_path):
             return []
-        return iosql_table_names(db_path)
+        return iosql_table_names(
+            db_path, backend='parquet' if self._uri_schema == 'parquet' else 'sqlite'
+        )
 
     def rename(self, new_uri_or_name, exist_ok=False, overwrite=False):
         """重命名当前 SQLite 目录库。
@@ -870,21 +883,26 @@ class Database(object):
             raise BadArgument(
                 f"Bad migration target uri `{target_uri}`: {e}"
             ) from e
-        if schema not in ['sqlite', 'sqlite3', 'postgresql']:
+        if schema not in ['sqlite', 'sqlite3', 'postgresql', 'parquet']:
             raise BadArgument(
                 f"Unsupported migration target schema `{schema}`；"
-                "可选: sqlite/sqlite3/postgresql"
+                "可选: sqlite/sqlite3/postgresql/parquet"
             )
 
     def _reject_migration_self_target(self, target_uri):
-        """拒绝把 SQLite 库迁移到自身或自身目录内（会静默翻倍/递归）。"""
-        if self._uri_schema not in ['sqlite', 'sqlite3']:
+        """拒绝把目录库迁移到自身或自身目录内（会静默翻倍/递归）。"""
+        if self._uri_schema not in ['sqlite', 'sqlite3', 'parquet']:
             return
         target_schema, _ = parse_db_schema(target_uri)
-        if target_schema not in ['sqlite', 'sqlite3']:
+        if target_schema not in ['sqlite', 'sqlite3', 'parquet']:
             return
-        source_path = os.path.realpath(_sqlite_path_from_uri(self._uri))
-        target_path = os.path.realpath(_sqlite_path_from_uri(target_uri))
+        def local_path(uri):
+            _, options = parse_db_schema(uri)
+            return os.path.realpath(os.path.join(
+                options.get('path') or '', options.get('db') or ''
+            ))
+        source_path = local_path(self._uri)
+        target_path = local_path(target_uri)
         if target_path == source_path:
             raise BadArgument(
                 "migrate_to target 不能与源库相同；修复: 指定一个新的目标路径"
@@ -954,6 +972,9 @@ class Database(object):
         elif uri_schema == 'postgresql':
             from .engines import postgresql
             engine = postgresql.Table
+        elif uri_schema == 'parquet':
+            from .engines import parquet
+            engine = parquet.Table
 
         if not engine:
             raise EngineNotExist(uri)

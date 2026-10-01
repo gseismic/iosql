@@ -309,6 +309,9 @@ class Table(BaseTable):
     分区模式，因为不知道在哪个分区，插入时才创建.sqlite3文件
     """
 
+    _storage_engine = 'sqlite'
+    _data_suffix = '.sqlite3'
+
     def __init__(self, *args, **kwargs):
         pragma_dict = kwargs.pop("pragma_dict", None)
         max_open_partitions = kwargs.pop("max_open_partitions", 5)
@@ -499,7 +502,7 @@ class Table(BaseTable):
             raise UnsafeOperation(f'unsafe table rename target: {target_path}')
         if not os.path.isdir(source_path):
             raise BadArgument(f'table does not exist: {old_name}')
-        if not is_iosql_table(source_path):
+        if not is_iosql_table(source_path, backend=self._storage_engine):
             raise UnsafeOperation(f'源目录不是有效 iosql 表: {source_path}')
         if os.path.exists(target_path):
             if not overwrite:
@@ -508,7 +511,7 @@ class Table(BaseTable):
                 raise UnsafeOperation(
                     f'table rename target exists and is not a directory: {target_path}'
                 )
-            if not is_iosql_table(target_path):
+            if not is_iosql_table(target_path, backend=self._storage_engine):
                 raise UnsafeOperation(f'目标目录不是有效 iosql 表: {target_path}')
 
         owner_ref = getattr(self, '_owner_db', None)
@@ -567,7 +570,8 @@ class Table(BaseTable):
                 warnings.warn(f'旧目标表残留在 {backup_path}: {exc}', RuntimeWarning)
         return self
 
-    def _validate_table_name(self, name):
+    @staticmethod
+    def _validate_table_name(name):
         value = str(name or '').strip()
         if not value:
             raise BadArgument('table name must not be empty')
@@ -2160,7 +2164,7 @@ class Table(BaseTable):
         referenced = {os.path.realpath(ref.path) for ref in refs}
         orphans = []
         for name in sorted(os.listdir(self.table_part_path)):
-            if not name.endswith('.sqlite3'):
+            if not name.endswith(self._data_suffix):
                 continue
             path = os.path.join(self.table_part_path, name)
             if os.path.realpath(path) in referenced:
@@ -2611,7 +2615,7 @@ class Table(BaseTable):
         Returns:
             Full path to the partition file
         """
-        path = os.path.join(self.table_part_path, f"{part_key}.sqlite3")
+        path = os.path.join(self.table_part_path, f"{part_key}{self._data_suffix}")
         # P0-3 纵深防御：即使分区 key 生成侧被绕过（fmt 注入/损坏 manifest），
         # 也不允许分区文件写出 data 目录
         if not self._is_safe_part_path(path):
@@ -5124,7 +5128,7 @@ class Table(BaseTable):
             return None
 
     def table_names(self):
-        return iosql_table_names(self.db_path)
+        return iosql_table_names(self.db_path, backend=self._storage_engine)
 
     def _overwrite_table_meta(self, createtable_meta):
         """table 创建信息"""

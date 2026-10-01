@@ -601,6 +601,32 @@ source_db.close()
 `10_existing_database_repartition.py`。默认模式会先准备并关闭各自的示例源库，
 再以“已有库”方式重新打开；设置环境变量后可指向真实库，且不会清理外部源库。
 
+## SQLite 与 Parquet 迁移
+
+SQLite 与 Parquet 目录库可以通过同一迁移接口互转。先用 dry-run 查看表、源行数和批次数，
+再使用 `verify="row-count"` 校验目标行数：
+
+```python
+with Database("sqlite://db/market.iosql") as source:
+    preview = source.migrate_to(
+        "parquet://db/archive.iosql",
+        dry_run=True,
+        verify="row-count",
+        batch_size=50_000,
+    )
+    result = source.migrate_to(
+        "parquet://db/archive.iosql",
+        verify="row-count",
+        batch_size=50_000,
+    )
+```
+
+Parquet → SQLite 的方向只需把源和目标 URI 对调。CLI 用 `iosql migrate -s SOURCE --target TARGET`；
+Parquet URI 显式使用 `parquet://`，并安装 `iosql[parquet]`。
+文件重写成本、流式读取生命周期和其他后端边界见 [Parquet 使用指南](parquet.md)。
+
+迁移窗口内暂停源库写入，并使用干净的目标表执行行数校验。
+
 ## SQLite 迁移到 PostgreSQL
 
 已有 SQLite 目录库迁移到 PostgreSQL 时，优先使用高层迁移接口。它会复用源表契约，

@@ -1,5 +1,8 @@
 # iosql CLI
 
+`migrate` 支持 SQLite/Parquet 源库，并可写入 SQLite、Parquet 或 PostgreSQL 目标库。
+Parquet URI 必须显式传 `parquet://`，并安装 `iosql[parquet]`；其他 CLI 运维命令仍只支持 SQLite。
+
 > 版本对齐：iosql v0.3.x。可视化管理台见 [ui.md](ui.md)。
 
 CLI 入口：
@@ -9,7 +12,7 @@ iosql --help
 python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 ```
 
-CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径或 `sqlite://...` / `sqlite3://...`。如果 source 输入 `postgresql://...` 等其他 URI，应直接拒绝，不要自动包装成 SQLite 路径。`iosql migrate --target` 例外，目标可传 `postgresql://...`。
+常规 CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径或 `sqlite://...` / `sqlite3://...`。`migrate` 是例外：它接受 SQLite 路径/URI 或 `parquet://...` 源库，并接受 SQLite、Parquet 或 PostgreSQL 目标。
 
 ## 命令速查表
 
@@ -31,7 +34,7 @@ CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径�
 | **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
 | | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation；`--partition` 会校验分区存在并列可用分区 |
 | | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件；`--partition` 同样校验（含仅存在于 obsolete 的分区） |
-| | `iosql migrate -s DB --target postgresql://... [--dry-run] [--verify row-count]` | 迁移 SQLite iosql 库到 PostgreSQL；拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表 |
+| | `iosql migrate -s DB --target parquet://... [--dry-run] [--verify row-count]` | SQLite/Parquet 源库迁移到 SQLite、Parquet 或 PostgreSQL；Parquet 源和目标使用显式 URI；拒绝同库/嵌套目标；行数校验要求目标库不存在同名表 |
 | | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库；`--dry-run` 也校验 interval/timezone 与目标父目录，目标不能等于/嵌套源库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份；拒绝与源库互相包含的路径 |
 | | `iosql restore --backup BACKUP --target DB` | 目录级恢复；备份和覆盖目标均须有真实表级 manifest 且分区文件完整，空目录不能作为备份；覆盖需 `--replace --yes`；复制后的副本会再次校验，替换失败回滚 |

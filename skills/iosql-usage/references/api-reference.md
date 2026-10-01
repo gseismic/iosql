@@ -18,9 +18,16 @@
 
 ### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32, max_ordered_read_connections=128)`
 
-数据库入口。支持 `sqlite://` 和 `postgresql://` URI。
+数据库入口。支持 `sqlite://`、`parquet://` 和 `postgresql://` URI。
+Parquet 需安装 `iosql[parquet]`，业务数据为 `data/*.parquet`，元数据为 SQLite。
+Parquet 支持分区、segment、读写、流式排序、维护和迁移；追加、修改和删除会重写受影响文件。
+Parquet 不支持 PRAGMA、持久化索引、`commit=False`、数据库目录 rename 和
+`aggregate_by_bucket`。文件预算参数也可传给 Parquet，用于元数据连接及有序流预算；
+接口细节见 [Parquet 使用指南](parquet.md)。
 
 **SQLite URI 格式**：`sqlite://path/database_name.iosql`
+
+**Parquet URI 格式**：`parquet://path/database_name.iosql`
 
 **PostgreSQL URI 格式**：`postgresql://user:pass@host:port/dbname`
 
@@ -36,9 +43,9 @@ python -m pip install "iosql[postgresql]"
 | `verbose` | `int` | 日志详细度，`0`=静默 |
 | `pragma_dict` | `dict`/`None` | 仅 SQLite；覆盖默认 balanced PRAGMA，例如 `{"synchronous": "full"}` |
 | `max_open_partitions` | `int` | 仅 SQLite；每张表最多缓存的打开分区数据库数，默认 `5` |
-| `max_connections_per_file` | `int` | 仅 SQLite；每个 SQLite 文件的连接池上限，默认 `1` |
-| `max_process_connections` | `int` | 仅 SQLite；进程内所有 mysqlite 池共享的真实连接预算，默认 `32` |
-| `max_ordered_read_connections` | `int` | 仅 SQLite；单次带全局 `order_by` 的流式归并同时读取的分区上限，默认 `128` |
+| `max_connections_per_file` | `int` | SQLite 文件及 Parquet 元数据的连接池上限，默认 `1` |
+| `max_process_connections` | `int` | 目录后端共享的元数据/SQLite 连接与有序流预算，默认 `32` |
+| `max_ordered_read_connections` | `int` | SQLite/Parquet 单次带全局 `order_by` 的流式归并同时读取的分区上限，默认 `128` |
 
 四个资源参数必须是正整数。分区数据库按带租约的线程安全 LRU 淘汰；两个元数据库
 不计入 `max_open_partitions`，但计入 `max_process_connections`。多个活跃实例
@@ -122,7 +129,8 @@ native partition 模式下会同步重命名旧表名前缀的子分区表。
 
 #### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> MigrationResult`
 
-把当前 iosql 库迁移到目标库。典型用途是 SQLite 到 PostgreSQL：
+把当前 iosql 库迁移到目标库。SQLite 与 Parquet 可互相迁移；SQLite/Parquet 也可迁移到
+PostgreSQL。Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parquet.md)。
 
 ```python
 source = Database("sqlite://db/market.iosql")
@@ -142,7 +150,7 @@ result = source.migrate_to(
 
 `dry_run=True` 只统计源表行数和估算批次数，不连接目标库；`mode`/`tables`/目标 URI
 会在 `dry_run` 阶段一并校验，且不会为不存在的表创建目录或 `meta.sqlite3`。
-SQLite 源迁移到 SQLite 目标时，目标不能与源库相同或位于源库目录内（`BadArgument`）。
+SQLite/Parquet 目录库作为源时，目标不能与源库相同或位于源库目录内（`BadArgument`）。
 `tables` 支持 `None`（全库）、表名列表/字符串、或 `{源表: 目标表}` 映射；空列表、
 未知源表或非法类型抛 `BadArgument`。`verify="row-count"` 会在迁移后比较源/目标
 行数，结果写入 `source_rows`、`target_rows` 和 `verified`。

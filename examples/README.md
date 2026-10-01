@@ -23,6 +23,7 @@
 | `11_sqlite_to_postgresql_migration.py` | 高级 | SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询。 |
 | `12_sqlite_postgresql_roundtrip.py` | 高级 | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
 | `13_streaming_ordered_query.py` | 进阶 | 对跨分区结果按 `open_time` 全局排序，并用 `query(...).iter_rows(...)` 惰性逐行读取。 |
+| `14_parquet_backend.py` | 高级 | Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
 
 ## 金融示例
 
@@ -36,6 +37,10 @@
 | `finance/04_news_announcements.py` | 新闻/公告事件按时间和类型过滤。 |
 
 ## 运行
+
+`14_parquet_backend.py` 演示 Parquet 分区文件、流式排序、重开和迁移。
+运行前安装 `python -m pip install -e ".[parquet]"`，再运行
+`python examples/14_parquet_backend.py`。
 
 先在仓库根目录安装开发版本：
 
@@ -61,6 +66,8 @@ python examples/10_existing_database_repartition.py
 python examples/11_sqlite_to_postgresql_migration.py
 python examples/12_sqlite_postgresql_roundtrip.py
 python examples/13_streaming_ordered_query.py
+python -m pip install -e ".[parquet]"
+python examples/14_parquet_backend.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
