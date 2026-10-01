@@ -895,15 +895,36 @@ database/
 
 | 能力 | SQLite 引擎 | PostgreSQL 引擎 |
 | --- | --- | --- |
-| 建表/契约 | `db.table()` 完整 | 迁移绑定 `db.table(name, spec=...)` |
+| 建表/契约 | `db.table()` 完整 | `db.table()` / `db.timeseries()`；重开需契约 |
 | 写入 | `write` / `buffered_writer` / `insert_all` / `upsert_all` | `write` / `insert_all` / `upsert_all` |
 | 条件查询 | `select` / `iter_select` / `iter_select_batches` | `select` / `iter_select` / `iter_select_batches` |
-| 时序查询 | `query` / `latest` / `asof` | 不支持 |
-| 查询计划 | `explain_select` | 不支持 |
+| 时序查询 | `query` / `latest` / `asof` | `query` / `latest` / `asof`，数据库端执行 |
+| 查询计划 | `explain_select` | `explain_select` / 查询对象 `.explain()`，原生 JSON |
+| 索引 | 单列索引 | 单列/复合 B-tree，安全删除、等价主键复用 |
 | 诊断维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` / `truncate` / `delete` / `delete_all` / `count_rows` | `delete` / `delete_all` / `count_rows` |
 | 迁移 | `migrate_to` / `to_postgresql` | `migrate_to`（作为源写回 SQLite） |
 
-PostgreSQL 引擎定位是**迁移目标 + 基础查询**，时序便捷查询（`query/latest/asof`）仅在 SQLite 侧提供；需要完整业务接口时以 SQLite 目录库为主存储，PG 作为迁移/备份目标。
+PostgreSQL 14+ 可作为在线时序存储。`query/latest/asof` 的筛选、排序、limit 和分组取最新值均由数据库执行。`query().iter_batches()` / `.iter_rows()` 使用命名游标；`select()` / `.to_list()` 会物化完整结果。start/end/as_of 包含边界，latest 保持请求 symbol 顺序；同时间按剩余主键升序决胜。指定 symbol 且有 symbol/time 前缀索引时，单分组 latest 使用 LATERAL LIMIT 1；其他分组使用 DISTINCT ON。单个 Table 使用一条连接，消费期间应先关闭流再执行其他会结束事务的操作。
+
+```python
+bars = db.timeseries('bars', time='ts', pk=['symbol', 'ts'],
+                     columns={'symbol': 'text', 'ts': 'integer', 'close': 'float'},
+                     partition_every='1day')
+for batch in bars.query(symbols='AAPL', start=start_ms, end=end_ms,
+                        columns=['ts', 'close'], order_by='ts').iter_batches(10_000):
+    consume(batch)
+plan = bars.query(symbols='AAPL', start=start_ms, end=end_ms).explain()
+measured = bars.latest(symbols=['AAPL', 'MSFT'], as_of=end_ms).explain(analyze=True)
+bars.create_index(columns=['symbol', 'ts'])  # 等价主键索引会被复用
+```
+
+`.explain()` 默认只规划，隐藏谓词常量；`analyze=True` 真实执行 SELECT 并提供耗时和 buffer，`raw_plan=True` 显式保留原始谓词与输出表达式，可能含业务常量。`QueryPlan.engine_plan` 保存结构化计划，分区列表使用 PG 关系名；默认 scanned_partitions 是计划访问关系，ANALYZE 时是 Actual Loops>0 的实际访问关系。segment 字段为空，过滤、排序和 limit 均在数据库执行。
+
+`create_index(column=...)` 或 `create_index(columns=[...])` 显式创建父表 B-tree；子分区自动继承。`drop_index(columns=[...])` 只删除有 iosql 标记、定义与归属仍匹配的二级索引；约束和外部用户索引受保护。`upsert_all()` 只合并输入主键的字段，缺字段保留，显式 None 写 NULL，重复主键按输入顺序合并；不读取全表。`count_rows()` 保持精确计数，可能扫描整个表。
+
+重开表会验证声明列的真实类型、主键顺序、分区形态与单列 RANGE 键。分区主键必须包含分区列。原生 date/timestamp/timestamptz 查询按契约时区绑定边界；calendar text 使用统一定长 compact 或无偏移 ISO 格式，查询精度独立于分区周期；带偏移时间使用 timestamptz。
+
+运行示例：`POSTGRES_DSN=... uv run --extra postgresql examples/15_postgresql_timeseries_query.py`。查询基准：`POSTGRES_DSN=... uv run --extra postgresql benchmarks/benchmark_postgresql_query.py`，默认覆盖百万/千万行。结果和环境见 [基准报告](benchmarks/results/postgresql-query-20261002.md)。
 
 ### 动态扩列（schema_policy='evolve'）语义
 

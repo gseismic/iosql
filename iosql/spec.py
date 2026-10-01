@@ -1170,6 +1170,11 @@ class QueryPlan:
     segment_skip_reasons: Dict[Any, str] = field(default_factory=dict)
     requires_global_sort: bool = False
     requires_python_limit: bool = False
+    engine: Optional[str] = None  # 原生计划所属引擎；旧目录计划保留默认值
+    engine_plan: Optional[Dict[str, Any]] = None  # 默认仅结构/指标；原始谓词需显式选择
+    planning_time_ms: Optional[float] = None  # ANALYZE 可用的规划耗时
+    execution_time_ms: Optional[float] = None  # 实际执行耗时；只规划时为 None
+    index_scans: List[Dict[str, Any]] = field(default_factory=list)  # 原生索引访问路径
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1188,6 +1193,11 @@ class QueryPlan:
             "segment_skip_reasons": dict(self.segment_skip_reasons),
             "requires_global_sort": self.requires_global_sort,
             "requires_python_limit": self.requires_python_limit,
+            "engine": self.engine,
+            "engine_plan": self.engine_plan,
+            "planning_time_ms": self.planning_time_ms,
+            "execution_time_ms": self.execution_time_ms,
+            "index_scans": list(self.index_scans),
         }
 
 

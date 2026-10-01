@@ -11,7 +11,7 @@ import threading
 
 import pytest
 
-from iosql import Database, Partition, Segment
+from iosql import Database, Segment
 from iosql.exception import BadArgument, UnsafeOperation
 from iosql.engines.postgresql import Table as PGTable
 from iosql.utils.mysqlite import Database as MyDatabase
@@ -24,6 +24,12 @@ class _FakeCursor:
 
     def execute(self, query, params=None):
         self.executed.append((query, params))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
 
 
 class _FakeConn:
@@ -46,8 +52,13 @@ def test_postgresql_create_index_uses_identifier_not_fstring(monkeypatch):
     monkeypatch.setattr(pg_table_module.psycopg2, "connect", lambda uri: fake_conn)
     table = PGTable("postgresql://u:p@localhost:5432/db", "ticks", partition_mode="native")
 
+    # 注入形列名仍须通过 Identifier 引用，目录证据在此独立替换。
+    from contextlib import nullcontext
+    monkeypatch.setattr(table, '_column_types', lambda: {'id); DROP TABLE x; --': 'integer'})
+    monkeypatch.setattr(table, '_index_definitions', lambda: [])
+    monkeypatch.setattr(table, '_transaction', lambda *a: nullcontext())
     table.create_index("id); DROP TABLE x; --", order="desc")
-    query = fake_conn.cursor_obj.executed[-1][0]
+    query = fake_conn.cursor_obj.executed[0][0]
     assert not isinstance(query, str)
 
 

@@ -7,6 +7,7 @@ import hashlib
 import warnings
 import itertools
 import time
+import sys
 from contextlib import contextmanager
 from typing import Any, Dict, List
 import arrow
@@ -20,6 +21,7 @@ from ...exception import BadArgument, SchemaConflict
 from ...utils.schema import parse_db_schema
 from ...logger import default_logger as logger
 from ...spec import TableContract, TableMigrationResult, WriteResult
+from .query import PostgreSQLQueryMixin
 from ..sqlite.query_util import (
     _quote_sql_identifier,
     build_or_cases_subquery,
@@ -105,7 +107,7 @@ def _fit_identifier(name, suffix):
     return f'{prefix}{suffix}'
 
 
-class Table(BaseTable):
+class Table(PostgreSQLQueryMixin, BaseTable):
     """PostgreSQL table with partition support.
     
     Supports two partition modes:
@@ -374,20 +376,63 @@ class Table(BaseTable):
         """已有表漂移检查：缺列/分区形态不符时抛 SchemaConflict。"""
         existing = self._fetch_table_columns()
         declared = list((column_type or {}).keys())
-        if existing:
-            missing = [col for col in declared if col not in existing]
-            if missing:
-                raise SchemaConflict(
-                    f'表 `{self._table_name}` 已存在但缺少契约列 {missing}；'
-                    '物理表与契约不一致。修复: 对齐 columns= 声明、'
-                    'DROP TABLE 后重建，或改用新的表名。'
-                )
+        missing = [col for col in declared if col not in existing]
+        if missing:
+            raise SchemaConflict(
+                f'表 `{self._table_name}` 已存在但缺少契约列 {missing}；'
+                '物理表与契约不一致。修复: 对齐 columns= 声明、'
+                'DROP TABLE 后重建，或改用新的表名。'
+            )
         if partition is not None and not self._is_partitioned_table():
             raise SchemaConflict(
                 f'表 `{self._table_name}` 已存在但未启用 native 分区，'
                 '而契约声明了 partition。修复: DROP TABLE 后重建，'
                 '或去掉 partition 声明。'
             )
+        with self.connect().cursor() as cursor:
+            cursor.execute(
+                'SELECT column_name, udt_name FROM information_schema.columns '
+                'WHERE table_schema=%s AND table_name=%s',
+                (self._schema_name(), self._table_name),
+            )
+            physical = dict(cursor.fetchall())
+            for name, declared in (column_type or {}).items():
+                if physical[name] != {'BIGINT': 'int8', 'DOUBLE PRECISION': 'float8',
+                                     'TEXT': 'text', 'BOOLEAN': 'bool', 'DATE': 'date',
+                                     'TIMESTAMP': 'timestamp', 'TIMESTAMPTZ': 'timestamptz',
+                                     'JSONB': 'jsonb', 'BYTEA': 'bytea'}[self._pg_column_type(declared)]:
+                    raise SchemaConflict(f'表 `{self._table_name}` 列 `{name}` 类型与契约不一致')
+            cursor.execute(
+                '''SELECT array_agg(a.attname ORDER BY k.ordinality)
+                   FROM pg_index i
+                   CROSS JOIN LATERAL unnest(i.indkey) WITH ORDINALITY k(attnum, ordinality)
+                   JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.attnum
+                   WHERE i.indrelid=to_regclass(%s) AND i.indisprimary
+                     AND k.ordinality<=i.indnkeyatts''',
+                (self._qualified_relation(),),
+            )
+            row = cursor.fetchone()
+            physical_pk = list(row[0] or []) if row else []
+            if physical_pk != self._primary_key:
+                raise SchemaConflict(f'表 `{self._table_name}` 主键与契约不一致: {physical_pk}')
+            cursor.execute(
+                '''SELECT p.partstrat, p.partnatts, a.attname
+                   FROM pg_partitioned_table p
+                   LEFT JOIN pg_attribute a ON a.attrelid=p.partrelid
+                        AND a.attnum=p.partattrs[0]
+                   WHERE p.partrelid=to_regclass(%s)''',
+                (self._qualified_relation(),),
+            )
+            row = cursor.fetchone()
+            if partition is None:
+                if row:
+                    raise SchemaConflict('物理表已分区，但契约未声明 partition')
+            elif not row or tuple(row) != ('r', 1, partition.TS_COL):
+                raise SchemaConflict('物理分区方式或分区键与契约不一致，要求单列 RANGE')
+
+    def _qualified_relation(self):
+        """供 to_regclass 使用的完整关系名，避免 schema 与特殊标识符歧义。"""
+        return f'{_quote_sql_identifier(self._schema_name())}.{_quote_sql_identifier(self._table_name)}'
 
     def _native_partition_child_renames(self, old_name, new_name):
         if self.partition_mode != self.PARTITION_MODE_NATIVE:
@@ -421,15 +466,18 @@ class Table(BaseTable):
     def use_contract(self, contract):
         contract = TableContract.ensure(contract)
         self._validate_contract_metadata(contract)
-        self._contract = contract
-        self._partition = contract.to_partition()
-        self._primary_key = list(contract.primary_key)
-        self._declared_column_types = dict(contract.columns or {})
-        self.create_table(
-            contract.columns,
-            pk=contract.primary_key,
-            partition=self._partition,
-        )
+        previous = (self._contract, self._partition, self._primary_key,
+                    self._declared_column_types, self._table_created)
+        try:
+            self._contract = contract
+            self._partition = contract.to_partition()
+            self._primary_key = list(contract.primary_key)
+            self._declared_column_types = dict(contract.columns or {})
+            self.create_table(contract.columns, pk=contract.primary_key, partition=self._partition)
+        except BaseException:
+            (self._contract, self._partition, self._primary_key,
+             self._declared_column_types, self._table_created) = previous
+            raise
         self._table_created = True
         return self
 
@@ -484,6 +532,14 @@ class Table(BaseTable):
             col_name: self._pg_column_type(col_type)
             for col_name, col_type in column_type.items()
         }
+        missing = [name for name in self._primary_key if name not in column_type]
+        if missing:
+            raise BadArgument(f'主键列未声明: {missing}')
+        if partition is not None:
+            if partition.TS_COL not in column_type:
+                raise BadArgument(f'分区列未声明: {partition.TS_COL}')
+            if self._primary_key and partition.TS_COL not in self._primary_key:
+                raise BadArgument('PostgreSQL 分区主键必须包含分区列；请将分区列加入 pk')
 
         # 已有表：不再依赖 CREATE TABLE IF NOT EXISTS 静默跳过，先做漂移检查
         if self._relation_exists(self._table_name):
@@ -640,6 +696,21 @@ class Table(BaseTable):
         if extra_data:
             data = [{**item, **extra_data} for item in data]
 
+        if self._contract and self._contract.time:
+            name = self._contract.time.name
+            kind = self._pg_column_type(self._contract.columns[name])
+            if kind in ('DATE', 'TIMESTAMP', 'TIMESTAMPTZ'):
+                clock = self._query_time_column(self._contract)
+                data = [dict(row, **{name: clock.normalize_value(row[name])})
+                        if isinstance(row, dict) and name in row and row[name] is not None else row
+                        for row in data]
+
+        self._union_columns(data)
+        for row in data:
+            missing = [name for name in (pk or []) if name not in row or row[name] is None]
+            if missing:
+                raise BadArgument(f'写入缺少非空主键字段: {missing}')
+
         if not self._table_created:
             column_types = kwargs.get('column_type') or self.suggest_column_types(
                 data,
@@ -663,7 +734,7 @@ class Table(BaseTable):
                 # Partition data and insert into appropriate partitions
                 partitioned_data: Dict[Any, List] = {}
                 for row in data:
-                    key = partition.get_key(row)
+                    key = self._native_partition_key(partition, row)
                     if key not in partitioned_data:
                         partitioned_data[key] = []
                     partitioned_data[key].append(row)
@@ -686,6 +757,25 @@ class Table(BaseTable):
                 else [None]
             ),
         )
+
+    def _native_partition_key(self, partition, row):
+        """calendar 墙上时间按本地边界路由，保证负时区 DATE 与小时 TIMESTAMP 可写。"""
+        if isinstance(partition, CalendarPartition):
+            kind = self._pg_column_type(self._partition_column_type(partition))
+            if kind in ('DATE', 'TIMESTAMP', 'TEXT'):
+                value = row[partition.TS_COL]
+                if getattr(value, 'tzinfo', None) is None and not (
+                    isinstance(value, str) and re.search(r'(Z|[+-]\d{2}:?\d{2})$', value)
+                ):
+                    if isinstance(value, str) and value.isdigit():
+                        formats = {4: 'YYYY', 6: 'YYYYMM', 8: 'YYYYMMDD',
+                                   10: 'YYYYMMDDHH', 12: 'YYYYMMDDHHmm', 14: 'YYYYMMDDHHmmss'}
+                        parsed = arrow.get(value, formats.get(len(value), partition.fmt))
+                    else:
+                        parsed = arrow.get(value)
+                    parsed = parsed.replace(tzinfo=partition.tz)
+                    return partition.get_key({partition.TS_COL: parsed})
+        return partition.get_key(row)
     
     def _union_columns(self, data: List[Dict]):
         """按首次出现顺序取整批行的列并集；缺列在参数里补 None。
@@ -976,31 +1066,30 @@ class Table(BaseTable):
             order_by=order_by,
             limit=limit,
         )
-        conn = self.connect()
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        columns_ = [desc[0] for desc in cursor.description]
-        rows = cursor.fetchall()
-        if not to_dict:
-            return rows
-        return [dict(zip(columns_, row)) for row in rows]
+        return self._execute_query(query, params, to_dict)
+
+    def _execute_query(self, query, params, to_dict=True):
+        """执行已编译 SQL 并及时释放普通游标；急切读取仅用于 to_list/select。"""
+        with self.connect().cursor() as cursor:
+            cursor.execute(query, params)
+            names = [desc[0] for desc in cursor.description]
+            rows = cursor.fetchall()
+        return [dict(zip(names, row)) for row in rows] if to_dict else rows
 
     def iter_select(self, fields='*', where=None, limit=None, order_by=None,
                     to_dict=True, batch_size=10_000, columns=None,
                     timeout_ms=None, **kwargs):
         self._reject_unknown_kwargs('iter_select', kwargs)
         fields = resolve_select_fields(fields, columns, 'iter_select')
-        for batch in self.iter_select_batches(
-            fields,
-            where,
-            limit=limit,
-            order_by=order_by,
-            to_dict=to_dict,
-            batch_size=batch_size,
-            timeout_ms=timeout_ms,
-        ):
-            for row in batch:
-                yield row
+        batches = self.iter_select_batches(
+            fields, where, limit=limit, order_by=order_by, to_dict=to_dict,
+            batch_size=batch_size, timeout_ms=timeout_ms,
+        )
+        try:
+            for batch in batches:
+                yield from batch
+        finally:
+            batches.close()
 
     def iter_select_batches(self, fields='*', where=None, limit=None, order_by=None,
                             to_dict=True, batch_size=10_000, columns=None,
@@ -1013,26 +1102,19 @@ class Table(BaseTable):
         """
         self._reject_unknown_kwargs('iter_select_batches', kwargs)
         fields = resolve_select_fields(fields, columns, 'iter_select_batches')
-        batch_size = self._normalize_batch_size(batch_size)
-        limit = self._normalize_limit(limit)
-        timeout_ms = self._normalize_timeout_ms(timeout_ms)
-        deadline = (
-            time.monotonic() + timeout_ms / 1000
-            if timeout_ms is not None else None
+        query, params = self._select_query(fields, where, order_by, limit)
+        yield from self._iter_query_batches(
+            query, params, to_dict=to_dict, batch_size=batch_size, timeout_ms=timeout_ms
         )
-        if limit == 0:
-            return
-        if timeout_ms is not None and self._in_explicit_tx:
-            raise BadArgument(
-                'timeout_ms is not supported inside an explicit transaction'
-            )
 
-        query, params = self._select_query(
-            fields,
-            where,
-            order_by=order_by,
-            limit=limit,
-        )
+    def _iter_query_batches(self, query, params, to_dict=True,
+                            batch_size=10_000, timeout_ms=None):
+        """任意内部 SELECT 共用命名游标；关闭迭代器时释放 portal 与自有事务。"""
+        batch_size = self._normalize_batch_size(batch_size)
+        timeout_ms = self._normalize_timeout_ms(timeout_ms)
+        deadline = time.monotonic() + timeout_ms / 1000 if timeout_ms is not None else None
+        if timeout_ms is not None and self._in_explicit_tx:
+            raise BadArgument('timeout_ms is not supported inside an explicit transaction')
         conn = self.connect()
 
         def _apply_statement_timeout():
@@ -1075,12 +1157,12 @@ class Table(BaseTable):
                         rows = [dict(zip(column_names, row)) for row in rows]
                     yield rows
             finally:
+                active_error = sys.exc_info()[0] is not None
                 try:
                     cursor.close()
                 except Exception:
-                    # statement_timeout 会回滚整笔只读迭代事务，事务回滚时
-                    # PostgreSQL 已销毁 portal；不要让 CLOSE 的次生错误覆盖超时。
-                    if deadline is None or time.monotonic() < deadline:
+                    # 失败事务中的 CLOSE 可能再次报错，保留原异常以正确回滚/转换。
+                    if not active_error:
                         raise
 
         if self._in_explicit_tx:
@@ -1576,6 +1658,9 @@ class Table(BaseTable):
                 raise BadArgument(f'Unknown order_by field `{field}`')
             # 与 SQLite 对齐：ASC NULLS FIRST / DESC NULLS LAST
             nulls = 'FIRST' if direction == 'asc' else 'LAST'
+            if field in self._primary_key:
+                # PG 主键禁止 NULL，可用原生索引正/反向顺序而不改变任何结果。
+                nulls = 'LAST' if direction == 'asc' else 'FIRST'
             parts.append(
                 f'{_pg_identifier(field)} {direction.upper()} NULLS {nulls}'
             )
@@ -1604,23 +1689,27 @@ class Table(BaseTable):
         if not kv_list:
             return
         
-        # Select existing data (全表按 pk 合并，不做 where 过滤)
-        existing = self.select('*', where=None, to_dict=True)
-        
-        # Build map by pk
-        existing_map = {tuple([item[k] for k in pk]): item for item in existing}
-        
-        for dic in kv_list:
-            key = tuple([dic[k] for k in pk])
-            if key in existing_map:
-                existing_map[key] = {**existing_map[key], **dic}
-            else:
-                existing_map[key] = dic
-        
-        # Insert updated data
-        self.insert_all(list(existing_map.values()), pk=pk, replace=True, 
-                      partition=partition, commit=commit, **kwargs)
-    
+        pk = [pk] if isinstance(pk, str) else list(pk or [])
+        if not pk:
+            raise BadArgument('upsert_all requires primary key')
+        data = list(kv_list)
+        self._union_columns(data)
+        merged = {}
+        for row in data:
+            missing = [column for column in pk if column not in row or row[column] is None]
+            if missing:
+                raise BadArgument(f'upsert_all 缺少非空主键字段: {missing}')
+            key = tuple(row[column] for column in pk)
+            merged[key] = {**merged.get(key, {}), **row}
+        # 仅在输入规模内合并重复主键；不同字段集合分开 SQL，缺字段保留旧值。
+        groups = {}
+        for row in merged.values():
+            groups.setdefault(tuple(sorted(row)), []).append(row)
+        with self._transaction(commit):
+            for rows in groups.values():
+                self.insert_all(rows, pk=pk, replace=True, partition=partition,
+                                commit=False, **kwargs)
+
     def delete(self, where):
         """Delete rows matching conditions.
 
@@ -1663,42 +1752,111 @@ class Table(BaseTable):
         )
         return cursor.rowcount
     
-    def create_index(self, column, order='asc', exist_ok=True):
-        """Create an index on a column."""
-        conn = self.connect()
-        cursor = conn.cursor()
+    def _index_columns(self, column, columns):
+        """统一单列/复合列声明；列顺序就是索引定义。"""
+        if column is not None and columns is not None:
+            raise BadArgument('column 和 columns 不能同时指定')
+        names = [column] if column is not None else columns
+        if not isinstance(names, (list, tuple)) or not names:
+            raise BadArgument('请提供 column 或非空 columns 列表')
+        if any(not isinstance(name, str) or not name for name in names):
+            raise BadArgument('索引列名必须是非空字符串')
+        if len(set(names)) != len(names):
+            raise BadArgument('索引列不能重复')
+        types = self._column_types()
+        for name in names:
+            if name not in types:
+                raise BadArgument(f'Unknown field `{name}`')
+        return list(names)
 
+    def _index_definitions(self):
+        """系统目录提供索引的真实归属、键顺序、约束依赖及 iosql 标记。"""
+        with self.connect().cursor() as cursor:
+            cursor.execute(
+                """SELECT c.relname,
+                          ARRAY(SELECT a.attname FROM unnest(i.indkey) WITH ORDINALITY k(num, pos)
+                                LEFT JOIN pg_attribute a ON a.attrelid=i.indrelid AND a.attnum=k.num
+                                WHERE k.pos<=i.indnkeyatts ORDER BY k.pos),
+                          ARRAY(SELECT (opt & 1)=1 FROM unnest(i.indoption) WITH ORDINALITY o(opt, pos)
+                                ORDER BY pos),
+                          i.indisprimary,
+                          EXISTS(SELECT 1 FROM pg_constraint co WHERE co.conindid=i.indexrelid),
+                          i.indisvalid, am.amname, i.indexprs IS NULL AND i.indpred IS NULL,
+                          obj_description(i.indexrelid, 'pg_class'), i.indnatts=i.indnkeyatts
+                   FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid
+                   JOIN pg_am am ON am.oid=c.relam
+                   WHERE i.indrelid=to_regclass(%s)""",
+                (self._qualified_relation(),),
+            )
+            return cursor.fetchall()
+
+    @staticmethod
+    def _index_marker(columns):
+        """标记由 iosql 管理的索引；不凭名称猜测用户对象的归属。"""
+        import json
+        return 'iosql:index:v1:' + json.dumps(columns, ensure_ascii=False)
+
+    def create_index(self, column=None, order='asc', exist_ok=True, *, columns=None):
+        """显式创建父表 B-tree；等价主键可复用，未来子分区自动继承。"""
         order_value = str(order or 'asc').strip().lower()
         if order_value not in ('asc', 'desc'):
             raise BadArgument(f'invalid index order: {order}')
-        order_str = 'DESC' if order_value == 'desc' else 'ASC'
-        index_name = self._index_name(column)
-        create_tpl = (
-            'CREATE INDEX IF NOT EXISTS {} ON {} ({} {})'
-            if exist_ok else 'CREATE INDEX {} ON {} ({} {})'
-        )
-        create_sql = sql.SQL(create_tpl).format(
-            sql.Identifier(index_name),
-            sql.Identifier(self._table_name),
-            sql.Identifier(column),
-            sql.SQL(order_str),
-        )
-
-        cursor.execute(create_sql)
-        if self.verbose >= 1:
-            logger.info(f'Created index {index_name}')
+        names = self._index_columns(column, columns)
+        index_name = self._index_name(names)
+        descending = [order_value == 'desc'] * len(names)
+        with self._transaction(not self._in_explicit_tx):
+            definitions = self._index_definitions()
+            for definition in definitions:
+                name, keys, directions, primary, constraint, valid, method, plain, marker, no_include = definition
+                equivalent = (list(keys) == names and list(directions) == descending
+                              and valid and method == 'btree' and plain and no_include)
+                if name == index_name and not equivalent:
+                    raise SchemaConflict(f'同名索引 `{name}` 定义与请求不一致')
+                if equivalent and (exist_ok or primary):
+                    return
+            # 同 schema 的同名对象不属于当前表时，CREATE INDEX 会失败，绝不静默忽略。
+            with self.connect().cursor() as cursor:
+                cursor.execute(sql.SQL('CREATE INDEX {} ON {} USING btree ({})').format(
+                    sql.Identifier(index_name), sql.Identifier(self._table_name),
+                    sql.SQL(', ').join(sql.Identifier(name) + sql.SQL(' ' + order_value.upper())
+                                      for name in names),
+                ))
+                cursor.execute(sql.SQL('COMMENT ON INDEX {} IS %s').format(
+                    sql.Identifier(index_name)), (self._index_marker(names),))
 
     def _index_name(self, column):
-        raw = f'{self._table_name}_{column}_idx'
+        names = [column] if isinstance(column, str) else list(column)
+        stem = f'{self._table_name}_{"_".join(names)}'
+        if len(names) == 1:
+            suffix = '_idx'
+        else:
+            import json
+            digest = hashlib.sha1(json.dumps(names, ensure_ascii=False).encode()).hexdigest()[:10]
+            suffix = f'_{digest}_idx'
+        raw = stem + suffix
         if len(raw.encode('utf-8')) <= _IDENTIFIER_MAX_BYTES:
             return raw
-        # PG 标识符 63 字节静默截断会撞名，超长时截断并追加哈希后缀
-        suffix = f'_{hashlib.sha1(raw.encode("utf-8")).hexdigest()[:8]}_idx'
-        return _fit_identifier(f'{self._table_name}_{column}', suffix)
+        suffix = f'_{hashlib.sha1(raw.encode()).hexdigest()[:10]}_idx'
+        return _fit_identifier(stem, suffix)
 
-    def drop_index(self, column):
-        raise NotImplementedError("drop_index not implemented for postgresql engine")
-    
+    def drop_index(self, column=None, *, columns=None):
+        """删除当前表的受管二级索引；约束索引与用户索引均受保护。"""
+        names = self._index_columns(column, columns)
+        marker = self._index_marker(names)
+        with self._transaction(not self._in_explicit_tx):
+            definitions = self._index_definitions()
+            for definition in definitions:
+                name, keys, directions, primary, constraint, valid, method, plain, comment, no_include = definition
+                if comment != marker:
+                    if name == self._index_name(names):
+                        raise SchemaConflict(f'索引 `{name}` 无 iosql 归属标记，拒绝删除')
+                    continue
+                if list(keys) != names or primary or constraint or method != 'btree' or not plain or not no_include:
+                    raise SchemaConflict(f'索引 `{name}` 定义或约束已变化，拒绝删除')
+                with self.connect().cursor() as cursor:
+                    cursor.execute(sql.SQL('DROP INDEX {}').format(
+                        sql.Identifier(self._schema_name(), name)))
+
     def suggest_column_types(self, data, column_type, n_suggest_check=None):
         """Suggest column types based on data (按整批行列并集推断)。"""
         suggested = {}

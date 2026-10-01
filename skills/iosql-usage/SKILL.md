@@ -143,6 +143,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | 布局诊断 + 重分区 | `layout_report()` → `spec().with_partition(...)` → `repartition_to(新库URI, spec=)`（只写新库） | [examples/04_layout_report_and_repartition.py](examples/04_layout_report_and_repartition.py) |
 | CLI 重分区 | `iosql repartition -s ... -t ... --partition 'duration(ts,every=1hour)' --target 新库` | [examples/07_partition_string_repartition_cli.py](examples/07_partition_string_repartition_cli.py) |
 | SQLite → PostgreSQL 迁移 | 先 `to_postgresql(..., dry_run=True)` 预览，再 `verify="row-count"` 正式迁移 | [examples/11_sqlite_to_postgresql_migration.py](examples/11_sqlite_to_postgresql_migration.py) |
+| PostgreSQL 在线时序查询、计划与复合索引 | `query/latest/asof`、`.explain(analyze=True)`、`create_index(columns=[...])` | [examples/15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) |
 | SQLite ⇄ PostgreSQL 双向 | PG 侧重开逻辑表需 `db.table(名字, spec=同一份契约)` | [examples/12_sqlite_postgresql_roundtrip.py](examples/12_sqlite_postgresql_roundtrip.py) |
 | SQLite ⇄ Parquet 迁移 | `db.migrate_to("parquet://...")` 或反向迁移；正式迁移可启用 `verify="row-count"` | [references/parquet.md](references/parquet.md) |
 | 逻辑分区 + 物理 segment 组合 | partition 与 segment 同时配置，explain 看两级裁剪 | [examples/05_partition_segments_smoke.py](examples/05_partition_segments_smoke.py) |

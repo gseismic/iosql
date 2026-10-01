@@ -214,6 +214,10 @@ class FakeCursor:
     def __exit__(self, exc_type, exc_value, exc_tb):
         return False
 
+    def close(self):
+        # 与 psycopg2 游标生命周期一致，供流式 finally 验证使用。
+        pass
+
     def fetchone(self):
         return self.fetchone_result
 

@@ -543,9 +543,9 @@ def test_query_iter_rows_order_by_streams_without_full_select(tmp_path, monkeypa
     observed = []
     original_part_ordered_rows = type(table)._part_ordered_rows
 
-    def _track_part_ordered_rows(self, part_dbfile, query, chunk_size):
+    def _track_part_ordered_rows(self, part_dbfile, query, chunk_size, deadline=None):
         for row in original_part_ordered_rows(
-            self, part_dbfile, query, chunk_size
+            self, part_dbfile, query, chunk_size, deadline
         ):
             observed.append(row["open_time"])
             yield row

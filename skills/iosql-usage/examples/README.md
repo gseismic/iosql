@@ -24,6 +24,7 @@
 | `12_sqlite_postgresql_roundtrip.py` | 高级 | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
 | `13_streaming_ordered_query.py` | 进阶 | 对跨分区结果按 `open_time` 全局排序，并用 `query(...).iter_rows(...)` 惰性逐行读取。 |
 | `14_parquet_backend.py` | 高级 | Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
+| `15_postgresql_timeseries_query.py` | 高级 | PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
 
 ## 金融示例
 
@@ -85,3 +86,5 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 `examples/mysqlite/` 保留少量 `iosql.utils.mysqlite` 示例，用于直接操作单个 SQLite 文件、schema-on-write、批量写入和连接池清理。新项目优先使用本目录上方的 `Database.table(...)` 主 API 示例。
 
 `examples/mysqlite-scenarios/` 按运维场景速查 mysqlite 完整能力面（增删改查、加列/删列、各类查询、表重命名与表信息、索引操作、在线备份），每个脚本独立可运行，详见该目录 README。
+
+`15_postgresql_timeseries_query.py` 需要 `POSTGRES_DSN` 与 `iosql[postgresql]`，使用随机表名并在结束时清理，可独立重复运行。

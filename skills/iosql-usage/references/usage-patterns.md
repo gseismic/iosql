@@ -720,12 +720,11 @@ table = db.table(
     columns={"symbol": "text", "ts": "bigint", "price": "double precision"},
     partition=Partition.duration("ts", every="1day"),
 )
-# 后续 write API 与 SQLite 主入口一致；复杂查询能力仍以 SQLite 引擎更完整
+# query/latest/asof 在 PG14+ 使用数据库端 SQL 与命名游标
 ```
 
-PostgreSQL 模式当前覆盖契约建表、批量写入、基础 `select()` /
-`iter_select_batches()` 和 SQLite 迁移目标；复杂 `latest/asof/explain_select`
-优化仍以 SQLite 引擎更完整。`Database.table_names()` 返回逻辑表，不暴露 native
+PostgreSQL 14+ 支持契约建表、批量写入、`query/latest/asof`、原生 JSON
+`explain_select`、命名游标流式读取、复合索引及双向迁移。`Database.table_names()` 返回逻辑表，不暴露 native
 partition 子表。
 
 PostgreSQL 与 SQLite 的行为差异：
@@ -798,3 +797,15 @@ def test_my_case():
     finally:
         db.close()
 ```
+
+## PostgreSQL 14+ 查询与诊断补充（PLAN-078）
+
+- `query/latest/asof` 在数据库内完成筛选和排序；start/end/as_of 均包含边界。latest 按请求 symbol 顺序输出，同时间按剩余主键升序决胜。`latest(symbols=[])` 为空，`query(symbols=[])` 保留既有无筛选行为。
+- 查询对象支持 `.to_list()` / `.one()` / `.iter_rows(batch_size=..., timeout_ms=...)` / `.iter_batches(...)` / `.explain(analyze=False, raw_plan=False)`。流式对象提前关闭会释放命名游标，显式写事务不会被读取擅自提交。同一 Table 的连接不应并发消费多个流。
+- PG 的 `explain_select` 追加仅关键字 analyze/raw_plan；默认不执行、隐藏谓词常量，analyze=True 提供实际耗时与 buffer，raw_plan=True 可能含业务常量。QueryPlan 追加 engine/engine_plan/planning_time_ms/execution_time_ms/index_scans；PG 分区列表使用关系名，segment 列表为空。默认 scanned_partitions 为计划关系，ANALYZE 时只记录 Actual Loops>0 的关系。
+- `create_index(column=None, order='asc', exist_ok=True, *, columns=None)` 支持复合 B-tree；与主键等价时复用。`drop_index(column=None, *, columns=None)` 仅删除当前表带 iosql 标记且定义匹配的二级索引；不能按名称误删用户索引或约束索引。
+- 重开物理表验证声明列类型、主键顺序、分区形态和 RANGE 单列键；分区主键必须包含分区列。
+- upsert_all 按输入主键增量合并，缺字段保留旧值，显式 None 写 NULL，重复主键按输入顺序合并。count_rows 是精确计数，可能全表扫描。
+- 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
+
+指定 symbols 的单 symbol 分组 latest 会在目录确认有效 symbol/time B-tree 前缀索引后使用 LATERAL LIMIT 1；无索引/多维分组/无 symbols 时使用 DISTINCT ON。

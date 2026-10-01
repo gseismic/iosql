@@ -80,7 +80,7 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
   已有物理表缺契约列、或声明分区但表未分区时抛 `SchemaConflict`。
 - 字符串 `fields` 只接受 `*` 或标识符列表；含 SQL 语法直接抛 `BadArgument`；
   `select()` / `iter_select*()` 拒绝未知 kwargs。
-- `insert_all` / `upsert_all` 按整批行列并集取值、缺列补 `NULL`，并按参数上限拆页；
+- `insert_all` 按整批行列并集取值、缺列补 `NULL`；`upsert_all` 仅更新输入字段、缺字段保留旧值，并按参数上限拆页；
   `commit=False` 会保持事务，后续提交写入或关闭时提交，失败整体回滚。
 - `order_by` 的 NULL 排序与 SQLite 一致：ASC → `NULLS FIRST`，DESC → `NULLS LAST`。
 - `upsert_all(..., where=...)` 已废弃（忽略并告警）；`calendar(...)` 的 `timestamptz` 边界带 UTC 偏移；
@@ -114,3 +114,15 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - ❌ 忽略测试数据隔离 → 每个测试用独立 `tmp_path`
 - ❌ 用 `insert_all()` 替代 `write()` → `insert_all` 是低层 API，不自动使用表契约
 - ❌ mysqlite `insert_all(commit=False)` / `Database(':memory:')` → 见上文 mysqlite 约定
+
+## PostgreSQL 14+ 查询与诊断补充（PLAN-078）
+
+- `query/latest/asof` 在数据库内完成筛选和排序；start/end/as_of 均包含边界。latest 按请求 symbol 顺序输出，同时间按剩余主键升序决胜。`latest(symbols=[])` 为空，`query(symbols=[])` 保留既有无筛选行为。
+- 查询对象支持 `.to_list()` / `.one()` / `.iter_rows(batch_size=..., timeout_ms=...)` / `.iter_batches(...)` / `.explain(analyze=False, raw_plan=False)`。流式对象提前关闭会释放命名游标，显式写事务不会被读取擅自提交。同一 Table 的连接不应并发消费多个流。
+- PG 的 `explain_select` 追加仅关键字 analyze/raw_plan；默认不执行、隐藏谓词常量，analyze=True 提供实际耗时与 buffer，raw_plan=True 可能含业务常量。QueryPlan 追加 engine/engine_plan/planning_time_ms/execution_time_ms/index_scans；PG 分区列表使用关系名，segment 列表为空。默认 scanned_partitions 为计划关系，ANALYZE 时只记录 Actual Loops>0 的关系。
+- `create_index(column=None, order='asc', exist_ok=True, *, columns=None)` 支持复合 B-tree；与主键等价时复用。`drop_index(column=None, *, columns=None)` 仅删除当前表带 iosql 标记且定义匹配的二级索引；不能按名称误删用户索引或约束索引。
+- 重开物理表验证声明列类型、主键顺序、分区形态和 RANGE 单列键；分区主键必须包含分区列。
+- upsert_all 按输入主键增量合并，缺字段保留旧值，显式 None 写 NULL，重复主键按输入顺序合并。count_rows 是精确计数，可能全表扫描。
+- 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
+
+指定 symbols 的单 symbol 分组 latest 会在目录确认有效 symbol/time B-tree 前缀索引后使用 LATERAL LIMIT 1；无索引/多维分组/无 symbols 时使用 DISTINCT ON。

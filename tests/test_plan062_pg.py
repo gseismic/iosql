@@ -63,6 +63,10 @@ class FakeCursor:
         rows, self.results = self.results[:size], self.results[size:]
         return rows
 
+    def close(self):
+        # 与 psycopg2 游标生命周期一致，供流式 finally 验证使用。
+        pass
+
     def fetchone(self):
         return self.fetchone_result
 
@@ -518,13 +522,13 @@ class TestPlaceholderRewriteP2:
         table = _make_table(fake_pg)
         fake_pg.cursor_obj.executed.clear()
 
-        table.select('*', order_by='ts')
-        assert '"ts" ASC NULLS FIRST' in render_sql(
+        table.select('*', order_by='price')
+        assert '"price" ASC NULLS FIRST' in render_sql(
             fake_pg.cursor_obj.executed[-1][0]
         )
 
-        table.select('*', order_by=[('ts', 'desc')])
-        assert '"ts" DESC NULLS LAST' in render_sql(
+        table.select('*', order_by=[('price', 'desc')])
+        assert '"price" DESC NULLS LAST' in render_sql(
             fake_pg.cursor_obj.executed[-1][0]
         )
 
@@ -760,9 +764,11 @@ class TestContractDriftP2:
             if 'current_schema' in lower:
                 cursor.fetchone_result = ('public',)
             elif 'information_schema.columns' in lower:
-                cursor.results = [(name,) for name in columns]
+                cursor.results = [(name, {'symbol': 'text', 'ts': 'int8', 'price': 'float8'}[name]) for name in columns] if 'udt_name' in lower else [(name,) for name in columns]
+            elif 'pg_index' in lower:
+                cursor.fetchone_result = (['symbol', 'ts'],)
             elif 'pg_partitioned_table' in lower:
-                cursor.fetchone_result = (1,) if partitioned else None
+                cursor.fetchone_result = (('r', 1, 'ts') if 'partstrat' in lower else (1,)) if partitioned else None
             elif 'pg_class' in lower:
                 cursor.fetchone_result = (1,) if relation_exists else None
         return responder
@@ -886,19 +892,19 @@ class TestApiParityP2:
         assert len(first.encode('utf-8')) <= 63
         assert first != second
 
-    def test_create_index_exist_ok_toggle(self, fake_pg):
+    def test_create_index_exist_ok_toggle(self, fake_pg, monkeypatch):
+        # 已有索引必须校验定义而不是只凭 IF NOT EXISTS 静默忽略。
         table = _make_table(fake_pg)
-
         fake_pg.cursor_obj.executed.clear()
         table.create_index('symbol', exist_ok=False)
-        assert render_sql(fake_pg.cursor_obj.executed[-1][0]) == (
-            'CREATE INDEX "ticks_symbol_idx" ON "ticks" ("symbol" ASC)'
-        )
-
+        assert any('CREATE INDEX "ticks_symbol_idx" ON "ticks" USING btree ("symbol" ASC)' == text
+                   for text in render_all(fake_pg.cursor_obj))
+        monkeypatch.setattr(table, '_index_definitions', lambda: [
+            ('ticks_symbol_idx', ['symbol'], [False], False, False, True,
+             'btree', True, table._index_marker(['symbol']), True)])
+        fake_pg.cursor_obj.executed.clear()
         table.create_index('symbol', exist_ok=True)
-        assert 'IF NOT EXISTS' in render_sql(
-            fake_pg.cursor_obj.executed[-1][0]
-        )
+        assert not any('CREATE INDEX' in text for text in render_all(fake_pg.cursor_obj))
 
     def test_file_partition_mode_still_rejected(self, fake_pg):
         with pytest.raises(BadArgument, match='file partition mode'):
