@@ -15,7 +15,7 @@ table = db["events"]
 
 `Database` 会按需创建目录和 SQLite 文件。使用完成后调用 `db.close()`；关闭后的实例不可继续使用，需要重新创建 `Database`。
 
-连接池模式下**不支持 `Database(":memory:")`**（会抛 `BadArgument`）：池中每个连接会各自打开独立的内存库，数据互不可见。需要内存库时直接使用 `sqlite3.connect(":memory:")`。
+连接池模式下**不支持内存数据库**（会抛 `BadArgument`），包括 `Database(":memory:")` 和 `uri=True` 的 `file:...?mode=memory`。内存 URI 的共享范围和生命周期依赖 SQLite URI/cache 配置，不属于本连接池支持的文件库契约。需要内存库时直接使用 `sqlite3.connect(":memory:")`。
 
 `timeout=` 同时决定默认的 `busy_timeout`（毫秒）；在 `pragma_dict` 中显式给出 `busy_timeout`/`journal_mode` 时以显式值为准，未给出时分别由 `timeout`/`wal` 参数派生。
 
@@ -59,10 +59,10 @@ table.insert_all(
 | `ensure_column` | 字段缺失时自动加列。 |
 | `replace` | 主键冲突时覆盖。 |
 | `ignore` | 主键冲突时跳过。 |
-| `batch_size` | 批量写入分批大小。 |
+| `batch_size` | 正整数的批量写入分批大小；非正数或非整数会抛 `BadArgument`。 |
 | `commit` | 必须为 True（默认值）；传 `False` 会抛 `ValueError`，连接池模式下批量操作结束时会统一提交，不支持延迟提交。 |
 
-批量写入按每行的 key 集合拆分语句：行中缺失的列不会由 Python 回填默认值，而是从语句中省略，交由 SQLite 求值列 `DEFAULT`（包括 `CURRENT_TIMESTAMP`、`(datetime('now'))` 等表达式默认值）。`insert({...})` 单行写入同样遵循该语义。
+批量写入按连续相同的 key 集合拆分语句，并保留行的输入顺序：行中缺失的列不会由 Python 回填默认值，而是从语句中省略，交由 SQLite 求值列 `DEFAULT`（包括 `CURRENT_TIMESTAMP`、`(datetime('now'))` 等表达式默认值）。`insert({...})` 单行写入同样遵循该语义。
 
 ## 查询和修改
 
@@ -77,8 +77,9 @@ table.update({"qty": 3}, where="order_id=1 AND line_id=1")
 table.delete(where="order_id=1 AND line_id=2")
 ```
 
-写入必须显式提交：`insert()`/`executemany()` 传 `commit=False` 会抛 `ValueError`（连接归还会 rollback，延迟提交会丢写）；
+池外写入必须显式提交：`insert()`、`execute()`、`execute_params()` 或 `executemany()` 传 `commit=False` 会抛 `ValueError`（连接归还会 rollback，延迟提交会丢写）；
 `Database(auto_commit=False)` 时，不在 `transaction()` 中的写入同样会被拒绝。需要在一次事务里写多行时使用 `transaction()`。
+在 `transaction()` 中，外层上下文统一提交，因此单条语句可传 `commit=False`。
 
 表结构变化会自动失效缓存；如果通过 `db.execute()` 或外部连接直接执行了 DDL，请在使用 `column_info()` / `default_values()` / `pk()` 前手动调用 `table.invalidate_cache()`。
 
@@ -109,10 +110,10 @@ db.force_close_all_connections()
 `get_connection()` 在同一线程内可重入：嵌套调用复用同一连接（`max_connections=1`
 时在外层连接中调用需要连接的 API 不会死锁）。
 
-`fork()` 后子进程会自动丢弃从父进程继承的连接并重建池状态。
+`fork()` 后子进程会一次性重建所有已注册连接池的同步状态和连接预算，丢弃空闲的父进程连接；仍处于父进程租约中的连接会在子进程归还时关闭，不会计入子进程预算。
 
 `db.pragma(...)` / `db.enable_wal(...)` 会同时作用到池中的空闲连接；正在使用中的
-连接在归还或新建时生效。
+连接在归还或新建时生效。`pragma_dict` 中的 `0` 和 `False` 也会作为有效值应用。
 
 可通过 `db.get_connection_pool_status()`、`db.get_process_connection_budget_status()`
 和 `db.is_connection_pool_healthy()` 查看状态。`force_close_all_connections()`

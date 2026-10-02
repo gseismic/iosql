@@ -1,3 +1,4 @@
+import os
 import time
 import sqlite3
 import logging
@@ -106,6 +107,7 @@ class Database(object):
         if pragma_dict is None or not pragma_dict.get('journal_mode'):
             self._pragma_dict['journal_mode'] = 'wal' if wal else 'delete'
         self._local = threading.local()
+        self._pid = os.getpid()
         
         # 添加连接池
         self._pool = DatabaseConnectionPool(
@@ -126,11 +128,10 @@ class Database(object):
     def enable_wal(self, enable: bool = True) -> None:
         """启用或禁用WAL模式（同时应用到池中空闲连接）"""
         mode = 'wal' if enable else 'delete'
-        self._pragma_dict['journal_mode'] = mode
-        self._apply_pragma_to_idle('journal_mode', mode)
+        self._pragma_one('journal_mode', mode)
 
     def _apply_pragma_to_idle(self, key: str, value: Any) -> None:
-        """把 PRAGMA 应用到池中空闲连接；使用中的连接不受影响（下次新建时生效）。"""
+        """把 PRAGMA 应用到空闲连接；借出连接归还时更新，新连接创建时生效。"""
         if str(value) == '':
             return
         if getattr(self, '_pool', None) is not None:
@@ -138,12 +139,18 @@ class Database(object):
 
     def _pragma_one(self, key: str, value: Optional[str] = None) -> None:
         """设置单个PRAGMA值（value=0 等 falsy 值同样生效）"""
+        self._ensure_current_process()
         value = '' if value is None else value
         key = key.lower()
-        current_value = str(self._pragma_dict.get(key, ''))
-        if str(value).lower() != current_value.lower():
-            self._pragma_dict[key] = str(value)
-            self._apply_pragma_to_idle(key, value)
+        if isinstance(value, bool):
+            value = '1' if value else '0'
+        value = str(value)
+        with self._lock:
+            current_value = str(self._pragma_dict.get(key, ''))
+            changed = value.lower() != current_value.lower()
+            if changed:
+                self._pragma_dict[key] = value
+                self._apply_pragma_to_idle(key, value)
 
     def pragma(self, key_or_dict: Union[str, Dict[str, Any]], value: Optional[str] = None) -> None:
         """设置PRAGMA值"""
@@ -206,8 +213,19 @@ class Database(object):
             yield conn
 
     def _ensure_open(self) -> None:
+        self._ensure_current_process()
         if getattr(self, '_closed', False):
             raise DatabaseConnectionError(f'Database is closed: {self.db_file}')
+
+    def _ensure_current_process(self) -> bool:
+        """fork 后丢弃线程本地事务引用并替换可能被锁住的配置锁。"""
+        current_pid = os.getpid()
+        if current_pid == self._pid:
+            return False
+        self._local = threading.local()
+        self._lock = threading.Lock()
+        self._pid = current_pid
+        return True
 
     def _ensure_db_dir(self) -> None:
         db_dirname = self.db_file.parent
@@ -217,6 +235,7 @@ class Database(object):
             db_dirname.mkdir(parents=True, exist_ok=True)
 
     def in_transaction(self) -> bool:
+        self._ensure_current_process()
         return getattr(self._local, 'transaction_conn', None) is not None
     
 
@@ -248,6 +267,7 @@ class Database(object):
 
     def commit(self) -> None:
         """提交当前 transaction() 上下文中的事务"""
+        self._ensure_current_process()
         conn = getattr(self._local, 'transaction_conn', None)
         if conn is None:
             raise DatabaseError('commit requires an active transaction() context')
@@ -255,6 +275,7 @@ class Database(object):
 
     def rollback(self) -> None:
         """回滚当前 transaction() 上下文中的事务"""
+        self._ensure_current_process()
         conn = getattr(self._local, 'transaction_conn', None)
         if conn is None:
             raise DatabaseError('rollback requires an active transaction() context')
@@ -269,16 +290,22 @@ class Database(object):
             return
 
         self._ensure_db_dir()
+        transaction_pid = os.getpid()
         with self._pool.get_connection() as conn:
             self._local.transaction_conn = conn
             try:
                 conn.execute('BEGIN IMMEDIATE;' if immediate else 'BEGIN;')
                 yield conn
-                conn.commit()
+                # fork 后该连接属于父进程租约，不能在子进程提交它。
+                if os.getpid() == transaction_pid:
+                    conn.commit()
             except Exception:
-                conn.rollback()
+                if os.getpid() == transaction_pid:
+                    conn.rollback()
                 raise
             finally:
+                if os.getpid() != transaction_pid:
+                    self._ensure_current_process()
                 self._local.transaction_conn = None
 
     def close(self) -> None:

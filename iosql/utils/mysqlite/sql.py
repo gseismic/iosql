@@ -134,22 +134,22 @@ def getarg_diclist_insertmany_known_fields(
 
 
 def group_rows_by_keys(data: List[Dict[str, Any]]) -> List[Tuple[List[str], List[List[Any]]]]:
-    """按每行的 key 集合分组，返回 [(字段列表, 参数列表), ...]。
+    """按连续相同的 key 集合分组，返回 [(字段列表, 参数列表), ...]。
 
     行中缺失的列不再由 Python 侧回填 DEFAULT，而是直接从语句中省略，
     交由 SQLite 求值列默认值（含 CURRENT_TIMESTAMP / (datetime('now')) 等表达式）。
-    这样既能修复表达式默认值被当成字面量写盘的问题，也保持字面量默认值语义。
+    这样既保持默认值语义，也保留异构行的输入顺序，避免 REPLACE 顺序变化。
     """
-    groups: 'OrderedDict[frozenset, Tuple[List[str], List[List[Any]]]]' = OrderedDict()
+    groups: List[Tuple[List[str], List[List[Any]]]] = []
+    previous_key = None
     for item in data:
         key = frozenset(item.keys())
-        group = groups.get(key)
-        if group is None:
-            fields = list(item.keys())
-            group = (fields, [])
-            groups[key] = group
-        group[1].append([item[field] for field in group[0]])
-    return list(groups.values())
+        if not groups or key != previous_key:
+            groups.append((list(item.keys()), []))
+        fields, values = groups[-1]
+        values.append([item[field] for field in fields])
+        previous_key = key
+    return groups
 
 
 def suggest_value_type(v: Any) -> str:

@@ -2,6 +2,7 @@ import re
 import math
 import json
 import sqlite3
+import numbers
 from collections import OrderedDict
 from typing import Dict, List, Optional, Union, Any, Tuple, TYPE_CHECKING
 from contextlib import contextmanager
@@ -9,6 +10,7 @@ from contextlib import contextmanager
 import arrow
 
 from .exception import (
+    BadArgument,
     NoSuchColumn, 
     NoSuchTable,
     TableAlreadyExists,
@@ -345,6 +347,7 @@ class Table:
             self._handle_error_on_connection(e, conn)
 
     def execute(self, sql: str, commit: Optional[bool] = None) -> None:
+        self._check_write_commit(commit)
         if self.verbose >= 2:
             logger.info(f'SQL: {sql}')
         
@@ -357,6 +360,7 @@ class Table:
 
     def execute_params(self, sql: str, params: Optional[List[Any]] = None,
                        commit: Optional[bool] = None) -> None:
+        self._check_write_commit(commit)
         with self._get_cursor() as (cursor, conn):
             self._execute_params_on_connection(cursor, conn, sql, params, commit)
 
@@ -399,17 +403,18 @@ class Table:
     def _check_write_commit(self, commit: Optional[bool]) -> None:
         """拒绝连接池模式下必然丢写的延迟提交用法。
 
-        连接归还时连接池会无条件 rollback，因此：
-        - 显式 ``commit=False`` 一律拒绝（与 insert_all 契约一致）；
+        连接归还时连接池会无条件 rollback，因此池外上下文中：
+        - 显式 ``commit=False`` 会丢失写入；
         - ``auto_commit=False`` 时不显式提交（commit=None）的写入会被丢弃。
+        显式 transaction() 由外层管理连接和提交，可安全使用 commit=False。
         """
+        if self.database.in_transaction():
+            return
         if commit is False:
             raise ValueError(
                 'commit=False 在连接池模式下会丢失写入：'
                 '请传 commit=True，事务提交请使用 database.transaction()'
             )
-        if self.database.in_transaction():
-            return
         if commit is None and not self.auto_commit:
             raise ValueError(
                 'auto_commit=False 时写入必须显式传 commit=True '
@@ -645,6 +650,13 @@ class Table:
                 'insert_all(commit=...) 仅支持 True: '
                 '连接池模式下批量操作结束时会统一提交，无法支持延迟提交'
             )
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, numbers.Integral)
+            or batch_size <= 0
+        ):
+            raise BadArgument('batch_size must be a positive integer')
+        batch_size = int(batch_size)
         # 要求keys一致: 但并不检验
         if not list_kv:
             return

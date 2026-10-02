@@ -5,6 +5,7 @@ import queue
 import weakref
 from contextlib import contextmanager
 from typing import Dict, Any, Optional
+from urllib.parse import parse_qs, urlsplit
 
 from .exception import BadArgument
 
@@ -22,13 +23,39 @@ class _ProcessConnectionBudget:
         # value=(声明的进程上限, 预留数量)，预留期间计入同一进程预算。
         self._external_reservations = {}
         self._in_use = 0
+        self._pid = os.getpid()
+        if hasattr(os, 'register_at_fork'):
+            os.register_at_fork(after_in_child=self._after_fork_in_child)
+
+    def _after_fork_in_child(self) -> None:
+        """在子进程用户代码运行前重建所有池，避免首个访问并发竞争。"""
+        self._ensure_current_process()
+
+    def _ensure_current_process(self) -> bool:
+        """子进程首次使用时重建进程级同步状态和所有已注册连接池。"""
+        current_pid = os.getpid()
+        if current_pid == self._pid:
+            return False
+
+        # fork 后不能获取父进程遗留的 Condition/池锁：其持有线程可能已不存在。
+        # 子进程只有 fork 调用线程继续运行，可直接替换同步原语并重置全部池。
+        pools = list(self._pools.keys())
+        self._condition = threading.Condition()
+        self._external_reservations = {}
+        self._in_use = 0
+        self._pid = current_pid
+        for pool in pools:
+            pool._reset_after_fork_state(current_pid)
+        return True
 
     def register(self, pool, limit: int) -> None:
+        self._ensure_current_process()
         with self._condition:
             self._pools[pool] = limit
             self._condition.notify_all()
 
     def unregister(self, pool) -> None:
+        self._ensure_current_process()
         with self._condition:
             self._pools.pop(pool, None)
             self._condition.notify_all()
@@ -58,14 +85,16 @@ class _ProcessConnectionBudget:
         return max(all_limits) if all_limits else _DEFAULT_MAX_PROCESS_CONNECTIONS
 
     def reset_after_fork(self, pool) -> None:
-        """fork 后子进程重建预算状态，丢弃从父进程继承的连接计数。"""
+        """兼容池级入口；进程预算由 ``_ensure_current_process`` 一次性重建。"""
+        self._ensure_current_process()
+        if pool._pid != os.getpid():
+            pool._reset_after_fork_state(os.getpid())
         with self._condition:
-            self._in_use = 0
-            self._external_reservations.clear()
             self._pools[pool] = pool._max_process_connections
             self._condition.notify_all()
 
     def acquire(self, requester) -> None:
+        self._ensure_current_process()
         while True:
             with self._condition:
                 if requester._closed:
@@ -90,6 +119,7 @@ class _ProcessConnectionBudget:
                 self._condition.wait(timeout=0.1)
 
     def release(self) -> None:
+        self._ensure_current_process()
         with self._condition:
             if self._in_use > 0:
                 self._in_use -= 1
@@ -109,6 +139,8 @@ class _ProcessConnectionBudget:
             or max_process_connections <= 0
         ):
             raise BadArgument('max_process_connections must be a positive integer')
+
+        self._ensure_current_process()
 
         while True:
             with self._condition:
@@ -151,6 +183,7 @@ class _ProcessConnectionBudget:
         """释放 ``reserve_external`` 返回的进程预算预留。"""
         if reservation is None:
             return
+        self._ensure_current_process()
         token, _ = reservation
         with self._condition:
             entry = self._external_reservations.pop(token, None)
@@ -159,6 +192,7 @@ class _ProcessConnectionBudget:
             self._condition.notify_all()
 
     def status(self) -> Dict[str, int]:
+        self._ensure_current_process()
         with self._condition:
             return {
                 'max_process_connections': self._effective_limit_locked(),
@@ -196,10 +230,22 @@ class DatabaseConnectionPool:
             raise ValueError('max_connections must be positive')
         if int(max_process_connections) <= 0:
             raise ValueError('max_process_connections must be positive')
-        # 池中的每个连接都会独立打开 ':memory:'，数据互不可见，因此直接拒绝
-        if str(db_file) == ':memory:' or str(db_file).startswith('file::memory:'):
+        # 内存 URI 的连接共享范围和生命周期依赖 URI/cache 配置，不纳入连接池契约。
+        db_file_text = str(db_file)
+        is_memory_uri = False
+        if kwargs.get('uri') and db_file_text.lower().startswith('file:'):
+            query = parse_qs(urlsplit(db_file_text).query)
+            is_memory_uri = any(
+                value.lower() == 'memory'
+                for value in query.get('mode', [])
+            )
+        if (
+            db_file_text == ':memory:'
+            or db_file_text.lower().startswith('file::memory:')
+            or is_memory_uri
+        ):
             raise BadArgument(
-                '连接池不支持 :memory: 数据库：每个连接会得到独立的内存库；'
+                '连接池不支持内存数据库（包括 :memory: 和 mode=memory URI）：'
                 '请改用文件数据库，或直接用 sqlite3.connect(":memory:")'
             )
         self.db_file = db_file
@@ -210,8 +256,12 @@ class DatabaseConnectionPool:
         )
         self._created_connections = 0
         self._checked_out = 0
+        self._checked_out_connections: Dict[int, sqlite3.Connection] = {}
+        self._inherited_connections: Dict[int, sqlite3.Connection] = {}
+        self._connections: Dict[int, sqlite3.Connection] = {}
+        self._connection_pragma_values: Dict[int, Dict[str, str]] = {}
         self._lock = threading.Lock()
-        self._pragma_dict = pragma_dict if pragma_dict is not None else {}
+        self._pragma_dict = dict(pragma_dict or {})
         self._conn_kwargs = kwargs
         self._closed = False
         # 记录创建进程 pid 与本线程当前持有的租约（支持同线程重入）
@@ -228,22 +278,48 @@ class DatabaseConnectionPool:
         except Exception:
             pass
 
+    @staticmethod
+    def _format_pragma_value(value: Any) -> Optional[str]:
+        """将 PRAGMA 值转成 SQL 字面值；None/空串表示不设置。"""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return '1' if value else '0'
+        value = str(value)
+        return value if value else None
+
     def _create_connection(self) -> sqlite3.Connection:
         _PROCESS_CONNECTION_BUDGET.acquire(self)
         conn_kwargs = {'timeout': 30.0}
         conn_kwargs.update(self._conn_kwargs)
         conn_kwargs.setdefault('check_same_thread', False)
+        conn = None
         try:
             conn = sqlite3.connect(self.db_file, **conn_kwargs)
             conn.row_factory = sqlite3.Row
-            for key, value in self._pragma_dict.items():
-                if value:
-                    try:
-                        conn.execute(f'PRAGMA {key}={value};')
-                    except sqlite3.OperationalError:
-                        pass
+            with self._lock:
+                pragma_dict = dict(self._pragma_dict)
+            applied = {}
+            for key, value in pragma_dict.items():
+                value = self._format_pragma_value(value)
+                if value is None:
+                    continue
+                try:
+                    conn.execute(f'PRAGMA {key}={value};')
+                    applied[key] = value
+                except sqlite3.OperationalError:
+                    # 与旧行为一致：不支持或暂时无法应用的 PRAGMA 不阻止连接创建。
+                    pass
+            with self._lock:
+                self._connections[id(conn)] = conn
+                self._connection_pragma_values[id(conn)] = applied
             return conn
         except Exception:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
             _PROCESS_CONNECTION_BUDGET.release()
             raise
 
@@ -260,8 +336,17 @@ class DatabaseConnectionPool:
         except Exception:
             pass
         finally:
-            self._decrement_created()
-            _PROCESS_CONNECTION_BUDGET.release()
+            tracked = False
+            with self._lock:
+                connection_id = id(conn)
+                tracked = self._connections.pop(connection_id, None) is not None
+                self._connection_pragma_values.pop(connection_id, None)
+                if self._checked_out_connections.pop(connection_id, None) is not None:
+                    self._checked_out = max(0, self._checked_out - 1)
+                if tracked and self._created_connections > 0:
+                    self._created_connections -= 1
+            if tracked:
+                _PROCESS_CONNECTION_BUDGET.release()
 
     def _decrement_created(self) -> None:
         with self._lock:
@@ -288,29 +373,73 @@ class DatabaseConnectionPool:
             bool: 是否刚刚执行了跨进程重置。
         """
         current_pid = os.getpid()
-        if current_pid == self._pid:
-            return False
-        self._reset_after_fork()
-        self._pid = current_pid
-        return True
+        was_forked = current_pid != self._pid
+        _PROCESS_CONNECTION_BUDGET._ensure_current_process()
+        if self._pid != current_pid:
+            self._reset_after_fork_state(current_pid)
+        return was_forked
 
-    def _reset_after_fork(self) -> None:
-        """子进程中丢弃父进程继承的连接与计数，重新开始。"""
-        idle = []
-        with self._lock:
-            while True:
-                try:
-                    idle.append(self._available.get_nowait())
-                except queue.Empty:
-                    break
-            self._created_connections = 0
-            self._checked_out = 0
+    def _reset_after_fork_state(self, current_pid: int) -> None:
+        """不获取父进程锁，重建池状态并隔离父进程连接租约。"""
+        old_available = self._available
+        previously_inherited = set(self._inherited_connections)
+        inherited = dict(self._inherited_connections)
+        inherited.update(self._connections)
+
+        # fork 可能发生在其他线程持有 queue/池锁时，因此只读旧队列的 deque，
+        # 不调用旧队列方法，也不获取任何从父进程继承的同步原语。
+        idle = list(old_available.queue)
+        idle_ids = {id(conn) for conn in idle}
+        active_ids = set(self._checked_out_connections)
+        active_ids.update(set(self._connections) - idle_ids)
         for conn in idle:
+            inherited[id(conn)] = conn
+
+        self._lock = threading.Lock()
+        self._available = queue.LifoQueue(maxsize=self._max_connections)
+        self._lease_local = threading.local()
+        self._created_connections = 0
+        self._checked_out = 0
+        self._checked_out_connections = {}
+        self._connections = {}
+        self._connection_pragma_values = {}
+        self._inherited_connections = inherited
+        self._pid = current_pid
+
+        # 空闲连接没有仍在执行的调用方，可以立即关闭；已 checkout 的连接保留到
+        # 旧租约归还时再关闭，避免影响 fork 调用栈中仍持有的连接对象。
+        for connection_id, conn in list(inherited.items()):
+            if connection_id in active_ids or connection_id in previously_inherited:
+                continue
             try:
                 conn.close()
             except Exception:
                 pass
-        _PROCESS_CONNECTION_BUDGET.reset_after_fork(self)
+            self._inherited_connections.pop(connection_id, None)
+
+    def _close_inherited_connection(self, conn: sqlite3.Connection) -> None:
+        """关闭父进程遗留连接，不触碰当前子进程的连接计数和预算。"""
+        with self._lock:
+            self._inherited_connections.pop(id(conn), None)
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def _apply_configured_pragmas_locked(self, conn: sqlite3.Connection) -> None:
+        """在池锁内将当前配置补齐到即将归还的连接。"""
+        connection_id = id(conn)
+        applied = self._connection_pragma_values.setdefault(connection_id, {})
+        for key, raw_value in self._pragma_dict.items():
+            value = self._format_pragma_value(raw_value)
+            if value is None or applied.get(key) == value:
+                continue
+            try:
+                conn.execute(f'PRAGMA {key}={value};')
+                applied[key] = value
+            except sqlite3.Error:
+                # PRAGMA 失败沿用创建连接和空闲连接路径的 best-effort 语义。
+                pass
 
     def _checkout_connection(self) -> sqlite3.Connection:
         while True:
@@ -336,6 +465,7 @@ class DatabaseConnectionPool:
                         should_close = True
                     else:
                         self._checked_out += 1
+                        self._checked_out_connections[id(conn)] = conn
                 if should_close:
                     self._close_connection(conn)
                     raise RuntimeError('connection pool is closed')
@@ -344,16 +474,26 @@ class DatabaseConnectionPool:
             self._close_connection(conn)
 
     def _return_connection(self, conn: sqlite3.Connection) -> None:
-        # 子进程里归还父进程继承的连接：直接丢弃，不能放回池中
-        if self._ensure_same_process():
-            self._close_connection(conn)
-            return
-
-        should_close = False
+        self._ensure_same_process()
+        connection_id = id(conn)
         with self._lock:
-            if self._checked_out > 0:
-                self._checked_out -= 1
-            should_close = self._closed
+            if connection_id in self._inherited_connections:
+                inherited = True
+                tracked = False
+                should_close = True
+            else:
+                inherited = False
+                tracked = self._checked_out_connections.pop(connection_id, None) is not None
+                if tracked:
+                    self._checked_out = max(0, self._checked_out - 1)
+                should_close = self._closed
+
+        if inherited:
+            self._close_inherited_connection(conn)
+            return
+        if not tracked:
+            # 重复归还不能把同一个连接重复放入可用队列。
+            return
 
         if should_close:
             self._close_connection(conn)
@@ -373,6 +513,7 @@ class DatabaseConnectionPool:
             if self._closed:
                 should_close = True
             else:
+                self._apply_configured_pragmas_locked(conn)
                 try:
                     self._available.put_nowait(conn)
                     should_close = False
@@ -382,6 +523,7 @@ class DatabaseConnectionPool:
             self._close_connection(conn)
 
     def _close_one_idle_connection_for_budget(self) -> bool:
+        self._ensure_same_process()
         try:
             conn = self._available.get_nowait()
         except queue.Empty:
@@ -396,6 +538,7 @@ class DatabaseConnectionPool:
         嵌套场景（如 max_connections=1 时在外层连接中调用需要连接的 API）
         若每次都从池中重新 checkout 会自锁，这里按线程维护带引用计数的租约。
         """
+        self._ensure_same_process()
         lease = getattr(self._lease_local, 'lease', None)
         if lease is not None:
             if self._closed:
@@ -418,7 +561,9 @@ class DatabaseConnectionPool:
             self._return_connection(conn)
 
     def force_close_all_connections(self):
+        self._ensure_same_process()
         idle = []
+        inherited = []
         with self._lock:
             self._closed = True
             while True:
@@ -426,12 +571,20 @@ class DatabaseConnectionPool:
                     idle.append(self._available.get_nowait())
                 except queue.Empty:
                     break
+            inherited = list(self._inherited_connections.values())
+            self._inherited_connections.clear()
 
         for conn in idle:
             self._close_connection(conn)
+        for conn in inherited:
+            try:
+                conn.close()
+            except Exception:
+                pass
         _PROCESS_CONNECTION_BUDGET.unregister(self)
 
     def get_pool_status(self) -> Dict[str, Any]:
+        self._ensure_same_process()
         with self._lock:
             return {
                 'max_connections': self._max_connections,
@@ -444,10 +597,13 @@ class DatabaseConnectionPool:
             }
 
     def apply_pragma_to_idle(self, key: str, value: Any) -> None:
-        """把 PRAGMA 应用到当前空闲连接；使用中的连接不受影响（等归还或新建时生效）。"""
+        """更新 PRAGMA 配置，并应用到空闲连接；借出连接在归还时更新。"""
+        self._ensure_same_process()
+        pragma_value = self._format_pragma_value(value)
         with self._lock:
             if self._closed:
                 return
+            self._pragma_dict[key] = value
             idle = []
             while True:
                 try:
@@ -455,15 +611,18 @@ class DatabaseConnectionPool:
                 except queue.Empty:
                     break
             for conn in idle:
-                try:
-                    conn.execute(f'PRAGMA {key}={value};')
-                except sqlite3.Error:
-                    pass
+                if pragma_value is not None:
+                    try:
+                        conn.execute(f'PRAGMA {key}={pragma_value};')
+                        self._connection_pragma_values.setdefault(id(conn), {})[key] = pragma_value
+                    except sqlite3.Error:
+                        pass
                 # 已排空队列，放回不会 Full（put 均在同锁内进行）
                 self._available.put_nowait(conn)
 
     def is_pool_healthy(self) -> bool:
         """池状态是否健康：已关闭、计数为负或超出上限都视为不健康。"""
+        self._ensure_same_process()
         with self._lock:
             if self._closed:
                 return False
