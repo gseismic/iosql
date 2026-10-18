@@ -2,7 +2,7 @@
 
 `iosql` 是一个接近原生 SQLite 的自动分区存储库。它把同一张逻辑表拆到多个 SQLite 分区文件中，保留 SQLite 的简单部署方式，同时提供逻辑分区、物理 row segment、查询裁剪、批量写入和布局诊断能力。时间序列只是普通分区表的一种 helper 用法。
 
-支持可选的 Parquet 和 PostgreSQL 后端；同一套表契约与读写接口可用于不同后端。
+支持 Parquet 和可选的 PostgreSQL 后端；同一套表契约与读写接口可用于不同后端。
 
 ## 特性
 
@@ -76,7 +76,13 @@ daily_bars/
 
 要求 Python 3.9 或更高版本。
 
-开发安装：
+普通安装：
+
+```bash
+python -m pip install iosql
+```
+
+仓库开发安装：
 
 ```bash
 python -m pip install -e .
@@ -88,11 +94,7 @@ python -m pip install -e .
 python -m pip install -e ".[postgresql]"
 ```
 
-需要 Parquet 后端时安装：
-
-```bash
-python -m pip install -e ".[parquet]"
-```
+Parquet 后端随默认依赖安装，普通安装和开发安装均包含 DuckDB，无需额外 extra。
 
 ### Parquet 后端
 
@@ -129,7 +131,9 @@ segment 表沿用现有 upsert/replace 限制。读取流存活期间，同表�
 与 `aggregate_by_bucket()` 暂不支持 Parquet。只接管 iosql 创建的目录库，
 不会自动注册任意已有 Parquet 文件。
 
-完整示例：[14_parquet_backend.py](examples/14_parquet_backend.py)。
+完整 Parquet 后端示例：[14_parquet_backend.py](examples/14_parquet_backend.py)。
+SQLite → Parquet 单向迁移示例：[16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py)，
+覆盖 dry-run、行数校验和目标库查询。
 
 构建 wheel：
 

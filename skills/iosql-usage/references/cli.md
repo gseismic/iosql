@@ -1,7 +1,8 @@
 # iosql CLI
 
 `migrate` 支持 SQLite/Parquet 源库，并可写入 SQLite、Parquet 或 PostgreSQL 目标库。
-Parquet URI 必须显式传 `parquet://`，并安装 `iosql[parquet]`；其他 CLI 运维命令仍只支持 SQLite。
+Parquet URI 必须显式传 `parquet://`；DuckDB 随 iosql 默认依赖安装。
+其他 CLI 运维命令仍只支持 SQLite。
 
 > 版本对齐：iosql v0.3.x。可视化管理台见 [ui.md](ui.md)。
 

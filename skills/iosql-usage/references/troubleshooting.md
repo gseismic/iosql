@@ -301,15 +301,15 @@ db = Database("mysql://localhost/db")  # EngineNotExist
 
 **症状**：打开 `parquet://...` 数据库时报错，提示 Parquet 后端需要 DuckDB。
 
-**原因**：Parquet 是可选后端，默认安装 iosql 时不会安装 DuckDB。
+**原因**：当前 Python 环境没有安装 DuckDB，或安装的 iosql 依赖不完整。
 
 **修复**：
 
 ```bash
-python -m pip install "iosql[parquet]"
+python -m pip install --upgrade iosql
 ```
 
-仓库开发环境可用 `python -m pip install -e ".[parquet]"`。其他 Parquet 使用差异见
+仓库开发环境可用 `python -m pip install -e .`。其他 Parquet 使用差异见
 [Parquet 使用指南](parquet.md)。
 
 ## SQLite 到 PostgreSQL 迁移

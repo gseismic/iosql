@@ -19,7 +19,7 @@
 ### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32, max_ordered_read_connections=128)`
 
 数据库入口。支持 `sqlite://`、`parquet://` 和 `postgresql://` URI。
-Parquet 需安装 `iosql[parquet]`，业务数据为 `data/*.parquet`，元数据为 SQLite。
+Parquet 后端随 iosql 默认依赖提供 DuckDB，业务数据为 `data/*.parquet`，元数据为 SQLite。
 Parquet 支持分区、segment、读写、流式排序、维护和迁移；追加、修改和删除会重写受影响文件。
 Parquet 不支持 PRAGMA、持久化索引、`commit=False`、数据库目录 rename 和
 `aggregate_by_bucket`。文件预算参数也可传给 Parquet，用于元数据连接及有序流预算；

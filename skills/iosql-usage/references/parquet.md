@@ -8,16 +8,16 @@
 Parquet 适合批量归档、历史数据回灌、按列投影分析和跨分区有序读取。追加、修改和删除
 会重写受影响的物理文件；高频逐行改写前应先评估重写成本。
 
-安装可选依赖：
+Parquet 后端依赖 DuckDB，已包含在 iosql 默认依赖中。普通安装即可使用：
 
 ~~~bash
-python -m pip install "iosql[parquet]"
+python -m pip install iosql
 ~~~
 
 在仓库开发环境中使用：
 
 ~~~bash
-python -m pip install -e ".[parquet]"
+python -m pip install -e .
 ~~~
 
 ## 打开、建表与查询
@@ -128,13 +128,14 @@ iosql migrate -s parquet://db/archive.iosql \
   --target sqlite://db/restored.iosql --verify row-count
 ~~~
 
-其他 CLI 运维命令与 Web 工作区仍使用 SQLite 目录库。完整、可重复运行的流程见
-[Parquet 示例](../examples/14_parquet_backend.py)。
+其他 CLI 运维命令与 Web 工作区仍使用 SQLite 目录库。SQLite → Parquet 的单向迁移示例见
+[16_sqlite_to_parquet.py](../examples/16_sqlite_to_parquet.py)；Parquet 后端和双向迁移的完整示例见
+[14_parquet_backend.py](../examples/14_parquet_backend.py)。
 
 ## 常见问题
 
-- `提示缺少 DuckDB`：安装 `iosql[parquet]`，本地开发安装可用
-  `python -m pip install -e ".[parquet]"`。
+- `提示缺少 DuckDB`：重新安装 iosql 及其默认依赖；本地开发安装可用
+  `python -m pip install -e .`，普通环境可用 `python -m pip install --upgrade iosql`。
 - `已有普通 Parquet 文件找不到表`：iosql 不会自动接管任意文件；需先通过 iosql API
   写入其管理的目录库，或迁移一份已有 iosql 表。
 - `同线程写入时报读取流错误`：先耗尽或关闭 `iter_rows()` / `iter_batches()` 流。

@@ -1,5 +1,9 @@
 # Parquet 后端设计
 
+> 安装策略更新（2026-10-18）：DuckDB 已纳入 iosql 默认依赖，普通安装即可使用 Parquet；
+> 引擎仍在打开 `parquet://` 后端时才导入 DuckDB。具体变更见
+> [PLAN-082](../dev/PLAN-082-parquet-default-dependency.md)。
+
 ## 目标与使用方式
 
 新增 `Database("parquet://db/market.iosql")`，通过既有 `table()`、
@@ -12,7 +16,7 @@ schema 演进、重开、计数、校验、整理和 SQLite/PostgreSQL 双向迁
 
 ## 存储与内部接口
 
-- 可选依赖 `duckdb>=1.1`，通过 `iosql[parquet]` 安装，默认安装不加载 DuckDB。
+- 默认依赖 `duckdb>=1.1`，普通安装即可使用 Parquet；DuckDB 仍按需导入。
 - 表级 `meta.sqlite3` 保存现有表契约和 segment manifest；业务文件位于
   `data/*.parquet`。manifest 添加 `storage_engine="parquet"` 防止以错误后端打开。
 - Parquet Table 继承现有目录表实现，复用契约、分区路由、where AST、查询计划、

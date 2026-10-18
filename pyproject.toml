@@ -13,14 +13,14 @@ authors = [
 ]
 dependencies = [
     "arrow",
+    "duckdb>=1.1",
     "typer>=0.9.0",
     "loguru>=0.7.0",
 ]
 
 [project.optional-dependencies]
-parquet = [
-    "duckdb>=1.1",
-]
+# 兼容旧安装命令；DuckDB 已是默认依赖，无需 extra。
+parquet = []
 postgresql = [
     "psycopg2-binary>=2.9",
 ]

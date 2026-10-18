@@ -234,7 +234,7 @@ def test_wrong_backend_and_plain_directory_are_rejected(tmp_path):
     assert not (plain / 'meta.sqlite3').exists()
 
 
-def test_optional_dependency_error_before_files_are_created(tmp_path, monkeypatch):
+def test_missing_default_dependency_error_before_files_are_created(tmp_path, monkeypatch):
     original_import = builtins.__import__
     def missing(name, *args, **kwargs):
         if name == 'duckdb':
@@ -242,7 +242,7 @@ def test_optional_dependency_error_before_files_are_created(tmp_path, monkeypatc
         return original_import(name, *args, **kwargs)
     monkeypatch.setattr(builtins, '__import__', missing)
     with Database(_uri(tmp_path)) as db:
-        with pytest.raises(BadArgument, match=r'iosql\[parquet\]'):
+        with pytest.raises(BadArgument, match=r'pip install --upgrade iosql'):
             db.table('records')
     assert not (tmp_path / 'parquet.iosql').exists()
 

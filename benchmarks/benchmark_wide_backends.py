@@ -511,7 +511,10 @@ def run_benchmark(args) -> dict:
     try:
         import duckdb
     except ImportError as error:
-        raise RuntimeError('缺少 Parquet 可选依赖，请运行 pip install "iosql[parquet]"') from error
+        raise RuntimeError(
+            '缺少 DuckDB；请安装 iosql 默认依赖：'
+            'python -m pip install -e . 或 python -m pip install --upgrade iosql'
+        ) from error
 
     runs = []
     total = len(args.rows) * args.repeats * 2

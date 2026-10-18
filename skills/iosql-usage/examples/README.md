@@ -25,6 +25,7 @@
 | `13_streaming_ordered_query.py` | 进阶 | 对跨分区结果按 `open_time` 全局排序，并用 `query(...).iter_rows(...)` 惰性逐行读取。 |
 | `14_parquet_backend.py` | 高级 | Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
 | `15_postgresql_timeseries_query.py` | 高级 | PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
+| `16_sqlite_to_parquet.py` | 进阶 | 准备 SQLite 源表，dry-run 后迁移到 Parquet，并在目标端查询和校验。 |
 
 ## 金融示例
 
@@ -39,9 +40,9 @@
 
 ## 运行
 
-`14_parquet_backend.py` 演示 Parquet 分区文件、流式排序、重开和迁移。
-运行前安装 `python -m pip install -e ".[parquet]"`，再运行
-`python examples/14_parquet_backend.py`。
+`14_parquet_backend.py` 演示 Parquet 分区文件、流式排序、重开和往返迁移；
+`16_sqlite_to_parquet.py` 专门演示 SQLite → Parquet 单向迁移。
+Parquet 后端随默认依赖安装，运行这些示例无需额外安装。
 
 先在仓库根目录安装开发版本：
 
@@ -67,8 +68,8 @@ python examples/10_existing_database_repartition.py
 python examples/11_sqlite_to_postgresql_migration.py
 python examples/12_sqlite_postgresql_roundtrip.py
 python examples/13_streaming_ordered_query.py
-python -m pip install -e ".[parquet]"
 python examples/14_parquet_backend.py
+python examples/16_sqlite_to_parquet.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

@@ -22,7 +22,8 @@ def _duckdb():
         import duckdb
     except ImportError as exc:
         raise BadArgument(
-            'Parquet 后端需要 DuckDB；请安装 pip install "iosql[parquet]"'
+            'Parquet 后端需要 DuckDB；请安装或更新 iosql: '
+            'python -m pip install --upgrade iosql'
         ) from exc
     return duckdb
 

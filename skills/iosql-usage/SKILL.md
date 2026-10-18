@@ -31,10 +31,11 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 
 ## 决策树：选对入口
 
-批量归档或列式分析可使用 `Database("parquet://db/archive.iosql")`，先安装
-`iosql[parquet]`。建表、查询和迁移沿用 iosql 主 API；Parquet 会重写受影响的数据文件，
+批量归档或列式分析可使用 `Database("parquet://db/archive.iosql")`。DuckDB 随 iosql
+默认依赖安装，无需额外 extra。建表、查询和迁移沿用主 API；Parquet 会重写受影响的数据文件，
 适合批量写入。先看 [Parquet 使用指南](references/parquet.md) 了解性能和接口边界，再运行
-[Parquet 示例](examples/14_parquet_backend.py)。CLI 目前只有 `migrate` 支持 Parquet URI。
+[SQLite → Parquet 迁移示例](examples/16_sqlite_to_parquet.py) 或
+[Parquet 后端完整示例](examples/14_parquet_backend.py)。CLI 目前只有 `migrate` 支持 Parquet URI。
 
 ```
 带时间戳/日期的数据（K线、tick、orderbook、财报、新闻）
@@ -71,7 +72,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 
 这条工作流对应主线示例的递进关系：01/02 解决建模入口，03 解决批量写入和计划确认，
 04～08 解决布局与运维，09/10 解决已有库，11/12 解决迁移，13 解决大结果集的有序流式读取，
-14 展示 Parquet 归档和 SQLite 往返迁移。
+14 展示 Parquet 归档和 SQLite 往返迁移；16 聚焦 SQLite 到 Parquet 的单向迁移。
 
 ## 参数怎么设：先估算数据量，再定分区
 
@@ -145,7 +146,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | SQLite → PostgreSQL 迁移 | 先 `to_postgresql(..., dry_run=True)` 预览，再 `verify="row-count"` 正式迁移 | [examples/11_sqlite_to_postgresql_migration.py](examples/11_sqlite_to_postgresql_migration.py) |
 | PostgreSQL 在线时序查询、计划与复合索引 | `query/latest/asof`、`.explain(analyze=True)`、`create_index(columns=[...])` | [examples/15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) |
 | SQLite ⇄ PostgreSQL 双向 | PG 侧重开逻辑表需 `db.table(名字, spec=同一份契约)` | [examples/12_sqlite_postgresql_roundtrip.py](examples/12_sqlite_postgresql_roundtrip.py) |
-| SQLite ⇄ Parquet 迁移 | `db.migrate_to("parquet://...")` 或反向迁移；正式迁移可启用 `verify="row-count"` | [references/parquet.md](references/parquet.md) |
+| SQLite ⇄ Parquet 迁移 | `db.migrate_to("parquet://...")` 或反向迁移；正式迁移可启用 `verify="row-count"` | [examples/16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py)、[references/parquet.md](references/parquet.md) |
 | 逻辑分区 + 物理 segment 组合 | partition 与 segment 同时配置，explain 看两级裁剪 | [examples/05_partition_segments_smoke.py](examples/05_partition_segments_smoke.py) |
 | 已有库整体重分区 | 读 `spec()` 构造新 spec → `repartition_to(..., batch_size=50_000)` | [examples/10_existing_database_repartition.py](examples/10_existing_database_repartition.py) |
 
@@ -187,6 +188,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | `12_sqlite_postgresql_roundtrip.py` | 演示 SQLite → PostgreSQL → SQLite 双向转换。 |
 | `13_streaming_ordered_query.py` | 对跨分区结果全局排序，并用 `query().iter_rows()` 惰性消费大结果集。 |
 | `14_parquet_backend.py` | 演示 Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
+| `15_postgresql_timeseries_query.py` | 演示 PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
+| `16_sqlite_to_parquet.py` | 演示 SQLite 源库 dry-run、迁移到 Parquet、row-count 校验和目标查询。 |
 
 金融示例位于 `examples/finance/`：`01_kline_bars.py` 解决 K 线 OHLCV，
 `02_orderbook_snapshots.py` 解决高频 orderbook 快照，`03_financial_reports.py` 解决财报
@@ -200,8 +203,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 单文件运维问题。进入低层示例前，先确认需求不是普通 `Database.table()` /
 `Database.timeseries()` 能解决的主 API 场景。
 
-运行示例前先执行 `python -m pip install -e .`；Parquet 示例还需安装
-`python -m pip install -e ".[parquet]"`。脚本默认把可重复生成的数据库放在各自
+运行示例前先执行 `python -m pip install -e .`，此安装已包含 DuckDB 和 Parquet 后端。
+脚本默认把可重复生成的数据库放在各自
 `examples/runtime/` 下。未设置 `POSTGRES_DSN` 时，11 和 12 只执行 SQLite 准备与 dry-run。
 
 本机 PostgreSQL 查询示例 15 可先执行 `bash examples/start_postgresql_test.sh`，
