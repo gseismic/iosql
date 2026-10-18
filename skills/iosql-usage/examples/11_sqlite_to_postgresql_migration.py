@@ -1,8 +1,9 @@
 """SQLite 目录库迁移到 PostgreSQL，并用 row-count 校验结果。"""
 
 import os
-import shutil
 from pathlib import Path
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database, Partition, Segment
 
@@ -20,7 +21,7 @@ TARGET_TABLE = os.environ.get(
 
 
 def prepare_source():
-    shutil.rmtree(SOURCE_PATH, ignore_errors=True)
+    reset_demo_path(SOURCE_PATH)
     SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
@@ -63,7 +64,7 @@ def run():
     prepare_source()
 
     with Database(SOURCE_URI) as source:
-        plan = source.to_postgresql(
+        plan = source.migrate_to(
             TARGET_URI,
             tables={SOURCE_TABLE: TARGET_TABLE},
             dry_run=True,
@@ -77,7 +78,7 @@ def run():
             return
 
         drop_target_table()
-        result = source.to_postgresql(
+        result = source.migrate_to(
             TARGET_URI,
             tables={SOURCE_TABLE: TARGET_TABLE},
             verify="row-count",

@@ -35,7 +35,7 @@ python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 | **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
 | | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation；`--partition` 会校验分区存在并列可用分区 |
 | | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件；`--partition` 同样校验（含仅存在于 obsolete 的分区） |
-| | `iosql migrate -s DB --target parquet://... [--dry-run] [--verify row-count]` | SQLite/Parquet 源库迁移到 SQLite、Parquet 或 PostgreSQL；Parquet 源和目标使用显式 URI；拒绝同库/嵌套目标；行数校验要求目标库不存在同名表 |
+| | `iosql migrate -s DB --target parquet://... [--dry-run] [--verify row-count]` | SQLite/Parquet 源库迁移到 SQLite、Parquet 或 PostgreSQL；Parquet 源和目标使用显式 URI；拒绝同库/嵌套目标；行数校验要求所选目标表不存在或为空；--specs JSON 可改变目标分区，--temp-dir/--lock-timeout 控制暂存与锁等待 |
 | | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库；`--dry-run` 也校验 interval/timezone 与目标父目录，目标不能等于/嵌套源库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份；拒绝与源库互相包含的路径 |
 | | `iosql restore --backup BACKUP --target DB` | 目录级恢复；备份和覆盖目标均须有真实表级 manifest 且分区文件完整，空目录不能作为备份；覆盖需 `--replace --yes`；复制后的副本会再次校验，替换失败回滚 |
@@ -44,7 +44,7 @@ python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 ## CLI 安全规则
 
 - `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。`--dry-run` 也会先解析 interval/timezone 并校验目标父目录，且拒绝目标等于源库/位于源库内部。
-- 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。替换过程原子化：备份用 `os.replace` 改名（近零成本），跨文件系统传 `--backup` 会明确拒绝（EXDEV，源库原封不动），失败自动回滚。
+- 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写文件，所以不要求 `--yes`。转换期间保持源库独占锁；备份复制已发布快照并合并 WAL，支持跨文件系统；完成后通过代际指针统一发布。提交决定前失败目标不变，决定后的中断由恢复屏障完成发布。备份和转换需要额外磁盘空间。
 - `restore --replace --yes` 只允许覆盖有真实表级 manifest 和完整分区文件的 iosql 库；备份也须通过同样的校验，空库没有可靠身份标记，当前不支持从空目录恢复。伪造 meta 的普通目录、根/家目录、符号链接以及与备份互相包含的路径全部拒绝。替换前校验临时副本，失败保留原目标。
 - `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库/嵌套目标，`--verify row-count` 要求目标库不存在同名表（否则迁移前直接报错）。
 - `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验；`--partition` 拼写错误会报错并列出可用分区（compact 同理）。

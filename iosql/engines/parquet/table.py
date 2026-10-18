@@ -10,6 +10,7 @@ import threading
 import time
 from contextlib import contextmanager
 
+from ...migration import OMITTED
 from ...exception import BadArgument, SchemaConflict, TableSpecConflict, UnsafeOperation
 from ...spec import PhysicalLayout, SegmentInfo, TableContract
 from ...utils.createtable import build_createtable_meta
@@ -537,29 +538,17 @@ class Table(DirectoryTable):
         Database._validate_migration_target(target_uri)
         Database._reject_migration_self_target(self, target_uri)
 
-    def migrate_to(self, target_uri, target_table=None, mode='append',
-                   batch_size=10_000, verify=None, dry_run=False):
-        self._check_target(target_uri)
-        from ...database import Database
-        Database._normalize_migration_mode(mode)
-        return super().migrate_to(
-            target_uri, target_table=target_table, mode=mode,
-            batch_size=batch_size, verify=verify, dry_run=dry_run,
-        )
+    def migrate_to(self, target_uri, tables=OMITTED, mode='append',
+                   batch_size=10_000, verify=None, dry_run=False, *,
+                   specs=None, temp_dir=None, lock_timeout=30.0, target_table=OMITTED):
+        """迁移当前表；tables 与 Database 相同，specs 支持目标重新分区。"""
+        from ...migration import migrate_table
+        return migrate_table(self, target_uri, tables, mode, batch_size, verify, dry_run,
+                             specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+                             target_table=target_table)
 
     def repartition_to(self, target_uri, table_name=None, spec=None,
                        mode='append', batch_size=10_000):
-        self._check_target(target_uri)
-        from ...database import Database
-        mode = Database._normalize_migration_mode(mode)
-        batch_size = self._normalize_migration_batch_size(batch_size)
-        # 与 migrate_to 共用流式拷贝，避免继承路径把整个分区加载到 Python。
-        from ...spec import RepartitionResult
-        with Database(target_uri, verbose=self.verbose) as target_db:
-            target_table = target_db.table(table_name or self._table_name, spec=spec or self.spec())
-            result = self._migrate_to_target_table(target_table, mode=mode, batch_size=batch_size)
-            return RepartitionResult(
-                source_uri=self._uri, target_uri=target_uri,
-                table=target_table.table_name, rows_copied=result.rows_copied,
-                partitions_created=target_table.table_parts(),
-            )
+        from ...migration import repartition
+        return repartition(self, target_uri, table_name=table_name, spec=spec,
+                           mode=mode, batch_size=batch_size)

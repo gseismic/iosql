@@ -240,7 +240,8 @@ def test_restore_copy_failure_leaves_target_intact(tmp_path, monkeypatch):
     def _boom(*args, **kwargs):
         raise OSError("copy failed")
 
-    monkeypatch.setattr(cli_module.shutil, "copytree", _boom)
+    import iosql.migration as migration_module
+    monkeypatch.setattr(migration_module, "copy_snapshot", _boom)
 
     result = _invoke(
         "restore",

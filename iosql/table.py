@@ -16,6 +16,55 @@ def resolve_select_fields(fields, columns, func_name):
 
 class BaseTable(metaclass=ABCMeta):
 
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        from .coordination import guard_table_class
+        guard_table_class(cls)
+
+    def _reload_after_migration(self):
+        """更换物理目录后重建连接，旧缓存不能跨代继续使用。"""
+        from .exception import UnsafeOperation
+
+        if getattr(self, '_iosql_explicitly_closed', False):
+            raise UnsafeOperation('表已经关闭，请重新通过 Database.table() 打开')
+        if getattr(self, '_in_explicit_tx', False):
+            raise UnsafeOperation('调用方事务仍未结束，不能重新绑定发布后的表')
+        if self._uri_schema in ('sqlite', 'sqlite3', 'parquet'):
+            from .coordination import physical_root
+            if not (physical_root(self._uri) / self._table_name).is_dir():
+                raise UnsafeOperation('表已被移除或重命名，请重新打开对应表')
+        constructor = getattr(self, '_iosql_constructor', None)
+        if constructor is None:
+            return
+        owner = getattr(self, '_owner_db', None)
+        pg_contract = getattr(self, '_contract', None) if self._uri_schema == 'postgresql' else None
+        args, kwargs = list(constructor[0]), dict(constructor[1])
+        if self._uri_schema in ('sqlite', 'sqlite3'):
+            import copy
+            kwargs['pragma_dict'] = copy.deepcopy(self._pragma_dict)
+        if self._uri_schema in ('sqlite', 'sqlite3', 'parquet'):
+            for key, attribute in (('max_open_partitions', '_num_opened_max_allowed'),
+                                   ('max_connections_per_file', '_max_connections_per_file'),
+                                   ('max_process_connections', '_max_process_connections'),
+                                   ('max_ordered_read_connections', '_max_ordered_read_connections')):
+                if hasattr(self, attribute):
+                    kwargs[key] = getattr(self, attribute)
+        for index, (key, value) in enumerate((('uri', self._uri), ('table_name', self._table_name))):
+            if len(args) > index:
+                args[index] = value
+            else:
+                kwargs[key] = value
+        self._iosql_invalidating = True
+        try:
+            self.close()
+            type(self).__init__(self, *args, **kwargs)
+            if pg_contract is not None:
+                self._restore_contract_after_migration(pg_contract)
+            if owner is not None:
+                self._owner_db = owner
+        finally:
+            self._iosql_invalidating = False
+
     def __init__(self, uri, table_name, verbose=0, **engine_options):
         self._uri = uri
         self._table_name = table_name

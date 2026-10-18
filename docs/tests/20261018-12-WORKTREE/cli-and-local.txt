@@ -1,0 +1,13 @@
+........................................................................ [ 69%]
+................................                                         [100%]
+=============================== warnings summary ===============================
+tests/test_safe_migration.py: 25 warnings
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:435: DeprecationWarning: select_all() 已废弃：等价于 select(fields, where, to_dict=True)，请改用 select(to_dict=True)
+    result = function(self, *args, **kwargs)
+
+tests/test_safe_migration.py::test_fork_does_not_unlock_parent_file_lease
+  /home/lsl/miniconda3/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=112262) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+104 passed, 26 warnings in 7.84s

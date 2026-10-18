@@ -126,3 +126,19 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
 
 指定 symbols 的单 symbol 分组 latest 会在目录确认有效 symbol/time B-tree 前缀索引后使用 LATERAL LIMIT 1；无索引/多维分组/无 symbols 时使用 DISTINCT ON。
+
+## 统一迁移与安全发布（PLAN-083）
+
+- `Database.migrate_to` 和 `Table.migrate_to` 都使用 `tables=None/list/dict`；对象决定全库/当前表范围，字典为 `{源名: 目标名}`。Table 的 `target_table=` 和旧第二位置目标名仍兼容，不能与 `tables=` 混用。`to_postgresql` 保留兼容，示例推荐 `migrate_to`。
+- 两者共同提供 `specs=None`、`temp_dir=None`、`lock_timeout=30.0` 关键字参数。`specs={"ticks":{"partition":"duration(ts,every=1hour)"}}` 在转换时改变目标布局；值也可以是 `source.spec().with_partition(...)`，键始终是已选源表名。支持 partition=None 移除分区，支持 segment；不隐式改列/主键/时间单位。
+- 已有目标必须兼容最终目标契约；`mode="replace"` 是主键冲突策略，不会清空或重建目标。`verify="row-count"` 要求各选中目标不存在或为空，实际行数在发布前验证；PG 还在正式事务里验证。
+- 迁移全程持有源、目标库独占锁，协作 API 读写立即抛 `DatabaseBusy`。已消费但未关闭的读取流也持共享锁；关闭后才能迁移。同线程持共享锁时拒绝升级，其他线程/进程等待至 `lock_timeout` 抛 `MigrationLockTimeout`。
+- 本地默认在源逻辑目录 `__iosql_migrations__/<任务ID>/` 转换，再将完整目标视图放到目标 `__iosql_generations__/<任务ID>/`，原子切换父目录 `.iosql-locks/` 中的控制记录。库 URI 不变。应通过 API 枚举路径，不能假定表一直在 `库根/表名`。
+- PG 使用专用源快照/正式目标事务、暂存 schema 和独立协调连接；全表转换后一次 COMMIT。调用方未提交事务不得被迁移提交或回滚，先结束原事务。提交状态与数据共同提交，回复不确定时按任务锁和持久状态确认。
+- `dry_run=True` 取得源共享锁，只统计源行数/目标契约，不连接或锁定目标，不创建业务临时目录。源需恢复时仅报告，不执行恢复。源协调锁文件可以产生。
+- 发布前失败保留暂存供排查，正式目标不变；已决定提交的本地中断由下次读写恢复，不能绕过屏障。发布确认后立即解锁，清理在锁外；清理失败不撤销提交。主 API 之外的原始文件访问/旧版客户端不参与此协议。
+- 结果保留旧字段，追加 rows_written、published、operation_id、source_spec、target_spec、partitions_created。rows_copied 是成功交给目标写入的源行数，ignore 时可能包含被忽略行；published 才表达正式发布。
+
+数值时间列改变为 calendar 时保留 ms/s 单位及原值（含早期 epoch），PG 数值边界使用同一单位。既有已绑定 PG 对象跨发布只读恢复绑定；新打开对象仍需要显式声明。`partitions_created` 仅记录本次新增目标分区。
+
+已完成本地提交的状态在被后续提交替换前按任务 ID 持久归档，旧代际清理不删除状态历史。buffered_writer 的 with 上下文持共享租约，append/flush 受维护屏障；flush 失败保留输入，不自动重试。迁移前应 flush 内存缓冲。PG 其他协作角色需具备读取控制 schema 状态的权限，迁移角色需管理该 schema；库不自动向 PUBLIC 扩大权限。

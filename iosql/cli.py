@@ -13,6 +13,7 @@ import base64
 import csv
 import errno
 import functools
+import inspect
 import io
 import json
 import os
@@ -29,6 +30,8 @@ import arrow
 import typer
 
 from iosql import Database, PartitionSpec, format_partition_spec
+from iosql.coordination import exclusive_resources, lease, physical_path, resource
+from iosql.migration import backup_snapshot, publish_snapshot
 from iosql.exception import IosqlError, PartitionSpecError
 from iosql.utils.mysqlite import Database as MyDatabase
 from iosql.utils.storage_identity import is_iosql_database
@@ -67,6 +70,19 @@ def _guard_command_errors(callback):
     @functools.wraps(callback)
     def wrapper(*args, **kwargs):
         try:
+            owned = {'migrate', 'repartition', 'backup', 'restore', 'rename_database', 'rename_table', 'web'}
+            if callback.__name__ not in owned:
+                source = inspect.signature(callback).bind_partial(*args, **kwargs).arguments.get('source')
+                if source:
+                    source_uri = _parse_uri(source)
+                    _uri_to_path(source_uri)
+                    try:
+                        resource(source_uri)
+                    except ValueError as exc:
+                        _fail(f'源库 URI 无效: {exc}')
+                    # CLI 也有直接扫描文件的路径，租约覆盖整个命令。
+                    with lease(source_uri):
+                        return callback(*args, **kwargs)
             return callback(*args, **kwargs)
         except _CliFailure as exc:
             typer.secho(exc.message, fg=typer.colors.RED, err=True)
@@ -568,7 +584,7 @@ def _write_row_batches_to_stream(
 
 
 def _part_db_paths(source_path: Path, table_name: str) -> List[Path]:
-    data_dir = source_path / table_name / "data"
+    data_dir = physical_path(source_path) / table_name / "data"
     if not data_dir.exists():
         return []
     return sorted(data_dir.glob("*.sqlite3"))
@@ -1414,6 +1430,9 @@ def migrate(
         help="迁移后校验模式；row-count 要求目标表在迁移前不存在或为空",
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只预览迁移计划，不连接目标库"),
+    specs: str = typer.Option("", "--specs", help='目标布局 JSON 或 @文件，按源表名指定，如 {"ticks":{"partition":"duration(ts,every=1hour)"}}'),
+    temp_dir: Optional[Path] = typer.Option(None, "--temp-dir", help="转换临时根目录，默认在源库内"),
+    lock_timeout: float = typer.Option(30.0, "--lock-timeout", help="等待源/目标独占锁的总秒数"),
 ):
     """在 SQLite、Parquet 目录库与 PostgreSQL 目标库之间迁移数据。"""
     if str(source).startswith('parquet://'):
@@ -1432,45 +1451,20 @@ def migrate(
 
     db = Database(source_uri)
     try:
-        if target_uri.startswith(("sqlite://", "sqlite3://", "parquet://")):
-            target_path = (Path(target_uri[len('parquet://'):])
-                           if target_uri.startswith('parquet://') else _uri_to_path(target_uri))
-            source_real = _real_path(source_path)
-            target_real = _real_path(target_path)
-            # 同库/嵌套目标会把行数翻倍或生成嵌套库，直接拒绝（L1-1）
-            if target_real == source_real:
-                _fail(f"migrate 源库与目标库不能相同: {source_path}")
-            if _is_within(target_real, source_real):
-                _fail(f"migrate 目标库不能位于源库内部: {target_path}")
-            # row-count 校验按“目标总行数 == 源行数”判定；目标已有同名表时必然误报
-            if verify_mode == "row-count" and not dry_run and target_path.exists():
-                if table_arg is None:
-                    target_names = list(db.table_names())
-                elif isinstance(table_arg, dict):
-                    target_names = list(table_arg.values())
-                else:
-                    target_names = list(table_arg)
-                if target_names:
-                    existing_db = Database(target_uri)
-                    try:
-                        existing = sorted(
-                            set(existing_db.table_names()) & set(target_names)
-                        )
-                    finally:
-                        existing_db.close()
-                    if existing:
-                        _fail(
-                            "row-count 校验要求目标表为空，但目标库已存在表: "
-                            f"{', '.join(existing)}；请改用 --mode replace/ignore "
-                            "或去掉 --verify row-count"
-                        )
+        layout_specs = None
+        if specs:
+            raw_specs = Path(specs[1:]).read_text(encoding="utf-8") if specs.startswith("@") else specs
+            try:
+                layout_specs = json.loads(raw_specs)
+            except ValueError as exc:
+                _fail(f"specs JSON 错误: {exc}")
         result = db.migrate_to(
             target_uri,
             tables=table_arg,
             mode=write_mode,
             batch_size=batch_size,
             verify=verify_mode,
-            dry_run=dry_run,
+            dry_run=dry_run, specs=layout_specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
         )
         _echo_json(result.to_dict())
     finally:
@@ -1897,51 +1891,26 @@ def repartition(
     if final_target_path.exists():
         _fail(f"目标数据库已存在: {final_target_path}")
 
-    db2 = Database(source_uri)
-    try:
-        t = _require_table(db2, table)
-        start = time.monotonic()
-        result = t.repartition_to(
-            final_target_uri,
-            table_name=target_table or table,
-            spec=new_spec,
-            batch_size=batch_size,
-        )
-        elapsed = time.monotonic() - start
-    finally:
-        db2.close()
-
     backup_path = None
-    if source_replaced:
-        if no_backup:
-            moved_old_path = source_path.with_name(
-                f"{source_path.name}.repartition_old_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{os.getpid()}"
+    # 覆盖源库的整个窗口也持有独占锁，避免转换后又写入旧布局。
+    with exclusive_resources((source_uri, final_target_uri), timeout=30.0):
+        with Database(source_uri) as db2:
+            t = _require_table(db2, table)
+            start = time.monotonic()
+            result = t.repartition_to(
+                final_target_uri, table_name=target_table or table,
+                spec=new_spec, batch_size=batch_size,
             )
-            os.replace(source_path, moved_old_path)
-            try:
-                os.replace(final_target_path, source_path)
-            except Exception:
-                os.replace(moved_old_path, source_path)
-                raise
-            _rmtree_robust(moved_old_path)
-        else:
-            backup_path = planned_backup_path
-            if backup_path.exists():
-                _fail(f"备份目标已存在: {backup_path}")
-            try:
-                os.replace(source_path, backup_path)
-            except OSError as e:
-                if e.errno == errno.EXDEV:
-                    _fail(
-                        f"--backup 与源库不在同一文件系统，原子备份不支持跨盘: {backup_path}"
-                    )
-                raise
-            try:
-                os.replace(final_target_path, source_path)
-            except Exception:
-                os.replace(backup_path, source_path)
-                raise
+            elapsed = time.monotonic() - start
+        if source_replaced:
+            if not no_backup:
+                backup_path = planned_backup_path
+                if backup_path.exists():
+                    _fail(f"备份目标已存在: {backup_path}")
+                backup_snapshot(source_uri, backup_path)
+            publish_snapshot(final_target_uri, source_uri)
+    if source_replaced:
+        _rmtree_robust(final_target_path)
 
     _echo_json({
         "result": result.to_dict(),
@@ -1970,7 +1939,7 @@ def backup(
         _fail(f"备份目标不能包含源库: {target_path}")
     if target_path.exists():
         _fail(f"备份目标已存在: {target_path}")
-    shutil.copytree(source_path, target_path, dirs_exist_ok=False)
+    backup_snapshot(f"sqlite://{source_path}", target_path)
     _echo_json({"source": str(source_path), "backup": str(target_path)})
 
 
@@ -1984,8 +1953,8 @@ def restore(
     """从备份恢复 SQLite 目录库。
 
     覆盖恢复前会校验备份和目标的真实表级 manifest，
-    并拒绝根/家目录、符号链接、以及与备份互相包含的路径；替换过程先把
-    备份复制到临时目录，成功后再原子换入，任一步失败都保持原目标不变。"""
+    并拒绝根/家目录、符号链接、以及与备份互相包含的路径。复制成功后
+    通过物理代际指针统一发布；已决定提交的中断由下一次操作恢复。"""
     if not backup_path.exists() or not backup_path.is_dir():
         _fail(f"备份目录不存在: {backup_path}")
     if backup_path.is_symlink():
@@ -2011,57 +1980,28 @@ def restore(
     if _is_within(backup_real, target_real):
         _fail(f"备份目录不能位于恢复目标内部: {target_path}")
 
-    if not _is_iosql_like_database(backup_path):
-        _fail(f"备份目录不是完整的 iosql 库，拒绝恢复: {backup_path}")
+    with exclusive_resources((f"sqlite://{backup_path.resolve()}", target_uri), timeout=30.0):
+        # 路径检查到加锁之间目标可能被创建；必须在独占范围重新检查授权。
+        target_exists = target_path.exists()
+        if not _is_iosql_like_database(backup_path):
+            _fail(f"备份目录不是完整的 iosql 库，拒绝恢复: {backup_path}")
 
-    if target_exists:
-        if not replace or not yes:
-            _fail("目标已存在，覆盖恢复必须同时提供 --replace --yes")
-        if not target_real.is_dir():
-            _fail(f"覆盖目标不是目录，拒绝删除: {target_path}")
-        if not _is_iosql_like_database(target_real):
-            _fail(
-                "目标目录不像 iosql 库（manifest 或分区文件无效），"
-                f"拒绝覆盖: {target_path}"
-            )
+        if target_exists:
+            if not replace or not yes:
+                _fail("目标已存在，覆盖恢复必须同时提供 --replace --yes")
+            if not target_real.is_dir():
+                _fail(f"覆盖目标不是目录，拒绝删除: {target_path}")
+            if not _is_iosql_like_database(target_real):
+                _fail(
+                    "目标目录不像 iosql 库（manifest 或分区文件无效），"
+                    f"拒绝覆盖: {target_path}"
+                )
 
-    target_parent = target_path.parent
-    if str(target_parent) and not target_parent.exists():
-        _fail(f"目标父目录不存在: {target_parent}")
+        target_parent = target_path.parent
+        if str(target_parent) and not target_parent.exists():
+            _fail(f"目标父目录不存在: {target_parent}")
 
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    tmp_new = target_path.with_name(f".{target_path.name}.restore_new_{stamp}_{os.getpid()}")
-    try:
-        shutil.copytree(backup_path, tmp_new, dirs_exist_ok=False)
-        if not _is_iosql_like_database(tmp_new):
-            _fail(f"复制后的备份校验失败，拒绝换入: {tmp_new}")
-    except BaseException:
-        if tmp_new.exists():
-            _rmtree_robust(tmp_new)
-        raise
-
-    if target_exists:
-        tmp_old = target_path.with_name(
-            f".{target_path.name}.restore_old_{stamp}_{os.getpid()}"
-        )
-        os.replace(target_path, tmp_old)
-        try:
-            os.replace(tmp_new, target_path)
-        except BaseException:
-            # 换入失败：把原目标改回来，保证数据不丢
-            os.replace(tmp_old, target_path)
-            raise
-        try:
-            _rmtree_robust(tmp_old)
-        except OSError as exc:
-            # 新目标已就位，旧目录残留不影响恢复结果
-            typer.secho(
-                f"警告: 旧目标目录未能删除 {tmp_old}: {exc}",
-                fg=typer.colors.YELLOW,
-                err=True,
-            )
-    else:
-        os.replace(tmp_new, target_path)
+        publish_snapshot(f"sqlite://{backup_path.resolve()}", target_uri)
 
     _echo_json({"backup": str(backup_path), "target": str(target_path)})
 

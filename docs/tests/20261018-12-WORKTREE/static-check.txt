@@ -1,0 +1,5 @@
+最终检查 40 个修改/新增 Python 文件
+Ruff: All checks passed!
+git diff --check: 通过
+源码校验和见 source-hashes.txt。
+8 组示例/skill 副本逐字节一致。

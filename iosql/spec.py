@@ -698,6 +698,7 @@ class PartitionSpec:
                 tz=spec.timezone or "UTC",
                 ts_col=spec.column,
                 every=spec.every,
+                time_unit=(time.unit if time and time.name == spec.column else spec.time_unit),
             )
         if unit not in [None, "ms"]:
             raise PartitionSpecError(
@@ -805,7 +806,7 @@ class PartitionSpec:
                 column=ts_col,
                 every=meta.get("every") or _calendar_every_from_fmt(fmt) or "1day",
                 kind="calendar",
-                time_unit="date",
+                time_unit=meta.get("time_unit", "date"),
                 timezone=meta.get("tz", "UTC"),
                 fmt=fmt,
             )
@@ -862,7 +863,7 @@ class TableContract:
             self.time = TimeColumn(
                 self.partition.column,
                 unit=(
-                    'date'
+                    (self.partition.time_unit or 'date')
                     if self.partition.kind == 'calendar'
                     else (self.partition.time_unit or 'ms')
                 ),
@@ -884,7 +885,7 @@ class TableContract:
             self.time = TimeColumn(
                 self.time.name,
                 unit=(
-                    'date'
+                    (self.partition.time_unit or 'date')
                     if self.partition.kind == 'calendar'
                     else (self.partition.time_unit or 'ms')
                 ),
@@ -1079,7 +1080,7 @@ class TableContract:
             time = TimeColumn(
                 partition.column,
                 unit=(
-                    "date"
+                    (partition.time_unit or "date")
                     if partition.kind == "calendar"
                     else (partition.time_unit or "ms")
                 ),
@@ -1451,6 +1452,12 @@ class TableMigrationResult:
     verify: Optional[str] = None
     verified: Optional[bool] = None
     dry_run: bool = False
+    rows_written: Optional[int] = None
+    published: Optional[bool] = None
+    operation_id: Optional[str] = None
+    source_spec: Optional[Dict[str, Any]] = None
+    target_spec: Optional[Dict[str, Any]] = None
+    partitions_created: List[Any] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1465,6 +1472,12 @@ class TableMigrationResult:
             "verify": self.verify,
             "verified": self.verified,
             "dry_run": self.dry_run,
+            "rows_written": self.rows_written,
+            "published": self.published,
+            "operation_id": self.operation_id,
+            "source_spec": self.source_spec,
+            "target_spec": self.target_spec,
+            "partitions_created": list(self.partitions_created),
         }
 
 
@@ -1475,6 +1488,14 @@ class MigrationResult:
     tables: List[TableMigrationResult] = field(default_factory=list)
     verify: Optional[str] = None
     dry_run: bool = False
+    published: Optional[bool] = None
+    operation_id: Optional[str] = None
+
+    @property
+    def rows_written(self) -> Optional[int]:
+        if any(item.rows_written is None for item in self.tables):
+            return None
+        return sum(item.rows_written for item in self.tables)
 
     @property
     def rows_copied(self) -> int:
@@ -1514,5 +1535,8 @@ class MigrationResult:
             "verify": self.verify,
             "verified": self.verified,
             "dry_run": self.dry_run,
+            "rows_written": self.rows_written,
+            "published": self.published,
+            "operation_id": self.operation_id,
             "tables": [item.to_dict() for item in self.tables],
         }

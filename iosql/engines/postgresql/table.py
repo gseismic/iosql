@@ -17,10 +17,11 @@ from psycopg2 import sql
 from ...table import BaseTable, resolve_select_fields
 from ...partition import Partition, CalendarPartition
 from ...core.query import Where
+from ...migration import OMITTED
 from ...exception import BadArgument, SchemaConflict
 from ...utils.schema import parse_db_schema
 from ...logger import default_logger as logger
-from ...spec import TableContract, TableMigrationResult, WriteResult
+from ...spec import TableContract, WriteResult
 from .query import PostgreSQLQueryMixin
 from ..sqlite.query_util import (
     _quote_sql_identifier,
@@ -156,6 +157,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         # commit=False 写入会保持事务打开，后续写操作并入同一事务
         self._in_explicit_tx = False
         self._tx_previous_autocommit = True
+        self._iosql_transaction_lease = None
         
         if self.verbose >= 1:
             logger.info(f'PostgreSQL Table {table_name} initialized with partition_mode={partition_mode}')
@@ -166,6 +168,49 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             self._conn = psycopg2.connect(self._uri)
             self._conn.autocommit = True
         return self._conn
+
+    def _preflight_public_call(self, name, args, kwargs):
+        """纯参数错误先于协调连接，保留离线契约校验能力。"""
+        if name != 'create_table':
+            return
+        columns = args[0] if args else kwargs.get('column_type')
+        pk = args[1] if len(args) > 1 else kwargs.get('pk')
+        partition = args[2] if len(args) > 2 else kwargs.get('partition')
+        partition = partition if partition is not None else self._partition
+        columns = dict(columns or {})
+        for type_ in columns.values():
+            self._pg_column_type(type_)
+        if any(column not in columns for column in pk or []):
+            raise BadArgument('主键列未声明')
+        if partition is not None:
+            if partition.TS_COL not in columns:
+                raise BadArgument(f'分区列未声明: {partition.TS_COL}')
+            if pk and partition.TS_COL not in pk:
+                raise BadArgument('PostgreSQL 分区主键必须包含分区列；请将分区列加入 pk')
+
+    def _restore_contract_after_migration(self, previous):
+        """已绑定对象重连只读校验，不能因一次读取重新创建被删除的表。"""
+        from ...exception import UnsafeOperation
+        if not self._relation_exists(self._table_name):
+            raise UnsafeOperation('表已被移除或重命名，请重新打开对应表')
+        contract = previous
+        with self.connect().cursor() as cursor:
+            cursor.execute("SELECT to_regclass('__iosql_control.table_contracts')")
+            if cursor.fetchone()[0] is not None:
+                cursor.execute('SELECT contract FROM __iosql_control.table_contracts '
+                               'WHERE schema_name=%s AND table_name=%s AND relation_oid=to_regclass(%s)',
+                               (self._schema_name(), self._table_name, self._qualified_relation()))
+                row = cursor.fetchone()
+                if row:
+                    import json
+                    stored = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                    contract = TableContract.from_dict(stored)
+        self._contract = contract
+        self._partition = contract.to_partition()
+        self._primary_key = list(contract.primary_key)
+        self._declared_column_types = dict(contract.columns)
+        self._verify_existing_table(contract.columns, self._partition)
+        self._table_created = True
     
     def close(self):
         """Close database connection."""
@@ -177,6 +222,13 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                     pass
                 self._in_explicit_tx = False
             self._conn.close()
+        self._release_transaction_lease()
+
+    def _release_transaction_lease(self):
+        held = getattr(self, '_iosql_transaction_lease', None)
+        self._iosql_transaction_lease = None
+        if held is not None:
+            held.__exit__(None, None, None)
 
     @contextmanager
     def _transaction(self, commit=True):
@@ -186,6 +238,11 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         连接关闭时未提交事务自动回滚。
         """
         conn = self.connect()
+        if getattr(self, '_iosql_migration_owned', False):
+            if commit:
+                raise BadArgument('迁移正式连接只能由发布器统一提交')
+            yield conn
+            return
         if self._in_explicit_tx:
             try:
                 yield conn
@@ -193,23 +250,31 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 conn.rollback()
                 self._in_explicit_tx = False
                 self._set_autocommit(conn, self._tx_previous_autocommit)
+                self._release_transaction_lease()
                 raise
             if commit:
                 conn.commit()
                 self._in_explicit_tx = False
                 self._set_autocommit(conn, self._tx_previous_autocommit)
+                self._release_transaction_lease()
             return
 
         previous_autocommit = conn.autocommit
         self._set_autocommit(conn, False)
         self._in_explicit_tx = True
         self._tx_previous_autocommit = previous_autocommit
+        if not commit:
+            from ...coordination import lease
+            pending = lease(self._uri)
+            pending.__enter__()
+            self._iosql_transaction_lease = pending
         try:
             yield conn
         except BaseException:
             conn.rollback()
             self._in_explicit_tx = False
             self._set_autocommit(conn, previous_autocommit)
+            self._release_transaction_lease()
             raise
         if commit:
             conn.commit()
@@ -985,6 +1050,16 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         column_type = self._partition_column_type(partition)
         normalized = str(column_type or 'text').strip().lower()
 
+        if self._pg_column_type(normalized) in ('BIGINT', 'DOUBLE PRECISION'):
+            clock = self._contract.time if self._contract else None
+            unit = (clock.unit if clock and clock.name == partition.TS_COL
+                    else getattr(partition, 'time_unit', None))
+            if unit not in ('ms', 's'):
+                raise BadArgument('数值列的 calendar 分区需要明确的 ms/s 时间单位')
+            scale = 1000 if unit == 'ms' else 1
+            return (int(start.to('UTC').timestamp() * scale),
+                    int(end.to('UTC').timestamp() * scale))
+
         if normalized in ['date']:
             return start.format('YYYY-MM-DD'), end.format('YYYY-MM-DD')
 
@@ -1404,109 +1479,14 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         for batch in self.iter_batches(batch_size=batch_size):
             yield from batch
 
-    def migrate_to(self, target_uri, target_table=None, mode='append',
-                   batch_size=10_000, verify=None, dry_run=False):
-        spec = self.spec()
-        if not spec:
-            raise BadArgument('migrate_to requires a TableContract')
-        table_name = target_table or self._table_name
-        if dry_run:
-            return self._migration_dry_run_result(
-                target_uri=target_uri,
-                target_name=table_name,
-                batch_size=batch_size,
-                verify=verify,
-            )
-
-        from ...database import Database
-
-        target_db = Database(target_uri)
-        try:
-            target = target_db.table(table_name, spec=spec)
-            return self._migrate_to_target_table(
-                target,
-                target_uri=target_uri,
-                target_name=table_name,
-                mode=mode,
-                batch_size=batch_size,
-                verify=verify,
-            )
-        finally:
-            target_db.close()
-
-    def _migrate_to_target_table(self, target_table, target_uri=None,
-                                 target_name=None, mode='append',
-                                 batch_size=10_000, verify=None):
-        batch_size = self._normalize_batch_size(batch_size)
-        verify = self._normalize_migration_verify(verify)
-
-        source_rows = self.count_rows() if verify == 'row-count' else None
-        rows_copied = 0
-        batches = 0
-        for batch in self.iter_batches(batch_size=batch_size):
-            if not batch:
-                continue
-            target_table.write(batch, mode=mode)
-            rows_copied += len(batch)
-            batches += 1
-
-        result = TableMigrationResult(
-            table=self._table_name,
-            target_table=target_name or getattr(
-                target_table,
-                'table_name',
-                self._table_name,
-            ),
-            source_uri=self._uri,
-            target_uri=target_uri,
-            rows_copied=rows_copied,
-            batches=batches,
-            source_rows=source_rows,
-            verify=verify,
-        )
-        if verify == 'row-count':
-            target_rows = target_table.count_rows()
-            result.target_rows = target_rows
-            result.verified = (
-                source_rows == rows_copied
-                and target_rows == source_rows
-            )
-            if not result.verified:
-                raise BadArgument(
-                    'row-count verification failed: '
-                    f'table={self._table_name}, source_rows={source_rows}, '
-                    f'rows_copied={rows_copied}, target_rows={target_rows}'
-                )
-        return result
-
-    def _migration_dry_run_result(self, target_uri=None, target_name=None,
-                                  batch_size=10_000, verify=None):
-        batch_size = self._normalize_batch_size(batch_size)
-        verify = self._normalize_migration_verify(verify)
-        source_rows = self.count_rows()
-        return TableMigrationResult(
-            table=self._table_name,
-            target_table=target_name or self._table_name,
-            source_uri=self._uri,
-            target_uri=target_uri,
-            rows_copied=0,
-            batches=math.ceil(source_rows / batch_size) if source_rows else 0,
-            source_rows=source_rows,
-            target_rows=None,
-            verify=verify,
-            verified=None,
-            dry_run=True,
-        )
-
-    def _normalize_migration_verify(self, verify):
-        if verify in [None, False, '']:
-            return None
-        value = str(verify).strip().lower()
-        if value in ['none', 'false', '0']:
-            return None
-        if value != 'row-count':
-            raise BadArgument('verify only supports row-count')
-        return value
+    def migrate_to(self, target_uri, tables=OMITTED, mode='append',
+                   batch_size=10_000, verify=None, dry_run=False, *,
+                   specs=None, temp_dir=None, lock_timeout=30.0, target_table=OMITTED):
+        """迁移当前表；tables 与 Database 相同，specs 支持目标重新分区。"""
+        from ...migration import migrate_table
+        return migrate_table(self, target_uri, tables, mode, batch_size, verify, dry_run,
+                             specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+                             target_table=target_table)
 
     def _select_query(self, fields, where=None, order_by=None, limit=None):
         column_types = self._column_types()

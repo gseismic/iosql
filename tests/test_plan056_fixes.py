@@ -11,6 +11,8 @@ import threading
 
 import pytest
 
+
+
 from iosql import Database, Segment
 from iosql.exception import BadArgument, UnsafeOperation
 from iosql.engines.postgresql import Table as PGTable
@@ -188,3 +190,5 @@ def test_write_compact_concurrency_preserves_all_rows(tmp_path):
     assert len(ids) == 300
     assert len(set(ids)) == 300
     db.close()
+
+pytestmark = pytest.mark.usefixtures("fake_pg_coordination")

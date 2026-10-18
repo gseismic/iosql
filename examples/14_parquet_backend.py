@@ -1,7 +1,8 @@
 """Parquet 分区存储、惰性排序、重开与 SQLite 往返迁移。"""
 
 from pathlib import Path
-import shutil
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database, Segment
 
@@ -15,7 +16,7 @@ BASE_TIME = 1735689600000
 
 def run():
     for path in [PARQUET_PATH, SQLITE_PATH, RESTORED_PATH]:
-        shutil.rmtree(path, ignore_errors=True)
+        reset_demo_path(path)
 
     uri = f'parquet://{PARQUET_PATH}'
     with Database(uri) as db:

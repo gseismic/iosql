@@ -3,7 +3,6 @@ from __future__ import annotations
 import copy
 import heapq
 import json
-import math
 import os
 import pathlib
 import shutil
@@ -19,6 +18,7 @@ from contextlib import closing, contextmanager
 
 import arrow
 
+from ...migration import OMITTED
 from ...exception import (
     BadArgument,
     InvalidUriSchema,
@@ -40,18 +40,16 @@ from ...spec import (
     PhysicalLayout,
     QueryPlan,
     QuerySpec,
-    RepartitionResult,
     TableContract,
-    TableMigrationResult,
     SegmentValidationResult,
     SegmentInfo,
-    TableSpec,
     WriteResult,
     _is_numeric_column_type,
     _normalize_column_descriptions,
     _normalize_column_ranges,
 )
 from ...table import BaseTable, resolve_select_fields
+from ...coordination import guard_query
 from ...utils.column import sqlite_type_of_value, suggest_sqlite_column_types
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite import Database as MyDatabase
@@ -60,7 +58,6 @@ from ...utils.mysqlite.connection_pool import (
     release_process_connections,
     reserve_process_connections,
 )
-from ...utils.schema import parse_db_schema
 from ...utils.storage_identity import iosql_table_names, is_iosql_table
 
 # from mysqlite import Database as MyDatabase
@@ -179,6 +176,7 @@ class _SqliteSortKey:
         return not (self < other) and not (other < self)
 
 
+@guard_query
 class _TableQuery:
     def __init__(self, table, query_spec):
         self._table = table
@@ -223,6 +221,7 @@ class _TableQuery:
         return self._query_spec
 
 
+@guard_query
 class _LatestQuery:
     def __init__(self, table, query_spec, columns, by):
         self._table = table
@@ -253,6 +252,7 @@ class _LatestQuery:
         return self._query_spec
 
 
+@guard_query
 class _BufferedWriter:
     def __init__(self, table, mode=None, max_rows=10_000, **write_kwargs):
         self._table = table
@@ -261,6 +261,7 @@ class _BufferedWriter:
         self._write_kwargs = write_kwargs
         self._buffer = []
         self._results = []
+        self._context = None
         if self._max_rows <= 0:
             raise BadArgument('max_rows must be positive')
 
@@ -277,7 +278,11 @@ class _BufferedWriter:
             return WriteResult()
         rows = self._buffer
         self._buffer = []
-        result = self._table.write(rows, mode=self._mode, **self._write_kwargs)
+        try:
+            result = self._table.write(rows, mode=self._mode, **self._write_kwargs)
+        except BaseException:
+            self._buffer = rows + self._buffer
+            raise
         self._results.append(result)
         return result
 
@@ -288,18 +293,29 @@ class _BufferedWriter:
         return list(self._results)
 
     def __enter__(self):
+        if self._context is not None:
+            raise UnsafeOperation('buffered_writer 上下文不能重复进入')
+        from ...coordination import operation
+        context = operation(self._table)
+        context.__enter__()
+        self._context = context
         return self
 
     def __exit__(self, exc_type, exc_value, exc_tb):
-        if exc_type is None:
-            self.flush()
-            return
-        if self._buffer:
-            warnings.warn(
-                f"buffered_writer 因异常未 flush {len(self._buffer)} 行缓冲数据",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+        try:
+            if exc_type is None:
+                self.flush()
+                return
+            if self._buffer:
+                warnings.warn(
+                    f"buffered_writer 因异常未 flush {len(self._buffer)} 行缓冲数据",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        finally:
+            context, self._context = self._context, None
+            if context is not None:
+                context.__exit__(exc_type, exc_value, exc_tb)
 
 
 class Table(TimeseriesQueryMixin, BaseTable):
@@ -440,7 +456,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         self._table_name = self._validate_table_name(self._table_name)
 
-        self.db_path = os.path.join(path, db)
+        from ...coordination import physical_path
+        self.db_path = str(physical_path(os.path.join(path, db)))
         self.db_meta_path = os.path.join(self.db_path, _DB_META_FILE)
 
         self.table_path = os.path.join(self.db_path, self._table_name)
@@ -1597,117 +1614,14 @@ class Table(TimeseriesQueryMixin, BaseTable):
                     continue
         return total
 
-    def migrate_to(self, target_uri, target_table=None, mode='append',
-                   batch_size=10_000, verify=None, dry_run=False):
-        spec = self.spec()
-        if not spec:
-            raise BadArgument('migrate_to requires a TableContract')
-        verify = self._normalize_migration_verify(verify)
-        table_name = target_table or self._table_name
-        if dry_run:
-            return self._migration_dry_run_result(
-                target_uri=target_uri,
-                target_name=table_name,
-                batch_size=batch_size,
-                verify=verify,
-            )
-
-        from ...database import Database
-
-        target_db = Database(target_uri)
-        try:
-            target = target_db.table(table_name, spec=spec)
-            return self._migrate_to_target_table(
-                target,
-                target_uri=target_uri,
-                target_name=table_name,
-                mode=mode,
-                batch_size=batch_size,
-                verify=verify,
-            )
-        finally:
-            target_db.close()
-
-    def _migrate_to_target_table(self, target_table, target_uri=None,
-                                 target_name=None, mode='append',
-                                 batch_size=10_000, verify=None):
-        batch_size = self._normalize_migration_batch_size(batch_size)
-        verify = self._normalize_migration_verify(verify)
-
-        source_rows = self.count_rows() if verify == 'row-count' else None
-        rows_copied = 0
-        batches = 0
-        for batch in self.iter_batches(batch_size=batch_size):
-            if not batch:
-                continue
-            target_table.write(batch, mode=mode)
-            rows_copied += len(batch)
-            batches += 1
-        result = TableMigrationResult(
-            table=self._table_name,
-            target_table=target_name or getattr(
-                target_table,
-                'table_name',
-                self._table_name,
-            ),
-            source_uri=self._uri,
-            target_uri=target_uri,
-            rows_copied=rows_copied,
-            batches=batches,
-            source_rows=source_rows,
-            verify=verify,
-        )
-        if verify == 'row-count':
-            target_rows = target_table.count_rows()
-            result.target_rows = target_rows
-            result.verified = (
-                source_rows == rows_copied
-                and target_rows == source_rows
-            )
-            if not result.verified:
-                raise BadArgument(
-                    'row-count verification failed: '
-                    f'table={self._table_name}, source_rows={source_rows}, '
-                    f'rows_copied={rows_copied}, target_rows={target_rows}'
-                )
-        return result
-
-    def _migration_dry_run_result(self, target_uri=None, target_name=None,
-                                  batch_size=10_000, verify=None):
-        batch_size = self._normalize_migration_batch_size(batch_size)
-        verify = self._normalize_migration_verify(verify)
-        source_rows = self.count_rows()
-        return TableMigrationResult(
-            table=self._table_name,
-            target_table=target_name or self._table_name,
-            source_uri=self._uri,
-            target_uri=target_uri,
-            rows_copied=0,
-            batches=math.ceil(source_rows / batch_size) if source_rows else 0,
-            source_rows=source_rows,
-            target_rows=None,
-            verify=verify,
-            verified=None,
-            dry_run=True,
-        )
-
-    def _normalize_migration_batch_size(self, batch_size):
-        if isinstance(batch_size, bool):
-            raise BadArgument('batch_size must be a positive integer')
-        batch_size = int(batch_size)
-        if batch_size <= 0:
-            raise BadArgument('batch_size must be a positive integer')
-        return batch_size
-
-    def _normalize_migration_verify(self, verify):
-        if verify in [None, False, '']:
-            return None
-        value = str(verify).strip().lower()
-        if value in ['none', 'false', '0']:
-            return None
-        if value != 'row-count':
-            raise BadArgument('verify only supports row-count')
-        return value
+    def migrate_to(self, target_uri, tables=OMITTED, mode='append',
+                   batch_size=10_000, verify=None, dry_run=False, *,
+                   specs=None, temp_dir=None, lock_timeout=30.0, target_table=OMITTED):
+        """迁移当前表；tables 与 Database 相同，specs 支持目标重新分区。"""
+        from ...migration import migrate_table
+        return migrate_table(self, target_uri, tables, mode, batch_size, verify, dry_run,
+                             specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+                             target_table=target_table)
 
     def _compact_target_rows(self, spec, target_rows):
         layout = spec.physical_layout
@@ -5152,47 +5066,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def repartition_to(self, target_uri, table_name=None, spec=None,
                        mode='append', batch_size=10_000):
-        table_name = table_name or self._table_name
-        if target_uri == self._uri and table_name == self._table_name:
-            raise BadArgument('repartition_to requires a different target uri or table')
-
-        target_spec = TableSpec.ensure(spec) if spec is not None else self.spec()
-        if not target_spec:
-            raise BadArgument('repartition_to requires a TableSpec')
-
-        from ...database import Database
-
-        target_schema, _ = parse_db_schema(target_uri)
-        target_options = {"verbose": self.verbose}
-        if target_schema in ["sqlite", "sqlite3"]:
-            target_options.update({
-                "pragma_dict": self._pragma_dict,
-                "max_open_partitions": self._num_opened_max_allowed,
-                "max_connections_per_file": self._max_connections_per_file,
-                "max_process_connections": self._max_process_connections,
-            })
-        target_db = Database(target_uri, **target_options)
-        try:
-            target_table = target_db.table(table_name, spec=target_spec)
-            rows_copied = 0
-            for part in self.table_parts():
-                rows = self._part_rows(part)
-                for start in range(0, len(rows), batch_size):
-                    batch = rows[start:start + batch_size]
-                    if batch:
-                        target_table.write(batch, mode=mode)
-                        rows_copied += len(batch)
-
-            partitions_created = target_table.table_parts()
-        finally:
-            target_db.close()
-        return RepartitionResult(
-            source_uri=self._uri,
-            target_uri=target_uri,
-            table=table_name,
-            rows_copied=rows_copied,
-            partitions_created=partitions_created,
-        )
+        from ...migration import repartition
+        return repartition(self, target_uri, table_name=table_name, spec=spec,
+                           mode=mode, batch_size=batch_size)
 
     def _add_columns_for_all_partitions(self, data_suggested_types):
         """

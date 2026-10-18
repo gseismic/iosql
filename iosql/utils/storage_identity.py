@@ -35,9 +35,12 @@ def is_iosql_table(path, *, deep=False, backend='sqlite'):
                 data_dir = table_path / "data"
                 if not data_dir.is_dir() or data_dir.is_symlink():
                     return False
+                has_parts = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='table_part'"
+                ).fetchone()
                 parts = conn.execute(
                     "SELECT part FROM table_part WHERE table_name = ?", (table_path.name,)
-                ).fetchall()
+                ).fetchall() if has_parts else []
                 # 新布局把可见 segment 记在表级 manifest；复制/重命名后
                 # 旧绝对 path 可能过期，以 part_key 还原目标文件。
                 has_segments = conn.execute(
@@ -100,7 +103,8 @@ def _valid_data_file(path, *, expected_rows=None, backend='sqlite'):
 
 def iosql_table_names(path, *, backend='sqlite'):
     """仅列出有真实表级 manifest 的子目录。"""
-    db_path = Path(path)
+    from ..coordination import physical_path
+    db_path = physical_path(path)
     if not db_path.is_dir():
         return []
     return sorted(
@@ -129,21 +133,25 @@ def is_iosql_scaffold(path):
         return False
 
 
-def is_iosql_database(path, *, allow_empty=False, deep=False):
+def is_iosql_database(path, *, allow_empty=False, deep=False, backend='sqlite'):
     """严格检查目录内容；空库没有身份标记，仅在明确允许时接受。"""
     db_path = Path(path)
     if db_path.is_symlink() or not db_path.is_dir():
         return False
     try:
+        from ..coordination import physical_path
+        db_path = physical_path(db_path)
         children = list(db_path.iterdir())
         if not children:
             return allow_empty
         if any(child.is_symlink() for child in children):
             return False
-        directories = [child for child in children if child.is_dir()]
+        directories = [child for child in children if child.is_dir()
+                       and child.name not in ('__iosql_migrations__', '__iosql_generations__')]
         if not directories:
             return False
-        valid_tables = [child for child in directories if is_iosql_table(child, deep=deep)]
+        valid_tables = [child for child in directories
+                        if is_iosql_table(child, deep=deep, backend=backend)]
         if not valid_tables:
             return False
         # 库根目录的普通文件允许随完整备份恢复；普通子目录不能伪装成表。

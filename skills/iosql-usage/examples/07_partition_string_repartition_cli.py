@@ -1,9 +1,10 @@
 """高级：用字符串 partition 和 CLI 执行安全重分区。"""
 
 from pathlib import Path
-import shutil
 import subprocess
 import sys
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database
 
@@ -16,8 +17,8 @@ TARGET_URI = f"sqlite://{TARGET_PATH}"
 
 
 def reset_database():
-    shutil.rmtree(SOURCE_PATH, ignore_errors=True)
-    shutil.rmtree(TARGET_PATH, ignore_errors=True)
+    reset_demo_path(SOURCE_PATH)
+    reset_demo_path(TARGET_PATH)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 

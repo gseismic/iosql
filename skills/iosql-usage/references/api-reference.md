@@ -127,7 +127,7 @@ native partition 模式下会同步重命名旧表名前缀的子分区表。
 返回 SQLite 进程级连接预算状态，包括 `max_process_connections`、
 `open_process_connections` 和 `registered_pools`。
 
-#### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> MigrationResult`
+#### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> MigrationResult`
 
 把当前 iosql 库迁移到目标库。SQLite 与 Parquet 可互相迁移；SQLite/Parquet 也可迁移到
 PostgreSQL。Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parquet.md)。
@@ -154,6 +154,10 @@ SQLite/Parquet 目录库作为源时，目标不能与源库相同或位于源�
 `tables` 支持 `None`（全库）、表名列表/字符串、或 `{源表: 目标表}` 映射；空列表、
 未知源表或非法类型抛 `BadArgument`。`verify="row-count"` 会在迁移后比较源/目标
 行数，结果写入 `source_rows`、`target_rows` 和 `verified`。
+
+两个接口的 `tables` 语义相同，Table 范围仅当前表。共同的 `specs` 按源名指定目标布局：`specs={"ticks":{"partition":"duration(ts,every=1hour)"}}`；值也可为完整 TableContract。允许 partition/segment/physical_layout/force_partition，保留源列、主键和时间含义。已有目标须兼容最终契约。
+
+迁移持有源/目标独占锁，全部转换后统一发布；默认临时目录在源库内，目标有独立物理代际。普通操作忙时立即抛 DatabaseBusy，迁移等待由 lock_timeout 控制。具体发布和恢复契约见 [design-contract.md](design-contract.md#统一迁移与安全发布plan-083)。结果追加 published/operation_id/rows_written/source_spec/target_spec/partitions_created；Table 旧 target_table 和位置目标名仍可用，两类参数不能同时传。
 
 `to_postgresql(target_uri, ...)` 是只接受 `postgresql://` 目标的语义别名。
 PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要先
@@ -215,7 +219,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `cleanup_obsolete` | `(partition=None, dry_run=True, validate=True) -> CleanupResult` | 清理 obsolete segment 文件 |
 | `count_rows` | `() -> int` | 统计当前可见行数（无参，双引擎一致） |
 | `rename` | `(new_name, exist_ok=False, overwrite=False) -> Table` | 重命名当前逻辑表 |
-| `migrate_to` | `(target_uri, target_table=None, mode='append', batch_size=10_000, verify=None, dry_run=False) -> TableMigrationResult` | 迁移单表 |
+| `migrate_to` | `(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> TableMigrationResult` | 迁移单表 |
 | `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |
 | `drop_index` | `(column)` | 删除所有分区上的列索引 |
@@ -756,3 +760,5 @@ db.close()
 - 重开物理表验证声明列类型、主键顺序、分区形态和 RANGE 单列键；分区主键必须包含分区列。
 - upsert_all 按输入主键增量合并，缺字段保留旧值，显式 None 写 NULL，重复主键按输入顺序合并。count_rows 是精确计数，可能全表扫描。
 - 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
+
+迁移新增字段说明：`partitions_created` 是本次新增目标分区列表；`source_spec/target_spec` 是转换前后完整契约；`stage/source_table/target_table/batch` 在迁移错误中提供定位信息。已有 PG 绑定对象跨发布可只读重连并恢复绑定，新打开 PG 对象仍需显式 spec。

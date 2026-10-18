@@ -1,8 +1,9 @@
 """SQLite 与 PostgreSQL 之间的双向转换示例。"""
 
 import os
-import shutil
 from pathlib import Path
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database, Partition, Segment
 
@@ -22,7 +23,7 @@ ROUNDTRIP_TABLE = "ticks_from_postgresql"
 
 
 def prepare_sqlite_source():
-    shutil.rmtree(SOURCE_PATH, ignore_errors=True)
+    reset_demo_path(SOURCE_PATH)
     SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
@@ -64,10 +65,10 @@ def drop_postgresql_table(uri, table_name):
 
 def run():
     spec = prepare_sqlite_source()
-    shutil.rmtree(ROUNDTRIP_PATH, ignore_errors=True)
+    reset_demo_path(ROUNDTRIP_PATH)
 
     with Database(SOURCE_URI) as sqlite_source:
-        dry_run = sqlite_source.to_postgresql(
+        dry_run = sqlite_source.migrate_to(
             POSTGRES_DSN or "postgresql://user:pass@localhost:5432/market",
             tables={SQLITE_TABLE: PG_TABLE},
             dry_run=True,
@@ -81,7 +82,7 @@ def run():
             return
 
         drop_postgresql_table(POSTGRES_DSN, PG_TABLE)
-        to_pg = sqlite_source.to_postgresql(
+        to_pg = sqlite_source.migrate_to(
             POSTGRES_DSN,
             tables={SQLITE_TABLE: PG_TABLE},
             verify="row-count",

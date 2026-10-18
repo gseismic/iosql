@@ -7,6 +7,7 @@ import arrow
 
 from ...core.query.timeseries import TimeseriesQueryMixin
 from ...exception import BadArgument
+from ...coordination import guard_query
 from ...spec import QueryPlan, QuerySpec
 from ..sqlite.query_util import _quote_sql_identifier
 
@@ -90,6 +91,7 @@ def _text_time_format(sample):
     return fmt, True
 
 
+@guard_query
 class _Query:
     """惰性查询对象；同一 SQL 同时用于读取和 explain，防止诊断与执行脱节。"""
 

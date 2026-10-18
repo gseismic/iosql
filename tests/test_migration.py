@@ -5,6 +5,8 @@ import iosql.engines.postgresql.table as pg_table_module
 import pytest
 
 
+
+
 def _uri(tmp_path, name="source.iosql"):
     return f"sqlite://{tmp_path}/{name}"
 
@@ -579,3 +581,5 @@ def test_postgresql_duration_partition_keeps_numeric_bounds(monkeypatch):
 
     assert (1735689600000, 1735776000000) in _executed_params(fake_conn)
     db.close()
+
+pytestmark = pytest.mark.usefixtures("fake_migration_publisher")

@@ -1,0 +1,79 @@
+Downloading pip (1.7MiB)
+ Downloaded pip
+Installed 27 packages in 8ms
+基线代码: /tmp/iosql-plan083-baseline-Y25r4W/iosql/__init__.py
+FFFFFF.                                                                  [100%]
+=================================== FAILURES ===================================
+_____________ test_mysqlite_integrity_error_rolls_back_connection ______________
+tests/test_plan056_fixes.py:141: in test_mysqlite_integrity_error_rolls_back_connection
+    t.execute_params(
+iosql/utils/mysqlite/table.py:363: in execute_params
+    self._check_write_commit(commit)
+iosql/utils/mysqlite/table.py:414: in _check_write_commit
+    raise ValueError(
+E   ValueError: commit=False 在连接池模式下会丢失写入：请传 commit=True，事务提交请使用 database.transaction()
+______________ test_group_rows_by_keys_groups_heterogeneous_rows _______________
+tests/test_plan062_mysqlite.py:98: in test_group_rows_by_keys_groups_heterogeneous_rows
+    assert sorted(fields for fields, _ in groups) == [['id'], ['id', 'name']]
+E   AssertionError: assert [['id'], ['id...'name', 'id']] == [['id'], ['id', 'name']]
+E
+E     Left contains one more item: ['name', 'id']
+E     Use -v to get more diff
+________ test_auto_commit_false_requires_transaction_or_explicit_commit ________
+tests/test_plan062_mysqlite.py:311: in test_auto_commit_false_requires_transaction_or_explicit_commit
+    with pytest.raises(ValueError, match='commit=False'):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ValueError
+____________________ test_numeric_text_buckets_and_overflow ____________________
+tests/test_plan072_fixes.py:329: in test_numeric_text_buckets_and_overflow
+    assert response.json()["y"] == [2.5, 10.0]
+           ^^^^^^^^^^^^^^^
+/home/lsl/.cache/uv/archive-v0/LDKVIQYu8JQtRuwgxCDE6/lib/python3.12/site-packages/httpx/_models.py:832: in json
+    return jsonlib.loads(self.content, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/decoder.py:341: in decode
+    raise JSONDecodeError("Extra data", s, end)
+E   json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 101)
+_____________ test_web_candle_order_pagination_and_sort_validation _____________
+tests/test_plan072_fixes.py:393: in test_web_candle_order_pagination_and_sort_validation
+    assert response.json()["open"] == [10]
+           ^^^^^^^^^^^^^^^
+/home/lsl/.cache/uv/archive-v0/LDKVIQYu8JQtRuwgxCDE6/lib/python3.12/site-packages/httpx/_models.py:832: in json
+    return jsonlib.loads(self.content, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/decoder.py:341: in decode
+    raise JSONDecodeError("Extra data", s, end)
+E   json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 128)
+_______________________ TestReadOnlyApi.test_chart_line ________________________
+tests/test_web.py:300: in test_chart_line
+    payload = resp.json()
+              ^^^^^^^^^^^
+/home/lsl/.cache/uv/archive-v0/LDKVIQYu8JQtRuwgxCDE6/lib/python3.12/site-packages/httpx/_models.py:832: in json
+    return jsonlib.loads(self.content, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/decoder.py:341: in decode
+    raise JSONDecodeError("Extra data", s, end)
+E   json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 105)
+=============================== warnings summary ===============================
+../../home/lsl/.cache/uv/archive-v0/LDKVIQYu8JQtRuwgxCDE6/lib/python3.12/site-packages/fastapi/testclient.py:1
+  /home/lsl/.cache/uv/archive-v0/LDKVIQYu8JQtRuwgxCDE6/lib/python3.12/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_plan056_fixes.py::test_mysqlite_integrity_error_rolls_back_connection
+FAILED tests/test_plan062_mysqlite.py::test_group_rows_by_keys_groups_heterogeneous_rows
+FAILED tests/test_plan062_mysqlite.py::test_auto_commit_false_requires_transaction_or_explicit_commit
+FAILED tests/test_plan072_fixes.py::test_numeric_text_buckets_and_overflow - ...
+FAILED tests/test_plan072_fixes.py::test_web_candle_order_pagination_and_sort_validation
+FAILED tests/test_web.py::TestReadOnlyApi::test_chart_line - json.decoder.JSO...
+6 failed, 1 passed, 1 warning in 3.71s

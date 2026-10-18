@@ -634,7 +634,7 @@ Parquet URI 显式使用 `parquet://`；DuckDB 随 iosql 默认依赖安装，�
 
 ```python
 source = Database("sqlite://db/market.iosql")
-result = source.to_postgresql(
+result = source.migrate_to(
     "postgresql://user:pass@localhost:5432/market",
     tables={"kline_1m": "pg_kline_1m"},
     batch_size=50_000,
@@ -647,7 +647,7 @@ source.close()
 迁移前可以 dry-run 预览；该模式只统计源表行数和估算批次数，不连接目标库：
 
 ```python
-plan = source.to_postgresql(
+plan = source.migrate_to(
     "postgresql://user:pass@localhost:5432/market",
     dry_run=True,
     batch_size=50_000,
@@ -662,7 +662,7 @@ source = Database("sqlite://db/market.iosql")
 ticks = source.table("ticks")
 result = ticks.migrate_to(
     "postgresql://user:pass@localhost:5432/market",
-    target_table="pg_ticks",
+    tables={"ticks": "pg_ticks"},
     batch_size=50_000,
 )
 source.close()
@@ -809,3 +809,15 @@ def test_my_case():
 - 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
 
 指定 symbols 的单 symbol 分组 latest 会在目录确认有效 symbol/time B-tree 前缀索引后使用 LATERAL LIMIT 1；无索引/多维分组/无 symbols 时使用 DISTINCT ON。
+
+迁移时可统一调整目标分区：
+
+```python
+result = ticks.migrate_to(
+    "parquet://db/hourly.iosql",
+    specs={"ticks": {"partition": "duration(ts,every=1hour)"}},
+    verify="row-count",
+)
+```
+
+多表同样传 `specs`，键使用源名。迁移全程禁止源/目标协作读写，默认临时目录在源库内；全部转换后统一发布。`temp_dir` 与 `lock_timeout` 可选，具体锁、恢复、兼容和结果语义见 design-contract.md 的 PLAN-083 一节。

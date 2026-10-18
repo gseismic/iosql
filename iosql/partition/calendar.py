@@ -1,4 +1,5 @@
 import re
+from datetime import datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict
 import arrow
@@ -69,7 +70,8 @@ class CalendarPartition(Partition):
         'YYYYMMDDHHmm': '1minute',
     }
     
-    def __init__(self, fmt: str, tz: str, ts_col: str, every: Any = None):
+    def __init__(self, fmt: str, tz: str, ts_col: str, every: Any = None,
+                 *, time_unit=None):
         """
         Args:
             fmt: Date format string (e.g., 'YYYYMMDD', 'YYYYMM', 'YYYYMMDDHH')
@@ -88,6 +90,9 @@ class CalendarPartition(Partition):
         self.fmt = fmt
         self.tz = tz
         self.TS_COL = ts_col
+        if time_unit not in (None, 'date', 'ms', 's'):
+            raise PartitionSpecError('calendar time_unit 必须是 ms/s/date')
+        self.time_unit = time_unit
         self.every = self.normalize_every(every) if every else None
         count, unit = self.parse_every(self.every or self.default_every_for_fmt(fmt))
         self._every_count = count
@@ -178,8 +183,15 @@ class CalendarPartition(Partition):
         return {plural: self._every_count}
     
     def _key_for_value_uncached(self, value: Any) -> str:
-        dt = arrow.get(value).to(self.tz)
+        dt = self._datetime(value)
         return self._bucket_start(dt).format(self.fmt)
+
+    def _datetime(self, value):
+        if self.time_unit in ('ms', 's') and isinstance(value, (int, float)):
+            seconds = value / 1000 if self.time_unit == 'ms' else value
+            # 显式单位避免 Arrow 把早期 epoch 毫秒猜成秒。
+            value = datetime.fromtimestamp(seconds, tz=timezone.utc)
+        return arrow.get(value).to(self.tz)
 
     def get_key(self, row: Dict[str, Any]) -> str:
         """Get partition key as formatted string.
@@ -195,7 +207,7 @@ class CalendarPartition(Partition):
             return self._key_for_value(value)
         except TypeError:
             # 非 hashable 自定义日期对象仍走兼容路径。
-            dt = arrow.get(value).to(self.tz)
+            dt = self._datetime(value)
             return self._bucket_start(dt).format(self.fmt)
     
     def get_range(self, key: str) -> tuple[int, int]:
@@ -236,6 +248,8 @@ class CalendarPartition(Partition):
         default_every = self.default_every_for_fmt(self.fmt)
         if self.every and self.every != default_every:
             meta['every'] = self.every
+        if self.time_unit in ('ms', 's'):
+            meta['time_unit'] = self.time_unit
         return meta
     
     @classmethod
@@ -263,4 +277,5 @@ class CalendarPartition(Partition):
             tz=meta['tz'],
             ts_col=meta['ts_col'],
             every=meta.get('every'),
+            time_unit=meta.get('time_unit'),
         )

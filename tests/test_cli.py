@@ -489,7 +489,7 @@ class _FakeTargetDatabase:
         self.closed = True
 
 
-def test_cli_migrate_to_postgresql_uri_with_table_mapping(tmp_path, monkeypatch):
+def test_cli_migrate_to_postgresql_uri_with_table_mapping(tmp_path, monkeypatch, fake_migration_publisher):
     db_path = _make_sample_db(tmp_path)
     fake_target = _FakeTargetDatabase()
     monkeypatch.setattr(
@@ -520,7 +520,7 @@ def test_cli_migrate_to_postgresql_uri_with_table_mapping(tmp_path, monkeypatch)
     assert fake_target.closed is True
 
 
-def test_cli_migrate_dry_run_and_verify_row_count(tmp_path, monkeypatch):
+def test_cli_migrate_dry_run_and_verify_row_count(tmp_path, monkeypatch, fake_migration_publisher):
     db_path = _make_sample_db(tmp_path)
     monkeypatch.setattr(
         Database,

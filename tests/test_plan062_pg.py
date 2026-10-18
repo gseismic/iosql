@@ -6,6 +6,8 @@
 import warnings
 
 import pytest
+
+
 import psycopg2
 from psycopg2 import sql
 
@@ -937,3 +939,5 @@ class TestCoreQueryP2:
         assert unique_or_and_cases([[a, b], [a]]) == [[a]]
         assert unique_or_and_cases([[a], [a, b]]) == [[a]]
         assert unique_or_and_cases([[a], [a], [a, b]]) == [[a]]
+
+pytestmark = pytest.mark.usefixtures("fake_pg_coordination")

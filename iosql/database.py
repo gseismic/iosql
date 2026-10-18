@@ -4,6 +4,7 @@ import threading
 import warnings
 import weakref
 from dataclasses import replace
+from .coordination import guard_database_class
 
 from .utils.schema import parse_db_schema
 from .exception import (
@@ -15,7 +16,7 @@ from .exception import (
 )
 from .engines import sqlite
 from .partition import Partition
-from .spec import MigrationResult, Segment, TableContract, TimeColumn, PartitionSpec
+from .spec import Segment, TableContract, TimeColumn, PartitionSpec
 from .utils.storage_identity import (
     iosql_table_names, is_iosql_database, is_iosql_scaffold, is_iosql_table,
 )
@@ -95,6 +96,7 @@ def _sqlite_uri_from_path(schema, path):
     return f"{schema}://{os.path.abspath(path)}"
 
 
+@guard_database_class
 class Database(object):
     '''
     table是BigTable
@@ -154,6 +156,23 @@ class Database(object):
     def uri(self):
         return self._uri
 
+    def _reload_after_migration(self):
+        """让外部持有的旧表对象在下一次使用时也能重新绑定。"""
+        if self._uri_schema == 'postgresql':
+            # PG 契约原来由实例保存，保留对象，交给表入口只读重连校验。
+            return
+        with self._tables_lock:
+            previous = list(self._tables.values())
+            self._tables.clear()
+        for table in previous:
+            if getattr(table, '_iosql_generation', None) == self._iosql_generation:
+                continue
+            table._iosql_invalidating = True
+            try:
+                table.close()
+            finally:
+                table._iosql_invalidating = False
+
     @staticmethod
     def _positive_int(name, value):
         if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
@@ -178,6 +197,8 @@ class Database(object):
                     if self._uri_schema in ['sqlite', 'sqlite3']
                     else os.path.join(options.get('path') or '', options.get('db') or '')
                 )
+                from .coordination import physical_path
+                db_path = str(physical_path(db_path))
                 table_path = os.path.join(db_path, table_name)
                 backend = 'parquet' if self._uri_schema == 'parquet' else 'sqlite'
                 if os.path.lexists(table_path):
@@ -666,6 +687,13 @@ class Database(object):
 
         with self._tables_lock:
             cached_tables = list(self._tables.values())
+        from .coordination import physical_root
+        if (str(physical_root(self._uri)) != os.path.realpath(source_path)
+                or str(physical_root(_sqlite_uri_from_path(self._uri_schema, target_path)))
+                != os.path.realpath(target_path)):
+            from .migration import rename_published_database
+            return rename_published_database(
+                self, _sqlite_uri_from_path(self._uri_schema, target_path))
         backup_path = None
         if os.path.exists(target_path):
             backup_path = self._rename_backup_path(target_path)
@@ -800,68 +828,12 @@ class Database(object):
         return get_process_connection_budget_status()
 
     def migrate_to(self, target_uri, tables=None, mode='append',
-                   batch_size=10_000, verify=None, dry_run=False):
-        # 所有选项校验都先于任何落盘/建连，dry_run 只做估算不产生副作用
-        verify = _normalize_migration_verify(verify)
-        mode = self._normalize_migration_mode(mode)
-        self._validate_migration_target(target_uri)
-        self._reject_migration_self_target(target_uri)
-        table_mapping = self._migration_table_mapping(tables)
-        if dry_run:
-            results = []
-            for source_name, target_name in table_mapping.items():
-                source_table = self[source_name]
-                spec = source_table.spec()
-                if not spec:
-                    raise BadArgument(
-                        f'migrate_to requires a TableContract: {source_name}'
-                    )
-                results.append(
-                    source_table._migration_dry_run_result(
-                        target_uri=target_uri,
-                        target_name=target_name,
-                        batch_size=batch_size,
-                        verify=verify,
-                    )
-                )
-            return MigrationResult(
-                source_uri=self._uri,
-                target_uri=target_uri,
-                tables=results,
-                verify=verify,
-                dry_run=True,
-            )
-
-        target_db = self._new_migration_target(target_uri)
-        results = []
-        try:
-            for source_name, target_name in table_mapping.items():
-                source_table = self[source_name]
-                spec = source_table.spec()
-                if not spec:
-                    raise BadArgument(
-                        f'migrate_to requires a TableContract: {source_name}'
-                    )
-                target_table = target_db.table(target_name, spec=spec)
-                results.append(
-                    source_table._migrate_to_target_table(
-                        target_table,
-                        target_uri=target_uri,
-                        target_name=target_name,
-                        mode=mode,
-                        batch_size=batch_size,
-                        verify=verify,
-                    )
-                )
-        finally:
-            target_db.close()
-        return MigrationResult(
-            source_uri=self._uri,
-            target_uri=target_uri,
-            tables=results,
-            verify=verify,
-            dry_run=False,
-        )
+                   batch_size=10_000, verify=None, dry_run=False, *,
+                   specs=None, temp_dir=None, lock_timeout=30.0):
+        """隔离转换后统一发布；specs 按源表名覆盖目标分区/段布局。"""
+        from .migration import migrate
+        return migrate(self, target_uri, tables, mode, batch_size, verify, dry_run,
+                       specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout)
 
     @staticmethod
     def _normalize_migration_mode(mode):
@@ -913,7 +885,8 @@ class Database(object):
             )
 
     def to_postgresql(self, target_uri, tables=None, mode='append',
-                      batch_size=10_000, verify=None, dry_run=False):
+                      batch_size=10_000, verify=None, dry_run=False, *,
+                      specs=None, temp_dir=None, lock_timeout=30.0):
         target_schema, _ = parse_db_schema(target_uri)
         if target_schema != 'postgresql':
             raise BadArgument('to_postgresql requires a postgresql:// target uri')
@@ -923,11 +896,16 @@ class Database(object):
             mode=mode,
             batch_size=batch_size,
             verify=verify,
-            dry_run=dry_run,
+            dry_run=dry_run, specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
         )
 
     def _migration_table_mapping(self, tables):
         names = self.table_names()
+        # 当前实例中显式声明但尚未首写的空表，也属于本次迁移范围。
+        with self._tables_lock:
+            for name, table in self._tables.items():
+                if name not in names and getattr(table, '_declared_spec', None) is not None:
+                    names.append(name)
         if tables is None:
             if not names:
                 raise BadArgument('migrate_to found no source tables')
@@ -953,7 +931,7 @@ class Database(object):
             raise BadArgument(
                 "migrate_to source table(s) not found: "
                 + ", ".join(str(name) for name in missing)
-                + f"；修复: 先检查 db.table_names()（当前: "
+                + "；修复: 先检查 db.table_names()（当前: "
                 + (", ".join(sorted(str(name) for name in known)) or "∅")
                 + "）"
             )

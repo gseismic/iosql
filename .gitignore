@@ -148,3 +148,8 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# iosql 运行时协调与迁移数据
+.iosql-locks/
+__iosql_migrations__/
+__iosql_generations__/

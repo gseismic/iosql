@@ -1,7 +1,8 @@
 """高级：检查分区行数布局，并把数据重分区到新的数据库。"""
 
 from pathlib import Path
-import shutil
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database, Segment
 
@@ -14,8 +15,8 @@ TARGET_URI = f"sqlite://{TARGET_PATH}"
 
 
 def reset_database():
-    shutil.rmtree(SOURCE_PATH, ignore_errors=True)
-    shutil.rmtree(TARGET_PATH, ignore_errors=True)
+    reset_demo_path(SOURCE_PATH)
+    reset_demo_path(TARGET_PATH)
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
 

@@ -1,7 +1,8 @@
 """将 SQLite 引擎中的时序表迁移到 Parquet 引擎。"""
 
 from pathlib import Path
-import shutil
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database
 
@@ -18,7 +19,7 @@ SOURCE_ROWS = [
 ]
 
 
-def migrate_sqlite_to_parquet(source_uri, target_uri, tables=None):
+def migrate_sqlite_to_parquet(source_uri, target_uri, tables=None, specs=None):
     """迁移已有 iosql SQLite 目录库到新 Parquet 库；目标库应为空。
 
     例如：migrate_sqlite_to_parquet(
@@ -30,6 +31,7 @@ def migrate_sqlite_to_parquet(source_uri, target_uri, tables=None):
         preview = source.migrate_to(
             target_uri,
             tables=tables,
+            specs=specs,
             dry_run=True,
             verify='row-count',
             batch_size=2,
@@ -40,6 +42,7 @@ def migrate_sqlite_to_parquet(source_uri, target_uri, tables=None):
         result = source.migrate_to(
             target_uri,
             tables=tables,
+            specs=specs,
             verify='row-count',
             batch_size=2,
         )
@@ -51,7 +54,7 @@ def migrate_sqlite_to_parquet(source_uri, target_uri, tables=None):
 def run():
     # 只清理本示例自己生成的目录，保证重复运行时目标库为空。
     for path in [SQLITE_PATH, PARQUET_PATH]:
-        shutil.rmtree(path, ignore_errors=True)
+        reset_demo_path(path)
 
     sqlite_uri = f'sqlite://{SQLITE_PATH}'
     parquet_uri = f'parquet://{PARQUET_PATH}'
@@ -68,7 +71,11 @@ def run():
         bars.write(SOURCE_ROWS)
         print('SQLite 源行数:', bars.count_rows())
 
-    result = migrate_sqlite_to_parquet(sqlite_uri, parquet_uri)
+    # 在同一次迁移中改为小时分区，源库仍保留天分区。
+    result = migrate_sqlite_to_parquet(
+        sqlite_uri, parquet_uri,
+        specs={'bars': {'partition': 'duration(ts,every=1hour)'}},
+    )
     assert result.verified
 
     # 以 Parquet URI 重开目标库，确认目标引擎能正常查询和读取文件。

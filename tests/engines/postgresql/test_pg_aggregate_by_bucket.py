@@ -4,11 +4,11 @@
 x 模式分类与返回结构；语义与 sqlite 引擎逐字段一致。
 """
 import pytest
-import psycopg2
+
+
 
 import iosql.engines.postgresql.table as pg_module
 from iosql import Database, TableContract
-from iosql.engines.postgresql import Table
 from iosql.exception import BadArgument
 
 pytest.importorskip("psycopg2")
@@ -191,3 +191,5 @@ def test_unknown_and_text_value_columns_rejected(fake_pg):
         table.aggregate_by_bucket('ts', ['symbol'], 3)
     with pytest.raises(BadArgument):
         table.aggregate_by_bucket('ts', ['price'], 0)
+
+pytestmark = pytest.mark.usefixtures("fake_pg_coordination")

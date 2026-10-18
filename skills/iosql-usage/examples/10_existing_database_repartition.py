@@ -1,8 +1,9 @@
 """已有库：读取原表契约，离线重分区到新的目标库。"""
 
 import os
-import shutil
 from pathlib import Path
+
+from _example_support import reset_database as reset_demo_path
 
 from iosql import Database
 
@@ -21,7 +22,7 @@ def prepare_demo_source():
     """构造并关闭源库，重分区阶段只通过持久化契约重新打开。"""
     if EXTERNAL_SOURCE_URI:
         return
-    shutil.rmtree(DEFAULT_SOURCE_PATH, ignore_errors=True)
+    reset_demo_path(DEFAULT_SOURCE_PATH)
     DEFAULT_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
@@ -45,7 +46,7 @@ def prepare_demo_source():
 def run():
     prepare_demo_source()
     if not EXTERNAL_TARGET_URI:
-        shutil.rmtree(DEFAULT_TARGET_PATH, ignore_errors=True)
+        reset_demo_path(DEFAULT_TARGET_PATH)
 
     with Database(
         SOURCE_URI,
