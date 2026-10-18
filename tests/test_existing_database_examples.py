@@ -36,6 +36,14 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
             "skills/iosql-usage/examples/13_streaming_ordered_query.py",
             "按 open_time 排序:",
         ),
+        (
+            "examples/18_save_as_compare_engines.py",
+            "另存完成，源库保留 20000 行，目标 20000 行",
+        ),
+        (
+            "skills/iosql-usage/examples/18_save_as_compare_engines.py",
+            "另存完成，源库保留 20000 行，目标 20000 行",
+        ),
     ],
 )
 def test_example_is_self_contained(script, expected):

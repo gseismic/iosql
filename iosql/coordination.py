@@ -550,7 +550,7 @@ def _constructing(function):
 
 def guard_table_class(cls):
     """在引擎继承边界接入所有公共方法，避免新增方法漏掉屏障。"""
-    excluded = {'migrate_to', 'repartition_to', 'rename'}
+    excluded = {'migrate_to', 'save_as', 'repartition_to', 'rename'}
     methods = {}
     for base in reversed(cls.__mro__):
         methods.update(vars(base))
@@ -569,7 +569,7 @@ def guard_table_class(cls):
 
 def guard_database_class(cls):
     for name, function in list(vars(cls).items()):
-        if name in ('migrate_to', 'to_postgresql', '__init__'):
+        if name in ('migrate_to', 'save_as', 'to_postgresql', '__init__'):
             continue
         if (not name.startswith('_') or name == '__getitem__') and inspect.isfunction(function):
             wrapper = _renaming if name == 'rename' else (

@@ -130,9 +130,26 @@ native partition 模式下会同步重命名旧表名前缀的子分区表。
 返回 SQLite 进程级连接预算状态，包括 `max_process_connections`、
 `open_process_connections` 和 `registered_pools`。
 
+#### `Database.save_as(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> MigrationResult`
+
+将当前库另存为独立副本。`Table.save_as()` 使用同一规范签名，只允许选择当前表，
+返回 `TableMigrationResult`。源业务数据、契约及对象 URI 保留，不自动切换 engine；
+副本和源库后续写入互不传播。支持同 engine 的不同库及 SQLite/Parquet/PostgreSQL 跨 engine。
+
+```python
+with Database("sqlite://db/market.iosql") as source:
+    result = source.save_as("parquet://db/comparison.iosql", verify="row-count")
+    assert result.published and result.verified
+```
+
+规范参数、默认值、预览、锁、发布、错误与恢复语义均与下述 `migrate_to()` 一致。
+Table 新接口只提供规范的 `tables` 选择及改名，不提供旧入口的 `target_table` 兼容参数。
+目标已有数据时按 `mode` 处理冲突，不自动清空；`verify="row-count"` 要求选中目标表
+不存在或为空。性能比较示例见 [18_save_as_compare_engines.py](../examples/18_save_as_compare_engines.py)。
+
 #### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> MigrationResult`
 
-把当前 iosql 库迁移到目标库，支持 SQLite、Parquet、PostgreSQL 之间的迁移。
+把当前 iosql 库复制到目标库并保留源库，支持 SQLite、Parquet、PostgreSQL 之间的迁移。
 Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parquet.md)。
 
 ```python
@@ -176,6 +193,10 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 ### `Table` 对象方法
 
 由 `Database.table()` 返回的表格对象提供以下方法：
+
+`save_as(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0)`
+将当前表另存为独立副本，返回 `TableMigrationResult`。`tables=None` 选择当前表，
+`tables={"bars": "archived_bars"}` 改目标名，不能选择其他源表；其余参数见上述库级另存和迁移说明。
 
 #### 写入
 

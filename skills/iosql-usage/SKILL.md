@@ -1,6 +1,6 @@
 ---
 name: iosql-usage
-description: This skill should be used when the user asks to use iosql, design partitioned tables, write or query time-series data, diagnose query plans, repartition, migrate between SQLite, Parquet, and PostgreSQL, use the Parquet backend, operate mysqlite, or mentions Database.table, Database.timeseries, Partition, Segment, iter_rows, repartition_to, or the iosql CLI.
+description: This skill should be used when the user asks to use iosql, design partitioned tables, write or query time-series data, diagnose query plans, repartition, save independent copies with save_as, migrate between SQLite, Parquet, and PostgreSQL, use the Parquet backend, operate mysqlite, or mentions Database.table, Database.timeseries, Partition, Segment, iter_rows, repartition_to, or the iosql CLI.
 ---
 
 # iosql 使用指南
@@ -138,6 +138,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | 期货/夜盘交易日 session | 建表传 `session_column="trading_date"`，查询 `query(session="2026-01-06")` | [references/usage-patterns.md](references/usage-patterns.md) #交易日session |
 | 打开已有库继续写 | `db.table("name")` 不重新声明契约；`write(mode="ignore")` 跳过重复主键 | [examples/09_existing_database_append.py](examples/09_existing_database_append.py) |
 | Parquet 批量归档/分析 | `Database("parquet://...")` 配合分区、segment 和流式有序查询 | [references/parquet.md](references/parquet.md)、[examples/14_parquet_backend.py](examples/14_parquet_backend.py) |
+| 保留源库，另存并比较 engine | `db.save_as(target_uri, verify="row-count")`；单表用 `table.save_as(...)` | [examples/18_save_as_compare_engines.py](examples/18_save_as_compare_engines.py) |
 
 ### 进阶（偶尔需要）
 
@@ -196,6 +197,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | `15_postgresql_timeseries_query.py` | 演示 PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
 | `16_sqlite_to_parquet.py` | 演示 SQLite 源库 dry-run、迁移到 Parquet、row-count 校验和目标查询。 |
 | `17_safe_migration_and_paths.py` | 演示大小写路径保留、迁移与备份，以及快照 junction/库锁符号链接拒绝。 |
+| `18_save_as_compare_engines.py` | 演示另存独立副本，校验相同查询结果后比较 SQLite/Parquet 首次与预热读取耗时。 |
 
 金融示例位于 `examples/finance/`：`01_kline_bars.py` 解决 K 线 OHLCV，
 `02_orderbook_snapshots.py` 解决高频 orderbook 快照，`03_financial_reports.py` 解决财报
@@ -238,6 +240,7 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 | | `table.describe()` / `table.update_metadata(...)` | 表与列的业务说明；更新仅 SQLite/Parquet 支持 |
 | 维护 | `table.layout_report()` / `table.repartition_to(uri, spec=)` / `table.migrate_to(...)` | 诊断 / 重分区 / 迁移单表 |
 | | `db.migrate_to(uri, tables=, specs=, verify=)` | SQLite/Parquet/PG 跨后端迁移，可调整目标布局 |
+| | `db.save_as(uri, tables=, specs=, verify=)` / `table.save_as(...)` | 保留源库的另存入口，规范参数及返回类型同 migrate_to |
 
 ## 关键规则（违反即抛异常）
 
@@ -251,6 +254,7 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 - 顶层导入只导出工厂与结果类型：用 `Partition.duration(...)`，不要 `from iosql import DurationPartition`。
 - 废弃参数不要在新代码使用：`partition_kind`/`time_unit`/`*_rows_per_file`/`group_by`/`select_all`/`delete(None)`。
 - `repartition_to()`/`migrate_to()` 写入目标布局，保留源表业务数据与契约；源库可产生协调文件和迁移工作区。
+- `save_as()` 与 `migrate_to()` 等价，保留源数据、契约和对象 URI，后续写入互不传播。目标已有数据按 `mode` 合并，不自动清空；性能比较推荐新目标与 `verify="row-count"`，再用相同查询和结果消费方式计时。
 - `specs` 按已选源表名配置目标布局；`mode="replace"` 只处理主键冲突，不清空目标。
 - 迁移以 `published` 确认正式发布；`rows_copied` 可包含 ignore 跳过的行。失败时记录 `operation_id`、`partial_result` 和 `recovery_path`，发布状态不确定时先查明状态再重试，见错误排查资料。
 - 缓冲写入异常退出会发未 flush 行数的 RuntimeWarning——不要吞掉（意味着数据未落库）。
@@ -273,7 +277,7 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 - [references/cli.md](references/cli.md) —— CLI 命令与安全规则
 - [references/ui.md](references/ui.md) —— 可视化管理台 iosql web（旧名 iosql ui）
 - [references/design-contract.md](references/design-contract.md) —— 接口契约、设计偏好与开发守则（本仓库开发必读）
-- [examples/README.md](examples/README.md) —— 主线 `01~17` 示例索引，每个示例对应一个常见问题；
+- [examples/README.md](examples/README.md) —— 主线 `01~18` 示例索引，每个示例对应一个常见问题；
   `examples/13_streaming_ordered_query.py` 专门覆盖有序大结果集的惰性读取。
 - [examples/finance/README.md](examples/finance/README.md) —— K线、orderbook、财报、新闻四类金融场景。
 - [examples/mysqlite/README.md](examples/mysqlite/README.md) 和

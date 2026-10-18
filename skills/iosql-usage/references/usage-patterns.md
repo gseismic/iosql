@@ -620,6 +620,22 @@ source_db.close()
 `10_existing_database_repartition.py`。默认模式会先准备并关闭各自的示例源库，
 再以“已有库”方式重新打开；设置环境变量后可指向真实库，且不会清理外部源库。
 
+## 另存副本并比较 engine
+
+`save_as()` 与 `migrate_to()` 都保留源库，前者更直接表达“另存一份”的意图。
+库对象默认复制全库；表对象默认只复制当前表，参数与结果类型沿用迁移接口。
+
+```python
+with Database("sqlite://db/market.iosql") as source:
+    result = source.save_as("parquet://db/comparison.iosql", verify="row-count")
+    assert result.published and result.verified
+```
+
+副本与源库后续写入互不影响，源对象仍指向原库。目标已有数据时按 `mode` 处理主键冲突，
+不自动清空。比较完整数据集时选择新目标并开启行数校验，再使用相同查询条件、投影、
+排序和消费方式计时。复制、打开库、校验的时间与查询时间分开；区分首次查询和预热重复查询，
+首次查询不意味着系统冷缓存。可运行示例：[18_save_as_compare_engines.py](../examples/18_save_as_compare_engines.py)。
+
 ## SQLite 与 Parquet 迁移
 
 SQLite 与 Parquet 目录库可以通过同一迁移接口互转。先用 dry-run 查看表、源行数和批次数，

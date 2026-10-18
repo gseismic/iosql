@@ -130,6 +130,8 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 
 ## 统一迁移与安全发布（PLAN-083）
 
+- PLAN-089 新增 `Database.save_as()` / `Table.save_as()`：保留源数据、契约及对象 URI 的另存入口，复用 `migrate_to()` 的规范参数、默认值、结果和发布/锁机制。Table 的新接口使用 `tables`，没有旧 `target_table` 参数。已有 `migrate_to()` 同样保留源库；已有目标按 `mode` 合并，不自动清空。查询性能比较推荐新目标与 `verify="row-count"`，并在复制后使用相同条件及消费方式计时。
+
 - `Database.migrate_to` 和 `Table.migrate_to` 都使用 `tables=None/list/dict`；对象决定全库/当前表范围，字典为 `{源名: 目标名}`。Table 的 `target_table=` 和旧第二位置目标名仍兼容，不能与 `tables=` 混用。`to_postgresql` 保留兼容，示例推荐 `migrate_to`。
 - 两者共同提供 `specs=None`、`temp_dir=None`、`lock_timeout=30.0` 关键字参数。`specs={"ticks":{"partition":"duration(ts,every=1hour)"}}` 在转换时改变目标布局；值也可以是 `source.spec().with_partition(...)`，键始终是已选源表名。支持 partition=None 移除分区，支持 segment；不隐式改列/主键/时间单位。
 - 已有目标必须兼容最终目标契约；`mode="replace"` 是主键冲突策略，不会清空或重建目标。`verify="row-count"` 要求各选中目标不存在或为空，实际行数在发布前验证；PG 还在正式事务里验证。

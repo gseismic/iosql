@@ -13,7 +13,7 @@
 - **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
 - **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`buffered_writer()` 缓冲批量写入。
 - **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
-- **统一迁移**：`migrate_to()` 在 SQLite、Parquet 与 PostgreSQL 之间迁移，支持选表、改名和调整目标布局；先暂存、校验，再统一发布。
+- **另存与统一迁移**：`save_as()` / `migrate_to()` 在 SQLite、Parquet 与 PostgreSQL 之间复制数据并保留源库，支持选表、改名和调整目标布局；先暂存、校验，再统一发布。
 - **时序语法糖**：`Database.timeseries()` 是 `table()` 的薄封装（duration/calendar 分区 + order_key + time），适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 - **可视化管理台**：`iosql web -s <db>` 启动本地 Web 管理台（默认只读，`--write` 开启维护），支持数据浏览、契约/分区/segment 透视、explain 裁剪可视化与时序快览图表。
 
@@ -664,6 +664,29 @@ iosql update-metadata -s sqlite://database/market.iosql -t ticks \
 
 Python 侧对应 `table.describe()` 与 `table.update_metadata(...)`，返回/输入均为 JSON 安全结构，适合程序与 LLM 直接消费。SQLite/Parquet 支持增量更新；PostgreSQL 可通过 `describe()` 读取已绑定契约中的元信息，不支持 `update_metadata()`。
 
+### 另存副本与 engine 性能对比
+
+`Database.save_as()` 把全库另存到目标 URI，`Table.save_as()` 只另存当前表。
+两者都会保留源业务数据和契约，源对象仍指向原库；副本后续写入与源库互不影响。
+已有的 `migrate_to()` 同样保留源库，`save_as()` 是表达另存意图的等价入口。
+
+```python
+with Database("sqlite://db/market.iosql") as source:
+    result = source.save_as("parquet://db/comparison.iosql", verify="row-count")
+    assert result.published and result.verified
+    rows = source.table("bars").query(symbols="AAPL", order_by="ts").to_list()
+```
+
+只另存一张表可调用 `source.table("bars").save_as(target_uri)`；选表、改名用
+`tables=["bars"]` 或 `tables={"bars": "archived_bars"}`，其余参数与 `migrate_to()` 一致。
+目标已有数据时按 `mode` 处理主键冲突，不自动清空；做性能比较时建议新目标并开启
+`verify="row-count"`，该校验要求选中目标表不存在或为空。
+
+[另存与查询计时示例](examples/18_save_as_compare_engines.py) 保留 SQLite 和 Parquet 两份相同数据，
+使用相同条件、投影、排序及完整结果消费方式，校验查询结果后比较首次查询与预热后中位耗时。
+运行 `uv run --with-editable . python examples/18_save_as_compare_engines.py`。
+另存耗时与查询耗时分开；首次查询不代表系统冷缓存，实际比较应使用自己的数据规模和查询负载。
+
 ### 统一迁移与调整目标分区
 
 `Database.migrate_to()` 与 `Table.migrate_to()` 支持 SQLite、Parquet 和 PostgreSQL 之间的迁移，默认复用源契约，也可通过 `specs` 调整目标布局。源业务数据和契约保留；协调文件与临时工作区由库管理。CLI 的源库支持 SQLite/Parquet；以 PostgreSQL 为源时使用 Python API 并先绑定表契约。
@@ -807,6 +830,7 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 | [15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) | PostgreSQL 时间窗、latest/asof、原生计划与复合索引。 |
 | [16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py) | SQLite → Parquet 预览、迁移、校验与目标查询。 |
 | [17_safe_migration_and_paths.py](examples/17_safe_migration_and_paths.py) | 大小写路径、安全迁移与备份、链接路径拒绝。 |
+| [18_save_as_compare_engines.py](examples/18_save_as_compare_engines.py) | `save_as()` 保留源库，校验副本后比较 SQLite/Parquet 相同查询的耗时。 |
 
 各示例的运行条件和环境配置见[完整示例索引](examples/README.md)。
 
@@ -840,6 +864,7 @@ python examples/13_streaming_ordered_query.py
 python examples/14_parquet_backend.py
 python examples/16_sqlite_to_parquet.py
 uv run --with-editable . python examples/17_safe_migration_and_paths.py
+uv run --with-editable . python examples/18_save_as_compare_engines.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 

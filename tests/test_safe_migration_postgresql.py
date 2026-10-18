@@ -63,6 +63,30 @@ def test_pg_partition_change_and_roundtrip(tmp_path, pg_uri):
             assert local['archived'].spec().partition is None
 
 
+@pytest.mark.parametrize('scope', ['database', 'table'])
+def test_save_as_postgresql_copy_and_return_preserve_sources(tmp_path, pg_uri, scope):
+    db, table = source_table(tmp_path)
+    with db:
+        original_rows = table.select(order_by='ts')
+        spec = table.spec()
+        owner = db if scope == 'database' else table
+        result = owner.save_as(pg_uri, verify='row-count', batch_size=1)
+        assert result.published and result.verified
+        assert table.select(order_by='ts') == original_rows
+        with Database(pg_uri) as pg:
+            archived = pg.table('ticks', spec=spec)
+            back_owner = pg if scope == 'database' else archived
+            back_uri = f'parquet://{tmp_path}/copy_back'
+            back = back_owner.save_as(back_uri, verify='row-count', batch_size=1)
+            assert back.published and back.verified
+            assert archived.uri == pg_uri
+            assert archived.select(order_by='ts') == original_rows
+            with Database(back_uri) as local:
+                assert local.table('ticks').select(order_by='ts') == original_rows
+                assert local.table('ticks').write({'ts': 9999, 'v': 'local'}).rows_written == 1
+            assert archived.count_rows() == table.count_rows() == 2
+
+
 def test_pg_all_tables_rollback_on_final_failure(tmp_path, pg_uri, monkeypatch):
     db, table = source_table(tmp_path)
     from iosql.engines.postgresql.table import Table

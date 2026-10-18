@@ -834,10 +834,25 @@ class Database(object):
     def migrate_to(self, target_uri, tables=None, mode='append',
                    batch_size=10_000, verify=None, dry_run=False, *,
                    specs=None, temp_dir=None, lock_timeout=30.0):
-        """隔离转换后统一发布；specs 按源表名覆盖目标分区/段布局。"""
+        """保留源库，隔离转换后统一发布；specs 按源表名覆盖目标布局。"""
         from .migration import migrate
         return migrate(self, target_uri, tables, mode, batch_size, verify, dry_run,
                        specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout)
+
+    def save_as(self, target_uri, tables=None, mode='append',
+                batch_size=10_000, verify=None, dry_run=False, *,
+                specs=None, temp_dir=None, lock_timeout=30.0):
+        """将库另存为独立副本，保留源数据、契约和当前对象的 URI。
+
+        参数、发布与锁语义同 migrate_to，返回 MigrationResult。
+        目标已有数据时按 mode 合并，不自动清空；完整复制推荐新目标与
+        verify='row-count'（要求选中目标表不存在或为空）。
+        """
+        return self.migrate_to(
+            target_uri, tables=tables, mode=mode, batch_size=batch_size,
+            verify=verify, dry_run=dry_run, specs=specs, temp_dir=temp_dir,
+            lock_timeout=lock_timeout,
+        )
 
     @staticmethod
     def _normalize_migration_mode(mode):

@@ -27,6 +27,7 @@
 | `15_postgresql_timeseries_query.py` | 高级 | PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
 | `16_sqlite_to_parquet.py` | 进阶 | 准备 SQLite 源表，dry-run 后迁移到 Parquet，并在目标端查询和校验。 |
 | `17_safe_migration_and_paths.py` | 高级 | 演示大小写路径保留、安全迁移与备份、快照拒绝 junction、库锁拒绝符号链接。 |
+| `18_save_as_compare_engines.py` | 进阶 | 用 `save_as()` 保留源库，校验 SQLite/Parquet 两份数据后比较相同查询的首次及预热耗时。 |
 
 ## 金融示例
 
@@ -72,6 +73,7 @@ python examples/13_streaming_ordered_query.py
 python examples/14_parquet_backend.py
 python examples/16_sqlite_to_parquet.py
 uv run --with-editable . python examples/17_safe_migration_and_paths.py
+uv run --with-editable . python examples/18_save_as_compare_engines.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
@@ -79,6 +81,12 @@ PYTHONPATH=. python examples/finance/01_kline_bars.py
 `12_sqlite_postgresql_roundtrip.py` 未设置 `POSTGRES_DSN` 时只执行 dry-run；设置后会演示 `sqlite -> postgresql -> sqlite` 双向转换。
 
 `17_safe_migration_and_paths.py` 在自己的临时演示目录中运行，结束后自动清理。Windows 上使用 `fsutil` 尝试启用大小写敏感目录，以 `mklink /J` 创建真实 junction；系统能力或权限不足时明确跳过对应场景。库锁符号链接需要 Windows 的相应权限。Linux/macOS 使用实际符号链接演示拒绝行为，输出会注明未验证 Windows 原机行为。快照部分使用与 CLI `iosql backup` 共用的内部维护入口。
+
+`18_save_as_compare_engines.py` 用 20,000 行数据演示另存和查询计时；只重置自己的两个
+演示路径，运行后保留源库及副本。复制和行数校验在查询计时前完成；两端使用相同条件、
+投影、排序和结果消费方式，先确认结果一致，再交替顺序重复查询并报告中位耗时。
+首次查询不代表系统冷缓存。需要比较实际业务性能时，用自己的数据规模、索引和查询负载，
+大规模写入/读取基准可参考 `benchmarks/benchmark_wide_backends.py`。
 
 ## 运行时数据
 

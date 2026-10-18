@@ -1617,7 +1617,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
     def migrate_to(self, target_uri, tables=OMITTED, mode='append',
                    batch_size=10_000, verify=None, dry_run=False, *,
                    specs=None, temp_dir=None, lock_timeout=30.0, target_table=OMITTED):
-        """迁移当前表；tables 与 Database 相同，specs 支持目标重新分区。"""
+        """保留源表并复制到目标；tables 与 Database 相同，specs 支持目标重新分区。"""
         from ...migration import migrate_table
         return migrate_table(self, target_uri, tables, mode, batch_size, verify, dry_run,
                              specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,

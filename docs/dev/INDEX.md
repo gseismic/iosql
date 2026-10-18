@@ -13,3 +13,4 @@
 | 2026-10-18 | [PLAN-086 Windows 路径大小写与快照重解析点防护](PLAN-086-windows-paths-and-snapshot-junctions.md) | 已完成（WORKTREE） | [结果](PLAN-086-windows-paths-and-snapshot-junctions-OUTCOME.md)：文件路径保留大小写；快照拒绝重解析点；回归 330 通过、6 项 Windows 原机用例跳过。 |
 | 2026-10-18 | [PLAN-087 路径安全示例与审查修复提交](PLAN-087-path-safety-example-and-commit.md) | 已完成（随本轮修复提交） | [结果](PLAN-087-path-safety-example-and-commit-OUTCOME.md)：主示例及技能副本运行通过，同步索引，提交 PLAN-084～087 相关代码与文档。 |
 | 2026-10-18 | [PLAN-088 README 与 iosql skill 同步](PLAN-088-readme-skill-sync.md) | 已完成 | [结果](PLAN-088-readme-skill-sync-OUTCOME.md)：补齐三后端能力、01～17 示例、元数据与迁移结果/异常说明；链接、示例副本、代码块语法和 skill 格式检查通过。 |
+| 2026-10-18 | [PLAN-089 保留源库的 save_as 接口](PLAN-089-save-as.md) | 已完成（随本次提交） | [结果](PLAN-089-save-as-OUTCOME.md)：新增库/表另存入口与查询计时示例，同步 README 和 skill；新增 28 项通过，扩展 419 通过、3 项基线失败、2 跳过。 |
