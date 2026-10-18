@@ -1,7 +1,7 @@
 interface:
   display_name: "iosql 使用指南"
-  short_description: "指导 iosql 分区建模、Parquet 归档、查询、维护和迁移"
-  default_prompt: "Use $iosql-usage to choose an iosql workflow for partitioned data, Parquet archiving, ordered reads, layout maintenance, or SQLite and Parquet migration."
+  short_description: "指导 iosql 分区建模、流式查询、元数据维护及 SQLite、Parquet、PostgreSQL 迁移"
+  default_prompt: "使用 $iosql-usage 帮我选择分区建模、流式查询、元数据维护或 SQLite、Parquet、PostgreSQL 迁移的合适用法。"
 
 policy:
   allow_implicit_invocation: true

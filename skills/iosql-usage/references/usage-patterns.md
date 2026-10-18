@@ -478,6 +478,25 @@ for seg in segments:
     print(seg["part_key"], seg["row_count"], seg["sealed"], seg["state"])
 ```
 
+## 表说明与字段元数据
+
+给已有、已持久化 schema 的 SQLite/Parquet 表补充业务说明：
+
+```python
+info = ticks.update_metadata(
+    description="逐笔行情，UTC 毫秒时间戳。",
+    column_descriptions={"ts": "事件时间。", "price": "成交价。"},
+    column_ranges={"price": {"low": 0, "high": float("inf")}},
+)
+print(ticks.describe())
+```
+
+建表也可传 `description` / `column_descriptions` / `column_ranges`。值域为声明的
+闭区间，不校验写入或参与 min/max 统计；返回值将无穷边界编码为 `"+inf"` / `"-inf"`。
+更新时省略的参数保持原值，映射中传 `{"price": None}` 清除该列条目，整个参数为 None
+清空该项。PostgreSQL 支持读取绑定契约的 `describe()`，不支持 `update_metadata()`。
+精确清除规则见 [API 参考](api-reference.md#表说明与字段元数据)。
+
 ## Where 条件构造
 
 ### Dict 格式（推荐）
@@ -625,7 +644,9 @@ Parquet → SQLite 的方向只需把源和目标 URI 对调。CLI 用 `iosql mi
 Parquet URI 显式使用 `parquet://`；DuckDB 随 iosql 默认依赖安装，无需 extra。
 文件重写成本、流式读取生命周期和其他后端边界见 [Parquet 使用指南](parquet.md)。
 
-迁移窗口内暂停源库写入，并使用干净的目标表执行行数校验。
+正式迁移持有源/目标独占租约，协作 API 在此期间报 `DatabaseBusy`。
+迁移前关闭读取流、flush 缓冲并退出缓冲写入上下文；行数校验要求选中目标表不存在或为空。
+dry-run 不连接目标，不验证目标权限或已有表兼容性。
 
 ## SQLite 迁移到 PostgreSQL
 
@@ -633,26 +654,17 @@ Parquet URI 显式使用 `parquet://`；DuckDB 随 iosql 默认依赖安装，�
 并按 `batch_size` 从 SQLite 物理文件逐批读取，适合海量 K 线：
 
 ```python
-source = Database("sqlite://db/market.iosql")
-result = source.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
-    tables={"kline_1m": "pg_kline_1m"},
-    batch_size=50_000,
-    verify="row-count",
-)
-print(result.to_dict())
-source.close()
-```
-
-迁移前可以 dry-run 预览；该模式只统计源表行数和估算批次数，不连接目标库：
-
-```python
-plan = source.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
-    dry_run=True,
-    batch_size=50_000,
-)
-print(plan.source_rows, plan.batches)
+with Database("sqlite://db/market.iosql") as source:
+    target_uri = "postgresql://user:pass@localhost:5432/market"
+    options = {
+        "tables": {"kline_1m": "pg_kline_1m"},
+        "batch_size": 50_000,
+        "verify": "row-count",
+    }
+    plan = source.migrate_to(target_uri, dry_run=True, **options)
+    print(plan.source_rows, plan.batches)  # 不连接目标库
+    result = source.migrate_to(target_uri, **options)
+    print(result.published, result.rows_written, result.verified)
 ```
 
 单表迁移：
@@ -687,7 +699,8 @@ iosql migrate \
 2. 先 dry-run，确认源行数、目标表名和批次数。
 3. 使用空目标表或新的目标表名。
 4. 全量迁移开启 `verify="row-count"`。
-5. 迁移窗口内暂停源库写入。
+5. 关闭读取流、flush 缓冲、退出缓冲写入上下文并结束未提交事务；库级独占租约负责阻止协作读写，原始文件访问和旧版客户端需另行停用。
+6. 预留暂存和完整目标视图的磁盘空间，检查 `published`；异常时保留 `operation_id`、`partial_result` 与 `recovery_path`，确认发布状态后再重试。
 
 PostgreSQL 也可以作为迁移源写回 SQLite。重新打开 PostgreSQL 逻辑表时，需要绑定
 同一份表契约：
@@ -820,4 +833,4 @@ result = ticks.migrate_to(
 )
 ```
 
-多表同样传 `specs`，键使用源名。迁移全程禁止源/目标协作读写，默认临时目录在源库内；全部转换后统一发布。`temp_dir` 与 `lock_timeout` 可选，具体锁、恢复、兼容和结果语义见 design-contract.md 的 PLAN-083 一节。
+多表同样传 `specs`，键使用源名。迁移全程禁止源/目标协作读写，本地源默认在源库内暂存，PostgreSQL 源使用系统临时目录；全部转换后统一发布。`temp_dir` 与 `lock_timeout` 可选，具体锁、恢复、兼容和结果语义见 design-contract.md 的 PLAN-083 一节。

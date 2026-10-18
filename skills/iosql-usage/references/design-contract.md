@@ -59,7 +59,8 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - 大文件导入优先用 `iosql import --batch-size` 读取 JSONL/CSV；JSON 数组兼容但不适合数 GB 文件。
 - SQLite→PostgreSQL 迁移优先用 `Database.migrate_to()` / `to_postgresql()`；按 `batch_size` 逐批读取 SQLite 物理文件，
   不会一次性载入全库。生产迁移先 `dry_run=True` 预览，再 `verify="row-count"` 校验。`migrate_to(dry_run=True)`
-  会先校验 `mode`/`tables`/目标 URI 且无落盘副作用；SQLite 源迁 SQLite 目标时目标不能等于/嵌套源库。
+  会先校验 `mode`/`tables`/目标 URI，不创建业务临时目录，但可创建源协调锁文件；
+  不连接目标，因此不校验目标连接、权限或既有表兼容性。本地源与目标不能相同或互相包含。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`
   （`db.table(name, spec=spec)`），见 `examples/12_sqlite_postgresql_roundtrip.py`。PG 流式导出使用命名游标（单语句快照），
   无序翻页不会跳行/重复。
@@ -81,7 +82,7 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - 字符串 `fields` 只接受 `*` 或标识符列表；含 SQL 语法直接抛 `BadArgument`；
   `select()` / `iter_select*()` 拒绝未知 kwargs。
 - `insert_all` 按整批行列并集取值、缺列补 `NULL`；`upsert_all` 仅更新输入字段、缺字段保留旧值，并按参数上限拆页；
-  `commit=False` 会保持事务，后续提交写入或关闭时提交，失败整体回滚。
+  `commit=False` 会保持事务，后续 `commit=True` 的写入或 delete 提交，关闭连接时未提交事务回滚，失败整体回滚。
 - `order_by` 的 NULL 排序与 SQLite 一致：ASC → `NULLS FIRST`，DESC → `NULLS LAST`。
 - `upsert_all(..., where=...)` 已废弃（忽略并告警）；`calendar(...)` 的 `timestamptz` 边界带 UTC 偏移；
   `table_parts()` 返回排序后的子分区关系名。

@@ -13,6 +13,7 @@
 - **二级查询裁剪**：`select(where=...)` 先裁剪 logical partitions，再通过 segment `stats_json` 跳过无关物理文件。
 - **写入分层**：`write(rows, mode=...)` 是高层主入口（契约感知），`insert_all()` 是低层基础（布尔标志），`buffered_writer()` 缓冲批量写入。
 - **布局维护**：`layout_report()` 检查分区行数，`compact()` 整理 row segment，`repartition_to()` 可生成新的分区布局。
+- **统一迁移**：`migrate_to()` 在 SQLite、Parquet 与 PostgreSQL 之间迁移，支持选表、改名和调整目标布局；先暂存、校验，再统一发布。
 - **时序语法糖**：`Database.timeseries()` 是 `table()` 的薄封装（duration/calendar 分区 + order_key + time），适合 `query(start/end)`、`latest()`、`asof()` 等业务查询。
 - **可视化管理台**：`iosql web -s <db>` 启动本地 Web 管理台（默认只读，`--write` 开启维护），支持数据浏览、契约/分区/segment 透视、explain 裁剪可视化与时序快览图表。
 
@@ -198,7 +199,7 @@ iosql rename-database -s database/market.iosql --target market-renamed.iosql
 iosql rename-table -s database/market.iosql -t ticks --new-table ticks_2026
 ```
 
-SQLite table 重命名会移动表目录并更新表内 manifest；database 重命名会移动整个目录库并刷新当前 `Database` 实例 URI。覆盖已有目标时需要显式传 `overwrite=True`；CLI 对应 `--overwrite --yes`。`Database.rename(overwrite=True)` 会校验源/目标都是 iosql 目录库，拒绝根目录、家目录和符号链接目标，并以“先改名到临时目录、再替换”的方式保证失败可回滚。
+SQLite table 重命名会移动表目录并更新表内 manifest；database 重命名会刷新当前 `Database` 实例 URI。普通库移动目录，已有代际发布的库使用快照发布并退休旧目录，需要复制数据与额外空间。覆盖已有目标时需要显式传 `overwrite=True`；CLI 对应 `--overwrite --yes`。`Database.rename(overwrite=True)` 会校验源/目标都是 iosql 目录库，拒绝根目录、家目录和符号链接目标；替换失败可回滚。
 
 ### 创建或打开表
 
@@ -373,9 +374,8 @@ SQLite 连接可能同时占用数据库、WAL 和 SHM 文件描述符；包含�
 确定性释放资源的首选方式；低层清理注册表使用弱引用，遗弃对象不会再被全局注册表
 保留。带 `order_by` 的查询若分区数超过 `max_ordered_read_connections` 或当前进程预算，
 会直接抛 `BadArgument`；应收窄查询范围、提高预算或去掉全局排序。外部归并仍是后续能力。
-永久保活，但不应以垃圾回收替代正常的生命周期管理。
 
-同机多个进程通过表级文件锁串行化同表写入及 `compact`/删除等维护操作；读者仍可在 WAL 下并行读取。跨分区查询没有统一快照，跨文件写入也没有崩溃原子性。`rename`、`restore`、备份和重分区需要维护窗口并关闭其他访问进程；详见 [多用户并发设计](docs/design/multi-user-concurrency-20260929-overview.md)。
+同机协作 API 使用库级共享/独占租约：普通操作持共享租约；迁移、重分区、备份/恢复和重命名等操作申请独占租约。独占操作期间，新的协作 API 调用会立即抛出 `DatabaseBusy`；迁移通过 `lock_timeout` 等待正在进行的共享操作结束。同表写入仍由表级文件锁串行化。普通跨分区查询不保证统一数据快照，普通跨文件写入也没有崩溃原子性。原始文件访问、未接入协调协议的旧版客户端及多机共享 WAL 目录不受保护；详见[统一迁移与安全发布设计](docs/design/migration-api-20261018-unified.md)。
 
 只有原始抓取数据可确定重放时才考虑 `synchronous=OFF`；掉电或系统崩溃时它可能损坏最近事务。
 
@@ -568,7 +568,9 @@ iosql export \
   --batch-size 50000
 ```
 
-无全局 `order_by` 时，查询按分区/segment 分批读取。`select()` 在全局 `order_by` 与 `limit` 同时提供时，会把 `ORDER BY ... LIMIT` 下推到每个 segment，再在 Python 层归并取前 `limit` 行（结果不变、内存有界）；只带全局 `order_by` 的流式输出仍会先合并排序再按批给出。
+无全局 `order_by` 时，查询按分区/segment 分批读取。SQLite 的 `select()` 在全局 `order_by` 与 `limit` 同时提供时，会把 `ORDER BY ... LIMIT` 下推到每个 segment，再在 Python 层归并取前 `limit` 行。带排序的 `iter_select*()` / `query(...).iter_rows()` / `.iter_batches()` 使用分区只读游标和堆归并，惰性输出；归并受 `max_ordered_read_connections` 与进程连接预算约束。PostgreSQL 的排序在数据库端执行。
+
+读取流从开始消费到耗尽或关闭期间持有共享租约；提前退出循环时应显式关闭流，迁移前还需 flush 缓冲并退出 `buffered_writer` 上下文。完整示例见 [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py)。
 
 CLI `import` 会批处理读取 JSONL/CSV 并写入既有契约表，适合 vendor 历史文件和离线回补包：
 
@@ -660,63 +662,54 @@ iosql update-metadata -s sqlite://database/market.iosql -t ticks \
 # 或 --column-desc "price="（空文本清除该列解释）
 ```
 
-Python 侧对应 `table.describe()` 与 `table.update_metadata(...)`，返回/输入均为 JSON 安全结构，适合程序与 LLM 直接消费。
+Python 侧对应 `table.describe()` 与 `table.update_metadata(...)`，返回/输入均为 JSON 安全结构，适合程序与 LLM 直接消费。SQLite/Parquet 支持增量更新；PostgreSQL 可通过 `describe()` 读取已绑定契约中的元信息，不支持 `update_metadata()`。
 
 ### 统一迁移与调整目标分区
 
-已有 SQLite 版 iosql 库可以直接迁移到 PostgreSQL。表契约会复用源库的主键、列类型、分区和排序字段；源业务数据和契约保留；协调文件与临时工作区由库管理。
+`Database.migrate_to()` 与 `Table.migrate_to()` 支持 SQLite、Parquet 和 PostgreSQL 之间的迁移，默认复用源契约，也可通过 `specs` 调整目标布局。源业务数据和契约保留；协调文件与临时工作区由库管理。CLI 的源库支持 SQLite/Parquet；以 PostgreSQL 为源时使用 Python API 并先绑定表契约。
 
 ```python
 from iosql import Database
 
-source = Database("sqlite://database/market.iosql")
+with Database("sqlite://database/market.iosql") as source:
+    options = {
+        "tables": ["daily_bars", "kline_1m"],  # 不传则迁移全库
+        "batch_size": 50_000,
+        "verify": "row-count",
+    }
+    target_uri = "postgresql://user:pass@localhost:5432/market"
+    plan = source.migrate_to(target_uri, dry_run=True, **options)
+    print(plan.source_rows, plan.batches)           # 预览不连接目标库
 
-result = source.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
-    tables=["daily_bars", "kline_1m"],   # 不传则迁移全库
-    batch_size=50_000,
-    verify="row-count",                  # 可选：迁移后校验源/目标行数
-)
-
-print(result.rows_copied, result.batches, result.verified)
-source.close()
-```
-
-迁移前可以先预览，不连接目标库：
-
-```python
-plan = source.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
-    dry_run=True,
-    batch_size=50_000,
-)
-print(plan.source_rows, plan.batches)
+    result = source.migrate_to(target_uri, **options)
+    print(result.published, result.rows_written, result.verified)
 ```
 
 单表迁移：
 
 ```python
-ticks = source.table("kline_1m")
-result = ticks.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
-    tables={"kline_1m": "pg_kline_1m"},
-    batch_size=50_000,
-)
+with Database("sqlite://database/market.iosql") as source:
+    ticks = source.table("kline_1m")
+    result = ticks.migrate_to(
+        "postgresql://user:pass@localhost:5432/market",
+        tables={"kline_1m": "pg_kline_1m"},
+        batch_size=50_000,
+    )
 ```
 
 PostgreSQL 作为源库写回 SQLite 时，需要重新绑定同一份表契约：
 
 ```python
-spec = source.table("kline_1m").spec()
-pg = Database("postgresql://user:pass@localhost:5432/market")
-pg.table("pg_kline_1m", spec=spec)
-result = pg.migrate_to(
-    "sqlite://database/from-postgresql.iosql",
-    tables={"pg_kline_1m": "kline_1m"},
-    verify="row-count",
-    batch_size=50_000,
-)
-pg.close()
+with Database("sqlite://database/market.iosql") as source:
+    spec = source.table("kline_1m").spec()
+with Database("postgresql://user:pass@localhost:5432/market") as pg:
+    pg.table("pg_kline_1m", spec=spec)
+    result = pg.migrate_to(
+        "sqlite://database/from-postgresql.iosql",
+        tables={"pg_kline_1m": "kline_1m"},
+        verify="row-count",
+        batch_size=50_000,
+    )
 ```
 
 CLI：
@@ -737,25 +730,29 @@ Database 和 Table 都使用 `tables=None/列表/映射`：分别默认全库和
 迁移时直接指定目标分区（`specs` 的键始终是源表名，未配置的表沿用源契约）：
 
 ```python
-result = ticks.migrate_to(
-    "parquet://database/hourly.iosql",
-    tables={"kline_1m": "hourly_bars"},
-    specs={"kline_1m": {"partition": "duration(ts,every=1hour)"}},
-    verify="row-count",
-)
+with Database("sqlite://database/market.iosql") as source:
+    ticks = source.table("kline_1m")
+    result = ticks.migrate_to(
+        "parquet://database/hourly.iosql",
+        tables={"kline_1m": "hourly_bars"},
+        specs={"kline_1m": {"partition": "duration(ts,every=1hour)"}},
+        verify="row-count",
+    )
 # 去掉目标分区：specs={"kline_1m": {"partition": None}}
 # 完整契约也可使用：specs={"kline_1m": ticks.spec().with_partition(every="1hour")}
 ```
 
 CLI 对应 `--specs '{"kline_1m":{"partition":"duration(ts,every=1hour)"}}'`，也支持 `--specs @布局.json`。布局可以修改 partition/segment，不会隐式改变列、主键或时间单位。已有目标需要与最终布局兼容；`mode="replace"` 仍是主键冲突策略，不能用于清空目标。
 
-正式迁移全程禁止源、目标的协作读写，取得不到锁的普通 API 立即抛 `DatabaseBusy`；迁移等待独占锁的总时限由 `lock_timeout=30.0` 控制。请先关闭读取流、flush 缓冲并结束未提交事务或缓冲写入上下文。锁在持久发布后释放，临时数据清理在锁外进行。临时转换默认放在原库 `__iosql_migrations__/任务ID/`，可用 `temp_dir=` 或 `--temp-dir` 更改。目标侧另准备完整代际，保证先转换、后统一发布；中断后的所有读写都会检查恢复屏障。失败的暂存保留供检查。
+正式迁移全程禁止源、目标的协作读写，取得不到锁的普通 API 立即抛 `DatabaseBusy`；迁移等待独占锁的总时限由 `lock_timeout=30.0` 控制。请先关闭读取流、flush 缓冲并结束未提交事务或缓冲写入上下文。锁在持久发布后释放，临时数据清理在锁外进行。本地源的临时转换默认放在原库 `__iosql_migrations__/任务ID/`，PostgreSQL 源使用系统临时目录；可用 `temp_dir=` 或 `--temp-dir` 更改。目标侧另准备完整代际，保证先转换、后统一发布；中断后的所有读写都会检查恢复屏障。失败的暂存保留供检查。
 
 旧内容在解锁前移入父目录协调空间的任务专属退休目录，锁外清理只删除该目录，避免误删原 URI 上后来新建的数据。合法空表可作为迁移目标，未写入表的当前实例声明在发布刷新后仍可用。库级协调层在 Windows 使用原生共享/独占文件锁；Windows 尚未进行原机和断电验证，不承诺 POSIX 目录 fsync 的同等持久性。
 
 [安全迁移与路径示例](examples/17_safe_migration_and_paths.py) 演示大小写目录、SQLite→Parquet 迁移与备份、快照 junction 和库锁符号链接拒绝。运行 `uv run --with-editable . python examples/17_safe_migration_and_paths.py`；示例会清理自己的临时目录，平台能力不足时明确跳过对应场景。
 
-`verify="row-count"` 要求所有选中目标表不存在或为空，在发布前比较真实行数。`dry_run=True` 只持源共享锁，不连接目标，不创建业务临时目录；源协调锁文件可以产生，待恢复的源库会报错。多个独立查询跨越发布时间可能分别读到旧版和新版。
+`verify="row-count"` 要求所有选中目标表不存在或为空，在发布前比较真实行数。`dry_run=True` 只持源共享锁，不连接目标，不创建业务临时目录；它不会验证目标连接、权限或已有表兼容性。源协调锁文件可以产生，待恢复的源库会报错。多个独立查询跨越发布时间可能分别读到旧版和新版。
+
+本地源和目标不能相同或互相包含，`temp_dir` 也不能位于目标库内。暂存和完整目标代际需要额外磁盘空间，已有目标的未选中表也会进入新副本。
 
 结果保留 `rows_copied` 等旧字段，新增 `published`、`operation_id`、`rows_written` 和逐表 `source_spec/target_spec/partitions_created`。`rows_copied` 包括 ignore 成功处理但跳过的行，不能用它判断是否已经发布。失败异常包含 `partial_result`；发布状态不确定时不要盲目追加重试。原始文件访问和未接入协调协议的旧版客户端不受此锁保护。
 
@@ -805,6 +802,13 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 | `10_existing_database_repartition.py` | 独立模拟已有源库，重新打开后重分区到新目标库。 |
 | `11_sqlite_to_postgresql_migration.py` | SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询。 |
 | `12_sqlite_postgresql_roundtrip.py` | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
+| [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py) | 跨分区全局排序，用 `query().iter_rows()` 惰性读取。 |
+| [14_parquet_backend.py](examples/14_parquet_backend.py) | Parquet 分区、segment、重开与 SQLite 双向迁移。 |
+| [15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) | PostgreSQL 时间窗、latest/asof、原生计划与复合索引。 |
+| [16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py) | SQLite → Parquet 预览、迁移、校验与目标查询。 |
+| [17_safe_migration_and_paths.py](examples/17_safe_migration_and_paths.py) | 大小写路径、安全迁移与备份、链接路径拒绝。 |
+
+各示例的运行条件和环境配置见[完整示例索引](examples/README.md)。
 
 金融场景示例位于 `examples/finance/`：
 
@@ -832,6 +836,10 @@ python examples/09_existing_database_append.py
 python examples/10_existing_database_repartition.py
 python examples/11_sqlite_to_postgresql_migration.py
 python examples/12_sqlite_postgresql_roundtrip.py
+python examples/13_streaming_ordered_query.py
+python examples/14_parquet_backend.py
+python examples/16_sqlite_to_parquet.py
+uv run --with-editable . python examples/17_safe_migration_and_paths.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
@@ -922,18 +930,21 @@ database/
 
 同一参数名承载三种语义是刻意保持的简写；需要精确控制作用范围时，`compact(partition=...)` / `cleanup_obsolete(partition=...)` 也可用 `partitions=` 别名传入分区键列表。
 
-### 双引擎支持面
+### 三后端支持面
 
-| 能力 | SQLite 引擎 | PostgreSQL 引擎 |
-| --- | --- | --- |
-| 建表/契约 | `db.table()` 完整 | `db.table()` / `db.timeseries()`；重开需契约 |
-| 写入 | `write` / `buffered_writer` / `insert_all` / `upsert_all` | `write` / `insert_all` / `upsert_all` |
-| 条件查询 | `select` / `iter_select` / `iter_select_batches` | `select` / `iter_select` / `iter_select_batches` |
-| 时序查询 | `query` / `latest` / `asof` | `query` / `latest` / `asof`，数据库端执行 |
-| 查询计划 | `explain_select` | `explain_select` / 查询对象 `.explain()`，原生 JSON |
-| 索引 | 单列索引 | 单列/复合 B-tree，安全删除、等价主键复用 |
-| 诊断维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` / `truncate` / `delete` / `delete_all` / `count_rows` | `delete` / `delete_all` / `count_rows` |
-| 迁移 | `migrate_to` / `to_postgresql` | `migrate_to`（作为源写回 SQLite） |
+| 能力 | SQLite | Parquet | PostgreSQL |
+| --- | --- | --- | --- |
+| 建表/契约 | `table` / `timeseries`，重开读取持久化契约 | 同 SQLite | `table` / `timeseries`；重开需显式绑定契约 |
+| 写入 | `write` / `buffered_writer` / `insert_all` / `upsert_all` | 同 SQLite，重写受影响文件 | `write` / `insert_all` / `upsert_all` |
+| 条件查询 | `select` / `iter_select` / `iter_select_batches` | 同 SQLite | 同 SQLite，数据库端执行 |
+| 时序查询 | `query` / `latest` / `asof` | 同 SQLite | 同名接口，数据库端执行 |
+| 查询计划 | `explain_select` / 查询对象 `.explain()`，分区与 segment 裁剪 | 同 SQLite | 原生 JSON，支持 `analyze=True` |
+| 索引 | 单列索引 | 无持久化索引 | 单列/复合 B-tree，安全删除、等价主键复用 |
+| 数据维护 | `truncate` / `delete` / `delete_all` / `count_rows` | 同 SQLite | `delete` / `delete_all` / `count_rows` |
+| 文件布局维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` | 同 SQLite | 无文件级维护 |
+| 元数据 | `describe` / `update_metadata` | 同 SQLite | `describe` 读取绑定契约 |
+| 迁移 | `migrate_to`，目标可为三种后端 | 同 SQLite | `migrate_to`；源表需绑定契约 |
+| CLI / Web | 支持 | CLI 仅 `migrate`，Web 暂不支持 | CLI 仅迁移目标，Web 暂不支持 |
 
 PostgreSQL 14+ 可作为在线时序存储。`query/latest/asof` 的筛选、排序、limit 和分组取最新值均由数据库执行。`query().iter_batches()` / `.iter_rows()` 使用命名游标；`select()` / `.to_list()` 会物化完整结果。start/end/as_of 包含边界，latest 保持请求 symbol 顺序；同时间按剩余主键升序决胜。指定 symbol 且有 symbol/time 前缀索引时，单分组 latest 使用 LATERAL LIMIT 1；其他分组使用 DISTINCT ON。单个 Table 使用一条连接，消费期间应先关闭流再执行其他会结束事务的操作。
 
@@ -973,15 +984,16 @@ bars.create_index(columns=['symbol', 'ts'])  # 等价主键索引会被复用
 - **高级层**（迁移与诊断）：`TableContract` / `TableSpec` / `PhysicalLayout` / `TimeColumn`，用于跨库绑定契约、手写复杂契约等场景。
 - `Case` 的运算符重载（`*`=and、`+`=or）属内部实现细节，文档与示例不示范；dict / 文本 where 是唯一推荐的条件表达形式。
 
-### 生产迁移 checklist
+### 生产迁移准备
 
 1. 源表必须有持久化契约：`source.table("name").spec()` 不应为 `None`。
 2. 先执行 `dry_run=True` 或 `iosql migrate --dry-run`，确认表名、源行数和批次数。
 3. 使用新的目标表名或确认目标表为空，再执行全量迁移。
 4. 对全量迁移启用 `verify="row-count"` 或 `--verify row-count`。
-5. 迁移窗口内暂停源库写入，避免校验期间源行数变化。
+5. 先关闭读取流、flush 内存缓冲、退出缓冲写入上下文并结束未提交事务；正式迁移由库级独占租约阻止协作读写。原始文件访问和旧版客户端需另行停用。
 6. PostgreSQL `table_names()` 只返回逻辑表；native partition 子表不需要用户直接操作。
 7. `calendar(...)` 迁移支持 `text` / `date` / `timestamp` 目标列的 native range 边界；text 日期建议统一使用 ISO 日期（如 `2026-01-05`）或 compact 日期（如 `20260105`），不要在同一列混用格式。
+8. 预留暂存与完整目标代际的磁盘空间；成功后检查 `published` 和 `verified`。失败时保留异常中的 `operation_id`、`partial_result`、`recovery_path`，先确认发布状态再重试。
 
 - `Segment.rows` 表当前不支持 `upsert`/`replace` 覆盖写；`compact()` 不做去重，只整理 append-only 数据布局。需要覆盖写时请关闭 segment 或使用 `append`/`ignore`。
 

@@ -60,7 +60,7 @@ with Database("sqlite://db/test.iosql") as db:
 # 自动 close()
 ```
 
-#### `Database.table(table_name, spec=None, pk=None, primary_key=None, columns=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=None, time=None, symbol_column=None, session_column=None)`
+#### `Database.table(table_name, spec=None, pk=None, primary_key=None, columns=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=None, time=None, symbol_column=None, session_column=None, description=None, column_descriptions=None, column_ranges=None)`
 
 核心表入口。创建或打开一张分区表。
 
@@ -71,7 +71,7 @@ with Database("sqlite://db/test.iosql") as db:
 | `pk` | `str`/`list[str]` | 主键（与 `spec` 互斥） |
 | `primary_key` | `str`/`list[str]` | 主键兼容别名（与 `pk` 同传冲突时报错） |
 | `columns` | `dict[str,str]` | 列名→类型映射 |
-| `partition` | `Partition` | 分区实例 |
+| `partition` | `Partition`/`str` | 分区实例或 `duration(...)` / `calendar(...)` / `range(...)` 字符串 |
 | `segment` | `Segment` | 物理分段配置 |
 | `order_key` | `str` | 排序键（用于 segment 统计） |
 | `conflict` | `str` | 冲突策略：`"append"`/`"upsert"`/`"replace"`/`"ignore"` |
@@ -79,13 +79,16 @@ with Database("sqlite://db/test.iosql") as db:
 | `time` | `str`/`TimeColumn` | 时间契约列；duration/calendar 分区未声明时自动反推 |
 | `symbol_column` | `str` | 标的列；默认 `None`——未声明时 `query(symbols=)` / `latest(symbols=)` 抛 `BadArgument`（timeseries() 默认 `"symbol"`） |
 | `session_column` | `str` | 交易日/session 列（期货夜盘等场景） |
+| `description` | `str`/`None` | 表的业务说明 |
+| `column_descriptions` | `dict`/`None` | 列名到业务说明的映射 |
+| `column_ranges` | `dict`/`None` | 数值列到 `{"low": 下界, "high": 上界}` 的映射，只存声明，不校验写入 |
 
 已有表上再次传 `spec=`（或快捷参数）时，声明的绑定字段
 （`order_key`/`symbol_column`/`session_column`/`conflict`/`schema_policy`）会通过
 `TableSpecConflict` 校验并写回持久化契约：存量仍为默认值或未声明时可被覆盖，
 否则报 `TableSpecConflict`（含修复提示）。快捷参数路径省略 `force_partition` 时按 False 处理；`spec=` 路径省略时保留契约原值，显式传入与契约冲突的值会报错。`force_partition=True` 会跳过分区冲突检查并把新分区契约落盘。
 
-#### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None)`
+#### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None, description=None, column_descriptions=None, column_ranges=None)`
 
 时序语法糖：`table()` 的薄封装，duration 场景等价于 `db.table(..., partition=Partition.duration(time, every=partition_every), order_key=time, time=time)`。calendar 场景传 `partition=Partition.calendar(...)`。
 
@@ -129,8 +132,8 @@ native partition 模式下会同步重命名旧表名前缀的子分区表。
 
 #### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> MigrationResult`
 
-把当前 iosql 库迁移到目标库。SQLite 与 Parquet 可互相迁移；SQLite/Parquet 也可迁移到
-PostgreSQL。Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parquet.md)。
+把当前 iosql 库迁移到目标库，支持 SQLite、Parquet、PostgreSQL 之间的迁移。
+Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parquet.md)。
 
 ```python
 source = Database("sqlite://db/market.iosql")
@@ -150,14 +153,19 @@ result = source.migrate_to(
 
 `dry_run=True` 只统计源表行数和估算批次数，不连接目标库；`mode`/`tables`/目标 URI
 会在 `dry_run` 阶段一并校验，且不会为不存在的表创建目录或 `meta.sqlite3`。
-SQLite/Parquet 目录库作为源时，目标不能与源库相同或位于源库目录内（`BadArgument`）。
+本地源和目标不能相同或互相包含（`BadArgument`）；`temp_dir` 不能位于目标库内。
 `tables` 支持 `None`（全库）、表名列表/字符串、或 `{源表: 目标表}` 映射；空列表、
-未知源表或非法类型抛 `BadArgument`。`verify="row-count"` 会在迁移后比较源/目标
-行数，结果写入 `source_rows`、`target_rows` 和 `verified`。
+未知源表或非法类型抛 `BadArgument`。`verify="row-count"` 要求各选中目标表不存在或为空，
+并在发布前比较真实源/目标行数，结果写入 `source_rows`、`target_rows` 和 `verified`。
+dry-run 不连接目标，因此不会验证目标连接、权限、已有表契约或空表条件。
 
 两个接口的 `tables` 语义相同，Table 范围仅当前表。共同的 `specs` 按源名指定目标布局：`specs={"ticks":{"partition":"duration(ts,every=1hour)"}}`；值也可为完整 TableContract。允许 partition/segment/physical_layout/force_partition，保留源列、主键和时间含义。已有目标须兼容最终契约。
 
-迁移持有源/目标独占锁，全部转换后统一发布；默认临时目录在源库内，目标有独立物理代际。普通操作忙时立即抛 DatabaseBusy，迁移等待由 lock_timeout 控制。具体发布和恢复契约见 [design-contract.md](design-contract.md#统一迁移与安全发布plan-083)。结果追加 published/operation_id/rows_written/source_spec/target_spec/partitions_created；Table 旧 target_table 和位置目标名仍可用，两类参数不能同时传。
+迁移持有源/目标独占锁，全部转换后统一发布。本地源默认在源库内暂存，PostgreSQL 源使用系统临时目录；本地目标有独立物理代际，PostgreSQL 目标使用暂存 schema 和事务提交。普通操作忙时立即抛 `DatabaseBusy`，迁移等待由 `lock_timeout` 控制。具体发布和恢复契约见 [design-contract.md](design-contract.md#统一迁移与安全发布plan-083)。Table 旧 `target_table` 和位置目标名仍可用，两类参数不能同时传。
+
+迁移前关闭已消费的读取流、flush 内存缓冲、退出 `buffered_writer` 上下文并结束未提交事务。
+`mode="replace"` 是主键冲突策略，不清空或重建目标；结果字段与异常排查见下文及
+[troubleshooting.md](troubleshooting.md#统一迁移与协作锁)。
 
 `to_postgresql(target_uri, ...)` 是只接受 `postgresql://` 目标的语义别名。
 PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要先
@@ -211,13 +219,15 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | 方法 | 签名 | 返回值 |
 |------|------|--------|
 | `spec` | `() -> TableContract\|None` | 表契约 |
+| `describe` | `() -> dict` | 表说明、主键和列类型/解释/声明值域 |
+| `update_metadata` | `(*, description=省略, column_descriptions=省略, column_ranges=省略) -> dict` | SQLite/Parquet 增量更新元信息；详见下节 |
 | `table_parts` | `() -> list` | 逻辑分区列表 |
 | `segments` | `(include_obsolete=False) -> list[dict]` | 物理 segment 清单 |
 | `validate` | `(deep=False, include_obsolete=False) -> SegmentValidationResult` | 校验 manifest 与物理文件 |
 | `layout_report` | `() -> LayoutReport` | 分区诊断报告 |
 | `compact` | `(partition=None, target_rows=None) -> CompactResult` | 整理 row segment |
 | `cleanup_obsolete` | `(partition=None, dry_run=True, validate=True) -> CleanupResult` | 清理 obsolete segment 文件 |
-| `count_rows` | `() -> int` | 统计当前可见行数（无参，双引擎一致） |
+| `count_rows` | `() -> int` | 统计当前可见行数（无参，各后端一致） |
 | `rename` | `(new_name, exist_ok=False, overwrite=False) -> Table` | 重命名当前逻辑表 |
 | `migrate_to` | `(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> TableMigrationResult` | 迁移单表 |
 | `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
@@ -225,6 +235,18 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `drop_index` | `(column)` | 删除所有分区上的列索引 |
 
 **并发语义**：写入路径（`write` / `buffered_writer` / 迁移写目标）与 `compact()` 共用 `_compact_lock` 串行化——compact 与写互斥是预期吞吐代价，换取不会向 obsolete segment 复活插入。
+
+#### 表说明与字段元数据
+
+`describe()` 返回 `name`、`description`、`primary_key`、`columns`；每列含 `name`、
+`type`、`description`、`range`。SQLite/Parquet 支持 `update_metadata()`；PostgreSQL
+读取已绑定契约中的说明，调用 `update_metadata()` 抛 `BadArgument`。
+
+`update_metadata()` 省略的参数保留原值；`description=None` 清除表说明，
+`column_descriptions=None` / `column_ranges=None` 清空对应映射，映射中单列值为 `None`
+只清除该列。字段须已存在，声明值域只用于数值列，采用闭区间 `low` / `high`；
+`to_dict()` / `describe()` 将无穷边界编码为 `"+inf"` / `"-inf"`。这些值域不校验写入，
+也不替代数据实际的 min/max 统计。增量更新要求已有持久化 schema 元数据。
 
 **PostgreSQL 引擎差异**：
 
@@ -560,13 +582,16 @@ CleanupResult(
 | `source_uri` | `str` | 源库 URI |
 | `target_uri` | `str` | 目标库 URI |
 | `tables` | `list[TableMigrationResult]` | 各表迁移结果 |
-| `rows_copied` | `int` | 总迁移行数 |
+| `rows_copied` | `int` | 成功交给目标写入的源行数总和，可包含 ignore 跳过的行 |
+| `rows_written` | `int\|None` | 各表实际写入行数之和；无法确定或 dry-run 时为 None |
 | `batches` | `int` | 总写入批次数 |
 | `source_rows` | `int\|None` | 源表总行数；dry-run 或 row-count 校验时可用 |
 | `target_rows` | `int\|None` | 目标表总行数；row-count 校验时可用 |
 | `verify` | `str\|None` | 校验模式 |
 | `verified` | `bool\|None` | 校验是否通过 |
 | `dry_run` | `bool` | 是否为预览结果 |
+| `published` | `bool\|None` | True 为正式发布；False 为未发布（含 dry-run）；None 为状态尚未确认 |
+| `operation_id` | `str\|None` | 本次任务 ID，用于定位异常与持久状态 |
 
 ### `TableMigrationResult`
 
@@ -576,13 +601,22 @@ CleanupResult(
 | `target_table` | `str` | 目标表名 |
 | `source_uri` | `str` | 源 URI |
 | `target_uri` | `str` | 目标 URI |
-| `rows_copied` | `int` | 迁移行数 |
+| `rows_copied` | `int` | 成功交给目标写入的源行数，可包含 ignore 跳过的行 |
+| `rows_written` | `int\|None` | 实际写入行数；无法确定或 dry-run 时为 None |
 | `batches` | `int` | 写入批次数 |
 | `source_rows` | `int\|None` | 源表行数 |
 | `target_rows` | `int\|None` | 目标表行数 |
 | `verify` | `str\|None` | 校验模式 |
 | `verified` | `bool\|None` | 校验是否通过 |
 | `dry_run` | `bool` | 是否为预览结果 |
+| `published` | `bool\|None` | 正式发布状态，含义同 MigrationResult |
+| `operation_id` | `str\|None` | 本次任务 ID |
+| `source_spec` / `target_spec` | `dict\|None` | 源/目标契约的序列化值，dry-run 也可检查布局变化 |
+| `partitions_created` | `list` | 本次新增的目标分区，不含目标既有分区 |
+
+用 `published` 判断是否正式发布，不能用 `rows_copied` 推断提交成功。
+迁移阶段失败的异常携带 `partial_result` 等进度信息；详见异常类型和
+[迁移错误排查](troubleshooting.md#统一迁移与协作锁)。
 
 ---
 
@@ -635,6 +669,16 @@ CleanupResult(
 | `ChunkVerificationError` | 数据块校验错误 |
 | `EngineNotExist` | 不支持的存储引擎 |
 | `InvalidUriSchema` | URI schema 无效 |
+| `DatabaseBusy` | 迁移/恢复独占期间协作 API 立即报忙，尚未进入业务读写 |
+| `MigrationError` | 迁移失败；记录任务和阶段，不代表目标已发布 |
+| `MigrationVerificationError` | 行数或目标完整性校验失败；同时继承 `MigrationError` 与 `BadArgument`；目标非空的前置检查仍抛 `BadArgument` |
+| `MigrationLockTimeout` | 获取源/目标库锁超过 `lock_timeout` |
+| `MigrationRecoveryRequired` | 提交记录待恢复或身份无法确认，访问被恢复屏障阻止 |
+
+异常从 `iosql.exception` 导入。`MigrationError` 提供 `operation_id`、`stage`、
+`source_table`、`target_table`、`batch`、`partial_result` 和 `recovery_path`；
+部分字段可为 None。迁移过程保留的其他 `IosqlError` 也可附带任务 ID、阶段、
+部分结果及恢复路径。发布状态不确定时应先检查持久状态，不能直接追加重试。
 
 ---
 

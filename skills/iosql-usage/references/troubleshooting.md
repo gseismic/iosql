@@ -98,7 +98,7 @@ table.repartition_to(source_uri)  # BadArgument: requires a different target uri
 # limit 不能为负数
 table.select("*", where=None, limit=-1)  # BadArgument: limit must be non-negative
 
-# select/iter_select* 不接受业务参数（会被静默忽略）
+# select/iter_select* 不接受业务参数（会明确报错）
 table.select("*", symbols=["AAPL"])  # BadArgument: 改用 query()/explain_select()
 
 # 写入行缺主键字段（不会退回 rowid 自增）
@@ -261,7 +261,7 @@ if result.layout_warnings:
 
 **症状**：`Database("data.sqlite3")` 报 `InvalidUriSchema`。
 
-**原因**：主 API 要求 `sqlite://` 或 `postgresql://` 前缀的 URI 格式。
+**原因**：主 API 要求 `sqlite://`、`parquet://` 或 `postgresql://` 前缀的 URI 格式。
 
 **排查**：
 
@@ -272,13 +272,16 @@ db = Database("sqlite://db/market.iosql")
 # 正确：PostgreSQL 使用 postgresql:// 前缀
 db = Database("postgresql://user:pass@localhost:5432/mydb")
 
+# 正确：Parquet 使用 parquet:// 前缀
+db = Database("parquet://db/archive.iosql")
+
 # 错误：直接传文件路径（低层 mysqlite 才接受）
 db = Database("db/market.iosql")  # 报 InvalidUriSchema
 ```
 
 ### EngineNotExist
 
-**症状**：URI schema 不是 `sqlite`/`sqlite3`/`postgresql`。
+**症状**：URI schema 不是 `sqlite`/`sqlite3`/`parquet`/`postgresql`。
 
 ```python
 db = Database("mysql://localhost/db")  # EngineNotExist
@@ -312,7 +315,54 @@ python -m pip install --upgrade iosql
 仓库开发环境可用 `python -m pip install -e .`。其他 Parquet 使用差异见
 [Parquet 使用指南](parquet.md)。
 
-## SQLite 到 PostgreSQL 迁移
+## 统一迁移与协作锁
+
+异常从 `iosql.exception` 导入；SQLite、Parquet 和 PostgreSQL 共用以下迁移规则。
+
+### DatabaseBusy / MigrationLockTimeout
+
+`DatabaseBusy` 表示协作 API 遇到迁移或恢复的独占租约，当前调用尚未进入业务读写。
+正式迁移等待源/目标锁超过 `lock_timeout` 时抛 `MigrationLockTimeout`。
+
+先耗尽或关闭已开始消费的读取流，flush 内存缓冲并退出 `buffered_writer` 上下文，
+结束 PostgreSQL 未提交事务。同线程仍持共享租约时升级独占锁会直接抛 `UnsafeOperation`，
+增加超时时间无法解决；其他线程/进程的长操作则需等待结束或调整 `lock_timeout`。
+
+提前退出读取循环时可显式管理流的生命周期：
+
+```python
+from contextlib import closing
+
+with closing(ticks.query(order_by="ts").iter_rows()) as rows:
+    first = next(rows, None)
+# 退出时关闭流，释放读取租约，然后才迁移或维护
+```
+
+### MigrationRecoveryRequired / 发布状态不确定
+
+发现待恢复提交记录，或控制记录/物理代际身份无法确认时，库会阻止普通访问。
+正常读写可在独占恢复锁下完成已有提交决定；dry-run 只报告需要恢复，不执行恢复。
+
+保留异常中的 `operation_id`、`stage`、`partial_result` 和 `recovery_path`（部分字段可为 None），
+按任务 ID 核对持久状态。若有 `partial_result`，其 `published` 为 True 表示已发布，False 表示未发布，
+None 表示状态不确定；`rows_copied` 本身不能证明提交。状态未确认前不要重复追加迁移，
+也不要删除控制记录或代际目录。身份校验仍失败时，保留现场并检查路径完整性或从有效备份恢复。
+
+本地逻辑 URI 经迁移后可能指向 `__iosql_generations__/<任务ID>/`；不能假定表目录始终在
+库根下，也不能丢弃父目录 `.iosql-locks/` 的控制记录。复制已发布数据使用备份/恢复入口。
+
+### dry-run 通过，正式迁移仍失败
+
+dry-run 只读源契约和行数，不连接目标。目标连接、权限、已有契约和空表条件要在正式迁移时
+检查。`specs` 的键必须是本次已选源表名；`mode="replace"` 不清空目标，也不允许覆盖
+不兼容契约。本地源与目标不能相同或互相包含，`temp_dir` 不得位于目标库内。
+转换工作区及完整目标代际需要额外空间，已有目标的未选中表也会复制。
+
+### 路径或快照报 UnsafeOperation
+
+库锁文件拒绝符号链接及 Windows 重解析点，快照根与子项同样拒绝链接/junction。
+检查源库、目标和锁文件是否为预期路径；不要通过删除锁文件或绕过检查来继续迁移。
+演示见 [17_safe_migration_and_paths.py](../examples/17_safe_migration_and_paths.py)。
 
 ### 缺少 psycopg2
 
@@ -355,22 +405,23 @@ iosql migrate -s sqlite://db/market.iosql \
   --batch-size 50000
 ```
 
-### row-count 校验失败
+### MigrationVerificationError / row-count 校验失败
 
-**症状**：`verify="row-count"` 或 `iosql migrate --verify row-count` 抛出
-`row-count verification failed`。
+**症状**：`verify="row-count"` 或 `iosql migrate --verify row-count` 报错。
+目标非空的前置检查抛 `BadArgument`；转换后的行数不一致抛 `MigrationVerificationError`，
+消息含 `row-count verification failed`。
 
 **常见原因**：
 
-1. 目标表在迁移前已有旧数据。
-2. 使用 `ignore` / `upsert` 导致目标实际新增行数少于源行数。
-3. 迁移期间源 SQLite 库仍有写入，源行数发生变化。
+1. 目标表在迁移前已有数据，不满足空表条件，会在转换前直接拒绝。
+2. 源表存在跨 segment/分区重复主键，目标写入策略合并或忽略后行数减少。
+3. 原始文件程序或未接入协调协议的旧客户端在迁移期间改写源数据。
 
 **排查**：
 
 1. 先执行 `iosql migrate ... --dry-run` 确认源表行数和批次数。
 2. 对全量迁移使用空目标表或独立目标表名。
-3. 迁移窗口内暂停源库写入，再执行 `--verify row-count`。
+3. 检查源主键是否适合目标布局与冲突策略，停用绕过库级租约的外部写入，再执行校验。协作 API 的源/目标读写由正式迁移自动阻止。
 
 ### PostgreSQL delete 行为与 SQLite 对齐
 

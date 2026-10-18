@@ -63,7 +63,8 @@ with Database("parquet://db/archive.iosql") as db:
 由各物理文件约束，跨文件唯一性需由调用方保证。
 
 文件替换以单个 Parquet 文件为原子单位；多文件写入和 manifest 更新没有统一事务。
-跨文件读取没有统一快照。需要一致迁移时，先暂停源库写入。
+普通跨文件读取没有统一快照。`migrate_to()` 全程持源/目标独占租约，
+协作 API 在此期间报 `DatabaseBusy`；迁移前先关闭读取流、flush 缓冲并退出缓冲写入上下文。
 
 ## 流式读取与并发
 
@@ -114,9 +115,15 @@ with Database("parquet://db/archive.iosql") as source:
     )
 ~~~
 
-`tables` 可选全库、表名列表或 `{源表: 目标表}` 映射。迁移目标不能与源目录相同或位于
-源目录内部；行数校验应使用干净的目标表。迁移前确认源表有持久化契约，并在迁移窗口暂停
-写入。
+`tables` 可选全库、表名列表或 `{源表: 目标表}` 映射，`specs` 按源名调整目标分区/segment。
+本地源与目标不能相同或互相包含；行数校验要求选中目标表不存在或为空。
+迁移前确认源表有完整契约，释放读取流和缓冲上下文，并预留暂存与完整目标代际的空间。
+dry-run 只读源、不连接目标，不验证目标权限、已有契约或空表条件；可能创建源协调锁文件。
+
+迁移先转换、校验，再统一发布。成功时检查 `result.published` 与 `result.verified`；
+`rows_copied` 可包含 ignore 跳过的行，实际写入量看 `rows_written`。失败时依据异常中的
+`operation_id`、`partial_result` 和 `recovery_path` 查明状态，再决定重试；
+详见[迁移错误排查](troubleshooting.md#统一迁移与协作锁)。
 
 CLI 只为 `migrate` 提供 Parquet URI 支持：
 
