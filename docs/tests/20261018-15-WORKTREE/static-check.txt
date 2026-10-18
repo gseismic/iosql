@@ -1,0 +1,13 @@
+All checks passed!
+iosql/cli.py: OK
+iosql/coordination.py: OK
+iosql/database.py: OK
+iosql/engines/parquet/table.py: OK
+iosql/engines/sqlite/table.py: OK
+iosql/file_lock.py: OK
+iosql/migration.py: OK
+iosql/table.py: OK
+iosql/utils/storage_identity.py: OK
+tests/test_file_lock.py: OK
+tests/test_plan084_migration_review.py: OK
+git diff --check 与本任务新增文本空白检查通过。

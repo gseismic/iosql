@@ -26,6 +26,7 @@
 | `14_parquet_backend.py` | 高级 | Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
 | `15_postgresql_timeseries_query.py` | 高级 | PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
 | `16_sqlite_to_parquet.py` | 进阶 | 准备 SQLite 源表，dry-run 后迁移到 Parquet，并在目标端查询和校验。 |
+| `17_safe_migration_and_paths.py` | 高级 | 演示大小写路径保留、安全迁移与备份、快照拒绝 junction、库锁拒绝符号链接。 |
 
 ## 金融示例
 
@@ -70,11 +71,14 @@ python examples/12_sqlite_postgresql_roundtrip.py
 python examples/13_streaming_ordered_query.py
 python examples/14_parquet_backend.py
 python examples/16_sqlite_to_parquet.py
+uv run --with-editable . python examples/17_safe_migration_and_paths.py
 PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
 `11_sqlite_to_postgresql_migration.py` 未设置 `POSTGRES_DSN` 时只执行 SQLite 源库准备和 dry-run；设置 `POSTGRES_DSN` 后会重建示例目标表并执行真实 PostgreSQL 迁移和行数校验。
 `12_sqlite_postgresql_roundtrip.py` 未设置 `POSTGRES_DSN` 时只执行 dry-run；设置后会演示 `sqlite -> postgresql -> sqlite` 双向转换。
+
+`17_safe_migration_and_paths.py` 在自己的临时演示目录中运行，结束后自动清理。Windows 上使用 `fsutil` 尝试启用大小写敏感目录，以 `mklink /J` 创建真实 junction；系统能力或权限不足时明确跳过对应场景。库锁符号链接需要 Windows 的相应权限。Linux/macOS 使用实际符号链接演示拒绝行为，输出会注明未验证 Windows 原机行为。快照部分使用与 CLI `iosql backup` 共用的内部维护入口。
 
 ## 运行时数据
 

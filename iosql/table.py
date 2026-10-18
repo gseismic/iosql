@@ -38,6 +38,7 @@ class BaseTable(metaclass=ABCMeta):
             return
         owner = getattr(self, '_owner_db', None)
         pg_contract = getattr(self, '_contract', None) if self._uri_schema == 'postgresql' else None
+        local_declaration = getattr(self, '_declared_spec', None)
         args, kwargs = list(constructor[0]), dict(constructor[1])
         if self._uri_schema in ('sqlite', 'sqlite3'):
             import copy
@@ -60,6 +61,9 @@ class BaseTable(metaclass=ABCMeta):
             type(self).__init__(self, *args, **kwargs)
             if pg_contract is not None:
                 self._restore_contract_after_migration(pg_contract)
+            elif local_declaration is not None and self.get_table_meta() is None:
+                # 未物化表没有落盘契约；保留仍在新视图中的当前实例声明。
+                self.use_contract(local_declaration)
             if owner is not None:
                 self._owner_db = owner
         finally:

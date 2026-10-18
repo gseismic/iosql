@@ -161,9 +161,13 @@ class Database(object):
         if self._uri_schema == 'postgresql':
             # PG 契约原来由实例保存，保留对象，交给表入口只读重连校验。
             return
+        from .coordination import physical_root
+        root = physical_root(self._uri)
         with self._tables_lock:
             previous = list(self._tables.values())
-            self._tables.clear()
+            # 保留仍存在的对象，尤其是契约尚未落盘的空表声明。
+            self._tables = {name: table for name, table in self._tables.items()
+                            if (root / name).is_dir()}
         for table in previous:
             if getattr(table, '_iosql_generation', None) == self._iosql_generation:
                 continue

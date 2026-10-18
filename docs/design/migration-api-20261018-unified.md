@@ -639,3 +639,20 @@ Database 保留 PG 实例缓存；旧 Table 在下一次受保护操作中关闭
 ### 12.6 缓冲写入
 
 已有 buffered_writer 的 append/flush 同样受库租约约束；with 上下文持续持共享租约，迁移须等其 flush/退出。flush 失败保留输入，不自动重试。没有使用上下文的缓冲写入者应先显式 flush；迁移复制已持久化源数据，不把内存中的待写缓冲视为源库记录。URI 中显式 connect_timeout 在专用 PG 连接上保留，不被锁等待配置覆盖。
+
+## 13. 审查修订（2026-10-18 15:39）
+
+基准 abc30fee0d812626d140bb3d9fcf7a870ac953e7；本节由 Codex（GPT-6，精确模型 ID 未提供）修订，实施见 docs/dev/PLAN-084-model-unknown-migration-review-fixes.md。
+
+- 发布后仍持独占租约时，将旧物理内容退休到库父目录稳定协调空间内的任务专属目录；锁外删除不再解析旧逻辑路径。若退休失败，仅报告残留，不删除可能已经复用的路径、不撤销新视图。
+- 快照过滤必须区分业务目录与 SQLite 侧车文件；合法业务表名不得因以 -wal/-shm 结尾或名为 .iosql-locks 而被忽略。
+- Windows 使用原生共享/独占文件锁，保持与 flock 相同的协调语义。普通访问不因缺少 fcntl 或 POSIX 目录同步接口失败；Windows 不宣称与 POSIX 目录 fsync 相同的断电持久性，原机及断电测试另行记录。
+- allow_empty=True 可以接纳全部为合法空表 scaffold 的目录库，但不接纳无关子目录；未写入的本地表声明跨代际刷新仍保留，新视图已有持久契约时以新契约为准。
+- 内部关闭和重连不得把有效句柄永久标记为用户关闭；calendar 持久分区范围保留既有毫秒格式，仅在分区裁剪比较时把秒级条件换算为毫秒，segment 的实际值统计仍使用秒。不要求重写已生成的 manifest。
+- ui 与 web 别名的启动行为一致，均不占用服务器整个生命周期的库共享租约。
+
+Windows 的共享/独占、立即返回和显式解锁参数依据 [Microsoft LockFileEx 文档](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-lockfileex)，通过标准库 ctypes 惰性绑定，不增加运行依赖。
+
+PLAN-085 补充：Windows 打开最终 `.lock` 文件时使用 `CreateFileW(OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT)`，再通过 `GetFileInformationByHandleEx(FileAttributeTagInfo)` 检查已打开句柄，发现任何重解析属性均抛 `UnsafeOperation`。句柄仅共享读写、不共享删除，防止持锁期间替换锁文件；验证通过后转为不可继承的 CRT 描述符，验证或转换失败时释放原生句柄。依据 [CreateFileW](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilew) 与 [GetFileInformationByHandleEx](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getfileinformationbyhandleex)。原机验证边界见 `docs/dev/PLAN-085-windows-lock-reparse-points-OUTCOME.md`。
+
+PLAN-086 补充：`resource()` 和 `physical_path()` 仅对锁身份使用 `normcase()`，文件系统访问、库控制目录和代际定位使用保留实际大小写的 `realpath()`。快照复制先对根目录和每个子项执行 `lstat()`，在过滤或递归前拒绝符号链接及 Windows 的 `FILE_ATTRIBUTE_REPARSE_POINT`，包含不会被 `is_symlink()` 识别的目录 junction；普通文件/目录分类复用该次属性结果。相关测试包含 Windows 原机的大小写敏感目录和 `mklink /J` 场景，当前 Linux 验证结果和原机执行边界见 `docs/dev/PLAN-086-windows-paths-and-snapshot-junctions-OUTCOME.md`。

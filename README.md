@@ -751,6 +751,10 @@ CLI 对应 `--specs '{"kline_1m":{"partition":"duration(ts,every=1hour)"}}'`，�
 
 正式迁移全程禁止源、目标的协作读写，取得不到锁的普通 API 立即抛 `DatabaseBusy`；迁移等待独占锁的总时限由 `lock_timeout=30.0` 控制。请先关闭读取流、flush 缓冲并结束未提交事务或缓冲写入上下文。锁在持久发布后释放，临时数据清理在锁外进行。临时转换默认放在原库 `__iosql_migrations__/任务ID/`，可用 `temp_dir=` 或 `--temp-dir` 更改。目标侧另准备完整代际，保证先转换、后统一发布；中断后的所有读写都会检查恢复屏障。失败的暂存保留供检查。
 
+旧内容在解锁前移入父目录协调空间的任务专属退休目录，锁外清理只删除该目录，避免误删原 URI 上后来新建的数据。合法空表可作为迁移目标，未写入表的当前实例声明在发布刷新后仍可用。库级协调层在 Windows 使用原生共享/独占文件锁；Windows 尚未进行原机和断电验证，不承诺 POSIX 目录 fsync 的同等持久性。
+
+[安全迁移与路径示例](examples/17_safe_migration_and_paths.py) 演示大小写目录、SQLite→Parquet 迁移与备份、快照 junction 和库锁符号链接拒绝。运行 `uv run --with-editable . python examples/17_safe_migration_and_paths.py`；示例会清理自己的临时目录，平台能力不足时明确跳过对应场景。
+
 `verify="row-count"` 要求所有选中目标表不存在或为空，在发布前比较真实行数。`dry_run=True` 只持源共享锁，不连接目标，不创建业务临时目录；源协调锁文件可以产生，待恢复的源库会报错。多个独立查询跨越发布时间可能分别读到旧版和新版。
 
 结果保留 `rows_copied` 等旧字段，新增 `published`、`operation_id`、`rows_written` 和逐表 `source_spec/target_spec/partitions_created`。`rows_copied` 包括 ignore 成功处理但跳过的行，不能用它判断是否已经发布。失败异常包含 `partial_result`；发布状态不确定时不要盲目追加重试。原始文件访问和未接入协调协议的旧版客户端不受此锁保护。

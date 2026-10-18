@@ -190,6 +190,7 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 | `14_parquet_backend.py` | 演示 Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
 | `15_postgresql_timeseries_query.py` | 演示 PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
 | `16_sqlite_to_parquet.py` | 演示 SQLite 源库 dry-run、迁移到 Parquet、row-count 校验和目标查询。 |
+| `17_safe_migration_and_paths.py` | 演示大小写路径保留、迁移与备份，以及快照 junction/库锁符号链接拒绝。 |
 
 金融示例位于 `examples/finance/`：`01_kline_bars.py` 解决 K 线 OHLCV，
 `02_orderbook_snapshots.py` 解决高频 orderbook 快照，`03_financial_reports.py` 解决财报

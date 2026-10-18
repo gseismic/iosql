@@ -70,7 +70,7 @@ def _guard_command_errors(callback):
     @functools.wraps(callback)
     def wrapper(*args, **kwargs):
         try:
-            owned = {'migrate', 'repartition', 'backup', 'restore', 'rename_database', 'rename_table', 'web'}
+            owned = {'migrate', 'repartition', 'backup', 'restore', 'rename_database', 'rename_table', 'web', 'ui'}
             if callback.__name__ not in owned:
                 source = inspect.signature(callback).bind_partial(*args, **kwargs).arguments.get('source')
                 if source:

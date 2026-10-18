@@ -1,0 +1,280 @@
+FFFFFFFFFFFFFFFF.FFFFFFFFFFFF.F.                                         [100%]
+=================================== FAILURES ===================================
+______ test_snapshot_merge_preserves_legal_table_names[events-wal-sqlite] ______
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['events-wal', 'ticks']
+E
+E     At index 0 diff: 'ticks' != 'events-wal'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+_____ test_snapshot_merge_preserves_legal_table_names[events-wal-parquet] ______
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['events-wal', 'ticks']
+E
+E     At index 0 diff: 'ticks' != 'events-wal'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+______ test_snapshot_merge_preserves_legal_table_names[events-shm-sqlite] ______
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['events-shm', 'ticks']
+E
+E     At index 0 diff: 'ticks' != 'events-shm'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+_____ test_snapshot_merge_preserves_legal_table_names[events-shm-parquet] ______
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['events-shm', 'ticks']
+E
+E     At index 0 diff: 'ticks' != 'events-shm'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+_____ test_snapshot_merge_preserves_legal_table_names[.iosql-locks-sqlite] _____
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['.iosql-locks', 'ticks']
+E
+E     At index 0 diff: 'ticks' != '.iosql-locks'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+____ test_snapshot_merge_preserves_legal_table_names[.iosql-locks-parquet] _____
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['.iosql-locks', 'ticks']
+E
+E     At index 0 diff: 'ticks' != '.iosql-locks'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+__ test_snapshot_merge_preserves_legal_table_names[.iosql.write.lock-sqlite] ___
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['.iosql.write.lock', 'ticks']
+E
+E     At index 0 diff: 'ticks' != '.iosql.write.lock'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+__ test_snapshot_merge_preserves_legal_table_names[.iosql.write.lock-parquet] __
+tests/test_plan084_migration_review.py:36: in test_snapshot_merge_preserves_legal_table_names
+    assert target.table_names() == sorted(['ticks', name])
+E   AssertionError: assert ['ticks'] == ['.iosql.write.lock', 'ticks']
+E
+E     At index 0 diff: 'ticks' != '.iosql.write.lock'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+_____________ test_backup_preserves_legal_table_names[events-wal] ______________
+tests/test_plan084_migration_review.py:46: in test_backup_preserves_legal_table_names
+    assert backup.table_names() == [name]
+E   AssertionError: assert [] == ['events-wal']
+E
+E     Right contains one more item: 'events-wal'
+E     Use -v to get more diff
+_____________ test_backup_preserves_legal_table_names[events-shm] ______________
+tests/test_plan084_migration_review.py:46: in test_backup_preserves_legal_table_names
+    assert backup.table_names() == [name]
+E   AssertionError: assert [] == ['events-shm']
+E
+E     Right contains one more item: 'events-shm'
+E     Use -v to get more diff
+____________ test_backup_preserves_legal_table_names[.iosql-locks] _____________
+tests/test_plan084_migration_review.py:46: in test_backup_preserves_legal_table_names
+    assert backup.table_names() == [name]
+E   AssertionError: assert [] == ['.iosql-locks']
+E
+E     Right contains one more item: '.iosql-locks'
+E     Use -v to get more diff
+__________ test_backup_preserves_legal_table_names[.iosql.write.lock] __________
+tests/test_plan084_migration_review.py:46: in test_backup_preserves_legal_table_names
+    assert backup.table_names() == [name]
+E   AssertionError: assert [] == ['.iosql.write.lock']
+E
+E     Right contains one more item: '.iosql.write.lock'
+E     Use -v to get more diff
+_____________ test_cross_device_publication_preserves_named_tables _____________
+tests/test_plan084_migration_review.py:62: in test_cross_device_publication_preserves_named_tables
+    assert target.table_names() == ['events-wal', 'ticks']
+E   AssertionError: assert ['ticks'] == ['events-wal', 'ticks']
+E
+E     At index 0 diff: 'ticks' != 'events-wal'
+E     Right contains one more item: 'ticks'
+E     Use -v to get more diff
+______________ test_old_cleanup_cannot_delete_recreated_database _______________
+tests/test_plan084_migration_review.py:106: in test_old_cleanup_cannot_delete_recreated_database
+    assert observed == [['ticks'], [{'id': 777}]]
+E   AssertionError: assert [[]] == [['ticks'], [{'id': 777}]]
+E
+E     At index 0 diff: [] != ['ticks']
+E     Right contains one more item: [{'id': 777}]
+E     Use -v to get more diff
+_____________ test_migrate_into_valid_scaffold_only_target[sqlite] _____________
+tests/test_plan084_migration_review.py:117: in test_migrate_into_valid_scaffold_only_target
+    result = source.migrate_to(target.uri, verify='row-count')
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+iosql/database.py:835: in migrate_to
+    return migrate(self, target_uri, tables, mode, batch_size, verify, dry_run,
+iosql/migration.py:549: in migrate
+    publisher.preflight(plans, verify)
+iosql/migration.py:271: in preflight
+    raise UnsafeOperation('目标不是完整的 iosql 数据库，拒绝接管')
+E   iosql.exception.UnsafeOperation: 目标不是完整的 iosql 数据库，拒绝接管
+____________ test_migrate_into_valid_scaffold_only_target[parquet] _____________
+tests/test_plan084_migration_review.py:116: in test_migrate_into_valid_scaffold_only_target
+    assert empty.get_table_meta() is None
+E   AssertionError: assert {'column_info': OrderedDict({'id': {'name': 'id', 'type': 'integer', 'is_pk': True, 'default': None, 'unique': False, ...artition': None, 'table_contract': {'version': 1, 'primary_key': ['id'], 'partition': None, 'segment': None, ...}, ...} is None
+E    +  where {'column_info': OrderedDict({'id': {'name': 'id', 'type': 'integer', 'is_pk': True, 'default': None, 'unique': False, ...artition': None, 'table_contract': {'version': 1, 'primary_key': ['id'], 'partition': None, 'segment': None, ...}, ...} = get_table_meta()
+E    +    where get_table_meta = <iosql.engines.parquet.table.Table object at 0x7ca06c3c6240>.get_table_meta
+_____ test_unwritten_declaration_survives_generation_refresh[False-sqlite] _____
+tests/test_plan084_migration_review.py:142: in test_unwritten_declaration_survives_generation_refresh
+    assert draft.spec() is not None
+E   assert None is not None
+E    +  where None = spec()
+E    +    where spec = <iosql.engines.sqlite.table.Table object at 0x7ca06c3c6600>.spec
+____ test_unwritten_declaration_survives_generation_refresh[False-parquet] _____
+tests/test_plan084_migration_review.py:139: in test_unwritten_declaration_survives_generation_refresh
+    source.migrate_to(target.uri)
+iosql/database.py:835: in migrate_to
+    return migrate(self, target_uri, tables, mode, batch_size, verify, dry_run,
+iosql/migration.py:549: in migrate
+    publisher.preflight(plans, verify)
+iosql/migration.py:271: in preflight
+    raise UnsafeOperation('目标不是完整的 iosql 数据库，拒绝接管')
+E   iosql.exception.UnsafeOperation: 目标不是完整的 iosql 数据库，拒绝接管
+_____ test_unwritten_declaration_survives_generation_refresh[True-sqlite] ______
+tests/test_plan084_migration_review.py:142: in test_unwritten_declaration_survives_generation_refresh
+    assert draft.spec() is not None
+E   assert None is not None
+E    +  where None = spec()
+E    +    where spec = <iosql.engines.sqlite.table.Table object at 0x7ca06c3c6fc0>.spec
+_____ test_unwritten_declaration_survives_generation_refresh[True-parquet] _____
+tests/test_plan084_migration_review.py:139: in test_unwritten_declaration_survives_generation_refresh
+    source.migrate_to(target.uri)
+iosql/database.py:835: in migrate_to
+    return migrate(self, target_uri, tables, mode, batch_size, verify, dry_run,
+iosql/migration.py:549: in migrate
+    publisher.preflight(plans, verify)
+iosql/migration.py:271: in preflight
+    raise UnsafeOperation('目标不是完整的 iosql 数据库，拒绝接管')
+E   iosql.exception.UnsafeOperation: 目标不是完整的 iosql 数据库，拒绝接管
+_______ test_internal_reconnect_does_not_mark_live_handle_closed[table] ________
+tests/test_plan084_migration_review.py:162: in test_internal_reconnect_does_not_mark_live_handle_closed
+    assert handle.select_all('*', order_by='id') == [{'id': 1}, {'id': 2}]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+iosql/coordination.py:468: in regular
+    with operation(self, refresh=not closing):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+iosql/coordination.py:441: in operation
+    _refresh(target, entry.generation)
+iosql/coordination.py:426: in _refresh
+    refresh()
+iosql/table.py:29: in _reload_after_migration
+    raise UnsafeOperation('表已经关闭，请重新通过 Database.table() 打开')
+E   iosql.exception.UnsafeOperation: 表已经关闭，请重新通过 Database.table() 打开
+______ test_internal_reconnect_does_not_mark_live_handle_closed[database] ______
+tests/test_plan084_migration_review.py:162: in test_internal_reconnect_does_not_mark_live_handle_closed
+    assert handle.select_all('*', order_by='id') == [{'id': 1}, {'id': 2}]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+iosql/coordination.py:468: in regular
+    with operation(self, refresh=not closing):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+iosql/coordination.py:441: in operation
+    _refresh(target, entry.generation)
+iosql/coordination.py:426: in _refresh
+    refresh()
+iosql/table.py:29: in _reload_after_migration
+    raise UnsafeOperation('表已经关闭，请重新通过 Database.table() 打开')
+E   iosql.exception.UnsafeOperation: 表已经关闭，请重新通过 Database.table() 打开
+_____ test_internal_reconnect_does_not_mark_live_handle_closed[reconnect] ______
+tests/test_plan084_migration_review.py:162: in test_internal_reconnect_does_not_mark_live_handle_closed
+    assert handle.select_all('*', order_by='id') == [{'id': 1}, {'id': 2}]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+iosql/coordination.py:468: in regular
+    with operation(self, refresh=not closing):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+iosql/coordination.py:441: in operation
+    _refresh(target, entry.generation)
+iosql/coordination.py:426: in _refresh
+    refresh()
+iosql/table.py:29: in _reload_after_migration
+    raise UnsafeOperation('表已经关闭，请重新通过 Database.table() 打开')
+E   iosql.exception.UnsafeOperation: 表已经关闭，请重新通过 Database.table() 打开
+_________ test_seconds_calendar_query_pruning_and_reopen[False-sqlite] _________
+tests/test_plan084_migration_review.py:179: in test_seconds_calendar_query_pruning_and_reopen
+    assert ticks.query(start=3600, end=7200).to_list() == [{'ts': 3601}]
+E   AssertionError: assert [] == [{'ts': 3601}]
+E
+E     Right contains one more item: {'ts': 3601}
+E     Use -v to get more diff
+________ test_seconds_calendar_query_pruning_and_reopen[False-parquet] _________
+tests/test_plan084_migration_review.py:179: in test_seconds_calendar_query_pruning_and_reopen
+    assert ticks.query(start=3600, end=7200).to_list() == [{'ts': 3601}]
+E   AssertionError: assert [] == [{'ts': 3601}]
+E
+E     Right contains one more item: {'ts': 3601}
+E     Use -v to get more diff
+_________ test_seconds_calendar_query_pruning_and_reopen[True-sqlite] __________
+tests/test_plan084_migration_review.py:179: in test_seconds_calendar_query_pruning_and_reopen
+    assert ticks.query(start=3600, end=7200).to_list() == [{'ts': 3601}]
+E   AssertionError: assert [] == [{'ts': 3601}]
+E
+E     Right contains one more item: {'ts': 3601}
+E     Use -v to get more diff
+_________ test_seconds_calendar_query_pruning_and_reopen[True-parquet] _________
+tests/test_plan084_migration_review.py:179: in test_seconds_calendar_query_pruning_and_reopen
+    assert ticks.query(start=3600, end=7200).to_list() == [{'ts': 3601}]
+E   AssertionError: assert [] == [{'ts': 3601}]
+E
+E     Right contains one more item: {'ts': 3601}
+E     Use -v to get more diff
+__________ test_server_alias_does_not_hold_command_lifetime_lease[ui] __________
+tests/test_plan084_migration_review.py:211: in test_server_alias_does_not_hold_command_lifetime_lease
+    assert observed == ['unlocked']
+E   AssertionError: assert ['busy'] == ['unlocked']
+E
+E     At index 0 diff: 'busy' != 'unlocked'
+E     Use -v to get more diff
+____________ test_local_operations_without_fcntl_use_portable_lock _____________
+tests/test_plan084_migration_review.py:216: in test_local_operations_without_fcntl_use_portable_lock
+    from iosql import file_lock
+E   ImportError: cannot import name 'file_lock' from 'iosql' (/home/lsl/macbook/pai-studio-fin/library/iosql/iosql/__init__.py)
+=========================== short test summary info ============================
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[events-wal-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[events-wal-parquet]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[events-shm-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[events-shm-parquet]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[.iosql-locks-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[.iosql-locks-parquet]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[.iosql.write.lock-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_snapshot_merge_preserves_legal_table_names[.iosql.write.lock-parquet]
+FAILED tests/test_plan084_migration_review.py::test_backup_preserves_legal_table_names[events-wal]
+FAILED tests/test_plan084_migration_review.py::test_backup_preserves_legal_table_names[events-shm]
+FAILED tests/test_plan084_migration_review.py::test_backup_preserves_legal_table_names[.iosql-locks]
+FAILED tests/test_plan084_migration_review.py::test_backup_preserves_legal_table_names[.iosql.write.lock]
+FAILED tests/test_plan084_migration_review.py::test_cross_device_publication_preserves_named_tables
+FAILED tests/test_plan084_migration_review.py::test_old_cleanup_cannot_delete_recreated_database
+FAILED tests/test_plan084_migration_review.py::test_migrate_into_valid_scaffold_only_target[sqlite]
+FAILED tests/test_plan084_migration_review.py::test_migrate_into_valid_scaffold_only_target[parquet]
+FAILED tests/test_plan084_migration_review.py::test_unwritten_declaration_survives_generation_refresh[False-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_unwritten_declaration_survives_generation_refresh[False-parquet]
+FAILED tests/test_plan084_migration_review.py::test_unwritten_declaration_survives_generation_refresh[True-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_unwritten_declaration_survives_generation_refresh[True-parquet]
+FAILED tests/test_plan084_migration_review.py::test_internal_reconnect_does_not_mark_live_handle_closed[table]
+FAILED tests/test_plan084_migration_review.py::test_internal_reconnect_does_not_mark_live_handle_closed[database]
+FAILED tests/test_plan084_migration_review.py::test_internal_reconnect_does_not_mark_live_handle_closed[reconnect]
+FAILED tests/test_plan084_migration_review.py::test_seconds_calendar_query_pruning_and_reopen[False-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_seconds_calendar_query_pruning_and_reopen[False-parquet]
+FAILED tests/test_plan084_migration_review.py::test_seconds_calendar_query_pruning_and_reopen[True-sqlite]
+FAILED tests/test_plan084_migration_review.py::test_seconds_calendar_query_pruning_and_reopen[True-parquet]
+FAILED tests/test_plan084_migration_review.py::test_server_alias_does_not_hold_command_lifetime_lease[ui]
+FAILED tests/test_plan084_migration_review.py::test_local_operations_without_fcntl_use_portable_lock
+29 failed, 3 passed in 3.02s

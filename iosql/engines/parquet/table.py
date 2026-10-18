@@ -113,6 +113,7 @@ class Table(DirectoryTable):
             meta['partition'] = partition.to_meta() if partition else None
             self._overwrite_table_meta(meta)
             self._persist_contract_metadata(contract)
+        os.makedirs(self.table_part_path, exist_ok=True)
         return result
 
     def insert_all(self, data, pk=None, extra_data=None, partition=None,
@@ -167,7 +168,7 @@ class Table(DirectoryTable):
                     yield
                 return
             fd = os.open(os.path.join(self.table_path, '.iosql.write.lock'),
-                         os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+                         os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
             while True:
                 try:
                     fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)

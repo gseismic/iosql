@@ -7,6 +7,7 @@ import math
 import os
 import shutil
 import sqlite3
+import stat
 import time
 import uuid
 import warnings
@@ -15,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .coordination import (
-    after_leases, atomic_json, exclusive_resources, lease, operation, physical_root, resource,
+    after_leases, atomic_json, ensure_directory, exclusive_resources, lease, operation, physical_root, resource,
     sync_directory, timeout_value,
 )
 from .exception import (
@@ -207,27 +208,36 @@ def _sync_tree(path):
         sync_directory(base)
 
 
+def _snapshot_stat(path):
+    """不跟随快照项；Windows junction 需检查重解析属性，不能只看 symlink。"""
+    value = path.lstat()
+    if stat.S_ISLNK(value.st_mode) or getattr(value, 'st_file_attributes', 0) & 0x400:
+        raise UnsafeOperation(f'数据库含符号链接或重解析点，拒绝复制: {path}')
+    return value
+
+
 def copy_snapshot(source, destination):
     """复制已锁定的目录快照，SQLite 必须包含已提交 WAL 页。"""
     source, destination = Path(source), Path(destination)
+    _snapshot_stat(source)
     destination.mkdir(parents=True, exist_ok=False)
     for child in source.iterdir():
-        if child.is_symlink():
-            raise UnsafeOperation(f'数据库含符号链接，拒绝复制: {child}')
-        if child.name in ('__iosql_generations__', '__iosql_migrations__',
-                          '__generation__.json', '.iosql-locks'):
+        info = _snapshot_stat(child)
+        if child.name in ('__iosql_generations__', '__iosql_migrations__', '__generation__.json'):
             continue
-        if child.name.endswith(('-wal', '-shm')) or child.name == '.iosql.write.lock':
+        regular_file = stat.S_ISREG(info.st_mode)
+        if regular_file and (child.name.endswith(('.sqlite3-wal', '.sqlite3-shm'))
+                             or child.name == '.iosql.write.lock'):
             continue
         target = destination / child.name
-        if child.is_dir():
+        if stat.S_ISDIR(info.st_mode):
             copy_snapshot(child, target)
-        elif child.suffix == '.sqlite3':
+        elif regular_file and child.suffix == '.sqlite3':
             with closing(sqlite3.connect(child.resolve().as_uri() + '?mode=ro', uri=True)) as src:
                 with closing(sqlite3.connect(str(target))) as dst:
                     src.backup(dst)
                     dst.commit()
-        elif child.is_file():
+        elif regular_file:
             shutil.copy2(child, target)
         else:
             raise UnsafeOperation(f'数据库含非普通文件: {child}')
@@ -258,7 +268,8 @@ class LocalPublisher:
         self.stage_db = None
         self.candidate = None
         self.old_names = []
-        self.old_files = []
+        self.old_entries = []
+        self.retired = None
         self.previous_parts = {}
         self.decided = False
 
@@ -270,7 +281,8 @@ class LocalPublisher:
             if not is_iosql_database(root, allow_empty=True, backend=self.backend, deep=True):
                 raise UnsafeOperation('目标不是完整的 iosql 数据库，拒绝接管')
         if self.previous.is_dir():
-            self.old_files = [p.name for p in self.previous.iterdir() if p.is_file()]
+            self.old_entries = [p.name for p in self.previous.iterdir()
+                                if p.name not in ('__iosql_generations__', '__iosql_migrations__')]
         with self.factory(self.uri) as db:
             names = set(db.table_names())
             self.old_names = sorted(names)
@@ -343,6 +355,27 @@ class LocalPublisher:
         self.decided = True
         self.coordinator.write_state(state.get('generation'), transaction)
         recover_local(self.coordinator, self.coordinator.state())
+        # 仍持独占租约，先隔离旧内容；解锁后绝不再按逻辑 URI 删除。
+        try:
+            self.retire_previous(operation_id)
+        except OSError as exc:
+            warnings.warn(f'已发布，旧内容退休未完成，保留残留: {exc}', RuntimeWarning)
+
+    def retire_previous(self, operation_id):
+        parent = self.item.control_dir / (self.item.token + '.retired')
+        if parent.is_symlink():
+            raise OSError('退休目录不能是符号链接，旧内容保留在原位置')
+        ensure_directory(parent)
+        retired = parent / operation_id
+        retired.mkdir(mode=0o700)
+        self.retired = retired
+        if self.previous != self.item.path:
+            os.rename(self.previous, retired / 'generation')
+        else:
+            for name in self.old_entries:
+                os.rename(self.previous / name, retired / name)
+        sync_directory(retired)
+        sync_directory(parent)
 
     def close(self):
         if self.stage_db is not None:
@@ -351,15 +384,8 @@ class LocalPublisher:
 
     def cleanup(self, published):
         if published:
-            if self.previous != self.item.path:
-                shutil.rmtree(self.previous)
-            else:
-                # 旧缓存只会访问这些退休路径，不会触及新代际的 WAL。
-                for name in self.old_names:
-                    shutil.rmtree(self.previous / name)
-                for name in self.old_files:
-                    (self.previous / name).unlink(missing_ok=True)
-        if published:
+            if self.retired is not None:
+                shutil.rmtree(self.retired)
             shutil.rmtree(self.workspace)
 
 

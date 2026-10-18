@@ -1,0 +1,8 @@
+...............................................                          [100%]
+=============================== warnings summary ===============================
+tests/test_plan084_migration_review.py: 25 warnings
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:475: DeprecationWarning: select_all() 已废弃：等价于 select(fields, where, to_dict=True)，请改用 select(to_dict=True)
+    result = function(self, *args, **kwargs)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+47 passed, 25 warnings in 3.97s

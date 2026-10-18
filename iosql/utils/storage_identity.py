@@ -33,7 +33,7 @@ def is_iosql_table(path, *, deep=False, backend='sqlite'):
                 return False
             if deep:
                 data_dir = table_path / "data"
-                if not data_dir.is_dir() or data_dir.is_symlink():
+                if data_dir.is_symlink() or (data_dir.exists() and not data_dir.is_dir()):
                     return False
                 has_parts = conn.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='table_part'"
@@ -153,7 +153,7 @@ def is_iosql_database(path, *, allow_empty=False, deep=False, backend='sqlite'):
         valid_tables = [child for child in directories
                         if is_iosql_table(child, deep=deep, backend=backend)]
         if not valid_tables:
-            return False
+            return allow_empty and all(is_iosql_scaffold(child) for child in directories)
         # 库根目录的普通文件允许随完整备份恢复；普通子目录不能伪装成表。
         return all(child in valid_tables or is_iosql_scaffold(child) for child in directories)
     except OSError:

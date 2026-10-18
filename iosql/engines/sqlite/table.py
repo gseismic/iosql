@@ -3754,6 +3754,12 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _excluded_parts_by_case(self, infos, case):
         op, case_min, case_max = self._case_partition_range(case)
+        if (getattr(self._partition, 'PARTITION_TYPE', None) == 'calendar'
+                and getattr(self._partition, 'time_unit', None) == 's'
+                and case.field == self._partition.TS_COL):
+            # 分区范围沿用毫秒格式；segment 的原始秒值统计不经过此换算。
+            case_min = case_min * 1000 if case_min is not None else None
+            case_max = case_max * 1000 if case_max is not None else None
         excluded_parts = set()
         for info in infos:
             part = info["part"]

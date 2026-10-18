@@ -1,0 +1,28 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+____________ test_local_operations_without_fcntl_use_portable_lock _____________
+tests/test_plan084_migration_review.py:245: in test_local_operations_without_fcntl_use_portable_lock
+    assert source.table_names() == ['ticks']
+           ^^^^^^^^^^^^^^^^^^^^
+iosql/coordination.py:468: in regular
+    with operation(self, refresh=not closing):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+iosql/coordination.py:439: in operation
+    with lease(uri, recover=recover) as entry:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/contextlib.py:137: in __enter__
+    return next(self.gen)
+           ^^^^^^^^^^^^^^
+iosql/coordination.py:354: in lease
+    coordinator.acquire(exclusive, deadline)
+iosql/coordination.py:154: in acquire
+    import fcntl
+tests/test_plan084_migration_review.py:235: in no_fcntl
+    raise ImportError('模拟没有 fcntl 的平台')
+E   ImportError: 模拟没有 fcntl 的平台
+=========================== short test summary info ============================
+FAILED tests/test_plan084_migration_review.py::test_local_operations_without_fcntl_use_portable_lock
+1 failed, 31 deselected in 0.13s

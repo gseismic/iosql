@@ -79,7 +79,9 @@ def resource(uri):
         path = Path(os.path.realpath(os.path.join(
             options.get('path') or '', options.get('db') or '',
         )))
-        return Resource('local:' + str(path), uri, schema, path)
+        # 身份规范化不能改写实际路径，Windows 目录可以启用大小写敏感。
+        key = 'local:' + os.path.normcase(str(path))
+        return Resource(key, uri, schema, path)
     if schema == 'postgresql':
         parsed = urlsplit(uri)
         # 密码、用户名与 search_path 不改变同一数据库的协调锁。
@@ -101,6 +103,10 @@ def timeout_value(value):
 
 
 def sync_directory(path):
+    if os.name == 'nt':
+        # Windows 没有可直接等价替代 POSIX 目录 fsync 的接口。
+        # 文件本身仍 fsync；不把此平台的原子替换描述为断电持久保证。
+        return
     fd = os.open(os.fspath(path), os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
     try:
         os.fsync(fd)
@@ -148,26 +154,25 @@ class LocalCoordinator:
     def __init__(self, item):
         self.resource = item
         self.fd = None
+        self.file_lock = None
         self.pid = os.getpid()
 
     def acquire(self, exclusive, deadline):
-        import fcntl
+        from .file_lock import FileLock, open_lock_file
 
         directory = self.resource.control_dir
         if directory.is_symlink():
             raise UnsafeOperation('库锁目录不能是符号链接')
         ensure_directory(directory)
         path = directory / (self.resource.token + '.lock')
-        flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
-        flags |= getattr(os, 'O_CLOEXEC', 0)
-        self.fd = os.open(path, flags, 0o600)
+        self.fd = open_lock_file(path)
         with _fds_lock:
             _open_fds.add(self.fd)
-        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         try:
+            self.file_lock = FileLock(self.fd)
             while True:
                 try:
-                    fcntl.flock(self.fd, mode | fcntl.LOCK_NB)
+                    self.file_lock.acquire(exclusive)
                     return
                 except BlockingIOError:
                     remaining = deadline - time.monotonic()
@@ -184,12 +189,12 @@ class LocalCoordinator:
             return
         if self.fd is None:
             return
-        import fcntl
-
         fd, self.fd = self.fd, None
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if self.file_lock is not None:
+                self.file_lock.release()
         finally:
+            self.file_lock = None
             with _fds_lock:
                 _open_fds.discard(fd)
             os.close(fd)
@@ -249,7 +254,7 @@ class LocalCoordinator:
 def physical_path(path):
     """调用方须持有逻辑库租约；物理代际路径不复用。"""
     path = Path(os.path.realpath(path))
-    item = Resource('local:' + str(path), '', 'sqlite', path)
+    item = Resource('local:' + os.path.normcase(str(path)), '', 'sqlite', path)
     state = LocalCoordinator(item).state()
     return _validated_root(path, state.get('physical_root'))
 
@@ -462,13 +467,16 @@ def guarded(function):
             if preflight is not None:
                 preflight(function.__name__, args, kwargs)
             closing = function.__name__ == 'close'
+            connecting = function.__name__ == 'connect'
             if closing and ((hasattr(self, '_tables') and not self._tables)
                             or (hasattr(self, '_conn') and self._conn is None)):
                 return function(self, *args, **kwargs)
-            with operation(self, refresh=not closing):
+            with operation(self, refresh=not (closing or connecting)):
                 result = function(self, *args, **kwargs)
                 if closing and not getattr(self, '_iosql_invalidating', False):
                     self._iosql_explicitly_closed = True
+                elif connecting:
+                    self._iosql_explicitly_closed = False
                 return result
         wrapped = regular
     wrapped._iosql_guarded = True

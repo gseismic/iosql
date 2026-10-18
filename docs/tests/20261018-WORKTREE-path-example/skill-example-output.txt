@@ -1,0 +1,6 @@
+大小写路径通过：MyDB 正常读写，mydb 保持完整
+迁移与备份通过：row-count 校验成功，未选中的合法业务表保留
+快照链接已拒绝: 数据库含符号链接或重解析点，拒绝复制: /home/lsl/macbook/pai-studio-fin/library/iosql/skills/iosql-usage/examples/runtime/17-safe-paths-mkc4tfcu/LinkedSource/ticks/outside
+清除链接后备份通过，库外文件保持完整
+POSIX 库锁符号链接已拒绝: Too many levels of symbolic links
+示例执行完成，运行平台：POSIX（本次不验证 Windows 原机行为）；临时演示目录已清理
