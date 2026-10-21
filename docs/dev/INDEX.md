@@ -14,3 +14,7 @@
 | 2026-10-18 | [PLAN-087 路径安全示例与审查修复提交](PLAN-087-path-safety-example-and-commit.md) | 已完成（随本轮修复提交） | [结果](PLAN-087-path-safety-example-and-commit-OUTCOME.md)：主示例及技能副本运行通过，同步索引，提交 PLAN-084～087 相关代码与文档。 |
 | 2026-10-18 | [PLAN-088 README 与 iosql skill 同步](PLAN-088-readme-skill-sync.md) | 已完成 | [结果](PLAN-088-readme-skill-sync-OUTCOME.md)：补齐三后端能力、01～17 示例、元数据与迁移结果/异常说明；链接、示例副本、代码块语法和 skill 格式检查通过。 |
 | 2026-10-18 | [PLAN-089 保留源库的 save_as 接口](PLAN-089-save-as.md) | 已完成（随本次提交） | [结果](PLAN-089-save-as-OUTCOME.md)：新增库/表另存入口与查询计时示例，同步 README 和 skill；新增 28 项通过，扩展 419 通过、3 项基线失败、2 跳过。 |
+| 2026-10-21 17:44 | [PLAN-090 SQLite 写入性能研究](PLAN-090-model-unknown-sqlite-write-research.md) | 研究中（WORKTREE） | 已确认固定结构批量写入中的重复类型扫描热点，继续验证批次、segment 与冲突策略。 |
+| 2026-10-21 18:10 | [PLAN-090 SQLite 写入性能研究](PLAN-090-model-unknown-sqlite-write-research.md) | 已完成研究（WORKTREE） | [结果](PLAN-090-model-unknown-sqlite-write-research-OUTCOME.md)：真实 CSV 导入首要耗时是写入前的 legacy 全列统计；当前源码隔离实验整体约 5.5 倍、90 轮通用对照完成。引擎与业务代码未改，两个性能问题已记录待修复。 |
+| 2026-10-21 18:27 | [PLAN-091 普通查询取消 legacy 统计预扫描](PLAN-091-model-unknown-query-without-legacy-stat-scans.md) | 实施中（WORKTREE） | 按用户确认的时间分区语义修复查询寻址，保留条件过滤、诊断统计及 row segment 的已有裁剪。 |
+| 2026-10-21 19:30 | [PLAN-091 普通查询取消 legacy 统计预扫描](PLAN-091-model-unknown-query-without-legacy-stat-scans.md) | 已完成（WORKTREE） | [结果](PLAN-091-model-unknown-query-without-legacy-stat-scans-OUTCOME.md)：相关回归 271 项通过；真实 CSV 副本导入 0.7624 → 0.1031 秒，保留全主键检查。6 项既有失败经 HEAD 复现，另记录连接池偶发异常。 |

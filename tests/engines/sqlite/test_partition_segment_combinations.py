@@ -13,7 +13,6 @@ partition 与 segment 四种组合的完整测试。
 """
 
 import os
-import shutil
 
 import pytest
 
@@ -208,8 +207,10 @@ class TestNeitherPartitionNorSegment:
             "*",
             where={"field": "id", "op": ">", "value": 10},
         )
-        # 无匹配数据时 scanned_partitions 为空
-        assert plan.scanned_partitions == []
+        # 无分区边界可供裁剪时仍检查该文件，结果是否为空由实际 SQL 决定。
+        assert plan.scanned_partitions == table.table_parts()
+        assert plan.skipped_partitions == []
+        assert table.select(where={"field": "id", "op": ">", "value": 10}) == []
         db.close()
 
     def test_spec_persists_across_reopen(self, tmp_path):

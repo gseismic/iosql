@@ -40,6 +40,9 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
   bool 等非法值抛 `PartitionSpecError`（`BadArgument` 子类）。
 - `segment` 支持 `max_rows`/`target_rows`/`min_rows` 三级参数和可选 `stats_columns`；
   partition/time/order/session 字段会自动保留 min/max 统计。
+- SQLite 普通查询使用已保存的分区边界定位 legacy 文件，不预扫描全列 MIN/MAX、时间范围和 COUNT；
+  row segment 继续复用已有 manifest 统计。显式 `count_rows()` 只统计行数；
+  `segments()`、布局/校验及 explain 等诊断仍可读取完整统计，explain 的裁剪决定与普通查询一致。
 - **单 writer 保证**：写入路径与 `compact()` 共用 `_compact_lock` 串行化，消除 compact 后向旧 segment 插入的复活竞态；
   compact 与写互斥是预期吞吐代价。同一逻辑表建议单 writer，多线程读取可按需提高 `max_connections_per_file`。
 - `compact()` 只整理当前可见 row segment，生成新的 sealed generation，并把旧 segment 标记为 `obsolete`；

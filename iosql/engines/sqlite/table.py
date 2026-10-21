@@ -1571,7 +1571,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if batch_size <= 0:
             raise BadArgument('batch_size must be a positive integer')
 
-        for ref in self._physical_part_refs():
+        for ref in self._physical_part_refs(lightweight=True):
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
             offset = 0
@@ -1604,7 +1604,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def count_rows(self):
         total = 0
-        for ref in self._physical_part_refs():
+        for ref in self._physical_part_refs(lightweight=True):
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
             with self._part_db(part_dbfile, auto_commit=False) as db:
@@ -2281,7 +2281,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             for cases in w.or_and_cases:
                 candidate_parts = self._get_select_parts(cases)
                 candidate_partition_keys.update(candidate_parts)
-                candidate_refs = self._physical_part_refs(candidate_parts)
+                # 裁剪决定复用普通查询的轻量引用；上方完整引用仅用于诊断展示。
+                candidate_refs = self._physical_part_refs(candidate_parts, lightweight=True)
                 candidate_ref_keys.update(
                     self._segment_lookup_key(ref) for ref in candidate_refs
                 )
@@ -2951,14 +2952,17 @@ class Table(TimeseriesQueryMixin, BaseTable):
     def _legacy_segment_info(self, logical_part, lightweight=False):
         """构建 legacy 分区的 segment 信息。
 
-        lightweight=True 供纯查询路径（无 where，裁剪统计不会被消费）使用：
-        跳过列统计/时间/session/COUNT 四项数据文件扫描（每项都是全段扫描，
-        24 列大表上 13 段合计 4s+），只保留查询寻址必需字段。PLAN-069 P1。
+        普通数据访问使用 lightweight，只保留文件寻址字段；完整统计供显式诊断。
+        已登记的 legacy 文件缺失时保留引用，由访问前的完整性检查报错。
         """
         path = self._get_part_dbfile(logical_part)
-        if not os.path.isfile(path):
-            return None
-        if lightweight:
+        exists = os.path.isfile(path)
+        if not exists:
+            spec = self.spec()
+            # segmented 布局只有 manifest 中的段文件，不要求存在同名 legacy 文件。
+            if spec and spec.segment:
+                return None
+        if lightweight or not exists:
             return SegmentInfo(
                 logical_part=logical_part,
                 segment_id=-1,
@@ -3101,11 +3105,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _get_select_part_refs(self, cases, skip_segment_stats=False):
         need_parts = self._get_select_parts(cases)
-        # 无 where 或有界执行预算路径跳过裁剪统计，避免为计算裁剪信息
-        # 预先扫描 legacy 文件；where 仍由实际查询执行，结果语义不变。
-        refs = self._physical_part_refs(
-            need_parts, lightweight=(not cases or skip_segment_stats),
-        )
+        # 分区边界已用于裁剪；普通查询不再为 legacy 文件临时计算列范围和行数。
+        # row segment 的既有 manifest 统计仍可使用，完整 where 始终下推 SQL。
+        refs = self._physical_part_refs(need_parts, lightweight=True)
         if not cases or skip_segment_stats:
             return refs
 
@@ -4325,6 +4327,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             )
         with self._mutation_lock():
             for ref in self._physical_part_refs():
+                self._ensure_ref_file_present(ref)
                 part_dbfile = self._get_part_dbfile(ref.part_key)
                 with self._part_db(part_dbfile, auto_commit=True) as part_db:
                     part_db[_PART_DATA_TABLE_NAME].create_index(
@@ -4335,6 +4338,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         dropped = 0
         with self._mutation_lock():
             for ref in self._physical_part_refs():
+                self._ensure_ref_file_present(ref)
                 part_dbfile = self._get_part_dbfile(ref.part_key)
                 with self._part_db(part_dbfile, auto_commit=True) as part_db:
                     dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
@@ -5087,6 +5091,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         # 每个part都手动增加字段
         for ref in self._physical_part_refs():
+            self._ensure_ref_file_present(ref)
             logger.info(f"Altering Table Schema: {ref.part_key} ..")
             part_dbfile = self._get_part_dbfile(ref.part_key)
             with self._part_db(part_dbfile, auto_commit=True) as part_db:
