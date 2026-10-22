@@ -140,9 +140,11 @@ def test_mysqlite_integrity_error_rolls_back_connection(tmp_path):
         )
         t.execute_params("INSERT INTO data (id, v) VALUES (?, ?)", [1, "a"], commit=True)
         with pytest.raises(sqlite3.IntegrityError):
-            t.execute_params(
-                "INSERT INTO data (id, v) VALUES (?, ?)", [1, "b"], commit=False
-            )
+            # 延迟提交只允许显式事务；让事务异常退出以验证连接回滚。
+            with db.transaction():
+                t.execute_params(
+                    "INSERT INTO data (id, v) VALUES (?, ?)", [1, "b"], commit=False
+                )
         t.execute_params("INSERT INTO data (id, v) VALUES (?, ?)", [2, "c"], commit=True)
         assert t.count() == 2
     finally:

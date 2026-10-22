@@ -8,7 +8,6 @@ DEPRECATED：当前核心分区实现是 `iosql.partition`（Calendar/Duration/R
 from collections import defaultdict
 from datetime import datetime
 import arrow
-import warnings
 
 
 def get_part_range(part, partition):
@@ -137,9 +136,11 @@ def get_partition_fn(partition, use_builtin=True):
     if use_builtin:
         # 默认为真
         if fn_name.startswith('TStoTSx'):
-            fn = lambda d: _partition_timestamp_div(fn_name, d)
+            def fn(d):
+                return _partition_timestamp_div(fn_name, d)
         elif fn_name.startswith('KTStoTSx'):
-            fn = lambda d: _partition_timestamp_div(fn_name, d//1000)
+            def fn(d):
+                return _partition_timestamp_div(fn_name, d//1000)
         else:
             import warnings
             warnings.warn('时间戳转为YYYYMMDDHH-like后，如果写入地和读取地时区不一致，可能导致错误的partition分区，应该放弃这种数据分区方法')
@@ -149,7 +150,8 @@ def get_partition_fn(partition, use_builtin=True):
             _name = fn_name[2:]
             # partition 11.298309803009033
             # partition 0.10912513732910156
-            fn = lambda d: arrow.get(d).format(_name)
+            def fn(d):
+                return arrow.get(d).format(_name)
             # 以下提速了几乎100倍
             # fn = lambda d: '%s%s' %(d[:4], d[5:7])
         else:

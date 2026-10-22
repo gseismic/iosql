@@ -12,16 +12,17 @@ import sys
 import threading
 import time
 import uuid
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .exception import (
     BadArgument, DatabaseBusy, MigrationLockTimeout,
-    MigrationRecoveryRequired, UnsafeOperation,
+    MigrationRecoveryRequired, UnsafeOperation, SchemaConflict,
 )
 from .utils.schema import parse_db_schema
+from .utils.mysqlite.exception import NoSuchColumn
 
 
 _FORMAT = 'iosql-coordination-v1'
@@ -241,6 +242,7 @@ class LocalCoordinator:
             'format': _FORMAT, 'identity': self.resource.key,
             'generation': generation, 'transaction': transaction,
             'physical_root': physical_root,
+            'namespace_revision': previous.get('namespace_revision'),
         })
         entry = _held().get(self.resource.key)
         if entry is not None:
@@ -292,6 +294,7 @@ class _Entry:
     exclusive: bool
     generation: str | None
     references: int = 1
+    namespace_revision: str | None = None  # 同一物理代内重命名引起的缓存失效版本。
 
 
 def _held():
@@ -339,7 +342,7 @@ def after_leases(callback):
 @contextmanager
 def lease(uri, *, exclusive=False, timeout=0.0, recover=True):
     """同线程复用租约；跨进程锁保持到最外层操作结束。"""
-    item = resource(uri)
+    item = uri if isinstance(uri, Resource) else resource(uri)
     if item.backend == 'memory':
         yield None
         return
@@ -381,6 +384,7 @@ def lease(uri, *, exclusive=False, timeout=0.0, recover=True):
                                  else '__iosql_control.migrations')
             raise
         entry = _Entry(coordinator, exclusive, state.get('generation'))
+        entry.namespace_revision = state.get('namespace_revision')
         held[item.key] = entry
         yield entry
     finally:
@@ -416,14 +420,16 @@ def _object_uri(owner, args=(), kwargs=None):
     return owner, uri
 
 
-def _refresh(owner, generation):
+def _refresh(owner, generation, namespace_revision=None):
     """已打开对象也必须观察发布版本，不能继续读旧 inode 的连接。"""
     lock = owner.__dict__.setdefault('_iosql_refresh_lock', threading.RLock())
     with lock:
         missing = object()
         previous = getattr(owner, '_iosql_generation', missing)
+        previous_revision = getattr(owner, '_iosql_namespace_revision', missing)
         owner._iosql_generation = generation
-        if previous is missing or previous == generation:
+        owner._iosql_namespace_revision = namespace_revision
+        if previous is missing or (previous == generation and previous_revision == namespace_revision):
             return
         refresh = getattr(owner, '_reload_after_migration', None)
         if refresh is not None:
@@ -431,7 +437,21 @@ def _refresh(owner, generation):
                 refresh()
             except BaseException:
                 owner._iosql_generation = previous
+                owner._iosql_namespace_revision = previous_revision
                 raise
+
+
+def invalidate_namespace(uri):
+    """重命名在独占租约内发布失效版本，不改变物理代际指针。"""
+    item = resource(uri)
+    entry = _held().get(item.key)
+    if entry is None or not entry.exclusive:
+        raise UnsafeOperation('命名空间发布需要库独占租约')
+    state = entry.coordinator.state()
+    revision = uuid.uuid4().hex
+    state.update(format=_FORMAT, identity=item.key, namespace_revision=revision)
+    atomic_json(item.state_path, state)
+    entry.namespace_revision = revision
 
 
 @contextmanager
@@ -441,9 +461,13 @@ def operation(owner, *, uri=None, recover=True, refresh=True):
     if uri is None:
         yield
         return
-    with lease(uri, recover=recover) as entry:
+    cached = getattr(target, '_iosql_resource', None)
+    if cached is None or cached.uri != uri:
+        cached = resource(uri)
+        target._iosql_resource = cached
+    with lease(cached, recover=recover) as entry:
         if entry is not None and refresh:
-            _refresh(target, entry.generation)
+            _refresh(target, entry.generation, entry.namespace_revision)
         yield
 
 
@@ -453,10 +477,26 @@ def guarded(function):
     if inspect.isgeneratorfunction(function):
         @functools.wraps(function)
         def generator(self, *args, **kwargs):
-            with operation(self):
+            from .utils.mysqlite.connection_pool import connection_deadline
+            timeout = kwargs.get('timeout_ms')
+            valid_timeout = (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+                             and math.isfinite(timeout) and timeout > 0)
+            deadline = time.monotonic() + timeout / 1000 if valid_timeout else None
+            with ExitStack() as scope:
+                with connection_deadline(deadline) if deadline is not None else nullcontext():
+                    scope.enter_context(operation(self))
                 iterator = function(self, *args, **kwargs)
                 try:
-                    yield from iterator
+                    if deadline is None:
+                        yield from iterator
+                    else:
+                        while True:
+                            try:
+                                with connection_deadline(deadline):
+                                    value = next(iterator)
+                            except StopIteration:
+                                break
+                            yield value
                 finally:
                     iterator.close()
         wrapped = generator
@@ -470,11 +510,23 @@ def guarded(function):
             connecting = function.__name__ == 'connect'
             if closing and ((hasattr(self, '_tables') and not self._tables)
                             or (hasattr(self, '_conn') and self._conn is None)):
+                if getattr(self, '_uri_schema', None) == 'postgresql':
+                    from .coordination_postgresql import close_idle_controls
+                    close_idle_controls(self._uri)
                 return function(self, *args, **kwargs)
             with operation(self, refresh=not (closing or connecting)):
-                result = function(self, *args, **kwargs)
+                try:
+                    result = function(self, *args, **kwargs)
+                except NoSuchColumn as exc:
+                    raise SchemaConflict(f'物理表缺少逻辑契约中的列: {exc}') from exc
                 if closing and not getattr(self, '_iosql_invalidating', False):
                     self._iosql_explicitly_closed = True
+                    if getattr(self, '_uri_schema', None) == 'postgresql':
+                        from .coordination_postgresql import close_idle_controls
+                        close_idle_controls(self._uri)
+                        entry = _held().get(self._iosql_resource.key)
+                        if entry is not None:
+                            entry.coordinator.reusable = False
                 elif connecting:
                     self._iosql_explicitly_closed = False
                 return result

@@ -122,10 +122,11 @@ iosql migrate -s sqlite://db/market.iosql --target parquet://db/archive.iosql --
 iosql migrate -s parquet://db/archive.iosql --target sqlite://db/restored.iosql --verify row-count
 ```
 
-Parquet 的追加、修改和删除会重写受影响的物理文件，适合批量归档与分析读取。
-建议使用 `buffered_writer()` 和 `Segment.rows` 限制写入次数与单文件大小；
+Parquet 的 append/ignore 追加写为不可变数据片，通过原子清单发布，不重写历史完整行；
+主键查重仍可能扫描历史键列。修改和删除会重写受影响的物理集合。
+建议使用 `buffered_writer()` 和 `Segment.rows` 限制数据片数与单文件大小；
 segment 表沿用现有 upsert/replace 限制。读取流存活期间，同表写入会等待；
-同一线程写入前应先耗尽或关闭读取流。数据文件原子替换，跨文件写入没有统一事务。
+同一线程写入前应先耗尽或关闭读取流。单个物理集合的清单原子切换，跨文件写入没有统一事务。
 
 支持 Python 数据与维护接口、表重命名和 CLI `migrate`。其余 CLI 命令、Web
 工作区发现、数据库目录重命名、SQLite PRAGMA、持久化索引、`commit=False`
@@ -480,6 +481,10 @@ all_segments = table.segments(include_obsolete=True)
 ```
 
 `compact()` 成功后会把旧 segment 标记为 `obsolete`，默认查询、`segments()`、`layout_report()` 和 `repartition_to()` 都只使用新 segment。`compact()` 本身不会物理删除旧 SQLite 文件；append-only 表中如果已经存在跨 segment 重复主键，compact 会把重复主键分到不同新 segment，保持现有查询结果不变。
+
+compact 使用临时磁盘进行外部排序，行数据只保留读取批和一个目标 chunk，另保留 segment 发布元数据；应预留与分区规模相当的暂存空间。新文件全部写入后，一次 manifest 事务切换可见集合并记录发布代成员。写入或发布失败保留旧集合，进程退出遗留的不可见文件可由 `validate()` 发现，重试时安全复用。`validate()` 同时核对发布记录与可见文件，合法的跨文件重复主键不视为损坏。
+
+SQLite 的 `create_index(column)` 持久保存逻辑定义，新分区、新 segment、compact 和 SQLite 目标迁移均继承；`drop_index(column)` 也删除该定义。SQLite/Parquet 的 latest 在物理文件内选出每组候选，Python 内存随组数增长；`upsert_all()` 只合并命中输入主键的行，缺字段保留旧值、显式 None 写 NULL。
 
 manifest 引用的 segment 文件缺失时，读取路径直接抛 `UnsafeOperation`，不会隐式重建空文件。`validate()` 会反向扫描 data 目录并报告未被 manifest 引用的孤儿 segment 文件（`orphan_segment_file` 警告，不计入错误）；`compact()` 遇到目标文件名被历史孤儿文件占用时，会先安全清理孤儿再复用。
 
@@ -960,7 +965,7 @@ database/
 | 能力 | SQLite | Parquet | PostgreSQL |
 | --- | --- | --- | --- |
 | 建表/契约 | `table` / `timeseries`，重开读取持久化契约 | 同 SQLite | `table` / `timeseries`；重开需显式绑定契约 |
-| 写入 | `write` / `buffered_writer` / `insert_all` / `upsert_all` | 同 SQLite，重写受影响文件 | `write` / `insert_all` / `upsert_all` |
+| 写入 | `write` / `buffered_writer` / `insert_all` / `upsert_all` | 同 SQLite；append/ignore 写新数据片，修改重写命中集合 | `write` / `insert_all` / `upsert_all` |
 | 条件查询 | `select` / `iter_select` / `iter_select_batches` | 同 SQLite | 同 SQLite，数据库端执行 |
 | 时序查询 | `query` / `latest` / `asof` | 同 SQLite | 同名接口，数据库端执行 |
 | 查询计划 | `explain_select` / 查询对象 `.explain()`，分区与 segment 裁剪 | 同 SQLite | 原生 JSON，支持 `analyze=True` |

@@ -1,0 +1,17 @@
+benchmarks/stress_open_files.py:9:8: F401 [*] `os` imported but unused
+examples/mysqlite-scenarios/02_add_drop_column.py:45:5: F841 Local variable `cached_before` is assigned to but never used
+iosql/engines/sqlite/__init__.py:1:20: F401 `.table.Table` imported but unused; consider removing, adding to `__all__`, or using a redundant alias
+iosql/partition/duration.py:2:31: F401 [*] `typing.Union` imported but unused
+iosql/utils/mysqlite/__init__.py:1:23: F401 `.database.Database` imported but unused; consider removing, adding to `__all__`, or using a redundant alias
+iosql/utils/mysqlite/__init__.py:2:20: F401 `.table.Table` imported but unused; consider removing, adding to `__all__`, or using a redundant alias
+iosql/utils/mysqlite/__init__.py:3:22: F401 `.version.__version__` imported but unused; consider removing, adding to `__all__`, or using a redundant alias
+iosql/utils/mysqlite/database.py:2:8: F401 [*] `time` imported but unused
+iosql/utils/mysqlite/database.py:4:8: F401 [*] `logging` imported but unused
+iosql/utils/mysqlite/database.py:7:8: F401 [*] `contextlib` imported but unused
+iosql/utils/partition.py:11:8: F401 [*] `warnings` imported but unused
+iosql/utils/partition.py:140:13: E731 Do not assign a `lambda` expression, use a `def`
+iosql/utils/partition.py:142:13: E731 Do not assign a `lambda` expression, use a `def`
+iosql/utils/partition.py:152:13: E731 Do not assign a `lambda` expression, use a `def`
+iosql/web/app.py:849:19: E741 Ambiguous variable name: `l`
+Found 15 errors.
+[*] 6 fixable with the `--fix` option (4 hidden fixes can be enabled with the `--unsafe-fixes` option).

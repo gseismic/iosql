@@ -32,8 +32,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 ## 决策树：选对入口
 
 批量归档或列式分析可使用 `Database("parquet://db/archive.iosql")`。DuckDB 随 iosql
-默认依赖安装，无需额外 extra。建表、查询和迁移沿用主 API；Parquet 会重写受影响的数据文件，
-适合批量写入。先看 [Parquet 使用指南](references/parquet.md) 了解性能和接口边界，再运行
+默认依赖安装，无需额外 extra。建表、查询和迁移沿用主 API；Parquet 追加采用不可变数据片，
+修改和删除重写受影响集合，适合批量归档。先看 [Parquet 使用指南](references/parquet.md) 了解性能和接口边界，再运行
 [SQLite → Parquet 迁移示例](examples/16_sqlite_to_parquet.py) 或
 [Parquet 后端完整示例](examples/14_parquet_backend.py)。CLI 目前只有 `migrate` 支持 Parquet URI。
 

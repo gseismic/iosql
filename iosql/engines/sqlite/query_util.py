@@ -99,6 +99,27 @@ def build_select_fields_sql(fields):
     raise BadArgument('BadFieldType')
 
 
+def validate_select_fields(fields, column_types):
+    """先解析投影再核对逻辑列，避免 SQLite 将未知双引号列解释为字符串。"""
+    sql = build_select_fields_sql(fields)
+    if sql == '*':
+        return
+    # 由本模块生成的投影只包含带双引号的标识符，支持列名中的逗号和转义引号。
+    names = re.findall(r'"((?:[^"]|"")*)"', sql)
+    for name in names:
+        _column_type(column_types, name.replace('""', '"'))
+
+
+def _qualified_fields_sql(fields, table_name):
+    """限定物理列名，缺失的物理列必须报错，不能触发 SQLite DQS 字面量。"""
+    sql = build_select_fields_sql(fields)
+    if sql == '*':
+        return sql
+    names = re.findall(r'"((?:[^"]|"")*)"', sql)
+    return ','.join(_quote_sql_identifier(table_name) + '.' +
+                    _quote_sql_identifier(name.replace('""', '"')) for name in names)
+
+
 def build_case_subquery(case, column_types):
     """Build a parameterized SQL fragment for one Case."""
     field = case.field
@@ -193,10 +214,11 @@ def _build_select_with_where(part_table_name, field_sql, where,
 
 def build_select_cases_query(part_table_name, fields, cases, column_types,
                              order_by_sql=None, limit=None):
+    validate_select_fields(fields, column_types)
     where = build_and_cases_subquery(cases, column_types)
     return _build_select_with_where(
         part_table_name,
-        build_select_fields_sql(fields),
+        _qualified_fields_sql(fields, part_table_name),
         where,
         order_by_sql=order_by_sql,
         limit=limit,
@@ -205,10 +227,11 @@ def build_select_cases_query(part_table_name, fields, cases, column_types,
 
 def build_select_or_cases_query(part_table_name, fields, or_cases, column_types,
                                 order_by_sql=None, limit=None):
+    validate_select_fields(fields, column_types)
     where = build_or_cases_subquery(or_cases, column_types)
     return _build_select_with_where(
         part_table_name,
-        build_select_fields_sql(fields),
+        _qualified_fields_sql(fields, part_table_name),
         where,
         order_by_sql=order_by_sql,
         limit=limit,

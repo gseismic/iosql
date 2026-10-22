@@ -1,0 +1,316 @@
+s..................ssssssssssssssssssssssssssssssssssssss.ssssssssssssss [  6%]
+ssssssssss..ss.......................................................... [ 13%]
+........................................................................ [ 20%]
+........................................................................ [ 27%]
+........................................................................ [ 34%]
+........................................................................ [ 41%]
+..................................F..................................... [ 48%]
+..................................................F..........F.......... [ 55%]
+........................................................................ [ 62%]
+........................................................................ [ 69%]
+........................F.F............................................. [ 76%]
+......................................ssssssssssssss.................... [ 83%]
+............................................F........................... [ 90%]
+..................ss...................ssss............................. [ 97%]
+............................s                                            [100%]
+=================================== FAILURES ===================================
+_____________ test_mysqlite_integrity_error_rolls_back_connection ______________
+
+tmp_path = PosixPath('/tmp/pytest-of-lsl/pytest-156/test_mysqlite_integrity_error_0')
+
+    def test_mysqlite_integrity_error_rolls_back_connection(tmp_path):
+        db = MyDatabase(str(tmp_path / "t.sqlite3"), auto_commit=False, verbose=0)
+        try:
+            t = db["data"]
+            t.create_table(
+                [{"name": "id", "type": "integer"}, {"name": "v", "type": "text"}],
+                pk=["id"],
+            )
+            t.execute_params("INSERT INTO data (id, v) VALUES (?, ?)", [1, "a"], commit=True)
+            with pytest.raises(sqlite3.IntegrityError):
+>               t.execute_params(
+                    "INSERT INTO data (id, v) VALUES (?, ?)", [1, "b"], commit=False
+                )
+
+tests/test_plan056_fixes.py:143: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+iosql/utils/mysqlite/table.py:363: in execute_params
+    self._check_write_commit(commit)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <iosql.utils.mysqlite.table.Table object at 0x75ba7f305820>
+commit = False
+
+    def _check_write_commit(self, commit: Optional[bool]) -> None:
+        """拒绝连接池模式下必然丢写的延迟提交用法。
+    
+        连接归还时连接池会无条件 rollback，因此池外上下文中：
+        - 显式 ``commit=False`` 会丢失写入；
+        - ``auto_commit=False`` 时不显式提交（commit=None）的写入会被丢弃。
+        显式 transaction() 由外层管理连接和提交，可安全使用 commit=False。
+        """
+        if self.database.in_transaction():
+            return
+        if commit is False:
+>           raise ValueError(
+                'commit=False 在连接池模式下会丢失写入：'
+                '请传 commit=True，事务提交请使用 database.transaction()'
+            )
+E           ValueError: commit=False 在连接池模式下会丢失写入：请传 commit=True，事务提交请使用 database.transaction()
+
+iosql/utils/mysqlite/table.py:414: ValueError
+______________ test_group_rows_by_keys_groups_heterogeneous_rows _______________
+
+    def test_group_rows_by_keys_groups_heterogeneous_rows():
+        groups = group_rows_by_keys([
+            {'id': 1, 'name': 'a'},
+            {'id': 2},
+            {'name': 'b', 'id': 3},
+        ])
+>       assert sorted(fields for fields, _ in groups) == [['id'], ['id', 'name']]
+E       AssertionError: assert [['id'], ['id...'name', 'id']] == [['id'], ['id', 'name']]
+E         
+E         Left contains one more item: ['name', 'id']
+E         Use -v to get more diff
+
+tests/test_plan062_mysqlite.py:98: AssertionError
+________ test_auto_commit_false_requires_transaction_or_explicit_commit ________
+
+tmp_path = PosixPath('/tmp/pytest-of-lsl/pytest-156/test_auto_commit_false_require0')
+
+    def test_auto_commit_false_requires_transaction_or_explicit_commit(tmp_path):
+        db = Database(str(tmp_path / 'auto_commit_false.db'), auto_commit=False, verbose=0)
+        try:
+            db['t'].create_table([{'name': 'i', 'type': 'integer'}], pk=['i'])
+    
+            with pytest.raises(ValueError, match='auto_commit'):
+                db['t'].insert({'i': 1})
+            with pytest.raises(DatabaseError, match='auto_commit'):
+                db.execute('INSERT INTO t (i) VALUES (1)')
+    
+            with db.transaction():
+                db['t'].insert({'i': 1})
+                db.execute('INSERT INTO t (i) VALUES (3)')
+    
+            # commit=False 一律拒绝，事务内也不例外（与 insert_all 一致）
+>           with pytest.raises(ValueError, match='commit=False'):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE <class 'ValueError'>
+
+tests/test_plan062_mysqlite.py:311: Failed
+____________________ test_numeric_text_buckets_and_overflow ____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-lsl/pytest-156/test_numeric_text_buckets_and_0')
+
+    def test_numeric_text_buckets_and_overflow(tmp_path):
+        db = _db(tmp_path / "chart.iosql")
+        try:
+            table = db.table(
+                "t", pk=["id"], order_key="x",
+                columns={"id": "integer", "x": "text", "v": "integer"},
+            )
+            table.write([
+                {"id": 1, "x": "2", "v": 2},
+                {"id": 2, "x": "10", "v": 10},
+                {"id": 3, "x": "3", "v": 3},
+            ])
+            agg = table.aggregate_by_bucket("x", ["v"], 4)
+            assert (agg["x_min"], agg["x_max"]) == ("2", "10")
+            assert sum(agg["counts"]["v"]) == 3
+            try:
+                from fastapi.testclient import TestClient
+                from iosql.web import create_app
+            except ImportError:
+                pass
+            else:
+                with TestClient(create_app(f"sqlite://{tmp_path / 'chart.iosql'}"), base_url="http://localhost") as client:
+                    response = client.get("/api/table/t/chart", params={
+                        "col": "v", "kind": "line", "buckets": 4,
+                    })
+                    assert response.status_code == 200, response.text
+>                   assert response.json()["y"] == [2.5, 10.0]
+                           ^^^^^^^^^^^^^^^
+
+tests/test_plan072_fixes.py:329: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/home/lsl/miniconda3/lib/python3.12/site-packages/httpx/_models.py:832: in json
+    return jsonlib.loads(self.content, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <json.decoder.JSONDecoder object at 0x75baac8a1730>
+s = '{"type":"meta","kind":"line","x_col":"x","time_col":null,"value_cols":["v"],"group_by_symbol":false}\n{"type":"error","detail":"symbol `` 的 x 值不是递增顺序","hint":"请检查时间列或排序契约；为避免误导，本次绘图已中止"}\n'
+_w = <built-in method match of re.Pattern object at 0x75baab26f510>
+
+    def decode(self, s, _w=WHITESPACE.match):
+        """Return the Python representation of ``s`` (a ``str`` instance
+        containing a JSON document).
+    
+        """
+        obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+        end = _w(s, end).end()
+        if end != len(s):
+>           raise JSONDecodeError("Extra data", s, end)
+E           json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 101)
+
+/home/lsl/miniconda3/lib/python3.12/json/decoder.py:341: JSONDecodeError
+_____________ test_web_candle_order_pagination_and_sort_validation _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-lsl/pytest-156/test_web_candle_order_paginati0')
+
+    def test_web_candle_order_pagination_and_sort_validation(tmp_path):
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+        from iosql.web import create_app
+    
+        path = tmp_path / "web.iosql"
+        db = _db(path)
+        table = db.table(
+            "bars", pk=["id"], order_key="ts",
+            columns={
+                "id": "integer", "ts": "integer", "open": "integer",
+                "high": "integer", "low": "integer", "close": "integer",
+            },
+        )
+        table.write([
+            {"id": 3, "ts": 3, "open": 30, "high": 30, "low": 30, "close": 30},
+            {"id": 1, "ts": 1, "open": 10, "high": 10, "low": 10, "close": 10},
+            {"id": 2, "ts": 2, "open": 20, "high": 20, "low": 20, "close": 20},
+            {"id": 4, "ts": 3, "open": 31, "high": 31, "low": 31, "close": 31},
+        ])
+        # 无主键表只能由底层入口构造，Web 不得给出会漏行的游标。
+        db.table("nopk").insert_all([
+            {"ts": 1, "v": "a"}, {"ts": 1, "v": "b"},
+        ])
+        db.close()
+        with TestClient(create_app(f"sqlite://{path}"), base_url="http://localhost") as client:
+            response = client.get("/api/table/bars/chart", params={
+                "col": "close", "kind": "candle", "buckets": 1,
+            })
+            assert response.status_code == 200, response.text
+>           assert response.json()["open"] == [10]
+                   ^^^^^^^^^^^^^^^
+
+tests/test_plan072_fixes.py:393: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/home/lsl/miniconda3/lib/python3.12/site-packages/httpx/_models.py:832: in json
+    return jsonlib.loads(self.content, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <json.decoder.JSONDecoder object at 0x75baac8a1730>
+s = '{"type":"meta","kind":"candle","x_col":"ts","time_col":null,"value_cols":["open","high","low","close"],"group_by_symb...0.0],[3,30.0,30.0,30.0,30.0],[3,31.0,31.0,31.0,31.0]]}\n{"type":"done","rows":4,"series":[{"symbol":null,"rows":4}]}\n'
+_w = <built-in method match of re.Pattern object at 0x75baab26f510>
+
+    def decode(self, s, _w=WHITESPACE.match):
+        """Return the Python representation of ``s`` (a ``str`` instance
+        containing a JSON document).
+    
+        """
+        obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+        end = _w(s, end).end()
+        if end != len(s):
+>           raise JSONDecodeError("Extra data", s, end)
+E           json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 128)
+
+/home/lsl/miniconda3/lib/python3.12/json/decoder.py:341: JSONDecodeError
+_______________________ TestReadOnlyApi.test_chart_line ________________________
+
+self = <test_web.TestReadOnlyApi object at 0x75ba86756a80>
+demo_db_path = PosixPath('/tmp/pytest-of-lsl/pytest-156/ui_demo0/demo.iosql')
+
+    def test_chart_line(self, demo_db_path):
+        params = {
+            "col": "price",
+            "symbol": "AAPL",
+            "start": BASE_TS,
+            "end": BASE_TS + DAY_MS,
+            "kind": "line",
+        }
+        with _client(f"sqlite://{demo_db_path}") as client:
+            resp = client.get("/api/table/ticks/chart", params=params)
+        assert resp.status_code == 200
+>       payload = resp.json()
+                  ^^^^^^^^^^^
+
+tests/test_web.py:300: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/home/lsl/miniconda3/lib/python3.12/site-packages/httpx/_models.py:832: in json
+    return jsonlib.loads(self.content, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/home/lsl/miniconda3/lib/python3.12/json/__init__.py:346: in loads
+    return _default_decoder.decode(s)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <json.decoder.JSONDecoder object at 0x75baac8a1730>
+s = '{"type":"meta","kind":"line","x_col":"ts","time_col":"ts","value_cols":["price"],"group_by_symbol":true}\n{"type":"da...1.0],[1735689611000,101.1],[1735776000000,101.0]]}\n{"type":"done","rows":13,"series":[{"symbol":"AAPL","rows":13}]}\n'
+_w = <built-in method match of re.Pattern object at 0x75baab26f510>
+
+    def decode(self, s, _w=WHITESPACE.match):
+        """Return the Python representation of ``s`` (a ``str`` instance
+        containing a JSON document).
+    
+        """
+        obj, end = self.raw_decode(s, idx=_w(s, 0).end())
+        end = _w(s, end).end()
+        if end != len(s):
+>           raise JSONDecodeError("Extra data", s, end)
+E           json.decoder.JSONDecodeError: Extra data: line 2 column 1 (char 105)
+
+/home/lsl/miniconda3/lib/python3.12/json/decoder.py:341: JSONDecodeError
+=============================== warnings summary ===============================
+tests/engines/sqlite/test_insert.py: 1 warning
+tests/test_partition.py: 13 warnings
+tests/test_partition_integration.py: 16 warnings
+tests/test_plan084_migration_review.py: 25 warnings
+tests/test_safe_migration.py: 26 warnings
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:475: DeprecationWarning: select_all() 已废弃：等价于 select(fields, where, to_dict=True)，请改用 select(to_dict=True)
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py: 29 warnings
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:475: DeprecationWarning: timeseries(target/min/max_rows_per_file=...) 已废弃：请改传 segment=Segment.rows(max_rows=..., target_rows=..., min_rows=...)
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py::test_latest_group_by_alias
+tests/engines/sqlite/test_timeseries_contract.py::test_latest_rejects_conflicting_by_arguments
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:475: DeprecationWarning: latest(group_by=) 已废弃：group_by 是 by 的别名，请改用 by=
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py::test_timeseries_supports_calendar_date_unit_and_prunes
+tests/engines/sqlite/test_timeseries_contract.py::test_calendar_date_range_query_scans_only_overlapping_partitions
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:475: DeprecationWarning: timeseries(partition_kind=...) 已废弃：calendar 场景请传 partition=Partition.calendar(...)，duration 为默认行为
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py::test_timeseries_supports_calendar_date_unit_and_prunes
+tests/engines/sqlite/test_timeseries_contract.py::test_calendar_date_range_query_scans_only_overlapping_partitions
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:475: DeprecationWarning: timeseries(time_unit=...) 已废弃：date 场景请使用 calendar 分区 (partition=Partition.calendar(...) 或 db.table(partition=...))
+    result = function(self, *args, **kwargs)
+
+tests/test_plan062_mysqlite.py::test_pool_rebuilds_connections_after_fork
+  /home/lsl/macbook/pai-studio-fin/library/iosql/tests/test_plan062_mysqlite.py:553: DeprecationWarning: This process (pid=1931883) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    child_pid = os.fork()
+
+tests/test_plan072_fixes.py::test_two_process_segment_writes_keep_manifest_consistent
+tests/test_plan072_fixes.py::test_two_process_segment_writes_keep_manifest_consistent
+tests/test_plan072_fixes.py::test_two_process_compact_and_write_do_not_lose_rows
+tests/test_plan072_fixes.py::test_two_process_compact_and_write_do_not_lose_rows
+tests/test_safe_migration.py::test_fork_does_not_unlock_parent_file_lease
+  /home/lsl/miniconda3/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=1931883) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_plan056_fixes.py::test_mysqlite_integrity_error_rolls_back_connection
+FAILED tests/test_plan062_mysqlite.py::test_group_rows_by_keys_groups_heterogeneous_rows
+FAILED tests/test_plan062_mysqlite.py::test_auto_commit_false_requires_transaction_or_explicit_commit
+FAILED tests/test_plan072_fixes.py::test_numeric_text_buckets_and_overflow - ...
+FAILED tests/test_plan072_fixes.py::test_web_candle_order_pagination_and_sort_validation
+FAILED tests/test_web.py::TestReadOnlyApi::test_chart_line - json.decoder.JSO...
+6 failed, 945 passed, 86 skipped, 3 deselected, 122 warnings in 48.84s

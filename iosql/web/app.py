@@ -405,26 +405,83 @@ def resolve_sort_col(
 
 
 def fast_row_count(table: Any) -> int:
-    """manifest 求和的零 I/O 行数（PLAN-061）。
+    """segment 复用持久计数；legacy 只执行 COUNT，不触发列范围统计。"""
+    from ..coordination import operation
+    with operation(table):
+        total = 0
+        for ref in table._physical_part_refs(lightweight=True):
+            table._ensure_ref_file_present(ref)
+            total += ref.row_count if ref.segment_id >= 0 else table._data_file_row_count(ref.part_key)
+        return total
 
-    segments() 的 row_count 由核心在写入/删除/compact 时维护（探针验证
-    删除后仍精确），求和与 count_rows() 等价但不打开任何数据文件——
-    2000 万行 0.0000s vs 2.66s。无 segment 记录、记录缺 row_count 或
-    读取异常时回退 count_rows() 兜底。
-    """
-    try:
-        segs = table.segments()
-    except Exception:
-        return table.count_rows()
-    if not segs:
-        return table.count_rows()
-    total = 0
-    for seg in segs:
-        n = seg.get("row_count") if isinstance(seg, dict) else None
-        if not isinstance(n, int):
-            return table.count_rows()
-        total += n
-    return total
+
+def physical_page(table, order_cols, direction, user_expr, cursor, limit):
+    """局部主键布局把物理文件加入排序身份，合法重复行仍能逐一翻页。"""
+    import hashlib
+    from ..coordination import operation
+    from ..engines.sqlite.query_util import build_select_or_cases_query
+
+    reverse = direction == 'desc'
+    order = [(column, direction) for column in order_cols]
+    with operation(table):
+        refs = table._physical_part_refs(lightweight=True)
+        tokens = [(str(ref.part_key), ref.generation) for ref in refs]
+        version = (getattr(table, '_iosql_generation', None), getattr(table, '_iosql_namespace_revision', None))
+        layout = hashlib.sha256(json.dumps((tokens, version)).encode()).hexdigest()
+        values = None
+        part = None
+        if cursor is not None:
+            if (not isinstance(cursor, dict) or cursor.get('version') != 1
+                    or cursor.get('layout') != layout
+                    or cursor.get('order') != order_cols or cursor.get('direction') != direction):
+                raise AppError(detail='分页游标已失效或不匹配当前排序',
+                               hint='文件布局已变化或游标无效，请重新从首页浏览', status=409)
+            values, part = cursor.get('values'), cursor.get('part')
+            if (not isinstance(values, list) or len(values) != len(order_cols)
+                    or any(value is None for value in values) or not isinstance(part, str)):
+                raise _bad_request('非法分页游标', hint='请原样回传上一页 next_cursor')
+        columns = table.spec().columns
+        candidates = []
+        sort_key = table._row_sort_key(table._parse_order_by(order))
+        order_sql = table._order_by_sql(order, '*', columns)
+        for ref in refs:
+            token = str(ref.part_key)
+            expr = None
+            prefix = None
+            if values is not None:
+                for column, value in zip(order_cols, values):
+                    branch = Case(column, '<' if reverse else '>', value)
+                    if prefix is not None:
+                        branch = prefix * branch
+                    expr = branch if expr is None else expr + branch
+                    equal = Case(column, '=', value)
+                    prefix = equal if prefix is None else prefix * equal
+                if (token < part if reverse else token > part):
+                    expr = expr + prefix
+            if user_expr is not None:
+                expr = user_expr if expr is None else user_expr * expr
+            where = table._build_where(expr)
+            query = build_select_or_cases_query(
+                'data', '*', where.or_and_cases, columns,
+                order_by_sql=order_sql, limit=limit + 1,
+            )
+            table._ensure_ref_file_present(ref)
+            with table._part_db(ref.path, auto_commit=False) as db:
+                candidates.extend((dict(row), token) for row in db['data'].query(query.sql, params=query.params))
+        # 先按文件方向稳定排序，再按 SQL 键排序，形成完整的物理身份顺序。
+        candidates.sort(key=lambda item: item[1], reverse=reverse)
+        candidates.sort(key=lambda item: sort_key(item[0]))
+        selected = candidates[:limit]
+        next_cursor = None
+        if len(candidates) > limit:
+            row, token = selected[-1]
+            next_cursor = {'version': 1, 'layout': layout, 'order': order_cols,
+                           'direction': direction, 'values': [row[column] for column in order_cols],
+                           'part': token}
+        rows = [row for row, _ in selected]
+        return {'columns': list(rows[0]) if rows else list(columns), 'rows': rows,
+                'next_cursor': next_cursor,
+                'order_by': ', '.join(f'{column} {direction}' for column in order_cols)}
 
 
 def cached_row_count(db_uri: str, table: Any, name: str) -> int:
@@ -583,7 +640,7 @@ def _register_read_routes(app: FastAPI) -> None:
             if with_stats:
                 entry["row_count"] = cached_row_count(db_uri, table, name)
                 entry["part_count"] = len(table.table_parts())
-                entry["segment_count"] = len(table.segments())
+                entry["segment_count"] = len(table._physical_part_refs(lightweight=True))
             tables.append(entry)
         return {"tables": tables}
 
@@ -597,7 +654,7 @@ def _register_read_routes(app: FastAPI) -> None:
             "name": name,
             "row_count": cached_row_count(db.uri, table, name),
             "part_count": len(table.table_parts()),
-            "segment_count": len(table.segments()),
+            "segment_count": len(table._physical_part_refs(lightweight=True)),
         }
 
     @app.get("/api/table/{name}/spec")
@@ -650,7 +707,8 @@ def _register_read_routes(app: FastAPI) -> None:
         # 由核心侧 ORDER BY+LIMIT 下推解决；这里用 manifest 求和无 I/O）
         if body.cursor is None and user_expr is None:
             try:
-                big_rows = fast_row_count(table)
+                # 首页告警只使用已持久化的行数，不为告警扫描 legacy 文件。
+                big_rows = sum(ref.row_count for ref in table._segment_infos())
             except Exception:
                 big_rows = 0
             if big_rows > BIG_TABLE_WARN_ROWS:
@@ -676,6 +734,8 @@ def _register_read_routes(app: FastAPI) -> None:
                 )
 
         where_expr: Any = user_expr
+        if spec.segment or (spec.partition and spec.partition.column not in pk_cols):
+            return physical_page(table, order_cols, direction, user_expr, body.cursor, limit)
         if body.cursor is not None:
             if not isinstance(body.cursor, (list, tuple)):
                 raise _bad_request(
@@ -846,8 +906,7 @@ def _detect_ohlc(columns: list[str]) -> Optional[tuple[str, str, str, str]]:
     lowered = {c.lower(): c for c in columns}
     for group in (("open", "high", "low", "close"), ("o", "h", "l", "c")):
         if all(g in lowered for g in group):
-            o, h, l, c = (lowered[g] for g in group)
-            return (o, h, l, c)
+            return tuple(lowered[g] for g in group)
     return None
 
 
@@ -1029,6 +1088,47 @@ def _chart_stream_y(value: Any, col: str) -> Optional[float]:
     return numeric if math.isfinite(numeric) else None
 
 
+def _numeric_text_chart_batches(table, fields, x_col, order, comps):
+    """数字文本轴在文件内转换再归并，避免词典序造成时间倒退或丢点。"""
+    import heapq
+    from contextlib import closing
+    from dataclasses import replace
+    from ..coordination import operation
+    from ..utils.mysqlite.connection_pool import reserve_process_connections, release_process_connections
+
+    with operation(table):
+        column_types = table.spec().columns
+        projections = ','.join(
+            f'CAST({table._quote_identifier(field)} AS INTEGER) AS {table._quote_identifier(field)}'
+            if field == x_col else table._quote_identifier(field) for field in fields)
+        order_sql = ','.join(table._quote_identifier(field) + ' ASC' for field, _ in order)
+        specs = []
+        for ref, query in table._select_queries_for_where(fields, table._build_where(comps or None), column_types):
+            table._ensure_ref_file_present(ref)
+            sql = f'SELECT {projections} FROM ({query.sql.rstrip(";")}) ORDER BY {order_sql}'
+            specs.append((ref.path, replace(query, sql=sql)))
+        if not specs:
+            return
+        if len(specs) > table._max_ordered_read_connections:
+            raise BadArgument('数字文本图表超出有序读取连接上限，请缩小查询范围')
+        streams = [table._part_ordered_rows(path, query, 1000) for path, query in specs]
+        reservation = reserve_process_connections(len(streams), table._max_process_connections)
+        try:
+            with closing(heapq.merge(*streams, key=table._row_sort_key(table._parse_order_by(order)))) as merged:
+                batch = []
+                for row in merged:
+                    batch.append(dict(row))
+                    if len(batch) >= EXPORT_BATCH_SIZE:
+                        yield batch
+                        batch = []
+                if batch:
+                    yield batch
+        finally:
+            for stream in streams:
+                stream.close()
+            release_process_connections(reservation)
+
+
 def _chart_raw_stream(table: Any, x_col: str, value_cols: tuple[str, ...],
                       symbol_col: str, group_by_symbol: bool,
                       comps: list[dict[str, Any]],
@@ -1053,10 +1153,12 @@ def _chart_raw_stream(table: Any, x_col: str, value_cols: tuple[str, ...],
     order_by = [(symbol_col, "asc"), (x_col, "asc")] if group_by_symbol else [(x_col, "asc")]
 
     try:
-        for batch in table.iter_select_batches(
-            fields, where=comps or None, order_by=order_by,
-            to_dict=True, batch_size=EXPORT_BATCH_SIZE,
-        ):
+        x_type = str(table.spec().columns.get(x_col, '')).lower()
+        batches = (_numeric_text_chart_batches(table, fields, x_col, order_by, comps)
+                   if any(kind in x_type for kind in ('text', 'char')) else table.iter_select_batches(
+                       fields, where=comps or None, order_by=order_by,
+                       to_dict=True, batch_size=EXPORT_BATCH_SIZE))
+        for batch in batches:
             for row in batch:
                 raw_symbol = row.get(symbol_col) if group_by_symbol else None
                 label = None if raw_symbol is None else str(raw_symbol)

@@ -95,10 +95,8 @@ def test_group_rows_by_keys_groups_heterogeneous_rows():
         {'id': 2},
         {'name': 'b', 'id': 3},
     ])
-    assert sorted(fields for fields, _ in groups) == [['id'], ['id', 'name']]
-    by_key = {tuple(fields): values for fields, values in groups}
-    assert by_key[('id', 'name')] == [[1, 'a'], [3, 'b']]
-    assert by_key[('id',)] == [[2]]
+    # 按连续字段集合分组才能保留异构输入的写入顺序和表达式默认值。
+    assert groups == [(['id', 'name'], [[1, 'a']]), (['id'], [[2]]), (['name', 'id'], [['b', 3]])]
 
 
 # ---------------------------------------------------------------- M1-1
@@ -307,20 +305,19 @@ def test_auto_commit_false_requires_transaction_or_explicit_commit(tmp_path):
             db['t'].insert({'i': 1})
             db.execute('INSERT INTO t (i) VALUES (3)')
 
-        # commit=False 一律拒绝，事务内也不例外（与 insert_all 一致）
-        with pytest.raises(ValueError, match='commit=False'):
-            with db.transaction():
-                db['t'].insert({'i': 2}, commit=False)
-        assert db['t'].count() == 2
+        # 显式事务内由外层提交，commit=False 不会把未完成事务归还连接池。
+        with db.transaction():
+            db['t'].insert({'i': 2}, commit=False)
+        assert db['t'].count() == 3
 
         # insert_all 自带事务并显式提交，auto_commit=False 下依然安全
         db['t'].insert_all([{'i': 4}, {'i': 5}])
-        assert db['t'].count() == 4
+        assert db['t'].count() == 5
 
         # update/delete 显式 commit=True，同样安全
         db['t'].update({'i': 40}, where='i=4')
         db['t'].delete('i=5')
-        assert db['t'].count() == 3
+        assert db['t'].count() == 4
     finally:
         db.close()
 

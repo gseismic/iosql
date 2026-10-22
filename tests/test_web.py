@@ -297,11 +297,15 @@ class TestReadOnlyApi:
         with _client(f"sqlite://{demo_db_path}") as client:
             resp = client.get("/api/table/ticks/chart", params=params)
         assert resp.status_code == 200
-        payload = resp.json()
-        assert payload["kind"] == "line"
-        assert payload["col"] == "price"
-        assert payload["symbol"] == "AAPL"
-        assert len(payload["x"]) == len(payload["y"]) > 0
+        # PLAN-074 起图表输出完整原始点的 NDJSON 流。
+        events = [json.loads(line) for line in resp.text.splitlines()]
+        assert events[0]['kind'] == 'line'
+        assert events[0]['value_cols'] == ['price']
+        points = [point for event in events if event['type'] == 'data'
+                  for point in event['points'] if event['symbol'] == 'AAPL']
+        assert events[-1]['type'] == 'done'
+        assert events[-1]['rows'] == len(points) > 0
+        assert all(len(point) == 2 for point in points)
 
     def test_chart_candle_shape(self, demo_db_path):
         # ticks 表无 OHLC 列；后端可降级为 line 或以 422+hint 明确拒绝

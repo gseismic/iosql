@@ -299,6 +299,8 @@ class Table:
             if match:
                 raise NoSuchColumn(match.group(1))
             raise e
+        elif str_e.startswith('no such column: '):
+            raise NoSuchColumn(str_e.partition(':')[2].strip()) from e
         elif 'no such table' in str_e:
             match = _TABLE_NAME_PATTERN.search(str_e)
             if match:
@@ -524,8 +526,7 @@ class Table:
         if not batch_data:
             return
 
-        # union 字段用于建表/加列（类型合并语义与旧路径一致）
-        union_fields = _union_fields_of_dictlist(batch_data)
+        # 稳定结构只需按字段分组；类型推断延迟到真实建表/加列的冷路径。
         statements = [
             (
                 getsqlarg_dict_insertmany(
@@ -542,14 +543,14 @@ class Table:
             if ensure_table:
                 # Note 这里忽略了not_null等参数, 用了默认数值
                 # 用户能传的只有 columns(包含了not_null等信息), pk
-                columns = suggest_columns(union_fields)
+                columns = suggest_columns(_union_fields_of_dictlist(batch_data))
                 self._create_table_on_connection(cursor, conn, columns, **kwargs)
                 self._executemany_statements_on_connection(cursor, conn, statements)
             else:
                 raise e
         except NoSuchColumn as e:
             if ensure_column:
-                self._ensure_columns_on_connection(cursor, conn, union_fields)
+                self._ensure_columns_on_connection(cursor, conn, _union_fields_of_dictlist(batch_data))
                 self._executemany_statements_on_connection(cursor, conn, statements)
             else:
                  raise e

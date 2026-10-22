@@ -1822,6 +1822,9 @@ def repartition(
         # dry-run 也强制解析，避免非法 interval/timezone 预览成功、实跑才失败
         _validate_runtime_partition(new_spec)
         report = t.layout_report()
+        source_tables = db.table_names()
+        if replace_source and target_table and target_table != table and target_table in source_tables:
+            _fail(f"目标表名会覆盖未选中的表: {target_table}")
     finally:
         db.close()
 
@@ -1866,6 +1869,8 @@ def repartition(
         "final_path": str(source_path if source_replaced else final_target_path),
         "target_table": target_table or table,
         "source_replaced": source_replaced,
+        "replaced_tables": [table],
+        "preserved_tables": [name for name in source_tables if name != table] if source_replaced else [],
         "batch_size": batch_size,
         "old_partition": old_spec.partition.to_dict() if old_spec.partition else None,
         "new_partition": new_spec.partition.to_dict() if new_spec.partition else None,
@@ -1897,6 +1902,12 @@ def repartition(
         with Database(source_uri) as db2:
             t = _require_table(db2, table)
             start = time.monotonic()
+            if source_replaced:
+                if target_table and target_table != table and target_table in db2.table_names():
+                    _fail(f"目标表名会覆盖未选中的表: {target_table}")
+                # 完整快照保留未选中表的文件、契约和索引，只移除待重建的表。
+                backup_snapshot(source_uri, final_target_path)
+                _rmtree_robust(final_target_path / table)
             result = t.repartition_to(
                 final_target_uri, table_name=target_table or table,
                 spec=new_spec, batch_size=batch_size,

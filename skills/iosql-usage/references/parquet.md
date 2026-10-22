@@ -5,8 +5,8 @@
 
 ## 适用场景与安装
 
-Parquet 适合批量归档、历史数据回灌、按列投影分析和跨分区有序读取。追加、修改和删除
-会重写受影响的物理文件；高频逐行改写前应先评估重写成本。
+Parquet 适合批量归档、历史数据回灌、按列投影分析和跨分区有序读取。append/ignore
+通过不可变数据片追加；修改和删除重写受影响的物理集合。
 
 Parquet 后端依赖 DuckDB，已包含在 iosql 默认依赖中。普通安装即可使用：
 
@@ -53,16 +53,20 @@ with Database("parquet://db/archive.iosql") as db:
 ## 存储布局与写入语义
 
 每张表的 `meta.sqlite3` 保存契约和 manifest，业务数据保存在
-`<table>/data/*.parquet`，文件使用 ZSTD 压缩。iosql 只识别自己管理的目录库，不会
+`<table>/data/*.parquet` 入口及其专属隐藏数据片目录，文件使用 ZSTD 压缩。
+追加后由 `<入口>.manifest.json` 列出可见文件；应通过 API、备份或迁移复制完整集合，
+不要只复制入口文件。iosql 只识别自己管理的目录库，不会
 自动把任意 Parquet 文件注册成表。
 
-`append`、`upsert`、`replace`、`ignore` 和条件删除会重写命中的文件。将多行合并为批次，
-或用 `buffered_writer(max_rows=...)` flush，避免逐行写入；用 `Segment.rows(max_rows=...)`
+`append`/`ignore` 仅写出本批新增行，历史主键检查可能扫描旧键列；`upsert`/`replace`
+及条件删除仍重写命中的集合。将多行合并为批次，或用 `buffered_writer(max_rows=...)`
+flush，限制数据片数量；用 `Segment.rows(max_rows=...)`
 限制单个物理文件大小。与其他后端一致，`Segment.rows` 表不支持 `upsert`/`replace`。
 带逻辑分区的 `upsert`/`replace` 要求分区列也属于主键；`append`/`ignore` 的唯一性
 由各物理文件约束，跨文件唯一性需由调用方保证。
 
-文件替换以单个 Parquet 文件为原子单位；多文件写入和 manifest 更新没有统一事务。
+单个物理集合在数据片落盘后原子切换清单，发布前失败不改变旧可见数据。
+旧数据片在发布后清理，清理失败不撤销成功发布；多物理集合写入仍没有统一事务。
 普通跨文件读取没有统一快照。`migrate_to()` 全程持源/目标独占租约，
 协作 API 在此期间报 `DatabaseBusy`；迁移前先关闭读取流、flush 缓冲并退出缓冲写入上下文。
 
@@ -72,6 +76,9 @@ with Database("parquet://db/archive.iosql") as db:
 持有读取流的线程直接写同表会报错。先耗尽迭代器，或显式关闭流，再写入、整理或清理。
 全局 `order_by` 的流式归并受 `max_ordered_read_connections` 和
 `max_process_connections` 预算约束。
+DuckDB 连接也计入进程预算；有序扫描在预留配额前取得元数据，预算无法满足时快速报错，
+连接等待、执行与批次消费共同受 `timeout_ms` 截止时间约束。每连接内存上限 256MB，
+排序等操作可使用临时磁盘；compact 可合并数据片并用外部排序限制 Python 内存。
 
 ## 与 SQLite 的能力差异
 
@@ -146,5 +153,5 @@ iosql migrate -s parquet://db/archive.iosql \
 - `已有普通 Parquet 文件找不到表`：iosql 不会自动接管任意文件；需先通过 iosql API
   写入其管理的目录库，或迁移一份已有 iosql 表。
 - `同线程写入时报读取流错误`：先耗尽或关闭 `iter_rows()` / `iter_batches()` 流。
-- `写入时间随文件变大而增加`：Parquet 修改需要重写受影响文件；增大写入批次并检查
-  `Segment.rows` 大小是否适合该表。
+- `写入时间随文件变大而增加`：追加仍有主键检查成本，修改需要重写命中集合；
+  合并小批、检查 `Segment.rows` 大小，并用 compact/repartition 整理文件布局。

@@ -1,0 +1,77 @@
+{
+  "generated_at": "2026-10-23T03:48:51.278640+08:00",
+  "environment": {
+    "python": "3.12.8",
+    "platform": "Linux",
+    "sqlite": "3.46.0",
+    "duckdb": "1.3.2"
+  },
+  "sources": {
+    "python_files_parsed_with_39_grammar": 97,
+    "javascript_files_checked": 8,
+    "example_files_identical": 40,
+    "production_python_sha256": "1a10dbdca46490da337868cb6edef92782acad12e8c43b901720c6c443d97912"
+  },
+  "operations": {
+    "limit_1_physical_reads": [
+      {
+        "sql": "select * from data  limit ?;",
+        "rows": 1
+      }
+    ],
+    "unordered_20k_batch_100": {
+      "rows": 20000,
+      "read_connections": 1,
+      "vm_instructions_approx": 60000
+    },
+    "segment_ignore_20": {
+      "physical_writes": 1,
+      "full_stats_refreshes": 0
+    },
+    "buffered_append_1000_resource_resolutions": 0,
+    "parquet_append_5x100": {
+      "rows_written_per_batch": [
+        100,
+        100,
+        100,
+        100,
+        100
+      ],
+      "total_rows_written": 500
+    }
+  },
+  "migration_modes": [
+    {
+      "backend": "sqlite",
+      "default_conflict": "replace",
+      "explicit_mode": "append",
+      "source_and_target_preserved": true
+    },
+    {
+      "backend": "sqlite",
+      "default_conflict": "ignore",
+      "explicit_mode": "append",
+      "source_and_target_preserved": true
+    },
+    {
+      "backend": "parquet",
+      "default_conflict": "replace",
+      "explicit_mode": "append",
+      "source_and_target_preserved": true
+    },
+    {
+      "backend": "parquet",
+      "default_conflict": "ignore",
+      "explicit_mode": "append",
+      "source_and_target_preserved": true
+    }
+  ],
+  "postgresql": {
+    "tested": true,
+    "independent_calls": 3,
+    "connections_created": 1,
+    "sql_statements": 10,
+    "server_version": 140022,
+    "connections_closed_after_close": 1
+  }
+}

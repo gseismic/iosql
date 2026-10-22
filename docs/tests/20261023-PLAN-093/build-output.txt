@@ -1,0 +1,201 @@
+Building wheel...
+running egg_info
+writing iosql.egg-info/PKG-INFO
+writing dependency_links to iosql.egg-info/dependency_links.txt
+writing entry points to iosql.egg-info/entry_points.txt
+writing requirements to iosql.egg-info/requires.txt
+writing top-level names to iosql.egg-info/top_level.txt
+reading manifest file 'iosql.egg-info/SOURCES.txt'
+writing manifest file 'iosql.egg-info/SOURCES.txt'
+running bdist_wheel
+running build
+running build_py
+copying iosql/coordination.py -> build/lib/iosql
+copying iosql/coordination_postgresql.py -> build/lib/iosql
+copying iosql/cli.py -> build/lib/iosql
+copying iosql/table.py -> build/lib/iosql
+copying iosql/migration.py -> build/lib/iosql
+copying iosql/web/app.py -> build/lib/iosql/web
+copying iosql/utils/partition.py -> build/lib/iosql/utils
+copying iosql/partition/duration.py -> build/lib/iosql/partition
+copying iosql/engines/parquet/table.py -> build/lib/iosql/engines/parquet
+copying iosql/engines/sqlite/__init__.py -> build/lib/iosql/engines/sqlite
+copying iosql/engines/sqlite/query_util.py -> build/lib/iosql/engines/sqlite
+copying iosql/engines/sqlite/table.py -> build/lib/iosql/engines/sqlite
+copying iosql/utils/mysqlite/database.py -> build/lib/iosql/utils/mysqlite
+copying iosql/utils/mysqlite/__init__.py -> build/lib/iosql/utils/mysqlite
+copying iosql/utils/mysqlite/sql.py -> build/lib/iosql/utils/mysqlite
+copying iosql/utils/mysqlite/table.py -> build/lib/iosql/utils/mysqlite
+copying iosql/utils/mysqlite/connection_pool.py -> build/lib/iosql/utils/mysqlite
+running egg_info
+writing iosql.egg-info/PKG-INFO
+writing dependency_links to iosql.egg-info/dependency_links.txt
+writing entry points to iosql.egg-info/entry_points.txt
+writing requirements to iosql.egg-info/requires.txt
+writing top-level names to iosql.egg-info/top_level.txt
+reading manifest file 'iosql.egg-info/SOURCES.txt'
+writing manifest file 'iosql.egg-info/SOURCES.txt'
+installing to build/bdist.linux-x86_64/wheel
+running install
+running install_lib
+creating build/bdist.linux-x86_64/wheel
+creating build/bdist.linux-x86_64/wheel/iosql
+copying build/lib/iosql/database.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/coordination.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/spec.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/coordination_postgresql.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/cli.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/exception.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql
+creating build/bdist.linux-x86_64/wheel/iosql/web
+copying build/lib/iosql/web/serializers.py -> build/bdist.linux-x86_64/wheel/./iosql/web
+copying build/lib/iosql/web/app.py -> build/bdist.linux-x86_64/wheel/./iosql/web
+copying build/lib/iosql/web/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/web
+copying build/lib/iosql/web/deps.py -> build/bdist.linux-x86_64/wheel/./iosql/web
+creating build/bdist.linux-x86_64/wheel/iosql/web/static
+creating build/bdist.linux-x86_64/wheel/iosql/web/static/vendor
+copying build/lib/iosql/web/static/vendor/uplot.min.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/vendor
+copying build/lib/iosql/web/static/vendor/uplot.min.css -> build/bdist.linux-x86_64/wheel/./iosql/web/static/vendor
+creating build/bdist.linux-x86_64/wheel/iosql/web/static/js
+copying build/lib/iosql/web/static/js/util.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/js/tab-maintain.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/js/components.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/js/tab-charts.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/js/tab-overview.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/js/tab-structure.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/js/tab-data.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static/js
+copying build/lib/iosql/web/static/index.html -> build/bdist.linux-x86_64/wheel/./iosql/web/static
+copying build/lib/iosql/web/static/app.js -> build/bdist.linux-x86_64/wheel/./iosql/web/static
+copying build/lib/iosql/web/static/style.css -> build/bdist.linux-x86_64/wheel/./iosql/web/static
+copying build/lib/iosql/web/errors.py -> build/bdist.linux-x86_64/wheel/./iosql/web
+copying build/lib/iosql/file_lock.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/table.py -> build/bdist.linux-x86_64/wheel/./iosql
+creating build/bdist.linux-x86_64/wheel/iosql/engines
+creating build/bdist.linux-x86_64/wheel/iosql/engines/parquet
+copying build/lib/iosql/engines/parquet/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/parquet
+copying build/lib/iosql/engines/parquet/table.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/parquet
+copying build/lib/iosql/engines/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/engines
+creating build/bdist.linux-x86_64/wheel/iosql/engines/postgresql
+copying build/lib/iosql/engines/postgresql/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/postgresql
+copying build/lib/iosql/engines/postgresql/table.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/postgresql
+copying build/lib/iosql/engines/postgresql/query.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/postgresql
+creating build/bdist.linux-x86_64/wheel/iosql/engines/sqlite
+copying build/lib/iosql/engines/sqlite/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/sqlite
+copying build/lib/iosql/engines/sqlite/query_util.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/sqlite
+copying build/lib/iosql/engines/sqlite/table.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/sqlite
+copying build/lib/iosql/engines/sqlite/const.py -> build/bdist.linux-x86_64/wheel/./iosql/engines/sqlite
+creating build/bdist.linux-x86_64/wheel/iosql/core
+copying build/lib/iosql/core/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/core
+creating build/bdist.linux-x86_64/wheel/iosql/core/query
+copying build/lib/iosql/core/query/timeseries.py -> build/bdist.linux-x86_64/wheel/./iosql/core/query
+copying build/lib/iosql/core/query/case.py -> build/bdist.linux-x86_64/wheel/./iosql/core/query
+copying build/lib/iosql/core/query/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/core/query
+copying build/lib/iosql/core/query/text_where.py -> build/bdist.linux-x86_64/wheel/./iosql/core/query
+copying build/lib/iosql/core/query/case_util.py -> build/bdist.linux-x86_64/wheel/./iosql/core/query
+copying build/lib/iosql/core/query/where.py -> build/bdist.linux-x86_64/wheel/./iosql/core/query
+copying build/lib/iosql/migration_postgresql.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/version.py -> build/bdist.linux-x86_64/wheel/./iosql
+copying build/lib/iosql/logger.py -> build/bdist.linux-x86_64/wheel/./iosql
+creating build/bdist.linux-x86_64/wheel/iosql/utils
+copying build/lib/iosql/utils/createtable.py -> build/bdist.linux-x86_64/wheel/./iosql/utils
+copying build/lib/iosql/utils/storage_identity.py -> build/bdist.linux-x86_64/wheel/./iosql/utils
+copying build/lib/iosql/utils/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/utils
+copying build/lib/iosql/utils/schema.py -> build/bdist.linux-x86_64/wheel/./iosql/utils
+copying build/lib/iosql/utils/partition.py -> build/bdist.linux-x86_64/wheel/./iosql/utils
+copying build/lib/iosql/utils/column.py -> build/bdist.linux-x86_64/wheel/./iosql/utils
+creating build/bdist.linux-x86_64/wheel/iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/database.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/exception.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/sql.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/table.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/connection_pool.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/version.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/logger.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/utils/mysqlite/const.py -> build/bdist.linux-x86_64/wheel/./iosql/utils/mysqlite
+copying build/lib/iosql/migration.py -> build/bdist.linux-x86_64/wheel/./iosql
+creating build/bdist.linux-x86_64/wheel/iosql/partition
+copying build/lib/iosql/partition/range.py -> build/bdist.linux-x86_64/wheel/./iosql/partition
+copying build/lib/iosql/partition/__init__.py -> build/bdist.linux-x86_64/wheel/./iosql/partition
+copying build/lib/iosql/partition/calendar.py -> build/bdist.linux-x86_64/wheel/./iosql/partition
+copying build/lib/iosql/partition/base.py -> build/bdist.linux-x86_64/wheel/./iosql/partition
+copying build/lib/iosql/partition/duration.py -> build/bdist.linux-x86_64/wheel/./iosql/partition
+running install_egg_info
+Copying iosql.egg-info to build/bdist.linux-x86_64/wheel/./iosql-0.3.0-py3.12.egg-info
+running install_scripts
+creating build/bdist.linux-x86_64/wheel/iosql-0.3.0.dist-info/WHEEL
+creating '/tmp/iosql-plan093-wheel/.tmp-4j1vty6r/iosql-0.3.0-py3-none-any.whl' and adding 'build/bdist.linux-x86_64/wheel' to it
+adding 'iosql/__init__.py'
+adding 'iosql/cli.py'
+adding 'iosql/coordination.py'
+adding 'iosql/coordination_postgresql.py'
+adding 'iosql/database.py'
+adding 'iosql/exception.py'
+adding 'iosql/file_lock.py'
+adding 'iosql/logger.py'
+adding 'iosql/migration.py'
+adding 'iosql/migration_postgresql.py'
+adding 'iosql/spec.py'
+adding 'iosql/table.py'
+adding 'iosql/version.py'
+adding 'iosql/core/__init__.py'
+adding 'iosql/core/query/__init__.py'
+adding 'iosql/core/query/case.py'
+adding 'iosql/core/query/case_util.py'
+adding 'iosql/core/query/text_where.py'
+adding 'iosql/core/query/timeseries.py'
+adding 'iosql/core/query/where.py'
+adding 'iosql/engines/__init__.py'
+adding 'iosql/engines/parquet/__init__.py'
+adding 'iosql/engines/parquet/table.py'
+adding 'iosql/engines/postgresql/__init__.py'
+adding 'iosql/engines/postgresql/query.py'
+adding 'iosql/engines/postgresql/table.py'
+adding 'iosql/engines/sqlite/__init__.py'
+adding 'iosql/engines/sqlite/const.py'
+adding 'iosql/engines/sqlite/query_util.py'
+adding 'iosql/engines/sqlite/table.py'
+adding 'iosql/partition/__init__.py'
+adding 'iosql/partition/base.py'
+adding 'iosql/partition/calendar.py'
+adding 'iosql/partition/duration.py'
+adding 'iosql/partition/range.py'
+adding 'iosql/utils/__init__.py'
+adding 'iosql/utils/column.py'
+adding 'iosql/utils/createtable.py'
+adding 'iosql/utils/partition.py'
+adding 'iosql/utils/schema.py'
+adding 'iosql/utils/storage_identity.py'
+adding 'iosql/utils/mysqlite/__init__.py'
+adding 'iosql/utils/mysqlite/connection_pool.py'
+adding 'iosql/utils/mysqlite/const.py'
+adding 'iosql/utils/mysqlite/database.py'
+adding 'iosql/utils/mysqlite/exception.py'
+adding 'iosql/utils/mysqlite/logger.py'
+adding 'iosql/utils/mysqlite/sql.py'
+adding 'iosql/utils/mysqlite/table.py'
+adding 'iosql/utils/mysqlite/version.py'
+adding 'iosql/web/__init__.py'
+adding 'iosql/web/app.py'
+adding 'iosql/web/deps.py'
+adding 'iosql/web/errors.py'
+adding 'iosql/web/serializers.py'
+adding 'iosql/web/static/app.js'
+adding 'iosql/web/static/index.html'
+adding 'iosql/web/static/style.css'
+adding 'iosql/web/static/js/components.js'
+adding 'iosql/web/static/js/tab-charts.js'
+adding 'iosql/web/static/js/tab-data.js'
+adding 'iosql/web/static/js/tab-maintain.js'
+adding 'iosql/web/static/js/tab-overview.js'
+adding 'iosql/web/static/js/tab-structure.js'
+adding 'iosql/web/static/js/util.js'
+adding 'iosql/web/static/vendor/uplot.min.css'
+adding 'iosql/web/static/vendor/uplot.min.js'
+adding 'iosql-0.3.0.dist-info/METADATA'
+adding 'iosql-0.3.0.dist-info/WHEEL'
+adding 'iosql-0.3.0.dist-info/entry_points.txt'
+adding 'iosql-0.3.0.dist-info/top_level.txt'
+adding 'iosql-0.3.0.dist-info/RECORD'
+removing build/bdist.linux-x86_64/wheel
+Successfully built /tmp/iosql-plan093-wheel/iosql-0.3.0-py3-none-any.whl

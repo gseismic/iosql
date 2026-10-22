@@ -1,0 +1,89 @@
+s....................................................................... [  6%]
+.sssssssss..ss.......................................................... [ 12%]
+........................................................................ [ 19%]
+........................................................................ [ 25%]
+........................................................................ [ 31%]
+........................................................................ [ 38%]
+........................................................................ [ 44%]
+........................................................................ [ 50%]
+........................................................................ [ 57%]
+........................................................................ [ 63%]
+........................................................................ [ 70%]
+........................................................................ [ 76%]
+........................................................................ [ 82%]
+........................................................................ [ 89%]
+.......................................ss...................ssss........ [ 95%]
+.................................................s                       [100%]
+=============================== warnings summary ===============================
+tests/engines/postgresql/test_postgresql.py: 1 warning
+tests/engines/sqlite/test_insert.py: 1 warning
+tests/test_partition.py: 13 warnings
+tests/test_partition_integration.py: 19 warnings
+tests/test_plan084_migration_review.py: 25 warnings
+tests/test_safe_migration.py: 26 warnings
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:519: DeprecationWarning: select_all() 已废弃：等价于 select(fields, where, to_dict=True)，请改用 select(to_dict=True)
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py: 29 warnings
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:519: DeprecationWarning: timeseries(target/min/max_rows_per_file=...) 已废弃：请改传 segment=Segment.rows(max_rows=..., target_rows=..., min_rows=...)
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py::test_latest_group_by_alias
+tests/engines/sqlite/test_timeseries_contract.py::test_latest_rejects_conflicting_by_arguments
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:519: DeprecationWarning: latest(group_by=) 已废弃：group_by 是 by 的别名，请改用 by=
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py::test_timeseries_supports_calendar_date_unit_and_prunes
+tests/engines/sqlite/test_timeseries_contract.py::test_calendar_date_range_query_scans_only_overlapping_partitions
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:519: DeprecationWarning: timeseries(partition_kind=...) 已废弃：calendar 场景请传 partition=Partition.calendar(...)，duration 为默认行为
+    result = function(self, *args, **kwargs)
+
+tests/engines/sqlite/test_timeseries_contract.py::test_timeseries_supports_calendar_date_unit_and_prunes
+tests/engines/sqlite/test_timeseries_contract.py::test_calendar_date_range_query_scans_only_overlapping_partitions
+  /home/lsl/macbook/pai-studio-fin/library/iosql/iosql/coordination.py:519: DeprecationWarning: timeseries(time_unit=...) 已废弃：date 场景请使用 calendar 分区 (partition=Partition.calendar(...) 或 db.table(partition=...))
+    result = function(self, *args, **kwargs)
+
+tests/test_plan062_mysqlite.py::test_pool_rebuilds_connections_after_fork
+  /home/lsl/macbook/pai-studio-fin/library/iosql/tests/test_plan062_mysqlite.py:550: DeprecationWarning: This process (pid=2644143) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    child_pid = os.fork()
+
+tests/test_plan072_fixes.py::test_two_process_segment_writes_keep_manifest_consistent
+tests/test_plan072_fixes.py::test_two_process_segment_writes_keep_manifest_consistent
+tests/test_plan072_fixes.py::test_two_process_compact_and_write_do_not_lose_rows
+tests/test_plan072_fixes.py::test_two_process_compact_and_write_do_not_lose_rows
+tests/test_plan093_resources.py::test_pg_controls_reuse_reconnect_fork_and_close
+tests/test_safe_migration.py::test_fork_does_not_unlock_parent_file_lease
+tests/test_safe_migration_postgresql.py::test_pg_fork_does_not_end_parent_advisory_session
+  /home/lsl/miniconda3/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=2644143) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================= slowest 10 durations =============================
+78.55s call     tests/test_partition_integration.py::TestLargeData::test_upsert_large_data
+3.05s call     tests/test_plan093_resources.py::test_budget_pool_lifecycle_is_safe_under_gc_and_threads
+2.49s call     tests/test_distribution.py::test_wheel_contains_web_assets_and_serves_them
+2.04s call     tests/test_partition_integration.py::TestLargeData::test_large_data_200k_rows_20_batches
+1.72s call     tests/test_existing_database_examples.py::test_example_is_self_contained[skills/iosql-usage/examples/18_save_as_compare_engines.py-\u53e6\u5b58\u5b8c\u6210\uff0c\u6e90\u5e93\u4fdd\u7559 20000 \u884c\uff0c\u76ee\u6807 20000 \u884c]
+1.41s call     tests/test_existing_database_examples.py::test_example_is_self_contained[examples/18_save_as_compare_engines.py-\u53e6\u5b58\u5b8c\u6210\uff0c\u6e90\u5e93\u4fdd\u7559 20000 \u884c\uff0c\u76ee\u6807 20000 \u884c]
+1.17s call     tests/test_benchmark_write.py::test_process_budget_prevents_emfile_with_many_active_tables
+1.06s call     tests/test_plan072_fixes.py::test_two_process_compact_and_write_do_not_lose_rows
+1.05s call     tests/test_plan072_fixes.py::test_two_process_segment_writes_keep_manifest_consistent
+0.95s call     tests/test_parquet_backend.py::test_buffered_delete_compact_and_cleanup
+=========================== short test summary info ============================
+SKIPPED [1] tests/core/query/test_case.py:14: Deprecated: list of Cases no longer supported in Where
+SKIPPED [1] tests/engines/sqlite/deprecated/test_basic.py:23: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/deprecated/test_basic.py:42: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/deprecated/test_basic.py:108: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/deprecated/test_basic.py:176: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/deprecated/test_basic.py:209: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/deprecated/test_debug.py:15: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/deprecated/test_debug.py:45: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/test_advance.py:17: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/test_advance.py:54: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/test_many_files.py:19: Deprecated: old string partition format no longer supported
+SKIPPED [1] tests/engines/sqlite/test_many_files.py:45: Deprecated: old string partition format no longer supported
+SKIPPED [2] tests/test_windows_lock_file.py:170: 需要 Windows 文件共享删除语义
+SKIPPED [2] tests/test_windows_paths_and_snapshots.py:182: 需要 Windows 大小写敏感目录
+SKIPPED [2] tests/test_windows_paths_and_snapshots.py:198: 需要 Windows 真实目录 junction
+SKIPPED [1] tests/utils/test_utils.py:45: Deprecated: old string partition format no longer supported
+1111 passed, 19 skipped, 128 warnings in 141.21s (0:02:21)

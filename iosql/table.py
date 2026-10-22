@@ -32,6 +32,11 @@ class BaseTable(metaclass=ABCMeta):
         if self._uri_schema in ('sqlite', 'sqlite3', 'parquet'):
             from .coordination import physical_root
             if not (physical_root(self._uri) / self._table_name).is_dir():
+                self._iosql_invalidating = True
+                try:
+                    self.close()
+                finally:
+                    self._iosql_invalidating = False
                 raise UnsafeOperation('表已被移除或重命名，请重新打开对应表')
         constructor = getattr(self, '_iosql_constructor', None)
         if constructor is None:

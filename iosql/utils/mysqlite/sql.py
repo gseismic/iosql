@@ -142,12 +142,15 @@ def group_rows_by_keys(data: List[Dict[str, Any]]) -> List[Tuple[List[str], List
     """
     groups: List[Tuple[List[str], List[List[Any]]]] = []
     previous_key = None
+    getter = None
     for item in data:
         key = frozenset(item.keys())
         if not groups or key != previous_key:
             groups.append((list(item.keys()), []))
+            fields = groups[-1][0]
+            getter = itemgetter(*fields) if len(fields) > 1 else None
         fields, values = groups[-1]
-        values.append([item[field] for field in fields])
+        values.append(list(getter(item)) if getter is not None else [item[field] for field in fields])
         previous_key = key
     return groups
 

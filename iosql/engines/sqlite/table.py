@@ -7,6 +7,7 @@ import os
 import pathlib
 import shutil
 import sqlite3
+import tempfile
 import threading
 import time
 import warnings
@@ -80,7 +81,6 @@ from .query_util import (
     build_delete_query,
     build_select_cases_query,
     build_select_count_query,
-    build_select_exists_query,
     build_select_or_cases_query,
 )
 
@@ -246,7 +246,7 @@ class _LatestQuery:
         return rows[0] if rows else None
 
     def iter_rows(self):
-        return iter(self.to_list())
+        return self._table._iter_latest_rows(self._query_spec, self._columns, self._by)
 
     def spec(self):
         return self._query_spec
@@ -555,6 +555,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             self.connect()
             self._rename_table_manifest(old_name, new_name)
             self._partition = self._load_partition()
+            from ...coordination import invalidate_namespace
+            invalidate_namespace(self._uri)
         except Exception as exc:
             if moved:
                 try:
@@ -1153,6 +1155,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def insert_all(self, data, pk=None, extra_data=None, partition=None,
                    replace=False, ignore=False, commit=True, **kwargs):
+        mode_resolved = kwargs.pop('_mode_resolved', False)
         if replace and ignore:
             raise BadArgument(
                 'insert_all: replace 与 ignore 互斥，只能传一个；'
@@ -1163,9 +1166,18 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if isinstance(data, dict):
             data = [data]
         data = list(data)
+        for index, row in enumerate(data):
+            if not isinstance(row, dict):
+                raise BadArgument(f'row[{index}] 必须是 dict')
+        data = self._add_extra_data(data, extra_data)
 
         contract = self.spec()
         if contract:
+            if contract.schema_policy == 'strict':
+                allowed = set(contract.columns)
+                unknown = {field for row in data for field in row if field not in allowed}
+                if unknown:
+                    raise SchemaConflict(f'严格 schema 禁止新增列: {sorted(unknown)}')
             self._ensure_contract_type_compatible(contract, data)
             pk = pk if pk is not None else contract.primary_key
             partition = partition if partition is not None else contract.to_partition()
@@ -1174,7 +1186,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             kwargs['column_type'] = column_type
             kwargs.setdefault('alter', contract.schema_policy == 'evolve')
             kwargs['table_contract'] = contract.to_dict()
-            if not replace and not ignore:
+            if not mode_resolved and not replace and not ignore:
                 if contract.conflict in ['upsert', 'replace']:
                     self._ensure_segment_conflict_supported(
                         contract,
@@ -1193,7 +1205,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         before_parts = set(self.table_parts())
         before_meta = self.get_table_meta()
-        rows = self._add_extra_data(data, extra_data)
+        rows = data
         self._ensure_pk_present(rows, pk)
 
         partitions_touched = self.do_insert_all(
@@ -1289,6 +1301,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             alter=alter,
             column_type=column_type,
             table_contract=spec.to_dict(),
+            _mode_resolved=True,
             **kwargs,
         )
 
@@ -1439,6 +1452,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         )
         # 一次取全量 refs：校验用可见部分，孤儿扫描必须带 obsolete
         all_refs = self._physical_part_refs(include_obsolete=True)
+        self._validate_compact_generations(all_refs, result)
         if include_obsolete:
             refs = all_refs
         else:
@@ -1571,30 +1585,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if batch_size <= 0:
             raise BadArgument('batch_size must be a positive integer')
 
-        for ref in self._physical_part_refs(lightweight=True):
-            self._ensure_ref_file_present(ref)
-            part_dbfile = self._get_part_dbfile(ref.part_key)
-            offset = 0
-            while True:
-                with self._part_db(part_dbfile, auto_commit=False) as db:
-                    try:
-                        rows = db[_PART_DATA_TABLE_NAME].query(
-                            (
-                                f'select * from {_PART_DATA_TABLE_NAME} '
-                                'limit ? offset ?'
-                            ),
-                            params=[batch_size, offset],
-                            to_dict=True,
-                        )
-                    except NoSuchTable:
-                        rows = []
-                if not rows:
-                    break
-                batch = [dict(row) for row in rows]
-                yield batch
-                if len(batch) < batch_size:
-                    break
-                offset += len(batch)
+        yield from self.iter_select_batches(batch_size=batch_size, to_dict=True)
 
     def iter_rows(self, batch_size=10_000):
         """逐行流式读取全表（iter_batches 的逐行语法糖，与 README 语义一致）。"""
@@ -1649,14 +1640,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if any(ref.segment_id < 0 for ref in refs):
             raise BadArgument('compact does not support legacy non-segment files')
 
-        rows = []
-        for ref in refs:
-            self._ensure_ref_file_present(ref)
-            rows.extend(
-                self._rows_from_part_dbfile(self._get_part_dbfile(ref.part_key))
-            )
-
-        rows = self._compact_sort_rows(rows, spec)
+        rows = self._compact_sorted_rows(refs, spec)
         chunks = self._compact_row_chunks(
             rows,
             spec.primary_key,
@@ -1666,56 +1650,105 @@ class Table(TimeseriesQueryMixin, BaseTable):
         result = CompactResult(
             table=self._table_name,
             partitions=[logical_part],
-            rows_read=len(rows),
             old_segments=len(refs),
         )
         new_infos = []
         try:
-            new_infos = self._write_compact_chunks(
-                logical_part,
-                chunks,
-                spec,
-            )
-            self._mark_segments_obsolete(refs)
-        except Exception:
-            self._mark_segments_obsolete(new_infos)
-            raise
+            # 构建代不进入可见 manifest；中断只留下可诊断的孤儿文件。
+            self._mutation_lock_state.defer_segment_manifest = True
+            with closing(rows):
+                new_infos = self._write_compact_chunks(logical_part, chunks, spec)
+        finally:
+            self._mutation_lock_state.defer_segment_manifest = False
+        self._publish_compact_generation(refs, new_infos)
 
         result.rows_written = sum(info.row_count for info in new_infos)
+        result.rows_read = result.rows_written
         result.new_segments = len(new_infos)
         result.obsolete_segments = len(refs)
         return result
 
-    def _compact_sort_rows(self, rows, spec):
-        if not rows:
-            return []
-        fields = []
-        for field in [
-            spec.order_key,
-            spec.time.name if spec.time else None,
-            spec.partition.column if spec.partition else None,
-        ]:
-            if field and field not in fields:
-                fields.append(field)
-        for field in spec.primary_key:
-            if field not in fields:
-                fields.append(field)
-        if not fields:
-            return list(rows)
+    def _publish_compact_generation(self, old_refs, new_infos):
+        """一次元数据提交切换整个可见集合，失败时读者继续使用旧代。"""
+        with self.table_meta_db.transaction():
+            for info in new_infos:
+                self._upsert_segment_info(info)
+            self._mark_segments_obsolete(old_refs)
+            records = self.table_meta_db['_iosql_compactions']
+            if new_infos:
+                records.insert({
+                    'logical_part': new_infos[0].logical_part,
+                    'generation': new_infos[0].generation,
+                    'part_keys_json': json.dumps([info.part_key for info in new_infos]),
+                    'state': 'committed',
+                }, pk=['logical_part', 'generation'], replace=True, ensure_table=True)
+            try:
+                for logical_part, generation in {(ref.logical_part, ref.generation) for ref in old_refs if ref.generation > 0}:
+                    records.execute_params(
+                        'UPDATE _iosql_compactions SET state=? WHERE logical_part=? AND generation=?',
+                        ['obsolete', logical_part, generation], commit=True,
+                    )
+            except NoSuchTable:
+                pass
 
-        def sort_key(row):
-            return tuple(self._row_sort_value(row, field) for field in fields)
-
+    def _validate_compact_generations(self, refs, result):
+        """发布记录与可见 manifest 必须一致；重复业务主键不属于损坏。"""
+        visible = {}
+        for ref in refs:
+            if ref.state != 'obsolete':
+                visible.setdefault((str(ref.logical_part), ref.generation), set()).add(ref.part_key)
         try:
-            return sorted(rows, key=sort_key)
-        except TypeError:
-            return sorted(
-                rows,
-                key=lambda row: tuple(str(row.get(field)) for field in fields),
-            )
+            records = self.table_meta_db['_iosql_compactions'].query(
+                'SELECT * FROM _iosql_compactions', to_dict=True)
+        except NoSuchTable:
+            return
+        for record in records:
+            if record['state'] == 'obsolete':
+                continue
+            try:
+                expected = set(json.loads(record['part_keys_json']))
+            except (TypeError, ValueError):
+                expected = None
+            actual = visible.get((str(record['logical_part']), record['generation']), set())
+            if record['state'] != 'committed' or expected is None or expected != actual:
+                result.add_error('incomplete_generation', 'compact 发布记录与可见 segment 不一致')
+
+    def _compact_sorted_rows(self, refs, spec):
+        """磁盘暂存加外部排序；除 segment 元数据外，只保留读取批和目标 chunk。"""
+        columns = list(spec.columns)
+        quoted = ','.join(self._quote_identifier(column) for column in columns)
+        order = list(dict.fromkeys(field for field in [
+            spec.order_key, spec.time.name if spec.time else None,
+            spec.partition.column if spec.partition else None, *spec.primary_key,
+        ] if field))
+        query = build_select_cases_query('data', '*', None, spec.columns)
+        with tempfile.TemporaryDirectory(prefix='iosql-compact-') as directory:
+            with closing(sqlite3.connect(os.path.join(directory, 'sort.sqlite3'))) as conn:
+                conn.row_factory = sqlite3.Row
+                conn.execute('PRAGMA temp_store=FILE')
+                conn.execute('PRAGMA cache_size=-4096')
+                conn.execute('CREATE TABLE rows (' + ','.join(
+                    self._quote_identifier(column) + ' BLOB' for column in columns) + ')')
+                insert = f'INSERT INTO rows ({quoted}) VALUES (' + ','.join('?' for _ in columns) + ')'
+                for ref in refs:
+                    self._ensure_ref_file_present(ref)
+                    stream = self._iter_part_query_batches(ref.path, query, 1000)
+                    with closing(stream):
+                        for batch in stream:
+                            conn.executemany(insert, [tuple(row[column] for column in columns) for row in batch])
+                conn.commit()
+                sql = 'SELECT * FROM rows'
+                if order:
+                    sql += ' ORDER BY ' + ','.join(self._quote_identifier(field) for field in order)
+                with closing(conn.execute(sql)) as cursor:
+                    while True:
+                        batch = cursor.fetchmany(1000)
+                        if not batch:
+                            break
+                        for row in batch:
+                            yield dict(row)
 
     def _compact_row_chunks(self, rows, primary_key, target_rows):
-        chunks = []
         current = []
         current_keys = set()
         for row in rows:
@@ -1731,15 +1764,14 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 len(current) >= target_rows
                 or (pk_value is not None and pk_value in current_keys)
             ):
-                chunks.append(current)
+                yield current
                 current = []
                 current_keys = set()
             current.append(row)
             if pk_value is not None:
                 current_keys.add(pk_value)
         if current:
-            chunks.append(current)
-        return chunks
+            yield current
 
     def _write_compact_chunks(self, logical_part, chunks, spec):
         if not chunks:
@@ -2133,6 +2165,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return len(refs)
 
     def _latest_rows(self, query_spec, columns, by):
+        return list(self._iter_latest_rows(query_spec, columns, by))
+
+    def _iter_latest_rows(self, query_spec, columns, by):
         table_spec = self.spec()
         if not table_spec:
             raise BadArgument('latest requires a TableSpec')
@@ -2145,23 +2180,29 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 '或显式传 latest(by=[...])'
             )
         group_fields = self._normalize_latest_by(by, symbol_column)
-        rows = _TableQuery(self, query_spec).to_list()
-        if not rows:
-            return []
-
-        self._ensure_latest_fields(rows[0], group_fields)
-
+        from .query_util import validate_select_fields
+        validate_select_fields(columns, table_spec.columns)
+        for field in group_fields:
+            if field not in table_spec.columns:
+                raise BadArgument(f'latest grouping field missing: {field}')
         requested_symbols = self._normalize_symbols(query_spec.symbols)
         latest_by_key = OrderedDict()
-        for row in rows:
+        time_column = self._query_time_column(table_spec).name
+        order = [(time_column, 'desc')] + [
+            (field, 'asc') for field in table_spec.primary_key if field != time_column
+        ]
+        sort_key = self._row_sort_key(self._parse_order_by(order))
+        for row in self._iter_latest_candidates(query_spec, group_fields, order):
             if requested_symbols is not None:
                 symbol = row.get(symbol_column)
                 if symbol not in requested_symbols:
                     continue
             key = tuple(row[field] for field in group_fields)
-            if key in latest_by_key:
-                continue
-            latest_by_key[key] = row
+            previous = latest_by_key.get(key)
+            if previous is None or sort_key(row) < sort_key(previous):
+                latest_by_key[key] = row
+
+        latest_by_key = OrderedDict(sorted(latest_by_key.items(), key=lambda item: sort_key(item[1])))
 
         if requested_symbols is None:
             latest_rows = list(latest_by_key.values())
@@ -2172,7 +2213,31 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 symbol_column,
                 group_fields,
             )
-        return self._project_columns(latest_rows, columns)
+        yield from self._project_columns(latest_rows, columns)
+
+    def _iter_latest_candidates(self, query_spec, group_fields, order):
+        """每个文件只返回每组首行，窗口排序在执行器内完成并可落盘。"""
+        spec = self.spec()
+        columns = dict(spec.columns)
+        fields_sql = ','.join(self._quote_identifier(field) for field in columns)
+        marker = '__iosql_latest_rank'
+        while marker in columns:
+            marker += '_'
+        partition_sql = ('PARTITION BY ' + ','.join(self._quote_identifier(field) for field in group_fields) + ' '
+                         if group_fields else '')
+        order_sql = self._order_by_sql(order, '*', columns)
+        where = self._build_where(self._compile_query_where(query_spec))
+        for ref, query in self._select_queries_for_where('*', where, columns):
+            self._ensure_ref_file_present(ref)
+            sql = ('SELECT ' + fields_sql + ' FROM (SELECT ' + fields_sql +
+                   ', ROW_NUMBER() OVER (' + partition_sql + 'ORDER BY ' + order_sql + ') AS ' +
+                   self._quote_identifier(marker) + ' FROM (' + query.sql.rstrip(';') + ')) WHERE ' +
+                   self._quote_identifier(marker) + '=1')
+            stream = self._iter_part_query_batches(ref.path, replace(query, sql=sql), 1000)
+            with closing(stream):
+                for batch in stream:
+                    for row in batch:
+                        yield dict(row)
 
 
 
@@ -2408,8 +2473,6 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if state is None:
             state = 'sealed' if self._bool_value(row.get('sealed')) else 'active'
         state = str(state or 'active').lower()
-        if state not in ['active', 'sealed', 'obsolete']:
-            state = 'sealed' if self._bool_value(row.get('sealed')) else 'active'
         return SegmentInfo(
             logical_part=row['logical_part'],
             segment_id=int(row['segment_id']),
@@ -2446,6 +2509,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         infos = [self._segment_from_row(row) for row in rows]
         if not include_obsolete:
+            if any(info.state not in ('active', 'sealed', 'obsolete') for info in infos):
+                raise UnsafeOperation('manifest 含非法发布状态，请运行 validate() 检查')
             infos = [info for info in infos if info.state != 'obsolete']
         return sorted(
             infos,
@@ -2484,6 +2549,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return rows[0].get('created_at') if rows else None
 
     def _upsert_segment_info(self, info):
+        if getattr(self._mutation_lock_state, 'defer_segment_manifest', False):
+            return
         now = arrow.now().format("YYYY-MM-DD HH:mm:ss")
         state = self._normalized_segment_state(info)
         row = {
@@ -2590,6 +2657,16 @@ class Table(TimeseriesQueryMixin, BaseTable):
     _column_stats_cache_hits = 0
     _column_stats_cache_misses = 0
 
+    def _data_file_stat_key(self, path):
+        signature = []
+        for candidate in (path, path + '-wal'):
+            try:
+                info = os.stat(candidate)
+                signature.append((info.st_mtime_ns, info.st_size))
+            except FileNotFoundError:
+                signature.append(None)
+        return (path, tuple(signature))
+
     def _data_file_column_stats(self, part_key):
         """按 segment 数据文件缓存列 MIN/MAX 统计（键含 mtime+size，
         任何写入都会改变键从而自动失效）。有 where 的重复查询不再
@@ -2604,8 +2681,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             return {}
         def _stat_key():
             try:
-                st = os.stat(part_dbfile)
-                return (part_dbfile, st.st_mtime_ns, st.st_size)
+                return self._data_file_stat_key(part_dbfile)
             except OSError:
                 return None
 
@@ -2713,6 +2789,19 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if not values:
                 stats[column] = {'min': None, 'max': None}
                 continue
+            declared = _canon_sqlite_type(table_spec.columns.get(column))
+            trustworthy = (
+                declared == 'text' and all(isinstance(value, str) for value in values)
+                or declared == 'integer' and all(isinstance(value, int) for value in values)
+                or declared == 'float' and all(
+                    isinstance(value, (int, float)) and float(value) == value
+                    for value in values
+                )
+            )
+            if not trustworthy:
+                # 转换后的 SQLite 值或排序无法从输入证明，保守扫描而不猜测亲和性。
+                stats[column] = {'min': None, 'max': None, 'complete': False}
+                continue
             try:
                 stats[column] = {'min': min(values), 'max': max(values)}
             except TypeError:
@@ -2808,40 +2897,6 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _pk_cases(self, row, pk):
         return [Case(field, '=', row[field]) for field in pk]
-
-    def _column_types_for_pk_lookup(self, table_spec):
-        meta = self.get_table_meta()
-        if meta:
-            return {
-                key: item["type"]
-                for key, item in meta["column_info"].items()
-            }
-        return dict(table_spec.columns or {})
-
-    def _find_existing_pk_segment(self, logical_part, row, pk, table_spec):
-        if not pk:
-            return None
-
-        column_types = self._column_types_for_pk_lookup(table_spec)
-        cases = self._pk_cases(row, pk)
-        query = build_select_exists_query(
-            _PART_DATA_TABLE_NAME,
-            cases,
-            column_types,
-        )
-        for ref in self._physical_part_refs([logical_part]):
-            part_dbfile = self._get_part_dbfile(ref.part_key)
-            with self._part_db(part_dbfile, auto_commit=False) as db:
-                try:
-                    rows = db[_PART_DATA_TABLE_NAME].query(
-                        query.sql,
-                        params=query.params,
-                    )
-                except NoSuchTable:
-                    continue
-            if rows:
-                return ref
-        return None
 
     def _write_segment_rows(
         self,
@@ -3019,9 +3074,20 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return excluded
 
     def _stats_excludes_case(self, stats, case):
+        if stats.get('complete') is False or case.value['type'] == 'variable':
+            return False
         stat_min = stats.get('min')
         stat_max = stats.get('max')
         if stat_min is None or stat_max is None:
+            return False
+        spec = self.spec()
+        declared = _canon_sqlite_type(spec.columns.get(case.field)) if spec else None
+        if declared == 'text' and not all(isinstance(value, str) for value in (stat_min, stat_max)):
+            # 兼容历史 manifest 中从数值输入错误产生的 text 列统计。
+            return False
+        if declared in ('integer', 'float') and not all(
+            isinstance(value, (int, float)) for value in (stat_min, stat_max)
+        ):
             return False
 
         op = case.op
@@ -3066,6 +3132,10 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         excluded = set()
         for info in refs:
+            if (_canon_sqlite_type(table_spec.columns.get(table_spec.session_column)) == 'text'
+                    and any(value is not None and not isinstance(value, str)
+                            for value in (info.session_min, info.session_max))):
+                continue
             if self._session_values_outside_segment(values, info):
                 excluded.add(self._segment_lookup_key(info))
         return excluded
@@ -3199,6 +3269,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if timeout_ms is not None else None
         )
         if limit == 0:
+            self._validate_projection_only(fields)
             return
 
         if order_by:
@@ -3215,6 +3286,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         meta = self.get_table_meta()
         if not meta:
+            self._validate_projection_only(fields)
             return
         column_types = {
             key: item["type"] for key, item in meta["column_info"].items()
@@ -3514,6 +3586,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             }
         else:
             # No such table
+            self._validate_projection_only(fields)
             return []
 
         w = self._build_where(where)
@@ -3525,6 +3598,21 @@ class Table(TimeseriesQueryMixin, BaseTable):
         )
         if limit == 0:
             return []
+
+        if not order_by and limit is not None:
+            # 无序查询逐文件扣除剩余额度；OR 在单条 SQL 内求并集，保留物理重复行。
+            result = []
+            for ref, query in self._select_queries_for_where(
+                fetch_fields, w, column_types, limit=limit,
+            ):
+                remaining = limit - len(result)
+                query = replace(query, params=list(query.params[:-1]) + [remaining])
+                self._ensure_ref_file_present(ref)
+                with self._part_db(self._get_part_dbfile(ref.part_key), auto_commit=False) as db:
+                    result.extend(db[_PART_DATA_TABLE_NAME].query(query.sql, params=query.params))
+                if len(result) >= limit:
+                    break
+            return [dict(row) for row in result] if to_dict else result
 
         # ORDER BY + LIMIT 下推：每 segment SQL 先取 top-N，再在 Python 归并，
         # 避免全表物化（UI /rows 大表分页依赖此路径），结果与不下推一致
@@ -3616,6 +3704,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return normalized
 
     def _select_fields_with_order(self, fields, order_by, column_types):
+        from .query_util import validate_select_fields
+        validate_select_fields(fields, column_types)
         project_fields = self._plain_select_fields(fields)
         if project_fields is None:
             return fields, None
@@ -3628,6 +3718,13 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if fetch_fields == project_fields:
             return fields, None
         return fetch_fields, project_fields
+
+    def _validate_projection_only(self, fields):
+        """空表和 limit=0 仍然验证已声明的投影，错误不能取决于是否有数据。"""
+        from .query_util import validate_select_fields
+        spec = self.spec()
+        if spec is not None:
+            validate_select_fields(fields, spec.columns)
 
     def _plain_select_fields(self, fields):
         if isinstance(fields, (tuple, list)):
@@ -4018,46 +4115,20 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _iter_part_query_batches(self, part_dbfile, query, batch_size,
                                  deadline=None):
-        offset = 0
-        base_sql = query.sql.rstrip().rstrip(';')
-        while True:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError('SQLite query exceeded timeout_ms budget')
-            sql = f'{base_sql} limit ? offset ?'
-            params = list(query.params) + [batch_size, offset]
-            with self._part_db(part_dbfile, auto_commit=False) as db:
-                try:
-                    if deadline is None:
-                        rows = db[_PART_DATA_TABLE_NAME].query(sql, params=params)
-                    else:
-                        with db.transaction(immediate=False) as conn:
-                            conn.set_progress_handler(
-                                lambda: int(time.monotonic() >= deadline), 1000,
-                            )
-                            try:
-                                rows = db[_PART_DATA_TABLE_NAME].query(
-                                    sql, params=params,
-                                )
-                                if time.monotonic() >= deadline:
-                                    raise TimeoutError(
-                                        'SQLite query exceeded timeout_ms budget'
-                                    )
-                            except sqlite3.OperationalError as exc:
-                                if time.monotonic() >= deadline:
-                                    raise TimeoutError(
-                                        'SQLite query exceeded timeout_ms budget'
-                                    ) from exc
-                                raise
-                            finally:
-                                conn.set_progress_handler(None, 0)
-                except NoSuchTable:
-                    rows = []
-            if not rows:
-                break
-            yield list(rows)
-            if len(rows) < batch_size:
-                break
-            offset += len(rows)
+        stream = self._part_ordered_rows(part_dbfile, query, batch_size, deadline)
+        reservation = reserve_process_connections(1, self._max_process_connections)
+        try:
+            batch = []
+            for row in stream:
+                batch.append(row)
+                if len(batch) == batch_size:
+                    yield batch
+                    batch = []
+            if batch:
+                yield batch
+        finally:
+            stream.close()
+            release_process_connections(reservation)
 
     def _open_part_read_conn(self, part_dbfile):
         """为有序流式扫描打开专用只读连接（绕开分区连接池）。
@@ -4111,6 +4182,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         conn = self._open_part_read_conn(part_dbfile)
         try:
             if deadline is not None:
+                conn.execute(f'PRAGMA busy_timeout={max(0, int((deadline - time.monotonic()) * 1000))}')
                 conn.set_progress_handler(
                     lambda: int(time.monotonic() >= deadline), 1000,
                 )
@@ -4172,6 +4244,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         """
         meta = self.get_table_meta()
         if not meta:
+            self._validate_projection_only(fields)
             return
         column_types = {
             key: item["type"] for key, item in meta["column_info"].items()
@@ -4217,6 +4290,12 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 '或去掉 order_by 改用分区自然序流式导出'
             )
 
+        chunk_size = self._merge_stream_chunk(batch_size, len(stream_specs))
+        # 后端在预留连接前固定扫描元数据，避免占满配额后再次申请元数据库连接。
+        part_streams = [
+            self._part_ordered_rows(path, query, chunk_size, deadline)
+            for path, query in stream_specs
+        ]
         try:
             reservation = reserve_process_connections(
                 len(stream_specs),
@@ -4229,17 +4308,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 f'{self._max_process_connections}；{exc}'
             ) from exc
 
-        chunk_size = self._merge_stream_chunk(batch_size, len(stream_specs))
-        part_streams = []
         merged_stream = None
         try:
-            part_streams = [
-                self._part_ordered_rows(
-                    part_dbfile, query, chunk_size, deadline,
-                )
-                for part_dbfile, query in stream_specs
-            ]
-
             emitted = 0
             pending = []
             merged_stream = heapq.merge(*part_streams, key=sort_key)
@@ -4326,22 +4396,44 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 f'invalid index order: {order}；合法值: asc/desc'
             )
         with self._mutation_lock():
-            for ref in self._physical_part_refs():
+            spec = self.spec()
+            if spec is None or column not in spec.columns:
+                raise BadArgument(f'Unknown field `{column}`')
+            for ref in self._physical_part_refs(lightweight=True):
                 self._ensure_ref_file_present(ref)
                 part_dbfile = self._get_part_dbfile(ref.part_key)
                 with self._part_db(part_dbfile, auto_commit=True) as part_db:
                     part_db[_PART_DATA_TABLE_NAME].create_index(
                         column, order_value, exist_ok=exist_ok
                     )
+            self.table_meta_db['_iosql_indexes'].insert(
+                {'column_name': column, 'sort_order': order_value},
+                pk=['column_name'], replace=True, ensure_table=True,
+            )
+
+    def _logical_indexes(self):
+        """逻辑表的持久索引定义，供未来分区、compact 与迁移复用。"""
+        try:
+            return self.table_meta_db['_iosql_indexes'].query(
+                'SELECT column_name, sort_order FROM _iosql_indexes', to_dict=True,
+            )
+        except NoSuchTable:
+            return []
 
     def drop_index(self, column):
         dropped = 0
         with self._mutation_lock():
-            for ref in self._physical_part_refs():
+            for ref in self._physical_part_refs(lightweight=True):
                 self._ensure_ref_file_present(ref)
                 part_dbfile = self._get_part_dbfile(ref.part_key)
                 with self._part_db(part_dbfile, auto_commit=True) as part_db:
                     dropped += part_db[_PART_DATA_TABLE_NAME].drop_column_index(column)
+            try:
+                self.table_meta_db['_iosql_indexes'].execute_params(
+                    'DELETE FROM _iosql_indexes WHERE column_name=?', [column], commit=True,
+                )
+            except NoSuchTable:
+                pass
         return dropped
 
     def upsert_all(
@@ -4355,29 +4447,10 @@ class Table(TimeseriesQueryMixin, BaseTable):
     def _upsert_all_locked(
         self, kv_list, pk, partition=None, commit=True, **kwargs
     ):
-        """Update or insert rows based on primary key.
+        """按受影响主键合并字段；缺字段保留旧值，显式 None 写 NULL。
 
-        注意：实现为全表 SELECT + 内存合并 + REPLACE 写回，复杂度 O(全表)，
-        不适合大表高频 upsert；Segment.rows 表不支持（内部走 replace 会报错）。
-        常规业务优先使用 `write(rows, mode='upsert')`（契约感知）。
-
-        Upsert semantics:
-        - For each item in kv_list with pk that exists in table: UPDATE (merge fields)
-        - For each item in kv_list with pk that doesn't exist: INSERT
-
-        Logic:
-        1. SELECT all existing rows (no WHERE - pk determines what to update)
-        2. Build a dict keyed by pk for fast lookup
-        3. For each item in kv_list:
-           - If pk exists: MERGE (update fields with new values)
-           - If pk is NEW: INSERT the new row
-        4. INSERT all rows with REPLACE
-
-        Args:
-            kv_list: List of dicts with values to update/insert
-            pk: Primary key columns
-            partition: Partition object (auto-loaded if not provided)
-            commit: Whether to commit transaction
+        每组最多 100 个输入键，Python 内存随输入及命中行数增长；
+        不读取或重写无关行。Segment.rows 仍按契约拒绝覆盖写入。
         """
         if isinstance(kv_list, dict):
             kv_list = [kv_list]
@@ -4389,29 +4462,23 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         self._ensure_pk_present(kv_list, pk)
 
-        # Step 1: SELECT all existing rows (no WHERE - pk is the identity)
-        data = self.select("*", where=None, to_dict=True)
+        pk = [pk] if isinstance(pk, str) else list(pk)
+        spec = self.spec()
+        self._ensure_segment_conflict_supported(spec, 'replace')
+        self._reject_cross_partition_replace(partition or self._partition, pk)
+        # 只读取输入主键对应的行，避免一个键的修改物化并重写整张表。
+        data = self._rows_for_primary_keys(kv_list, pk, spec, partition or self._partition)
 
-        # Step 2: Build dict keyed by pk for O(1) lookup
-        # Format: {(pk1, pk2, ...): {full_row_dict}}
+        # 用持久类型后的主键索引命中行，避免 text 主键的数值输入丢失旧字段。
         data = {tuple([item[k] for k in pk]): item for item in data}
 
-        # Step 3: Merge kv_list into existing data
-        # - If pk exists: update only the fields present in kv_list (partial update)
-        # - If pk is new: insert the complete new row
-        for dic in kv_list:
-            key = tuple([dic[k] for k in pk])
+        keys = self._normalize_pk_keys(kv_list, pk, spec)
+        for key, dic in zip(keys, kv_list):
             if key in data:
-                # Existing row: merge fields (new values override old)
-                # Using {**existing, **new} ensures new values take precedence
                 data[key] = {**data[key], **dic}
             else:
-                # New row: insert the complete row
                 data[key] = dic
 
-        # Step 4: INSERT with REPLACE (SQLite upsert behavior)
-        # - Existing rows: UPDATE based on pk
-        # - New rows: INSERT
         self.insert_all(
             list(data.values()),
             pk=pk,
@@ -4421,9 +4488,28 @@ class Table(TimeseriesQueryMixin, BaseTable):
             commit=commit,
             **kwargs,
         )
-        # def insert_all(self, data, pk=None, extra_data=None, partition=None,
-        #                replace=False, ignore=False, commit=True, **kwargs):
-        # raise NotImplementedError()
+
+    def _rows_for_primary_keys(self, rows, pk, spec, partition):
+        """按主键中的分区列直达文件，避免对每个键重复枚举整库分区。"""
+        groups = OrderedDict()
+        known_parts = {self._part_token(part) for part in self.table_parts()}
+        for row in rows:
+            logical_part = partition.get_key(row) if partition else None
+            groups.setdefault(logical_part, []).append(row)
+        data = []
+        for logical_part, group in groups.items():
+            refs = self._physical_part_refs([logical_part], lightweight=True)
+            for start in range(0, len(group), 100):
+                cases = [self._pk_cases(row, pk) for row in group[start:start + 100]]
+                query = build_select_or_cases_query('data', '*', cases, spec.columns)
+                for ref in refs:
+                    # 新键的分区可以尚不存在，不能为查询创建空文件。
+                    if not os.path.exists(ref.path) and self._part_token(logical_part) not in known_parts:
+                        continue
+                    self._ensure_ref_file_present(ref)
+                    with self._part_db(ref.path, auto_commit=False) as db:
+                        data.extend(db['data'].query(query.sql, params=query.params, to_dict=True))
+        return data
 
     def delete(self, where):
         """Delete rows matching the where clause from all relevant partitions.
@@ -4641,42 +4727,49 @@ class Table(TimeseriesQueryMixin, BaseTable):
             )
             return
 
-        for row in rows:
-            existing = self._find_existing_pk_segment(
-                logical_part,
-                row,
-                pk,
-                table_spec,
+        # 批内先按持久类型去重，随后每文件、每组键一次查询；新增行统一 append。
+        normalized = self._unique_pk_rows(rows, pk, table_spec)
+        existing_keys = set()
+        for start in range(0, len(normalized), 100):
+            chunk = normalized[start:start + 100]
+            cases = [self._pk_cases(row, pk) for _, row in chunk]
+            query = build_select_or_cases_query('data', pk, cases, table_spec.columns)
+            for ref in self._physical_part_refs([logical_part], lightweight=True):
+                self._ensure_ref_file_present(ref)
+                with self._part_db(ref.path, auto_commit=False) as db:
+                    for row in db['data'].query(query.sql, params=query.params):
+                        existing_keys.add(tuple(row[field] for field in pk))
+        pending = [row for key, row in normalized if key not in existing_keys]
+        if pending:
+            self._append_segment_rows(
+                logical_part, part_column, pending, pk, partition,
+                False, False, commit, layout, part_kwargs,
             )
-            if existing is not None:
-                if ignore:
-                    continue
-                self._write_segment_rows(
-                    existing,
-                    logical_part,
-                    part_column,
-                    [row],
-                    pk,
-                    partition,
-                    replace,
-                    ignore,
-                    commit,
-                    layout,
-                    part_kwargs,
-                )
-            else:
-                self._append_segment_rows(
-                    logical_part,
-                    part_column,
-                    [row],
-                    pk,
-                    partition,
-                    replace,
-                    ignore,
-                    commit,
-                    layout,
-                    part_kwargs,
-                )
+
+    def _unique_pk_rows(self, rows, pk, table_spec):
+        """用 SQLite 亲和性归一主键并保留首行，正确处理 text 列的数值输入。"""
+        seen = set()
+        unique = []
+        for key, row in zip(self._normalize_pk_keys(rows, pk, table_spec), rows):
+            if key not in seen:
+                seen.add(key)
+                unique.append((key, row))
+        return unique
+
+    def _normalize_pk_keys(self, rows, pk, table_spec):
+        """归一输入主键的持久类型，供批量 ignore 与局部 upsert 共用。"""
+        with closing(sqlite3.connect(':memory:')) as conn:
+            fields = [f'k{i}' for i in range(len(pk))]
+            definitions = [
+                f'{field} {_canon_sqlite_type(table_spec.columns.get(column)) or "BLOB"}'
+                for field, column in zip(fields, pk)
+            ]
+            conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ', ordinal INTEGER)')
+            conn.executemany('INSERT INTO keys VALUES (' +
+                             ','.join('?' for _ in range(len(pk) + 1)) + ')',
+                             [tuple(row[field] for field in pk) + (i,) for i, row in enumerate(rows)])
+            return [tuple(item[:-1]) for item in conn.execute(
+                'SELECT * FROM keys ORDER BY ordinal')]
 
     def _do_insert_part(
         self,
@@ -5146,6 +5239,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             }
             mysqlite_columns.append(dic)
 
+        indexes = self._logical_indexes()
         with self._part_db(part_dbfile, auto_commit=True) as db:
             db[part_table_name].create_table(
                 mysqlite_columns,
@@ -5153,6 +5247,10 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 save_meta=True,
                 table_comment=None,
             )
+            for definition in indexes:
+                db[part_table_name].create_index(
+                    definition['column_name'], definition['sort_order'], exist_ok=True,
+                )
 
     @property
     def table_meta_db(self):

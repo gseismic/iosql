@@ -433,6 +433,10 @@ def _copy(plans, publisher, source, batch_size, mode):
     for plan in plans:
         plan.result.source_rows = source.count(plan) if source else plan.source.count_rows()
         target = publisher.table(plan)
+        if (getattr(target, '_storage_engine', None) == 'sqlite'
+                and hasattr(plan.source, '_logical_indexes')):
+            for definition in plan.source._logical_indexes():
+                target.create_index(definition['column_name'], definition['sort_order'])
         iterator = source.batches(plan, batch_size) if source else plan.source.iter_batches(batch_size=batch_size)
         try:
             with closing(iterator):

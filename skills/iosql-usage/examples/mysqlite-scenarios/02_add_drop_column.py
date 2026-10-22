@@ -43,6 +43,7 @@ def run():
 
     print("== 删除列走原生 SQL（API 无 drop_column；execute 不失效 schema 缓存）")
     cached_before = list(dict(events.column_info()["column_type"]).keys())
+    print("删除前缓存字段:", cached_before)
     events.execute('ALTER TABLE "events" DROP COLUMN "score"')
     cached_after = list(dict(events.column_info()["column_type"]).keys())
     print(f"缓存视图: {cached_after}  <- 仍含已删的 score，Table 缓存不感知原生 DDL")

@@ -8,12 +8,17 @@ import math
 import tempfile
 import threading
 import time
+import json
+import uuid
+import warnings
 from contextlib import contextmanager
 
 from ...migration import OMITTED
+from ...coordination import atomic_json, sync_directory
 from ...exception import BadArgument, SchemaConflict, TableSpecConflict, UnsafeOperation
 from ...spec import PhysicalLayout, SegmentInfo, TableContract
 from ...utils.createtable import build_createtable_meta
+from ...utils.mysqlite.connection_pool import reserve_process_connections, release_process_connections
 from ..sqlite.table import Table as DirectoryTable, _canon_sqlite_type
 from ..sqlite.query_util import build_delete_query, build_select_count_query
 
@@ -195,38 +200,41 @@ class Table(DirectoryTable):
                 self._db_parts_condition.notify_all()
 
     @contextmanager
-    def _connection(self, deadline=None):
-        with tempfile.TemporaryDirectory(prefix='iosql-parquet-') as temp_dir:
-            conn = _duckdb().connect(config={
-                'threads': 1, 'memory_limit': '256MB', 'temp_directory': temp_dir,
-            })
-            timer = None
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+    def _connection(self, deadline=None, reserved=False):
+        reservation = None if reserved else reserve_process_connections(1, self._max_process_connections)
+        try:
+            with tempfile.TemporaryDirectory(prefix='iosql-parquet-') as temp_dir:
+                conn = _duckdb().connect(config={
+                    'threads': 1, 'memory_limit': '256MB', 'temp_directory': temp_dir,
+                })
+                timer = None
+                try:
+                    if deadline is not None:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise TimeoutError('Parquet 查询超过 timeout_ms')
+                        timer = threading.Timer(remaining, conn.interrupt)
+                        timer.daemon = True
+                        timer.start()
+                    yield conn
+                except _duckdb().InterruptException as exc:
+                    raise TimeoutError('Parquet 查询超过 timeout_ms') from exc
+                finally:
+                    if timer is not None:
+                        timer.cancel()
+                        timer.join()
                     conn.close()
-                    raise TimeoutError('Parquet 查询超过 timeout_ms')
-                timer = threading.Timer(remaining, conn.interrupt)
-                timer.daemon = True
-                timer.start()
-            try:
-                yield conn
-            except _duckdb().InterruptException as exc:
-                raise TimeoutError('Parquet 查询超过 timeout_ms') from exc
-            finally:
-                if timer is not None:
-                    timer.cancel()
-                    timer.join()
-                conn.close()
+        finally:
+            release_process_connections(reservation)
 
-    def _create_view(self, conn, path):
+    def _create_view(self, conn, path, columns=None):
         if not os.path.isfile(path) or os.path.islink(path):
             raise UnsafeOperation(f'Parquet 数据文件缺失或为符号链接: {path}')
         try:
-            relation = conn.read_parquet(path)
+            relation = conn.read_parquet(self._parquet_files(path), union_by_name=True)
             physical = set(relation.columns)
-            meta = self.get_table_meta()
-            columns = (meta or {}).get('column_info') or {}
+            if columns is None:
+                columns = (self.get_table_meta() or {}).get('column_info') or {}
             projections = []
             for column, info in columns.items():
                 field = self._quote_identifier(column)
@@ -242,8 +250,9 @@ class Table(DirectoryTable):
 
     @contextmanager
     def _part_db(self, part_dbfile, auto_commit=True):
+        columns = (self.get_table_meta() or {}).get('column_info') or {}
         with self._read_lease(part_dbfile), self._connection() as conn:
-            self._create_view(conn, part_dbfile)
+            self._create_view(conn, part_dbfile, columns)
             try:
                 yield _Scan(conn)
             except _duckdb().BinderException as exc:
@@ -261,10 +270,10 @@ class Table(DirectoryTable):
                 self._quote_identifier(column) for column in pk
             ) + ')')
         conn.execute('CREATE TABLE data (' + ', '.join(definitions) + ')')
-        if os.path.exists(path):
+        if path is not None and os.path.exists(path):
             if os.path.islink(path):
                 raise UnsafeOperation(f'Parquet 数据文件不能是符号链接: {path}')
-            relation = conn.read_parquet(path)
+            relation = conn.read_parquet(self._parquet_files(path), union_by_name=True)
             physical = set(relation.columns)
             relation.create_view('source_data')
             fields = [self._quote_identifier(column) for column in columns]
@@ -272,17 +281,85 @@ class Table(DirectoryTable):
                            for column, field in zip(columns, fields)]
             conn.execute('INSERT INTO data SELECT ' + ', '.join(expressions) + ' FROM source_data')
 
-    def _publish(self, conn, path):
+    def _parquet_files(self, path):
+        """清单是物理集合的唯一发布点；缺文件或越界引用不能退化为空数据。"""
+        manifest = path + '.manifest.json'
+        if not os.path.exists(manifest):
+            return [path]
+        if os.path.islink(manifest):
+            raise UnsafeOperation(f'Parquet 清单不能是符号链接: {manifest}')
+        try:
+            with open(manifest, encoding='utf-8') as handle:
+                payload = json.load(handle)
+            files = payload['files']
+            if payload.get('format') != 'iosql-parquet-parts-v1' or not isinstance(files, list) or not files:
+                raise ValueError('invalid manifest')
+            directory = self._fragment_directory(path)
+            if os.path.islink(directory):
+                raise ValueError('symlink directory')
+            resolved = []
+            for name in files:
+                if name == '@base':
+                    candidate = path
+                elif (isinstance(name, str) and len(name) == 40 and name.endswith('.parquet')
+                      and all(char in '0123456789abcdef' for char in name[:-8])):
+                    candidate = os.path.join(directory, name)
+                else:
+                    raise ValueError('invalid fragment name')
+                if not os.path.isfile(candidate) or os.path.islink(candidate):
+                    raise ValueError('missing or unsafe fragment')
+                resolved.append(candidate)
+            if len(resolved) != len(set(resolved)):
+                raise ValueError('duplicate fragment')
+            return resolved
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise UnsafeOperation(f'Parquet 数据清单损坏: {manifest}') from exc
+
+    @staticmethod
+    def _fragment_directory(path):
+        return os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.parts')
+
+    def _publish(self, conn, path, append=False):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.islink(path):
             raise UnsafeOperation(f'Parquet 数据文件不能是符号链接: {path}')
-        fd, temporary = tempfile.mkstemp(prefix='.iosql-', suffix='.tmp', dir=os.path.dirname(path))
+        initial = not os.path.exists(path)
+        directory = os.path.dirname(path) if initial else self._fragment_directory(path)
+        if os.path.islink(directory):
+            raise UnsafeOperation(f'Parquet 数据片目录不能是符号链接: {directory}')
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix='.iosql-', suffix='.tmp', dir=directory)
         os.close(fd)
         try:
             conn.table('data').write_parquet(temporary, compression='zstd')
             with open(temporary, 'rb') as file:
                 os.fsync(file.fileno())
-            os.replace(temporary, path)
+            if initial:
+                os.replace(temporary, path)
+                sync_directory(directory)
+            else:
+                previous = self._parquet_files(path)
+                name = uuid.uuid4().hex + '.parquet'
+                fragment = os.path.join(directory, name)
+                os.replace(temporary, fragment)
+                sync_directory(directory)
+                sync_directory(os.path.dirname(path))
+                files = [('@base' if item == path else os.path.basename(item)) for item in previous] if append else []
+                atomic_json(path + '.manifest.json', {
+                    'format': 'iosql-parquet-parts-v1', 'files': files + [name],
+                })
+                visible = set(files + [name])
+                for candidate_name in os.listdir(directory):
+                    if (candidate_name not in visible and len(candidate_name) == 40
+                            and candidate_name.endswith('.parquet')
+                            and all(char in '0123456789abcdef' for char in candidate_name[:-8])):
+                        candidate = os.path.join(directory, candidate_name)
+                        try:
+                            if os.path.islink(candidate):
+                                raise UnsafeOperation('清理目标是符号链接')
+                            os.remove(candidate)
+                        except (OSError, UnsafeOperation) as exc:
+                            warnings.warn(f'Parquet 发布后的旧数据片清理未完成: {candidate}: {exc}', RuntimeWarning)
         finally:
             if os.path.exists(temporary):
                 os.remove(temporary)
@@ -338,13 +415,23 @@ class Table(DirectoryTable):
         try:
             with self._connection() as conn:
                 conn.execute('BEGIN TRANSACTION')
-                self._mutable_table(conn, path, column_types, pk)
+                self._mutable_table(conn, path if replace else None, column_types, pk)
                 conn.executemany(
                     f'INSERT{action} INTO data ({fields}) VALUES ({placeholders})',
                     [[row.get(column) for column in column_types] for row in part_data],
                 )
+                if not replace and os.path.exists(path) and pk:
+                    conn.read_parquet(self._parquet_files(path), union_by_name=True).create_view('existing_data')
+                    predicate = ' AND '.join(
+                        f'data.{self._quote_identifier(column)} = existing_data.{self._quote_identifier(column)}'
+                        for column in pk
+                    )
+                    if ignore:
+                        conn.execute(f'DELETE FROM data USING existing_data WHERE {predicate}')
+                    elif conn.execute(f'SELECT 1 FROM data JOIN existing_data ON {predicate} LIMIT 1').fetchone():
+                        raise BadArgument('Parquet 主键冲突；append 不允许覆盖已有行')
                 conn.execute('COMMIT')
-                self._publish(conn, path)
+                self._publish(conn, path, append=not replace)
         except _duckdb().ConstraintException as exc:
             raise BadArgument(f'Parquet 主键冲突或约束失败: {exc}') from exc
         except _duckdb().ConversionException as exc:
@@ -389,9 +476,18 @@ class Table(DirectoryTable):
             for column, reverse in self._parse_order_by(order_by)
         )
 
-    def _scan_rows(self, path, query, batch_size, deadline=None):
-        with self._read_lease(path, deadline), self._connection(deadline) as conn:
-            self._create_view(conn, path)
+    def _normalize_pk_keys(self, rows, pk, table_spec):
+        with self._connection() as conn:
+            fields = [f'k{i}' for i in range(len(pk))]
+            definitions = [f'{field} {_sql_type(table_spec.columns[column])}' for field, column in zip(fields, pk)]
+            conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ', ordinal BIGINT)')
+            conn.executemany('INSERT INTO keys VALUES (' + ','.join('?' for _ in range(len(pk) + 1)) + ')',
+                             [tuple(row[column] for column in pk) + (index,) for index, row in enumerate(rows)])
+            return [tuple(item[:-1]) for item in conn.execute('SELECT * FROM keys ORDER BY ordinal').fetchall()]
+
+    def _scan_rows(self, path, query, batch_size, deadline=None, columns=None):
+        with self._read_lease(path, deadline), self._connection(deadline, reserved=True) as conn:
+            self._create_view(conn, path, columns)
             try:
                 cursor = conn.execute(query.sql, query.params)
                 names = [d[0] for d in cursor.description]
@@ -410,11 +506,14 @@ class Table(DirectoryTable):
                 raise UnsafeOperation(f'Parquet 查询失败 {path}: {exc}') from exc
 
     def _iter_part_query_batches(self, part_dbfile, query, batch_size, deadline=None):
-        yield from self._scan_rows(part_dbfile, query, batch_size, deadline)
+        yield from super()._iter_part_query_batches(part_dbfile, query, batch_size, deadline)
 
     def _part_ordered_rows(self, part_dbfile, query, chunk_size, deadline=None):
-        for batch in self._scan_rows(part_dbfile, query, chunk_size, deadline):
-            yield from batch
+        columns = (self.get_table_meta() or {}).get('column_info') or {}
+        def rows():
+            for batch in self._scan_rows(part_dbfile, query, chunk_size, deadline, columns):
+                yield from batch
+        return rows()
 
     def iter_batches(self, batch_size=10_000):
         yield from self.iter_select_batches(batch_size=batch_size)
@@ -441,6 +540,14 @@ class Table(DirectoryTable):
     def _batch_column_stats(self, rows, table_spec):
         return self._serializable_stats(super()._batch_column_stats(rows, table_spec))
 
+    def _data_file_stat_key(self, path):
+        manifest = path + '.manifest.json'
+        try:
+            info = os.stat(manifest)
+        except FileNotFoundError:
+            return super()._data_file_stat_key(path)
+        return (path, info.st_mtime_ns, info.st_size)
+
     def _data_file_column_stats(self, part_key):
         return self._serializable_stats(super()._data_file_column_stats(part_key))
 
@@ -451,8 +558,29 @@ class Table(DirectoryTable):
             replace=replace, ignore=ignore, commit=commit,
             logical_part=logical_part, **part_kwargs,
         )
-        # 以实际存储值更新统计，避免类型转换（数值→文本、浮点→整数）造成错误裁剪。
-        return self._refresh_segment_info(logical_part, segment.segment_id, segment.part_key, layout)
+        if replace or ignore:
+            return self._refresh_segment_info(logical_part, segment.segment_id, segment.part_key, layout)
+        # 新增行计数精确，无法证明与持久类型一致的列统计会保守禁用。
+        return self._increment_segment_info(segment, rows, layout, TableContract.ensure(part_kwargs['table_contract']))
+
+    def _segment_cleanup_files(self, ref):
+        files = [path for path in (ref.path, ref.path + '.manifest.json') if os.path.isfile(path)]
+        directory = self._fragment_directory(ref.path)
+        if os.path.islink(directory):
+            raise UnsafeOperation(f'Parquet 数据片目录不能是符号链接: {directory}')
+        if os.path.isdir(directory):
+            for name in os.listdir(directory):
+                path = os.path.join(directory, name)
+                if not os.path.isfile(path) or os.path.islink(path):
+                    raise UnsafeOperation(f'Parquet 数据片不是普通文件: {path}')
+                files.append(path)
+        return files
+
+    def _remove_orphan_part_file(self, path):
+        if not self._is_safe_part_path(path) or not self._close_part_db_if_idle(path):
+            raise UnsafeOperation(f'不能清理被占用或越界的 Parquet 文件: {path}')
+        for candidate in self._segment_cleanup_files(SegmentInfo(path=path, logical_part=None, segment_id=-1, part_key=None)):
+            os.remove(candidate)
 
     def _legacy_segment_info(self, logical_part, lightweight=False):
         path = self._get_part_dbfile(logical_part)
@@ -498,7 +626,7 @@ class Table(DirectoryTable):
                 delete_query = build_delete_query('data', cases, column_types)
                 try:
                     with self._connection() as conn:
-                        self._create_view(conn, path)
+                        self._create_view(conn, path, {column: {'type': type_} for column, type_ in column_types.items()})
                         count = conn.execute(count_query.sql, count_query.params).fetchone()[0]
                         if not count:
                             continue

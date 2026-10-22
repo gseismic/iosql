@@ -3,6 +3,7 @@ import sqlite3
 import threading
 import queue
 import weakref
+import time
 from contextlib import contextmanager
 from typing import Dict, Any, Optional
 from urllib.parse import parse_qs, urlsplit
@@ -11,6 +12,18 @@ from .exception import BadArgument
 
 
 _DEFAULT_MAX_PROCESS_CONNECTIONS = 32
+_query_deadline = threading.local()
+
+
+@contextmanager
+def connection_deadline(deadline):
+    """为当前一次迭代推进继承查询截止时间，不能跨 yield 污染其他请求。"""
+    previous = getattr(_query_deadline, 'value', None)
+    _query_deadline.value = min(previous, deadline) if previous is not None else deadline
+    try:
+        yield
+    finally:
+        _query_deadline.value = previous
 
 
 class _ProcessConnectionBudget:
@@ -68,9 +81,10 @@ class _ProcessConnectionBudget:
         - 全部空闲时取所有池声明上限的最大值：空闲的保守临时池不应永久压缩
           全局预算（旧实现恒取 min()，一个临时小池会拖垮整个进程）。
         """
+        pools = self._pool_items()
         limits = [
             limit
-            for pool, limit in self._pools.items()
+            for pool, limit in pools
             if pool is requester or pool._checked_out > 0
         ]
         limits.extend(
@@ -81,8 +95,18 @@ class _ProcessConnectionBudget:
             limits.append(int(external_limit))
         if limits:
             return min(limits)
-        all_limits = list(self._pools.values())
+        all_limits = [limit for _, limit in pools]
         return max(all_limits) if all_limits else _DEFAULT_MAX_PROCESS_CONNECTIONS
+
+    def _pool_items(self):
+        """先复制底层弱引用映射，再解引用；GC/析构注销不会修改正在遍历的字典。"""
+        snapshot = self._pools.data.copy()
+        items = []
+        for reference, limit in snapshot.items():
+            pool = reference()
+            if pool is not None:
+                items.append((pool, limit))
+        return items
 
     def reset_after_fork(self, pool) -> None:
         """兼容池级入口；进程预算由 ``_ensure_current_process`` 一次性重建。"""
@@ -96,6 +120,9 @@ class _ProcessConnectionBudget:
     def acquire(self, requester) -> None:
         self._ensure_current_process()
         while True:
+            deadline = getattr(_query_deadline, 'value', None)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('等待连接预算超过 timeout_ms')
             with self._condition:
                 if requester._closed:
                     raise RuntimeError('connection pool is closed')
@@ -103,7 +130,7 @@ class _ProcessConnectionBudget:
                 if self._in_use < limit:
                     self._in_use += 1
                     return
-                pools = list(self._pools)
+                pools = [pool for pool, _ in self._pool_items()]
 
             reclaimed = False
             for pool in pools:
@@ -116,7 +143,8 @@ class _ProcessConnectionBudget:
                 continue
 
             with self._condition:
-                self._condition.wait(timeout=0.1)
+                remaining = max(0, deadline - time.monotonic()) if deadline is not None else 0.1
+                self._condition.wait(timeout=min(0.1, remaining))
 
     def release(self) -> None:
         self._ensure_current_process()
@@ -162,7 +190,7 @@ class _ProcessConnectionBudget:
                     )
                     self._in_use += count
                     return token, count
-                pools = list(self._pools)
+                pools = [pool for pool, _ in self._pool_items()]
 
             reclaimed = False
             for pool in pools:
@@ -443,6 +471,9 @@ class DatabaseConnectionPool:
 
     def _checkout_connection(self) -> sqlite3.Connection:
         while True:
+            deadline = getattr(_query_deadline, 'value', None)
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError('等待文件连接超过 timeout_ms')
             self._ensure_same_process()
             with self._lock:
                 if self._closed:
@@ -454,7 +485,8 @@ class DatabaseConnectionPool:
                 conn = self._new_connection_if_allowed()
                 if conn is None:
                     try:
-                        conn = self._available.get(timeout=0.1)
+                        remaining = max(0, deadline - time.monotonic()) if deadline is not None else 0.1
+                        conn = self._available.get(timeout=min(0.1, remaining))
                     except queue.Empty:
                         continue
 

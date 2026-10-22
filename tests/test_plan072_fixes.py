@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import multiprocessing as mp
+import json
 
 import pytest
 from typer.testing import CliRunner
@@ -326,7 +327,11 @@ def test_numeric_text_buckets_and_overflow(tmp_path):
                     "col": "v", "kind": "line", "buckets": 4,
                 })
                 assert response.status_code == 200, response.text
-                assert response.json()["y"] == [2.5, 10.0]
+                events = [json.loads(line) for line in response.text.splitlines()]
+                assert events[-1]['type'] == 'done'
+                # 当前图表契约保留每个原始点，不能再断言旧的桶平均值。
+                assert [point for event in events if event['type'] == 'data'
+                        for point in event['points']] == [[2, 2.0], [3, 3.0], [10, 10.0]]
         table.write({"id": 5, "x": "-4", "v": 5})
         negative = table.aggregate_by_bucket("x", ["v"], 4)
         assert negative["x_min"] == "-4"
@@ -390,8 +395,11 @@ def test_web_candle_order_pagination_and_sort_validation(tmp_path):
             "col": "close", "kind": "candle", "buckets": 1,
         })
         assert response.status_code == 200, response.text
-        assert response.json()["open"] == [10]
-        assert response.json()["close"] == [31]
+        events = [json.loads(line) for line in response.text.splitlines()]
+        assert events[-1]['type'] == 'done'
+        points = [point for event in events if event['type'] == 'data' for point in event['points']]
+        assert [point[1] for point in points] == [10, 20, 30, 31]
+        assert [point[-1] for point in points] == [10, 20, 30, 31]
         assert client.post("/api/table/nopk/rows", json={
             "order_by": "ts", "limit": 1,
         }).status_code == 422

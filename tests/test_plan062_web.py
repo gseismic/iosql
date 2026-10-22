@@ -421,6 +421,14 @@ class TestCountBudget:
     """P2：/count 过滤统计超查询时间预算 422；无筛选走 manifest 不受限。"""
 
     def test_filtered_count_budget(self, demo_uri, monkeypatch):
+        import time
+        from iosql.engines.sqlite.table import Table
+        original = Table._part_ordered_rows
+        def slow_rows(self, *args, **kwargs):
+            # 明确消耗预算，不能假设小表在较快机器上也需要超过 1ms。
+            time.sleep(0.01)
+            yield from original(self, *args, **kwargs)
+        monkeypatch.setattr(Table, '_part_ordered_rows', slow_rows)
         monkeypatch.setattr(web_app, "MAX_COUNT_QUERY_MS", 1)
         with _client(demo_uri) as client:
             resp = client.post("/api/table/prices/count", json={

@@ -47,6 +47,10 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
   compact 与写互斥是预期吞吐代价。同一逻辑表建议单 writer，多线程读取可按需提高 `max_connections_per_file`。
 - `compact()` 只整理当前可见 row segment，生成新的 sealed generation，并把旧 segment 标记为 `obsolete`；
   默认查询和 `segments()` 不扫描 obsolete。`repartition_to()` 写入新库，不要假设它会原地修改源库。
+- PLAN-093：compact 使用临时磁盘外部排序；构建文件不可见，全部成功后在一个元数据事务中
+  切换可见集合及发布记录。失败/进程退出保留旧可用集合；校验核对代成员，不拒绝合法重复主键。
+  CLI 单表 `--replace-source` 保留未选中表；dry-run 列出替换和保留范围。表重命名通过
+  持久 namespace_revision 让其他实例、进程丢弃旧文件句柄。
 - manifest 引用文件缺失时读取直接抛 `UnsafeOperation`（不隐式重建）；`validate()` 会以 `orphan_segment_file`
   警告列出孤儿文件；compact 可安全复用被孤儿占用的目标文件名。需要释放旧文件时先 `validate(deep=True)`，
   再用 `cleanup_obsolete(dry_run=False)`。
@@ -64,6 +68,16 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
   不会一次性载入全库。生产迁移先 `dry_run=True` 预览，再 `verify="row-count"` 校验。`migrate_to(dry_run=True)`
   会先校验 `mode`/`tables`/目标 URI，不创建业务临时目录，但可创建源协调锁文件；
   不连接目标，因此不校验目标连接、权限或既有表兼容性。本地源与目标不能相同或互相包含。
+- 无序读取同样使用单只读游标与 fetchmany，避免 OFFSET 重扫；无序 LIMIT 逐文件下推并停止。
+  latest 在文件内使用窗口查询筛出每组候选，Python 常驻内存随分组数增长；低层 upsert_all
+  只读取输入主键对应的行，按输入顺序合并。SQLite 逻辑单列索引定义持久化，未来文件、compact
+  以及迁移到 SQLite 的文件继承定义；不向无索引能力的 Parquet 目标承诺迁移索引。
+- 显式 write(mode=...) 优先于表 conflict；strict 在创建任何数据文件前校验整批字段。
+  未知投影列抛 BadArgument，物理缺列抛库级异常。统计无法证明与持久类型/比较亲和性一致时
+  保守扫描，不能以裁剪改变行集合。segment ignore 批量查重并保持批内首行语义。
+- Web 普通首页和快速计数不读取全列范围统计；局部主键布局的游标含物理文件身份，完整保留
+  跨文件重复行。布局或排序变化使游标显式失效。PG 控制会话有界复用，每次调用仍重新取锁和
+  检查 generation；关闭、断连、解锁失败及 fork 均有明确的清理路径。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`
   （`db.table(name, spec=spec)`），见 `examples/12_sqlite_postgresql_roundtrip.py`。PG 流式导出使用命名游标（单语句快照），
   无序翻页不会跳行/重复。

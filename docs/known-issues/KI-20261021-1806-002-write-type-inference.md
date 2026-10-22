@@ -2,6 +2,7 @@
 
 - 创建：2026-10-21 18:06（Asia/Shanghai）。模型：Codex，精确模型 ID 未提供，记为 `model-unknown`。
 - 初始状态：未解决。
+- 当前状态：已修复（PLAN-093，2026-10-23）。
 - 来源：PLAN-090 写入路径 profile 与独立对照。
 - 确认版本：`5f6ff5b17ae9e23948d3f3697bf411c1b555c999`。
 - 引入依据：`git diff 81c5e0a^ 81c5e0a -- iosql/utils/mysqlite/table.py` 确认 `81c5e0ab8acdac39807f890a64d8306dd9640c9f` 替换固定结构快速路径并加入无条件字段类型扫描。原修复是为保留 SQLite 表达式默认值语义，不能简单回退。
@@ -15,3 +16,9 @@
 候选方向：schema 推断延迟到实际需要建表或补列时执行；同构行恢复快速参数转换，异构行仍保留输入顺序、省略列默认值与事务回滚语义。8 项诊断语义检查通过，但尚未完成正式修复的全部回归，因此状态仍为未解决。
 
 本问题会影响实际导入，但业务当前首要耗时见 KI-20261021-1806-001。研究与原始数据见 `docs/dev/PLAN-090-model-unknown-sqlite-write-research-OUTCOME.md` 和 `docs/tests/20261021-17-WORKTREE/main.json`。
+
+## 2026-10-23：PLAN-093 修复
+
+固定结构写入不再执行无用途的 `_union_fields_of_dictlist()`；类型推断延迟到实际建表或补列的冷路径。连续相同字段集合使用 itemgetter 转换参数，异构行仍保持输入顺序，省略列继续由 SQLite 求值默认表达式。
+
+`test_fixed_schema_writes_do_not_infer_all_types` 将该推断函数替换为会抛错的探针，固定结构及异构字段写入仍成功，主键替换顺序与缺列默认值正确；原有类型冲突回归仍通过。相关证据和完整回归见 `docs/tests/20261023-PLAN-093/`。旧 NVMe/HDD 数字是历史观测，本次未将调用计数改进外推为业务 HDD 吞吐倍数。

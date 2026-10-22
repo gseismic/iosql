@@ -1,5 +1,5 @@
 import math
-from typing import Any, Dict, Union
+from typing import Any, Dict
 from .base import Partition, normalize_part_value
 from ..exception import PartitionSpecError
 
