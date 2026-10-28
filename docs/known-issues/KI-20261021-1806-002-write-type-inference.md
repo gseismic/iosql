@@ -17,6 +17,15 @@
 
 本问题会影响实际导入，但业务当前首要耗时见 KI-20261021-1806-001。研究与原始数据见 `docs/dev/PLAN-090-model-unknown-sqlite-write-research-OUTCOME.md` 和 `docs/tests/20261021-17-WORKTREE/main.json`。
 
+## 2026-10-21 23:57：真实列数的整月 profile 补证
+
+- 更新者：Codex，精确模型 ID 未提供，记为 `model-unknown`。状态保持未解决。
+- 确认版本：`c329cd07958f890b483b78e8603880f86d62aab6`，本轮未修改库代码。
+- 13 列、43,200 行、120 个已有 schema 文件的隔离回放，cProfile 记录 561,600 次 `suggest_value_type()`，`_union_fields_of_dictlist()` 累计 1.176 秒；这是带 profiler 的成本，不能用作无 profiler 的墙钟阶段占比。
+- 3 轮正常计时：NVMe 原导入 `1.4557 秒`、CPU `1.2612 秒`；仅在实验进程省去无用途的类型推断为 `1.2074 秒`、CPU `1.0043 秒`。与批量 append 实验叠加为 `0.6601 秒`、CPU `0.4443 秒`。全部主键核验通过，正式代码保持原状。
+- 当前恢复器传 `force=True`，已绕过 PLAN-090 的查询预检查；现场 30 秒样本约 60% 处于 D 状态，M3 回放主要耗时落在原生 commit 和 close。本条的 CPU 优化仍有价值，但不是当前 HDD 延迟的全部原因。
+- 关联 `KI-20261021-2357-001`；结果：`docs/dev/PLAN-092-model-unknown-live-import-profile-OUTCOME.md`；原始记录：`docs/tests/20261021-23-WORKTREE/`。
+
 ## 2026-10-23：PLAN-093 修复
 
 固定结构写入不再执行无用途的 `_union_fields_of_dictlist()`；类型推断延迟到实际建表或补列的冷路径。连续相同字段集合使用 itemgetter 转换参数，异构行仍保持输入顺序，省略列继续由 SQLite 求值默认表达式。

@@ -20,3 +20,5 @@
 | 2026-10-21 18:27 | [PLAN-091 普通查询取消 legacy 统计预扫描](PLAN-091-model-unknown-query-without-legacy-stat-scans.md) | 实施中（WORKTREE） | 按用户确认的时间分区语义修复查询寻址，保留条件过滤、诊断统计及 row segment 的已有裁剪。 |
 | 2026-10-21 19:30 | [PLAN-091 普通查询取消 legacy 统计预扫描](PLAN-091-model-unknown-query-without-legacy-stat-scans.md) | 已完成（WORKTREE） | [结果](PLAN-091-model-unknown-query-without-legacy-stat-scans-OUTCOME.md)：相关回归 271 项通过；真实 CSV 副本导入 0.7624 → 0.1031 秒，保留全主键检查。6 项既有失败经 HEAD 复现，另记录连接池偶发异常。 |
 | 2026-10-21 23:31 | [PLAN-091 普通查询取消 legacy 统计预扫描](PLAN-091-model-unknown-query-without-legacy-stat-scans.md) | 已提交（479f8e8） | [结果](PLAN-091-model-unknown-query-without-legacy-stat-scans-OUTCOME.md)：按用户授权提交修复及 PLAN-090 研究记录，补记实际修复提交编号；未推送，测试产物保留本地。 |
+| 2026-10-21 23:45 | [PLAN-092 恢复导入现场 profile](PLAN-092-model-unknown-live-import-profile.md) | 研究中 | 对正在执行的恢复导入采样，使用隔离回放区分 CPU、SQLite 与 HDD 成本；不改生产代码和运行进程。 |
+| 2026-10-21 23:57 | [PLAN-092 恢复导入现场 profile](PLAN-092-model-unknown-live-import-profile.md) | 已完成 profile（WORKTREE） | [结果](PLAN-092-model-unknown-live-import-profile-OUTCOME.md)：现场 60% 样本为磁盘等待，M3 整月控制回放约 71% 耗时在 commit/close；27 轮核验通过，两个 CPU 热点另有量化，未改生产代码。 |
