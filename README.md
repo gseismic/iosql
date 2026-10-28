@@ -575,6 +575,8 @@ iosql export \
 
 无全局 `order_by` 时，查询按分区/segment 分批读取。SQLite 的 `select()` 在全局 `order_by` 与 `limit` 同时提供时，会把 `ORDER BY ... LIMIT` 下推到每个 segment，再在 Python 层归并取前 `limit` 行。带排序的 `iter_select*()` / `query(...).iter_rows()` / `.iter_batches()` 使用分区只读游标和堆归并，惰性输出；归并受 `max_ordered_read_connections` 与进程连接预算约束。PostgreSQL 的排序在数据库端执行。
 
+SQLite/Parquet 配置 `max_process_connections=1` 时，无序流会先将当前物理文件的查询结果写入临时文件并释放读取连接，然后向调用方交付批次，使处理批次时的读写和 `save_as()` 不会等待自身占用的配额。内存仍按批次使用，但首批要等待当前文件扫描完成，临时磁盘用量随该文件的查询结果增长；`limit` 会下推到文件查询。多个流或有序流占满进程连接预算时，新的连接申请会快速抛出 `BadArgument`，可关闭已打开的流或调大 `max_process_connections` 后重试。
+
 读取流从开始消费到耗尽或关闭期间持有共享租约；提前退出循环时应显式关闭流，迁移前还需 flush 缓冲并退出 `buffered_writer` 上下文。完整示例见 [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py)。
 
 CLI `import` 会批处理读取 JSONL/CSV 并写入既有契约表，适合 vendor 历史文件和离线回补包：

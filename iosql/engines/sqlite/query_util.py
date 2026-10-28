@@ -115,6 +115,12 @@ def _qualified_fields_sql(fields, table_name):
     sql = build_select_fields_sql(fields)
     if sql == '*':
         return sql
+    if isinstance(fields, (list, tuple)):
+        items = [_select_identifier_field_sql(field) for field in fields]
+        return ','.join(
+            item if item == '*' else _quote_sql_identifier(table_name) + '.' + item
+            for item in items
+        )
     names = re.findall(r'"((?:[^"]|"")*)"', sql)
     return ','.join(_quote_sql_identifier(table_name) + '.' +
                     _quote_sql_identifier(name.replace('""', '"')) for name in names)
@@ -235,6 +241,21 @@ def build_select_or_cases_query(part_table_name, fields, or_cases, column_types,
         where,
         order_by_sql=order_by_sql,
         limit=limit,
+    )
+
+
+def build_select_primary_keys_query(part_table_name, fields, rows, pk, column_types):
+    """内部主键匹配只接受绑定值，不解析用户条件中的字段引用。"""
+    validate_select_fields(fields, column_types)
+    for field in pk:
+        _column_type(column_types, field)
+    condition = ' and '.join(_quote_sql_identifier(field) + ' = ?' for field in pk)
+    where = SqlQuery(
+        ' or '.join('(' + condition + ')' for _ in rows),
+        [row[field] for row in rows for field in pk],
+    )
+    return _build_select_with_where(
+        part_table_name, _qualified_fields_sql(fields, part_table_name), where,
     )
 
 

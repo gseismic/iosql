@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from typing import Dict, Any, Optional
 from urllib.parse import parse_qs, urlsplit
 
+from ...exception import BadArgument as IosqlBadArgument
 from .exception import BadArgument
 
 
@@ -143,6 +144,13 @@ class _ProcessConnectionBudget:
                 continue
 
             with self._condition:
+                limit = self._effective_limit_locked(requester)
+                if self._external_reservations and self._in_use >= limit:
+                    # 流在消费者返回前不会释放预留；继续等待可能永久自锁。
+                    raise IosqlBadArgument(
+                        '连接配额被流式查询占满；请先关闭读取流，'
+                        '或提高 max_process_connections'
+                    )
                 remaining = max(0, deadline - time.monotonic()) if deadline is not None else 0.1
                 self._condition.wait(timeout=min(0.1, remaining))
 
@@ -238,10 +246,13 @@ def get_process_connection_budget_status() -> Dict[str, int]:
 
 def reserve_process_connections(count: int, max_process_connections: int):
     """为外部 SQLite 连接预留与 mysqlite 池共享的进程预算。"""
-    return _PROCESS_CONNECTION_BUDGET.reserve_external(
-        count,
-        max_process_connections,
-    )
+    try:
+        return _PROCESS_CONNECTION_BUDGET.reserve_external(
+            count,
+            max_process_connections,
+        )
+    except BadArgument as exc:
+        raise IosqlBadArgument(str(exc)) from exc
 
 
 def release_process_connections(reservation) -> None:

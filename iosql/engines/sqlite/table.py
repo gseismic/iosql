@@ -5,6 +5,7 @@ import heapq
 import json
 import os
 import pathlib
+import pickle
 import shutil
 import sqlite3
 import tempfile
@@ -16,6 +17,7 @@ from dataclasses import replace
 # from itertools import chain
 from collections import OrderedDict
 from contextlib import closing, contextmanager
+from functools import lru_cache
 
 import arrow
 
@@ -30,7 +32,7 @@ from ...exception import (
 )
 from ...logger import default_logger as logger
 from ...partition import Partition
-from ...core.query import Case, get_case_range
+from ...core.query import get_case_range
 from ...core.query.timeseries import TimeseriesQueryMixin
 from ...spec import (
     CleanupResult,
@@ -82,6 +84,7 @@ from .query_util import (
     build_select_cases_query,
     build_select_count_query,
     build_select_or_cases_query,
+    build_select_primary_keys_query,
 )
 
 
@@ -126,6 +129,60 @@ def _canon_sqlite_type(type_):
     """声明类型归一到库规范类型（integer/float/text/blob）；无法识别返回 None。"""
     value = str(type_).strip().lower().split('(', 1)[0].strip()
     return _SQLITE_TYPE_ALIASES.get(value)
+
+
+@lru_cache(maxsize=512)
+def _sqlite_parse_column_declaration(declaration, column):
+    """由 SQLite 区分类型与列约束，并读取该列的内置排序规则。"""
+    quoted = '"' + column.replace('"', '""') + '"'
+    try:
+        with closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute('CREATE TABLE keys (' + quoted + ' ' + declaration + ')')
+            columns = conn.execute('PRAGMA table_info(keys)').fetchall()
+            if len(columns) != 1 or columns[0][1] != column:
+                raise BadArgument('SQLite 列声明包含额外的列')
+            type_name = columns[0][2]
+            conn.execute('CREATE INDEX key_index ON keys(' + quoted + ')')
+            collation = conn.execute('PRAGMA index_xinfo(key_index)').fetchone()[4].upper()
+    except (sqlite3.Error, TypeError, IndexError) as exc:
+        raise BadArgument(f'无法确认 SQLite 列声明: {declaration}') from exc
+    if collation not in ('BINARY', 'NOCASE', 'RTRIM'):
+        raise BadArgument(f'不支持 SQLite 列排序规则: {collation}')
+    return type_name, collation
+
+
+def _sqlite_column_declaration(type_, column=None):
+    # mysqlite 建表时未给出类型会使用 TEXT，而非 SQLite 的无类型列。
+    declaration = str(type_ or 'TEXT')
+    try:
+        return _sqlite_parse_column_declaration(declaration, '__iosql_value')
+    except BadArgument:
+        if column is None:
+            raise
+        return _sqlite_parse_column_declaration(declaration, str(column))
+
+
+def _sqlite_affinity(type_, column=None):
+    """按 SQLite 实际声明类型求亲和性，约束中的文本不参与判断。"""
+    value = _sqlite_column_declaration(type_, column)[0].upper()
+    if 'INT' in value:
+        return 'INTEGER'
+    if any(token in value for token in ('CHAR', 'CLOB', 'TEXT')):
+        return 'TEXT'
+    if not value or 'BLOB' in value:
+        return 'BLOB'
+    if any(token in value for token in ('REAL', 'FLOA', 'DOUB')):
+        return 'REAL'
+    return 'NUMERIC'
+
+
+def _sqlite_declared_collation(type_, column=None):
+    return _sqlite_column_declaration(type_, column)[1]
+
+
+_SQLITE_NOCASE_TRANSLATION = str.maketrans(
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz',
+)
 
 
 def _sqlite_sort_rank(value):
@@ -2180,6 +2237,11 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 '或显式传 latest(by=[...])'
             )
         group_fields = self._normalize_latest_by(by, symbol_column)
+        # 首次写入前没有列类型可校验，契约中的分组列仍然有效。
+        if not table_spec.columns and not self.table_parts():
+            from .query_util import build_select_fields_sql
+            build_select_fields_sql(columns)
+            return
         from .query_util import validate_select_fields
         validate_select_fields(columns, table_spec.columns)
         for field in group_fields:
@@ -2285,6 +2347,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 return None
             return [item.strip() for item in text.split(',') if item.strip()]
         if isinstance(columns, (list, tuple)):
+            if any(str(column).strip() == '*' for column in columns):
+                return None
             return list(columns)
         raise BadArgument('columns must be a string/list/tuple')
 
@@ -2757,6 +2821,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return info
 
     def _batch_column_stats(self, rows, table_spec):
+        physical_types = self._physical_column_types(table_spec)
         configured = table_spec.segment.stats_columns
         if configured is None:
             columns = list(table_spec.columns or {})
@@ -2789,16 +2854,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if not values:
                 stats[column] = {'min': None, 'max': None}
                 continue
-            declared = _canon_sqlite_type(table_spec.columns.get(column))
-            trustworthy = (
-                declared == 'text' and all(isinstance(value, str) for value in values)
-                or declared == 'integer' and all(isinstance(value, int) for value in values)
-                or declared == 'float' and all(
-                    isinstance(value, (int, float)) and float(value) == value
-                    for value in values
-                )
-            )
-            if not trustworthy:
+            if not self._stats_values_match_storage(physical_types.get(column), values, column):
                 # 转换后的 SQLite 值或排序无法从输入证明，保守扫描而不猜测亲和性。
                 stats[column] = {'min': None, 'max': None, 'complete': False}
                 continue
@@ -2894,9 +2950,6 @@ class Table(TimeseriesQueryMixin, BaseTable):
         )
         self._upsert_segment_info(info)
         return info
-
-    def _pk_cases(self, row, pk):
-        return [Case(field, '=', row[field]) for field in pk]
 
     def _write_segment_rows(
         self,
@@ -3066,27 +3119,67 @@ class Table(TimeseriesQueryMixin, BaseTable):
         )
 
     def _excluded_segments_by_case(self, refs, case):
+        if not refs or case.value['type'] == 'variable':
+            return set()
         excluded = set()
+        physical_types = self._physical_column_types(self.spec())
         for info in refs:
             stats = (info.stats or {}).get(case.field)
-            if stats and self._stats_excludes_case(stats, case):
+            if stats and self._stats_excludes_case(stats, case, physical_types):
                 excluded.add(self._segment_lookup_key(info))
         return excluded
 
-    def _stats_excludes_case(self, stats, case):
+    def _physical_column_types(self, table_spec):
+        """优先使用实际建表记录，契约的列类型可能被首次写入参数覆盖。"""
+        columns = dict(table_spec.columns if table_spec else {})
+        meta = self.get_table_meta() or {}
+        columns.update({
+            column: info['type']
+            for column, info in (meta.get('column_info') or {}).items()
+            if info.get('type') is not None
+        })
+        return columns
+
+    def _stats_values_match_storage(self, type_, values, column=None):
+        """无法证明统计值与存储值一致时禁止裁剪，包括历史 manifest。"""
+        if self._storage_engine == 'sqlite':
+            try:
+                if _sqlite_declared_collation(type_, column) != 'BINARY':
+                    return False
+                affinity = _sqlite_affinity(type_, column)
+            except BadArgument:
+                return False
+            if affinity == 'TEXT':
+                return all(isinstance(value, str) for value in values)
+            if affinity in ('INTEGER', 'NUMERIC'):
+                return all(isinstance(value, (int, float)) and value == value for value in values)
+            if affinity != 'REAL':
+                return False
+        else:
+            declared = _canon_sqlite_type(type_)
+            if declared == 'text':
+                return all(isinstance(value, str) for value in values)
+            if declared == 'integer':
+                return all(isinstance(value, int) for value in values)
+            if declared != 'float':
+                return False
+        try:
+            return all(
+                isinstance(value, (int, float)) and float(value) == value
+                for value in values
+            )
+        except OverflowError:
+            return False
+
+    def _stats_excludes_case(self, stats, case, physical_types):
         if stats.get('complete') is False or case.value['type'] == 'variable':
             return False
         stat_min = stats.get('min')
         stat_max = stats.get('max')
         if stat_min is None or stat_max is None:
             return False
-        spec = self.spec()
-        declared = _canon_sqlite_type(spec.columns.get(case.field)) if spec else None
-        if declared == 'text' and not all(isinstance(value, str) for value in (stat_min, stat_max)):
-            # 兼容历史 manifest 中从数值输入错误产生的 text 列统计。
-            return False
-        if declared in ('integer', 'float') and not all(
-            isinstance(value, (int, float)) for value in (stat_min, stat_max)
+        if not self._stats_values_match_storage(
+            physical_types.get(case.field), (stat_min, stat_max), case.field,
         ):
             return False
 
@@ -3123,6 +3216,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             return set()
         if case.field != table_spec.session_column:
             return set()
+        if case.value['type'] == 'variable':
+            return set()
         if case.op in ['eq', '==', '=']:
             values = [case.value['value']]
         elif case.op == 'in':
@@ -3131,10 +3226,13 @@ class Table(TimeseriesQueryMixin, BaseTable):
             return set()
 
         excluded = set()
+        physical_types = self._physical_column_types(table_spec)
         for info in refs:
-            if (_canon_sqlite_type(table_spec.columns.get(table_spec.session_column)) == 'text'
-                    and any(value is not None and not isinstance(value, str)
-                            for value in (info.session_min, info.session_max))):
+            bounds = (info.session_min, info.session_max)
+            if (all(value is not None for value in bounds)
+                    and not self._stats_values_match_storage(
+                        physical_types.get(table_spec.session_column), bounds, table_spec.session_column,
+                    )):
                 continue
             if self._session_values_outside_segment(values, info):
                 excluded.add(self._segment_lookup_key(info))
@@ -3228,7 +3326,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
     ):
         fields = resolve_select_fields(fields, columns, 'iter_select')
         self._reject_unknown_select_kwargs(kwargs, 'iter_select')
-        for batch in self.iter_select_batches(
+        batches = self.iter_select_batches(
             fields,
             where,
             limit=limit,
@@ -3237,9 +3335,11 @@ class Table(TimeseriesQueryMixin, BaseTable):
             batch_size=batch_size,
             timeout_ms=timeout_ms,
             **kwargs,
-        ):
-            for row in batch:
-                yield row
+        )
+        with closing(batches):
+            for batch in batches:
+                for row in batch:
+                    yield row
 
     def iter_select_batches(
         self,
@@ -3300,36 +3400,39 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         emitted = 0
         pending = []
-        for rows in self._iter_select_raw_batches(
+        raw_batches = self._iter_select_raw_batches(
             fetch_fields,
             w,
             column_types,
             batch_size,
             deadline,
-        ):
-            if not rows:
-                continue
-            if project_fields is not None:
-                rows = self._project_fields(
-                    rows, project_fields, to_dict=to_dict
-                )
-            if to_dict:
-                rows = [dict(item) for item in rows]
+            limit,
+        )
+        with closing(raw_batches):
+            for rows in raw_batches:
+                if not rows:
+                    continue
+                if project_fields is not None:
+                    rows = self._project_fields(
+                        rows, project_fields, to_dict=to_dict
+                    )
+                if to_dict:
+                    rows = [dict(item) for item in rows]
 
-            for row in rows:
+                for row in rows:
+                    if limit is not None and emitted >= limit:
+                        break
+                    pending.append(row)
+                    emitted += 1
+                    if len(pending) >= batch_size:
+                        yield pending
+                        pending = []
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError(
+                                'SQLite query exceeded timeout_ms budget'
+                            )
                 if limit is not None and emitted >= limit:
                     break
-                pending.append(row)
-                emitted += 1
-                if len(pending) >= batch_size:
-                    yield pending
-                    pending = []
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise TimeoutError(
-                            'SQLite query exceeded timeout_ms budget'
-                        )
-            if limit is not None and emitted >= limit:
-                break
         if pending:
             yield pending
             if deadline is not None and time.monotonic() >= deadline:
@@ -3805,6 +3908,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if isinstance(fetch_fields, (list, tuple))
             else None
         )
+        if fetch_set is not None and any(str(field).strip() == '*' for field in fetch_set):
+            fetch_set = None
         parts = []
         for field, reverse in specs:
             if fetch_set is not None and field not in fetch_set:
@@ -4040,11 +4145,12 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return data
 
     def _iter_select_raw_batches(self, fields, where_obj, column_types,
-                                 batch_size, deadline=None):
+                                 batch_size, deadline=None, limit=None):
         for ref, query in self._select_queries_for_where(
             fields,
             where_obj,
             column_types,
+            limit=limit,
             skip_segment_stats=deadline is not None,
         ):
             self._ensure_ref_file_present(ref)
@@ -4118,6 +4224,51 @@ class Table(TimeseriesQueryMixin, BaseTable):
         stream = self._part_ordered_rows(part_dbfile, query, batch_size, deadline)
         reservation = reserve_process_connections(1, self._max_process_connections)
         try:
+            if self._max_process_connections == 1:
+                # 仅一个配额时先落盘当前文件的结果，释放连接后再交给消费者。
+                # 避免消费者读写或 save_as 写目标时等待自己持有的连接。
+                with tempfile.TemporaryFile() as spool:
+                    names = None
+                    row_cursor = None
+                    batch_count = 0
+                    try:
+                        batch = []
+                        for row in stream:
+                            if names is None:
+                                names = tuple(row.keys())
+                            batch.append(tuple(row))
+                            if len(batch) == batch_size:
+                                pickle.dump(batch, spool, protocol=pickle.HIGHEST_PROTOCOL)
+                                batch_count += 1
+                                batch = []
+                        if batch:
+                            pickle.dump(batch, spool, protocol=pickle.HIGHEST_PROTOCOL)
+                            batch_count += 1
+                        stream.close()
+                        if names and self._storage_engine == 'sqlite':
+                            # 已关闭游标仍保留 description，可重建原生 sqlite3.Row。
+                            with closing(sqlite3.connect(':memory:')) as conn:
+                                row_cursor = conn.execute('SELECT ' + ','.join(
+                                    'NULL AS ' + self._quote_identifier(name) for name in names
+                                ))
+                    finally:
+                        stream.close()
+                        release_process_connections(reservation)
+                        reservation = None
+                    spool.seek(0)
+                    for _ in range(batch_count):
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise TimeoutError('SQLite query exceeded timeout_ms budget')
+                        try:
+                            batch = pickle.load(spool)
+                        except (EOFError, pickle.UnpicklingError) as exc:
+                            raise UnsafeOperation('单连接流的临时文件不完整或损坏') from exc
+                        if row_cursor is not None:
+                            yield [sqlite3.Row(row_cursor, values) for values in batch]
+                        else:
+                            from ..parquet.table import _Row
+                            yield [_Row(names, values) for values in batch]
+                return
             batch = []
             for row in stream:
                 batch.append(row)
@@ -4469,10 +4620,13 @@ class Table(TimeseriesQueryMixin, BaseTable):
         # 只读取输入主键对应的行，避免一个键的修改物化并重写整张表。
         data = self._rows_for_primary_keys(kv_list, pk, spec, partition or self._partition)
 
-        # 用持久类型后的主键索引命中行，避免 text 主键的数值输入丢失旧字段。
-        data = {tuple([item[k] for k in pk]): item for item in data}
-
-        keys = self._normalize_pk_keys(kv_list, pk, spec)
+        normalization_spec = self._pk_normalization_spec(kv_list, pk, spec, kwargs)
+        # 查询返回的是物理存储值，还需应用主键列的排序规则。
+        data = {
+            self._stored_pk_key(item, pk, normalization_spec): item
+            for item in data
+        }
+        keys = self._normalize_pk_keys(kv_list, pk, normalization_spec)
         for key, dic in zip(keys, kv_list):
             if key in data:
                 data[key] = {**data[key], **dic}
@@ -4498,15 +4652,21 @@ class Table(TimeseriesQueryMixin, BaseTable):
             groups.setdefault(logical_part, []).append(row)
         data = []
         for logical_part, group in groups.items():
-            refs = self._physical_part_refs([logical_part], lightweight=True)
+            refs = []
+            for ref in self._physical_part_refs([logical_part], lightweight=True):
+                # 不存在的未登记 legacy 分区只是候选路径；已登记的段缺失必须报错。
+                if (ref.segment_id < 0 and not os.path.exists(ref.path)
+                        and self._part_token(logical_part) not in known_parts):
+                    continue
+                self._ensure_ref_file_present(ref)
+                refs.append(ref)
+            if not refs:
+                continue
             for start in range(0, len(group), 100):
-                cases = [self._pk_cases(row, pk) for row in group[start:start + 100]]
-                query = build_select_or_cases_query('data', '*', cases, spec.columns)
+                query = build_select_primary_keys_query(
+                    'data', '*', group[start:start + 100], pk, spec.columns,
+                )
                 for ref in refs:
-                    # 新键的分区可以尚不存在，不能为查询创建空文件。
-                    if not os.path.exists(ref.path) and self._part_token(logical_part) not in known_parts:
-                        continue
-                    self._ensure_ref_file_present(ref)
                     with self._part_db(ref.path, auto_commit=False) as db:
                         data.extend(db['data'].query(query.sql, params=query.params, to_dict=True))
         return data
@@ -4728,23 +4888,54 @@ class Table(TimeseriesQueryMixin, BaseTable):
             return
 
         # 批内先按持久类型去重，随后每文件、每组键一次查询；新增行统一 append。
-        normalized = self._unique_pk_rows(rows, pk, table_spec)
+        normalization_spec = self._pk_normalization_spec(rows, pk, table_spec, part_kwargs)
+        normalized = self._unique_pk_rows(rows, pk, normalization_spec)
         existing_keys = set()
+        known_parts = {self._part_token(part) for part in self.table_parts()}
+        refs = []
+        for ref in self._physical_part_refs([logical_part], lightweight=True):
+            if (ref.segment_id < 0 and not os.path.exists(ref.path)
+                    and self._part_token(logical_part) not in known_parts):
+                continue
+            self._ensure_ref_file_present(ref)
+            refs.append(ref)
         for start in range(0, len(normalized), 100):
             chunk = normalized[start:start + 100]
-            cases = [self._pk_cases(row, pk) for _, row in chunk]
-            query = build_select_or_cases_query('data', pk, cases, table_spec.columns)
-            for ref in self._physical_part_refs([logical_part], lightweight=True):
-                self._ensure_ref_file_present(ref)
+            if refs:
+                query = build_select_primary_keys_query(
+                    'data', pk, [row for _, row in chunk], pk, normalization_spec.columns,
+                )
+            for ref in refs:
                 with self._part_db(ref.path, auto_commit=False) as db:
                     for row in db['data'].query(query.sql, params=query.params):
-                        existing_keys.add(tuple(row[field] for field in pk))
+                        existing_keys.add(self._stored_pk_key(row, pk, normalization_spec))
         pending = [row for key, row in normalized if key not in existing_keys]
         if pending:
             self._append_segment_rows(
                 logical_part, part_column, pending, pk, partition,
                 False, False, commit, layout, part_kwargs,
             )
+
+    def _pk_normalization_spec(self, rows, pk, table_spec, write_kwargs):
+        """使用持久列类型；首次写入时先固定与物理建表一致的推断结果。"""
+        columns = dict(table_spec.columns if table_spec else {})
+        columns.update(write_kwargs.get('column_type') or {})
+        meta = self.get_table_meta()
+        if meta and meta.get('column_info'):
+            columns.update({
+                column: info.get('type')
+                for column, info in (meta.get('column_info') or {}).items()
+                if info.get('type') is not None
+            })
+        else:
+            columns = dict(self.suggest_column_types(
+                rows, column_type=columns,
+                n_suggest_check=write_kwargs.get('n_suggest_check', _DEFAULT_N_SUGGEST_CHECK),
+            ))
+            write_kwargs['column_type'] = columns
+        if table_spec is None:
+            return TableContract(primary_key=pk, columns=columns)
+        return replace(table_spec, columns=columns)
 
     def _unique_pk_rows(self, rows, pk, table_spec):
         """用 SQLite 亲和性归一主键并保留首行，正确处理 text 列的数值输入。"""
@@ -4756,20 +4947,38 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 unique.append((key, row))
         return unique
 
+    def _stored_pk_key(self, row, pk, table_spec):
+        """应用 SQLite 内置列排序规则，供输入键和物理存储键共用。"""
+        values = []
+        for field in pk:
+            value = row[field]
+            if self._storage_engine == 'sqlite' and isinstance(value, str):
+                collation = _sqlite_declared_collation(table_spec.columns.get(field), field)
+                if collation == 'NOCASE':
+                    # SQLite NOCASE 只折叠 ASCII，遇到 NUL 后仍比较原始字节长度。
+                    value = (
+                        value.split('\0', 1)[0].translate(_SQLITE_NOCASE_TRANSLATION),
+                        len(value.encode('utf-8')),
+                    )
+                elif collation == 'RTRIM':
+                    value = value.rstrip(' ')
+            values.append(value)
+        return tuple(values)
+
     def _normalize_pk_keys(self, rows, pk, table_spec):
         """归一输入主键的持久类型，供批量 ignore 与局部 upsert 共用。"""
         with closing(sqlite3.connect(':memory:')) as conn:
             fields = [f'k{i}' for i in range(len(pk))]
             definitions = [
-                f'{field} {_canon_sqlite_type(table_spec.columns.get(column)) or "BLOB"}'
+                f'{field} {_sqlite_affinity(table_spec.columns.get(column), column)}'
                 for field, column in zip(fields, pk)
             ]
             conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ', ordinal INTEGER)')
             conn.executemany('INSERT INTO keys VALUES (' +
                              ','.join('?' for _ in range(len(pk) + 1)) + ')',
                              [tuple(row[field] for field in pk) + (i,) for i, row in enumerate(rows)])
-            return [tuple(item[:-1]) for item in conn.execute(
-                'SELECT * FROM keys ORDER BY ordinal')]
+            return [self._stored_pk_key(dict(zip(pk, item[:-1])), pk, table_spec)
+                    for item in conn.execute('SELECT * FROM keys ORDER BY ordinal')]
 
     def _do_insert_part(
         self,
