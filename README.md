@@ -122,6 +122,38 @@ iosql migrate -s sqlite://db/market.iosql --target parquet://db/archive.iosql --
 iosql migrate -s parquet://db/archive.iosql --target sqlite://db/restored.iosql --verify row-count
 ```
 
+#### 用 CLI 将 SQLite 另存为 Parquet
+
+`migrate` 可以把整个 SQLite 目录库复制到独立的 Parquet 目录库，保留源库的业务数据和契约。以下是跨磁盘迁移 K 线库的示例；请根据实际环境调整路径，并选用尚不存在的目标目录：
+
+```bash
+iosql_source="/media/lsl/M3/finbase.crypto/binance/future_usdt/kline.sqlite-6h.iosql"
+iosql_target="/media/lsl/Z1/finbase.crypto/binance/future_usdt/kline.parquet-6h.iosql"
+iosql_work="/media/lsl/Z1/finbase.crypto/binance/future_usdt/.iosql-migration-work"
+
+# 先预览：统计源库的行数和预计批次数，不创建目标库
+iosql migrate \
+  --source "sqlite://$iosql_source" \
+  --target "parquet://$iosql_target" \
+  --batch-size 50000 \
+  --verify row-count \
+  --dry-run
+
+# 确认预览后执行另存，并在发布前比较源和目标的行数
+iosql migrate \
+  --source "sqlite://$iosql_source" \
+  --target "parquet://$iosql_target" \
+  --batch-size 50000 \
+  --verify row-count \
+  --temp-dir "$iosql_work"
+```
+
+`--temp-dir` 指定转换工作区，须位于目标库之外；示例把它放在目标盘，与目标代际位于同一文件系统，避免发布时跨盘复制。目标盘需预留工作区和目标数据所需的空间。源库和目标库不能相同或互相包含，`--verify row-count` 要求选中的目标表不存在或为空。
+
+预览会统计源库全部选中表，数据量大时可能耗时；它不连接目标，因此不检查目标权限或已有表。正式迁移前应停止其他程序向源库写入，并关闭读取流、缓冲写入和未提交事务；迁移使用协作锁，不能约束直接操作 SQLite 文件或未接入协调协议的旧客户端。读取源库时可能产生协调锁、SQLite WAL 或 SHM 文件，但不会删除源业务数据。
+
+正式命令成功后，检查 JSON 输出中的 `published: true`、`verified: true` 和相等的 `source_rows`、`target_rows`。行数校验不能替代逐行内容校验；迁移失败或中断时先检查错误和恢复状态，再决定如何重试。迁移后的副本使用 `parquet://` URI 打开。
+
 Parquet 的 append/ignore 追加写为不可变数据片，通过原子清单发布，不重写历史完整行；
 主键查重仍可能扫描历史键列。修改和删除会重写受影响的物理集合。
 建议使用 `buffered_writer()` 和 `Segment.rows` 限制数据片数与单文件大小；
