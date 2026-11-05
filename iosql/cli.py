@@ -30,6 +30,7 @@ import arrow
 import typer
 
 from iosql import Database, PartitionSpec, format_partition_spec
+from iosql._migration_progress import observe as _observe_migration
 from iosql.coordination import exclusive_resources, lease, physical_path, resource
 from iosql.migration import backup_snapshot, publish_snapshot
 from iosql.exception import IosqlError, PartitionSpecError
@@ -49,6 +50,80 @@ EXIT_OK = 0
 EXIT_FAILURE = 1
 EXIT_VALIDATION_FAILED = 2
 EXIT_INTERRUPT = 130
+
+
+class _MigrationProgress:
+    """将迁移事件写到 stderr；定期提示仍在处理，不影响 stdout 的 JSON。"""
+
+    def __init__(self, heartbeat_interval=5.0, update_interval=2.0):
+        self._heartbeat_interval = heartbeat_interval
+        self._update_interval = update_interval
+        self._started = time.monotonic()
+        self._last_print = self._started
+        self._status = '准备迁移'
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = None
+        self._disabled = False
+
+    def _print(self, now, heartbeat=False):
+        if self._disabled:
+            return
+        suffix = '，仍在处理' if heartbeat else ''
+        try:
+            typer.echo(f'[迁移] {self._status}{suffix}（已用时 {int(now - self._started)} 秒）', err=True)
+        except Exception:
+            # 进度输出不可用时，仍应让迁移正常完成或报告其真实错误。
+            self._disabled = True
+        self._last_print = now
+
+    def __enter__(self):
+        with self._lock:
+            self._print(time.monotonic())
+        self._thread = threading.Thread(target=self._heartbeat, daemon=True)
+        try:
+            self._thread.start()
+        except RuntimeError:
+            self._thread = None
+        return self
+
+    def __exit__(self, *args):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _heartbeat(self):
+        while not self._stop.wait(min(1.0, self._heartbeat_interval)):
+            with self._lock:
+                now = time.monotonic()
+                if now - self._last_print >= self._heartbeat_interval:
+                    self._print(now, heartbeat=True)
+
+    def __call__(self, event, **details):
+        if event == 'phase':
+            status = details['message']
+        elif event.startswith('count_'):
+            side = '源表' if details['phase'] == 'source' else '暂存目标表'
+            table = details['table']
+            if event == 'count_start':
+                status = f'统计{side} {table} 行数'
+            elif event == 'count_progress':
+                status = (f'统计{side} {table}：已检查文件 {details["done"]:,}/{details["total"]:,}，'
+                          f'累计 {details["rows"]:,} 行')
+            else:
+                status = f'{side} {table} 统计完成：{details["rows"]:,} 行'
+        elif event.startswith('copy_'):
+            rows = details.get('rows', 0)
+            status = f'复制表 {details["table"]}：{rows:,}/{details["total"]:,} 行'
+            if event == 'copy_done':
+                status += '，复制完成'
+        else:
+            return
+        with self._lock:
+            self._status = status
+            now = time.monotonic()
+            if event not in ('count_progress', 'copy_progress') or now - self._last_print >= self._update_interval:
+                self._print(now)
 
 
 class _CliFailure(Exception):
@@ -1431,10 +1506,24 @@ def migrate(
     ),
     dry_run: bool = typer.Option(False, "--dry-run", help="只预览迁移计划，不连接目标库"),
     specs: str = typer.Option("", "--specs", help='目标布局 JSON 或 @文件，按源表名指定，如 {"ticks":{"partition":"duration(ts,every=1hour)"}}'),
-    temp_dir: Optional[Path] = typer.Option(None, "--temp-dir", help="转换临时根目录，默认在源库内"),
+    temp_dir: Optional[Path] = typer.Option(None, "--temp-dir", help="转换临时根目录；本地目标默认使用目标文件系统"),
     lock_timeout: float = typer.Option(30.0, "--lock-timeout", help="等待源/目标独占锁的总秒数"),
 ):
-    """在 SQLite、Parquet 目录库与 PostgreSQL 目标库之间迁移数据。"""
+    """在 SQLite、Parquet 目录库与 PostgreSQL 目标库之间迁移数据。
+
+    \b
+    示例（请将路径和表名替换为实际值）：
+      预览 SQLite → Parquet：
+        iosql migrate -s src --target parquet://dst --dry-run
+      迁移全部表并校验行数：
+        iosql migrate -s src --target parquet://dst --verify row-count
+      只迁移 ticks 表：
+        iosql migrate -s src -t ticks --target parquet://one --verify row-count
+      Parquet → SQLite：
+        iosql migrate -s parquet://dst --target sqlite://back --verify row-count
+
+    迁移进度写入标准错误，完成后的 JSON 结果写入标准输出。
+    """
     if str(source).startswith('parquet://'):
         source_uri = str(source).strip()
         source_path = Path(source_uri[len('parquet://'):])
@@ -1449,26 +1538,28 @@ def migrate(
     if batch_size <= 0:
         _fail("batch-size 必须大于 0")
 
-    db = Database(source_uri)
-    try:
-        layout_specs = None
-        if specs:
-            raw_specs = Path(specs[1:]).read_text(encoding="utf-8") if specs.startswith("@") else specs
-            try:
-                layout_specs = json.loads(raw_specs)
-            except ValueError as exc:
-                _fail(f"specs JSON 错误: {exc}")
-        result = db.migrate_to(
-            target_uri,
-            tables=table_arg,
-            mode=write_mode,
-            batch_size=batch_size,
-            verify=verify_mode,
-            dry_run=dry_run, specs=layout_specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
-        )
+    with _MigrationProgress() as progress, _observe_migration(progress):
+        db = Database(source_uri)
+        try:
+            layout_specs = None
+            if specs:
+                raw_specs = Path(specs[1:]).read_text(encoding="utf-8") if specs.startswith("@") else specs
+                try:
+                    layout_specs = json.loads(raw_specs)
+                except ValueError as exc:
+                    _fail(f"specs JSON 错误: {exc}")
+            result = db.migrate_to(
+                target_uri,
+                tables=table_arg,
+                mode=write_mode,
+                batch_size=batch_size,
+                verify=verify_mode,
+                dry_run=dry_run, specs=layout_specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+            )
+        finally:
+            db.close()
+        progress('phase', message='预览完成' if dry_run else '迁移完成')
         _echo_json(result.to_dict())
-    finally:
-        db.close()
 
 
 @app.command()

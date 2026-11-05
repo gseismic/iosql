@@ -849,4 +849,4 @@ result = ticks.migrate_to(
 )
 ```
 
-多表同样传 `specs`，键使用源名。迁移全程禁止源/目标协作读写，本地源默认在源库内暂存，PostgreSQL 源使用系统临时目录；全部转换后统一发布。`temp_dir` 与 `lock_timeout` 可选，具体锁、恢复、兼容和结果语义见 design-contract.md 的 PLAN-083 一节。
+多表同样传 `specs`，键使用源名。迁移全程禁止源/目标协作读写；本地目标默认在目标文件系统暂存，PostgreSQL 目标使用原有源库或系统临时目录；全部转换后统一发布。`temp_dir` 与 `lock_timeout` 可选，具体锁、恢复、兼容和结果语义见 design-contract.md 的 PLAN-083 一节。

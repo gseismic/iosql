@@ -6,6 +6,7 @@
 - 初始分析范围：WORKTREE，基准提交 `b752db62fa34c31a880d4bf8b3cdcdce011ea48c`。实施基线更新为 `7a0f87fd1289eb551896b9d38c509cd2c4edc311`，实施计划见 `docs/dev/PLAN-083-model-unknown-safe-migration.md`。
 - 相关工作区内容：未跟踪的 `examples/16_sqlite_to_parquet.py` 及其 skill 副本；已有修改的 README、示例索引和 Parquet 指南。本轮期间另有 Parquet 默认依赖相关并行改动，当时仅做设计；后续已获实施授权，需要同步示例和文档。实现仍位于 WORKTREE，未提交。
 - 设计依据：用户指定的 `api-design-zh`；现有迁移实现、示例和 PLAN-054 的长期兼容约定。
+- 2026-11-05 17:13 更新：环境未提供具体模型 ID（`model-unknown`）；本地目标的默认临时工作区调整为目标文件系统，取代本文历史上的源目录默认值，分析与验证见 `docs/plans/PLAN-20261105-003-model-unknown-migration-workspace.md`（WORKTREE，基准提交 `e9dee736a579f2319af91b2f022f1b0706968dcd`）。
 
 ## 1. 推荐方案
 

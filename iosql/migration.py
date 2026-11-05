@@ -15,6 +15,7 @@ from contextlib import ExitStack, closing
 from dataclasses import dataclass
 from pathlib import Path
 
+from ._migration_progress import counting, emit
 from .coordination import (
     after_leases, atomic_json, ensure_directory, exclusive_resources, lease, operation, physical_root, resource,
     sync_directory, timeout_value,
@@ -171,14 +172,23 @@ def _check_names(mapping, engine):
             raise BadArgument('目标表名为保留名称或超过 PostgreSQL 标识符限制')
 
 
-def _workspace(owner, temp_dir, operation_id):
+def _default_workspace_root(source_item, target_item):
+    if target_item.path is not None:
+        path = target_item.path
+        if path.is_dir() and path.stat().st_dev != path.parent.stat().st_dev:
+            # 目标根是独立挂载点时，父目录不在目标文件系统中。
+            return path / '__iosql_migrations__'
+        return target_item.control_dir / (target_item.token + '.workspaces')
+    if source_item.path is None:
+        import tempfile
+        return Path(tempfile.gettempdir()) / 'iosql-migrations'
+    return source_item.path / '__iosql_migrations__'
+
+
+def _workspace(owner, target_item, temp_dir, operation_id):
     item = resource(owner.uri)
     if temp_dir is None:
-        if item.path is None:
-            import tempfile
-            root = Path(tempfile.gettempdir()) / 'iosql-migrations'
-        else:
-            root = item.path / '__iosql_migrations__'
+        root = _default_workspace_root(item, target_item)
     else:
         root = Path(temp_dir).absolute()
         if item.path and root.is_relative_to(physical_root(owner.uri)):
@@ -312,7 +322,7 @@ class LocalPublisher:
     def finish_stage(self, plans):
         for plan in plans:
             target = self.table(plan)
-            plan.result.target_rows = target.count_rows()
+            plan.result.target_rows = _count_rows(plan, 'target', target.count_rows)
             previous = self.previous_parts.get(plan.name, set())
             plan.result.partitions_created = [part for part in target.table_parts() if part not in previous]
             if plan.result.verify:
@@ -320,6 +330,7 @@ class LocalPublisher:
         self.stage_db.close()
         self.stage_db = None
         payload = self.workspace / 'payload'
+        emit('phase', message='检查暂存数据完整性')
         for plan in plans:
             if not is_iosql_table(payload / plan.target_name, backend=self.backend, deep=True):
                 raise MigrationVerificationError(f'目标暂存表完整性校验失败: {plan.target_name}')
@@ -429,14 +440,24 @@ def _verify(plan, actual):
     plan.result.verified = True
 
 
+def _count_rows(plan, phase, count):
+    emit('count_start', phase=phase, table=plan.name)
+    with counting(phase, plan.name):
+        rows = count()
+    emit('count_done', phase=phase, table=plan.name, rows=rows)
+    return rows
+
+
 def _copy(plans, publisher, source, batch_size, mode):
     for plan in plans:
-        plan.result.source_rows = source.count(plan) if source else plan.source.count_rows()
+        plan.result.source_rows = _count_rows(
+            plan, 'source', lambda: source.count(plan) if source else plan.source.count_rows())
         target = publisher.table(plan)
         if (getattr(target, '_storage_engine', None) == 'sqlite'
                 and hasattr(plan.source, '_logical_indexes')):
             for definition in plan.source._logical_indexes():
                 target.create_index(definition['column_name'], definition['sort_order'])
+        emit('copy_start', table=plan.name, total=plan.result.source_rows)
         iterator = source.batches(plan, batch_size) if source else plan.source.iter_batches(batch_size=batch_size)
         try:
             with closing(iterator):
@@ -451,11 +472,15 @@ def _copy(plans, publisher, source, batch_size, mode):
                         plan.result.rows_written = None
                     else:
                         plan.result.rows_written += count
+                    emit('copy_progress', table=plan.name, rows=plan.result.rows_copied,
+                         total=plan.result.source_rows)
         except Exception as exc:
             exc.source_table = plan.name
             exc.target_table = plan.target_name
             exc.batch = plan.result.batches + 1
             raise
+        emit('copy_done', table=plan.name, rows=plan.result.rows_copied,
+             total=plan.result.source_rows)
 
 
 def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
@@ -517,6 +542,7 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
 
     try:
         try:
+            emit('phase', message='等待源库锁并检查迁移计划')
             with lease(source_uri, recover=not dry_run, timeout=(
                     0.0 if dry_run else max(0.0, lock_deadline - time.monotonic()))):
                 if owner.uri != source_uri:
@@ -526,7 +552,7 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
                     plans = plan_sources()
                     if dry_run:
                         for plan in plans:
-                            plan.result.source_rows = plan.source.count_rows()
+                            plan.result.source_rows = _count_rows(plan, 'source', plan.source.count_rows)
                             plan.result.batches = math.ceil(plan.result.source_rows / batch_size)
                         return aggregate if isinstance(owner, Database) else aggregate.tables[0]
         except DatabaseBusy as exc:
@@ -535,6 +561,7 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
             from .exception import MigrationLockTimeout
             raise MigrationLockTimeout('等待源库预检锁超过 lock_timeout') from exc
         stage = 'waiting-locks'
+        emit('phase', message='等待源库和目标库的迁移锁')
         with ExitStack() as stack:
             entries = stack.enter_context(exclusive_resources((source_uri, target_uri),
                 max(0.0, lock_deadline - time.monotonic())))
@@ -542,6 +569,7 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
                 raise UnsafeOperation('源对象 URI 在迁移预检后发生变化，请重新发起迁移')
             stack.enter_context(operation(owner, uri=source_uri))
             stage = 'planning'
+            emit('phase', message='检查迁移计划与源表')
             plans = plan_sources()
             source = None
             if source_item.backend == 'postgresql' and not dry_run:
@@ -550,7 +578,6 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
                 source = stack.enter_context(SourceSnapshot(
                     source_uri, plans, max(0.0, lock_deadline - time.monotonic())))
             coordinator = entries[target_item.key].coordinator
-            workspace = _workspace(owner, temp_dir, operation_id)
             if hasattr(owner, '_new_migration_target'):
                 factory = owner._new_migration_target
             else:
@@ -568,22 +595,30 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
                     return Database(uri, **options)
             if target_item.backend == 'postgresql':
                 from .migration_postgresql import PostgreSQLPublisher
+                workspace = _workspace(owner, target_item, temp_dir, operation_id)
                 publisher = PostgreSQLPublisher(target_uri, coordinator, workspace, factory,
                                                 max(0.0, lock_deadline - time.monotonic()))
             else:
-                publisher = LocalPublisher(target_uri, coordinator, workspace, factory)
+                # 先验证目标身份，才能安全地在目标根挂载点内创建管理目录。
+                publisher = LocalPublisher(target_uri, coordinator, None, factory)
             publisher.mode = mode
             publisher.batch_size = batch_size
             stack.callback(publisher.close)
             stage = 'preflight'
+            emit('phase', message='检查目标库')
             publisher.preflight(plans, verify)
             stage = 'staging'
+            emit('phase', message='准备目标暂存空间')
+            if target_item.path is not None:
+                publisher.workspace = _workspace(owner, target_item, temp_dir, operation_id)
             publisher.prepare(plans)
             stage = 'copying'
             _copy(plans, publisher, source, batch_size, mode)
             stage = 'verification'
+            emit('phase', message='统计并校验目标数据')
             publisher.finish_stage(plans)
             stage = 'publishing'
+            emit('phase', message='发布目标库')
             publisher.publish(operation_id)
             published = True
             aggregate.published = True

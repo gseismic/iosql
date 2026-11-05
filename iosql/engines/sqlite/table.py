@@ -22,6 +22,7 @@ from functools import lru_cache
 import arrow
 
 from ...migration import OMITTED
+from ..._migration_progress import count_reporter
 from ...exception import (
     BadArgument,
     InvalidUriSchema,
@@ -1652,14 +1653,18 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def count_rows(self):
         total = 0
-        for ref in self._physical_part_refs(lightweight=True):
+        refs = self._physical_part_refs(lightweight=True)
+        report = count_reporter()
+        for index, ref in enumerate(refs, 1):
             self._ensure_ref_file_present(ref)
             part_dbfile = self._get_part_dbfile(ref.part_key)
             with self._part_db(part_dbfile, auto_commit=False) as db:
                 try:
                     total += db[_PART_DATA_TABLE_NAME].count()
                 except NoSuchTable:
-                    continue
+                    pass
+            if report is not None:
+                report(index, len(refs), total)
         return total
 
     def migrate_to(self, target_uri, tables=OMITTED, mode='append',

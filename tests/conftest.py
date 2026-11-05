@@ -6,6 +6,21 @@ import pytest
 
 
 @pytest.fixture
+def invoke_separate():
+    """分别捕获标准输出与标准错误，兼容不同 Click 版本。"""
+    from typer.testing import CliRunner
+    try:
+        runner = CliRunner(mix_stderr=False)
+    except TypeError:
+        runner = CliRunner()
+
+    def invoke(app, *args):
+        return runner.invoke(app, [str(arg) for arg in args], terminal_width=80)
+
+    return invoke
+
+
+@pytest.fixture
 def fake_pg_coordination(monkeypatch):
     import iosql.coordination as coordination
     original = coordination._coordinator

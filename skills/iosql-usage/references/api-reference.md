@@ -178,7 +178,7 @@ dry-run 不连接目标，因此不会验证目标连接、权限、已有表契
 
 两个接口的 `tables` 语义相同，Table 范围仅当前表。共同的 `specs` 按源名指定目标布局：`specs={"ticks":{"partition":"duration(ts,every=1hour)"}}`；值也可为完整 TableContract。允许 partition/segment/physical_layout/force_partition，保留源列、主键和时间含义。已有目标须兼容最终契约。
 
-迁移持有源/目标独占锁，全部转换后统一发布。本地源默认在源库内暂存，PostgreSQL 源使用系统临时目录；本地目标有独立物理代际，PostgreSQL 目标使用暂存 schema 和事务提交。普通操作忙时立即抛 `DatabaseBusy`，迁移等待由 `lock_timeout` 控制。具体发布和恢复契约见 [design-contract.md](design-contract.md#统一迁移与安全发布plan-083)。Table 旧 `target_table` 和位置目标名仍可用，两类参数不能同时传。
+迁移持有源/目标独占锁，全部转换后统一发布。本地目标默认在目标文件系统暂存；PostgreSQL 目标继续使用源库内或系统临时目录，显式 `temp_dir` 可覆盖默认位置。本地目标有独立物理代际，PostgreSQL 目标使用暂存 schema 和事务提交。普通操作忙时立即抛 `DatabaseBusy`，迁移等待由 `lock_timeout` 控制。具体发布和恢复契约见 [design-contract.md](design-contract.md#统一迁移与安全发布plan-083)。Table 旧 `target_table` 和位置目标名仍可用，两类参数不能同时传。
 
 迁移前关闭已消费的读取流、flush 内存缓冲、退出 `buffered_writer` 上下文并结束未提交事务。
 `mode="replace"` 是主键冲突策略，不清空或重建目标；结果字段与异常排查见下文及

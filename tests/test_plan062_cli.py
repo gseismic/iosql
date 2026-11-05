@@ -366,11 +366,11 @@ def test_migrate_verify_row_count_prechecks_preexisting_target(tmp_path):
     assert _row_count(target) == 4
 
 
-def test_migrate_verify_row_count_on_fresh_target(tmp_path):
+def test_migrate_verify_row_count_on_fresh_target(tmp_path, invoke_separate):
     source = _make_db(tmp_path, "source.iosql")
     target = tmp_path / "fresh.iosql"
 
-    result = _invoke(
+    result = invoke_separate(app,
         "migrate",
         "-s",
         source,

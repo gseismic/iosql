@@ -3,6 +3,7 @@
 import multiprocessing
 import os
 import shutil
+import tempfile
 import threading
 from pathlib import Path
 
@@ -93,6 +94,8 @@ def test_common_tables_legacy_and_preview(tmp_path):
         assert preview.rows_written is None and preview.published is False
         assert not (tmp_path / 'unused').exists()
         assert not (tmp_path / 'source' / '__iosql_migrations__').exists()
+        unused = resource(uri(tmp_path / 'unused'))
+        assert not (unused.control_dir / (unused.token + '.workspaces')).exists()
         assert table.migrate_to(uri(tmp_path / 'legacy1'), 'x').target_table == 'x'
         assert table.migrate_to(uri(tmp_path / 'legacy2'), target_table='x').target_table == 'x'
         assert source.migrate_to(uri(tmp_path / 'selected'), tables=['ticks', 'ticks']).rows_copied == 1
@@ -150,7 +153,12 @@ def test_midstream_failure_retains_stage_and_releases_locks(tmp_path, monkeypatc
         assert failure.value.__cause__.args == ('injected source failure',)
         assert closed == [True]
         assert old.select_all('*') == [{'ts': 9, 'v': 'old'}]
-        assert list((tmp_path / 'source' / '__iosql_migrations__').glob('*/task.json'))
+        item = resource(target.uri)
+        workspace = item.control_dir / (item.token + '.workspaces') / failure.value.operation_id
+        assert (workspace / 'task.json').is_file()
+        assert table.select_all('*', order_by='ts') == [
+            {'ts': 1, 'v': 'new'}, {'ts': 2, 'v': 'new'},
+        ]
         old.write({'ts': 10, 'v': 'unlocked'})
 
 
@@ -297,17 +305,152 @@ def test_cleanup_runs_after_all_locks_released(tmp_path, monkeypatch):
         assert observed == [1, 'source-unlocked']
 
 
-def test_cross_filesystem_temp_copy(tmp_path):
+@pytest.mark.parametrize('backend', ['sqlite', 'parquet'])
+def test_default_workspace_uses_target_filesystem(tmp_path, monkeypatch, backend):
     shared = Path('/dev/shm')
     if not shared.is_dir() or shared.stat().st_dev == tmp_path.stat().st_dev or not os.access(shared, os.W_OK):
         pytest.skip('没有独立可写的内存文件系统')
-    import tempfile
+    import iosql.migration as migration
+
+    original_prepare = LocalPublisher.prepare
+    original_copy = migration.copy_snapshot
+    workspaces = []
+    published_copies = []
+
+    def prepare(publisher, plans):
+        workspaces.append(publisher.workspace)
+        assert publisher.workspace.stat().st_dev == shared.stat().st_dev
+        return original_prepare(publisher, plans)
+
+    def copy_snapshot(source, destination):
+        if Path(source).name == 'payload':
+            published_copies.append((source, destination))
+        return original_copy(source, destination)
+
+    monkeypatch.setattr(LocalPublisher, 'prepare', prepare)
+    monkeypatch.setattr(migration, 'copy_snapshot', copy_snapshot)
+    with tempfile.TemporaryDirectory(prefix='iosql-migration-test-', dir=shared) as dest:
+        target_uri = uri(Path(dest) / 'target', backend)
+        target_item = resource(target_uri)
+        with Database(uri(tmp_path / 'source')) as source:
+            table = make(source, rows=[{'ts': 1, 'v': 'a'}])
+            result = source.migrate_to(target_uri, verify='row-count')
+            assert result.published and result.verified
+            assert table.select_all('*') == [{'ts': 1, 'v': 'a'}]
+        assert workspaces[0].parent == target_item.control_dir / (target_item.token + '.workspaces')
+        assert not workspaces[0].exists()
+        assert not (tmp_path / 'source' / '__iosql_migrations__').exists()
+        assert not published_copies
+        with Database(target_uri) as target:
+            assert target['ticks'].select_all('*') == [{'ts': 1, 'v': 'a'}]
+
+
+@pytest.mark.parametrize('has_existing_table', [False, True])
+def test_mountpoint_workspace_is_created_after_target_preflight(tmp_path, monkeypatch, has_existing_table):
+    import iosql.migration as migration
+
+    target_path = tmp_path / 'target'
+    target_path.mkdir()
+    source_uri, target_uri = uri(tmp_path / 'source'), uri(target_path)
+    if has_existing_table:
+        with Database(target_uri) as target:
+            make(target, 'keep', rows=[{'ts': 2, 'v': 'keep'}])
+    original_stat = Path.stat
+
+    def mountpoint_stat(path, *args, **kwargs):
+        value = original_stat(path, *args, **kwargs)
+        if path == target_path:
+            fields = list(value)
+            fields[2] = value.st_dev + 1
+            return os.stat_result(fields)
+        return value
+
+    with monkeypatch.context() as context:
+        context.setattr(Path, 'stat', mountpoint_stat)
+        assert migration._default_workspace_root(resource(source_uri), resource(target_uri)) == (
+            target_path / '__iosql_migrations__'
+        )
+
+    monkeypatch.setattr(
+        migration, '_default_workspace_root',
+        lambda source, target: target.path / '__iosql_migrations__',
+    )
+    with Database(source_uri) as source:
+        make(source, rows=[{'ts': 1, 'v': 'a'}])
+        result = source.migrate_to(target_uri, verify='row-count')
+        assert result.published and result.verified
+    assert not (target_path / '__iosql_migrations__' / result.operation_id).exists()
+    with Database(target_uri) as target:
+        assert target['ticks'].select_all('*') == [{'ts': 1, 'v': 'a'}]
+        if has_existing_table:
+            assert target['keep'].select_all('*') == [{'ts': 2, 'v': 'keep'}]
+
+
+def test_local_target_preflight_failure_creates_no_workspace(tmp_path):
+    target_path = tmp_path / 'target'
+    target_path.mkdir()
+    foreign = target_path / 'foreign'
+    foreign.mkdir()
+    (foreign / 'keep.txt').write_text('保留', encoding='utf-8')
+    target_uri = uri(target_path)
+    with Database(uri(tmp_path / 'source')) as source:
+        make(source, rows=[{'ts': 1, 'v': 'a'}])
+        with pytest.raises(UnsafeOperation, match='目标不是完整的 iosql 数据库'):
+            source.migrate_to(target_uri)
+    target_item = resource(target_uri)
+    assert not (target_item.control_dir / (target_item.token + '.workspaces')).exists()
+    assert (foreign / 'keep.txt').read_text(encoding='utf-8') == '保留'
+
+
+@pytest.mark.parametrize('backend', ['sqlite', 'parquet'])
+def test_repartition_to_another_table_in_same_database(tmp_path, backend):
+    database_uri = uri(tmp_path / 'database', backend)
+    rows = [{'ts': 1, 'v': 'a'}, {'ts': 12, 'v': 'b'}]
+    with Database(database_uri) as db:
+        table = make(db, rows=rows)
+        result = table.repartition_to(
+            database_uri, table_name='archive',
+            spec=table.spec().with_partition(Partition.range('ts', every=10)),
+        )
+        assert result.rows_copied == 2
+    with Database(database_uri) as db:
+        assert db['ticks'].select_all('*', order_by='ts') == rows
+        assert db['archive'].select_all('*', order_by='ts') == rows
+        assert db['archive'].table_parts() == [0, 10]
+
+
+def test_postgresql_target_keeps_previous_default_workspace(tmp_path, monkeypatch):
+    import iosql.migration as migration
+
+    target = resource('postgresql://user:password@localhost:5432/db')
+    local_source = resource(uri(tmp_path / 'source'))
+    remote_source = resource('postgresql://user:password@otherhost:5432/db')
+    monkeypatch.setattr(tempfile, 'gettempdir', lambda: str(tmp_path))
+    assert migration._default_workspace_root(local_source, target) == local_source.path / '__iosql_migrations__'
+    assert migration._default_workspace_root(remote_source, target) == tmp_path / 'iosql-migrations'
+
+
+def test_cross_filesystem_temp_copy(tmp_path, monkeypatch):
+    shared = Path('/dev/shm')
+    if not shared.is_dir() or shared.stat().st_dev == tmp_path.stat().st_dev or not os.access(shared, os.W_OK):
+        pytest.skip('没有独立可写的内存文件系统')
+    import iosql.migration as migration
+    original_copy = migration.copy_snapshot
+    published_copies = []
+
+    def copy_snapshot(source, destination):
+        if Path(source).name == 'payload':
+            published_copies.append((source, destination))
+        return original_copy(source, destination)
+
+    monkeypatch.setattr(migration, 'copy_snapshot', copy_snapshot)
     temporary = Path(tempfile.mkdtemp(prefix='iosql-migration-test-', dir=shared))
     try:
         with Database(uri(tmp_path / 'source')) as source:
             make(source, rows=[{'ts': 1, 'v': 'a'}])
             assert source.migrate_to(uri(tmp_path / 'target'), temp_dir=temporary, verify='row-count').verified
             assert not list(temporary.iterdir())
+            assert len(published_copies) == 1
     finally:
         shutil.rmtree(temporary)
 
@@ -348,17 +491,16 @@ def test_nested_maintenance_cleanup_waits_for_outer_lease(tmp_path, monkeypatch)
         assert observed == [True]
 
 
-def test_cli_specs_uses_unified_migration(tmp_path):
+def test_cli_specs_uses_unified_migration(tmp_path, invoke_separate):
     import json
-    from typer.testing import CliRunner
     from iosql.cli import app
     with Database(uri(tmp_path / 'source')) as source:
         make(source, rows=[{'ts': 1000, 'v': 'a'}, {'ts': 3601000, 'v': 'b'}])
-    result = CliRunner().invoke(app, [
+    result = invoke_separate(app,
         'migrate', '-s', str(tmp_path / 'source'), '--target', uri(tmp_path / 'target', 'parquet'),
         '--table', 'ticks:archive', '--specs', '{"ticks":{"partition":"range(ts,width=1000000)"}}',
         '--verify', 'row-count', '--temp-dir', str(tmp_path / 'temporary'), '--lock-timeout', '0.1',
-    ])
+    )
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output)
     assert payload['published'] and payload['verified']
