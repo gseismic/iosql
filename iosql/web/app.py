@@ -26,6 +26,8 @@
 from __future__ import annotations
 
 import csv
+import datetime
+import decimal
 import json
 import logging
 import math
@@ -95,8 +97,11 @@ BIG_TABLE_WARN_ROWS = 1_000_000
 # chart 数据以 NDJSON 按批传输；每批最多 2048 个原始记录。
 CHART_STREAM_BATCH_ROWS = 2048
 
-# 最多同时绘制 32 个 symbol；超限时显式报错，不静默截断。
-MAX_CHART_SYMBOLS = 32
+# 图表分组超限时显式报错，不静默截断；旧接口沿用其原有名称。
+MAX_CHART_GROUPS = 32
+MAX_CHART_SYMBOLS = MAX_CHART_GROUPS
+MAX_CHART_CATEGORIES = 1000
+MAX_SAFE_JS_INTEGER = 2**53 - 1
 
 EXPORT_BATCH_SIZE = 5000
 
@@ -153,6 +158,16 @@ class LatestBody(BaseModel):
     columns: Optional[list[str]] = None
     where: Optional[list[dict[str, Any]]] = None
     session: Optional[str] = None
+
+
+class ChartBody(_StrictBody):
+    """通用图表的坐标、分组和筛选；数据以只读流返回。"""
+
+    x: str
+    y: str
+    group_by: Optional[str] = None
+    where: Optional[list[dict[str, Any]]] = None
+    kind: str = "auto"
 
 
 class ValidateBody(BaseModel):
@@ -351,6 +366,14 @@ def table_columns(table: Any, spec: Any) -> list[str]:
         return list(spec.columns.keys())
     sample = table.select(limit=1, to_dict=True)
     return list(sample[0].keys()) if sample else []
+
+
+def chart_column_types(table: Any, spec: Any) -> dict[str, str]:
+    """优先使用契约列；无契约时仅使用后端可提供的物理列类型。"""
+    if spec is not None and spec.columns:
+        return dict(spec.columns)
+    physical = getattr(table, "_column_types", None)
+    return dict(physical()) if callable(physical) else {}
 
 
 def resolve_sort_col(
@@ -660,7 +683,13 @@ def _register_read_routes(app: FastAPI) -> None:
     @app.get("/api/table/{name}/spec")
     def get_spec(name: str, request: Request) -> dict:
         table = get_table(request.app.state.db, name)
-        return {"name": name, "spec": serialize_contract(table.spec())}
+        spec = table.spec()
+        result = {"name": name, "spec": serialize_contract(spec)}
+        if spec is None:
+            columns = chart_column_types(table, spec)
+            if columns:
+                result["columns"] = columns
+        return result
 
     @app.get("/api/table/{name}/parts")
     def get_parts(name: str, request: Request) -> dict:
@@ -878,6 +907,10 @@ def _register_read_routes(app: FastAPI) -> None:
         # 兼容旧客户端传入 buckets 参数，但 Charts 始终返回范围内全部原始行。
         return _chart_endpoint(name, request, col, symbol, start, end, kind)
 
+    @app.post("/api/table/{name}/chart")
+    def post_chart(name: str, body: ChartBody, request: Request) -> StreamingResponse:
+        return _generic_chart_endpoint(name, body, request)
+
     @app.get("/api/table/{name}/export")
     def get_export(name: str, request: Request,
                    format: str = Query(...),
@@ -1086,6 +1119,228 @@ def _chart_stream_y(value: Any, col: str) -> Optional[float]:
             hint="chart 仅支持数值列；请检查数据质量",
         ) from exc
     return numeric if math.isfinite(numeric) else None
+
+
+def _chart_column_type(types: dict[str, str], column: str) -> str:
+    """按契约判断数轴或类别轴，不以字段名称猜测业务含义。"""
+    dtype = str(types.get(column, "")).lower().split("(", 1)[0].strip()
+    if dtype in {"int", "integer", "bigint", "smallint", "real", "float", "double",
+                 "double precision", "numeric", "decimal", "number"}:
+        return "numeric"
+    if dtype in {"text", "string", "str", "varchar", "char", "character",
+                 "character varying", "date", "datetime", "timestamp", "timestamptz",
+                 "timestamp without time zone", "timestamp with time zone", "time",
+                 "time without time zone", "time with time zone", "boolean", "bool"}:
+        return "category"
+    raise _bad_request(
+        f"列 `{column}` 的类型 `{dtype or '未知'}` 暂不支持绘图",
+        hint="请选择数值、文本、日期或布尔类型的列",
+    )
+
+
+def _validate_chart_where(comps: Optional[list[dict[str, Any]]], columns: list[str]) -> None:
+    for comp in comps or []:
+        if "field" in comp:
+            if comp["field"] not in columns:
+                raise _bad_request(
+                    f"筛选列 `{comp['field']}` 不存在",
+                    hint=f"可用列: {', '.join(columns)}",
+                )
+        else:
+            _validate_chart_where(comp.get("and") or comp.get("or"), columns)
+
+
+def _generic_chart_endpoint(name: str, body: ChartBody, request: Request) -> StreamingResponse:
+    table = get_table(request.app.state.db, name)
+    spec = table.spec()
+    types = chart_column_types(table, spec)
+    columns = list(types)
+    if not types:
+        raise _bad_request("无法确定表的列类型", hint="请先为表声明列类型")
+    for column in (body.x, body.y, body.group_by):
+        if column is not None and column not in columns:
+            raise _bad_request(f"列 `{column}` 不存在", hint=f"可用列: {', '.join(columns)}")
+    x_type = _chart_column_type(types, body.x)
+    y_type = _chart_column_type(types, body.y)
+    group_type = _chart_column_type(types, body.group_by) if body.group_by is not None else None
+    if x_type == "numeric" and spec and spec.time and spec.time.name == body.x and spec.time.unit == "ms":
+        x_type = "time"
+    elif x_type == "category" and (str(types[body.x]).lower().strip() == "date" or
+            (spec and spec.time and spec.time.name == body.x and spec.time.unit == "date")):
+        x_type = "date"
+    if body.kind not in ("auto", "ohlc"):
+        raise _bad_request("不支持的图型", hint="kind 仅支持 auto 或 ohlc")
+    value_cols = (body.y,)
+    kind = "line" if x_type in {"time", "date"} and y_type == "numeric" else "scatter"
+    if body.kind == "ohlc":
+        value_cols = _detect_ohlc(columns)
+        if not value_cols or x_type == "category":
+            raise _bad_request("无法绘制 OHLC 四线", hint="需要数值或时间 X 轴及完整的 OHLC 数值列")
+        if any(_chart_column_type(types, column) != "numeric" for column in value_cols):
+            raise _bad_request("OHLC 列必须是数值类型", hint="请选择数值类型的 OHLC 列")
+        y_type, kind = "numeric", "ohlc"
+    comps = normalize_where(body.where)
+    _validate_chart_where(comps, columns)
+    date_columns = {column for column, dtype in types.items() if str(dtype).lower().strip() == "date"}
+    if spec and spec.time and spec.time.unit == "date":
+        date_columns.add(spec.time.name)
+    return _chart_stream_response(_generic_chart_stream(
+        table, body.x, value_cols, body.group_by, group_type, types, date_columns,
+        build_case(comps), x_type, y_type, kind,
+    ))
+
+
+def _chart_category(value: Any, column: str, allow_null: bool, boolean: bool = False) -> Any:
+    if value is None:
+        if allow_null:
+            return None
+        raise _bad_request(f"X 轴列 `{column}` 含空值", hint="请过滤空值或选择其他 X 轴")
+    if boolean:
+        if isinstance(value, int) and value in (0, 1):
+            return bool(value)
+        raise _bad_request(f"布尔列 `{column}` 含不符合契约的数据", hint="请检查数据类型")
+    if not isinstance(value, (str, bool, datetime.date, datetime.time)):
+        raise _bad_request(f"类别列 `{column}` 含不符合契约的数据", hint="请检查数据类型")
+    converted = to_jsonable(value)
+    if not isinstance(converted, (str, bool)):
+        raise _bad_request(f"类别列 `{column}` 含不符合契约的数据", hint="请检查数据类型")
+    return converted
+
+
+def _chart_date(value: Any, column: str) -> datetime.date:
+    text = str(to_jsonable(value))
+    try:
+        if not ((len(text) == 8 and text.isdigit()) or
+                (len(text) == 10 and text[4] == "-" and text[7] == "-")):
+            raise ValueError("invalid date")
+        iso = f"{text[:4]}-{text[4:6]}-{text[6:]}" if len(text) == 8 else text
+        return datetime.date.fromisoformat(iso)
+    except ValueError as exc:
+        raise _bad_request(f"日期列 `{column}` 含无效日期", hint="请使用 YYYY-MM-DD 或 YYYYMMDD") from exc
+
+
+def _generic_chart_stream(table: Any, x_col: str, value_cols: tuple[str, ...],
+                          group_col: Optional[str], group_type: Optional[str], types: dict[str, str],
+                          date_columns: set[str], where: Any,
+                          x_type: str, y_type: str, kind: str) -> Iterator[str]:
+    fields = list(dict.fromkeys(([group_col] if group_col else []) + [x_col] + list(value_cols)))
+    yield _chart_event({
+        "type": "meta", "kind": kind, "x_col": x_col, "value_cols": list(value_cols),
+        "x_type": x_type, "y_type": y_type, "group_by": group_col,
+    })
+    counts: dict[Any, int] = {}
+    pending: dict[Any, list[list[Any]]] = {}
+    previous: dict[Any, Any] = {}
+    categories_x: set[Any] = set()
+    categories_y: set[Any] = set()
+    bool_columns = {
+        column for column, dtype in types.items()
+        if str(dtype).lower().strip() in {"bool", "boolean"}
+    }
+    total_rows = 0
+    order = ([(group_col, "asc")] if group_col else []) + [(x_col, "asc")]
+    batches = None
+    try:
+        batches = table.iter_select_batches(
+            fields, where=where, order_by=order, to_dict=True, batch_size=EXPORT_BATCH_SIZE,
+        )
+        for batch in batches:
+            for row in batch:
+                raw_group = row.get(group_col) if group_col else None
+                if raw_group is None:
+                    group = None
+                elif group_type == "category":
+                    if group_col in date_columns:
+                        _chart_date(raw_group, group_col)
+                    group = (raw_group if group_col in date_columns and isinstance(raw_group, int)
+                             and not isinstance(raw_group, bool) else
+                             _chart_category(raw_group, group_col, False, group_col in bool_columns))
+                else:
+                    if isinstance(raw_group, decimal.Decimal):
+                        group = raw_group if raw_group.is_finite() else None
+                    else:
+                        group = (raw_group if isinstance(raw_group, int) and not isinstance(raw_group, bool)
+                                 else _chart_stream_y(raw_group, group_col))
+                    if group is None:
+                        raise _bad_request("分组列包含非有限数值", hint="请检查数据或选择其他分组列")
+                if group is not None and not isinstance(group, (str, int, float, bool, decimal.Decimal)):
+                    raise _bad_request("分组列包含不支持的值", hint="请选择文本或数值分组列")
+                if group not in counts and len(counts) >= MAX_CHART_GROUPS:
+                    raise _bad_request(
+                        f"查询结果超过 {MAX_CHART_GROUPS} 个分组",
+                        hint=f"请添加筛选条件，使分组不超过 {MAX_CHART_GROUPS} 个",
+                    )
+                raw_x = row.get(x_col)
+                if x_type == "date" and isinstance(raw_x, int) and not isinstance(raw_x, bool):
+                    x = raw_x
+                elif x_type in {"category", "date"}:
+                    x = _chart_category(raw_x, x_col, False, x_col in bool_columns)
+                else:
+                    x = _chart_stream_x(raw_x, x_col)
+                comparison_x = x
+                if x_type == "date":
+                    comparison_x = _chart_date(x, x_col)
+                if x_type not in {"category", "date"} and isinstance(x, int) and abs(x) > MAX_SAFE_JS_INTEGER:
+                    raise _bad_request(f"X 轴列 `{x_col}` 超过安全整数范围", hint="请选择其他列或先转换数值精度")
+                if x_type != "category" and group in previous and comparison_x < previous[group]:
+                    raise _bad_request("图表 X 轴顺序异常", hint="请检查列类型和数据")
+                previous[group] = comparison_x
+                if x_type == "category":
+                    categories_x.add(x)
+                    if len(categories_x) > MAX_CHART_CATEGORIES:
+                        raise _bad_request("X 轴类别过多", hint="请添加筛选条件，缩小类别范围")
+                point = [x]
+                for column in value_cols:
+                    raw_value = row.get(column)
+                    if y_type == "category" and raw_value is not None and column in date_columns:
+                        _chart_date(raw_value, column)
+                        if isinstance(raw_value, int) and not isinstance(raw_value, bool):
+                            raw_value = str(raw_value)
+                    if (y_type != "category" and isinstance(raw_value, int)
+                            and not isinstance(raw_value, bool) and abs(raw_value) > MAX_SAFE_JS_INTEGER):
+                        raise _bad_request(f"Y 轴列 `{column}` 超过安全整数范围", hint="请选择其他列或先转换数值精度")
+                    value = (_chart_category(raw_value, column, True, column in bool_columns) if y_type == "category"
+                             else _chart_stream_y(raw_value, column))
+                    if y_type == "category" and value is not None:
+                        categories_y.add(value)
+                        if len(categories_y) > MAX_CHART_CATEGORIES:
+                            raise _bad_request("Y 轴类别过多", hint="请添加筛选条件，缩小类别范围")
+                    point.append(value)
+                points = pending.setdefault(group, [])
+                points.append(point)
+                counts[group] = counts.get(group, 0) + 1
+                total_rows += 1
+                if len(points) >= CHART_STREAM_BATCH_ROWS:
+                    yield _chart_event({"type": "data", "group": _chart_wire_group(group), "points": points})
+                    pending[group] = []
+        for group, points in pending.items():
+            if points:
+                yield _chart_event({"type": "data", "group": _chart_wire_group(group), "points": points})
+        yield _chart_event({
+            "type": "done", "rows": total_rows,
+            "series": [{"group": _chart_wire_group(group), "rows": count} for group, count in counts.items()],
+        })
+    except Exception as exc:
+        if isinstance(exc, AppError):
+            detail, hint = exc.detail, exc.hint
+        elif isinstance(exc, BadArgument):
+            detail, hint = str(exc), "请检查筛选条件和列类型"
+        else:
+            logger.exception("generic chart stream failed")
+            detail, hint = "图表数据读取失败", "请检查服务端日志和表数据后重试"
+        yield _chart_event({"type": "error", "detail": detail, "hint": hint})
+    finally:
+        if batches is not None and hasattr(batches, "close"):
+            batches.close()
+
+
+def _chart_wire_group(group: Any) -> Any:
+    """大整数和定点数分组使用十进制文本，避免浏览器将不同分组合并。"""
+    if isinstance(group, decimal.Decimal):
+        return str(group)
+    if isinstance(group, int) and not isinstance(group, bool) and abs(group) > MAX_SAFE_JS_INTEGER:
+        return str(group)
+    return group
 
 
 def _numeric_text_chart_batches(table, fields, x_col, order, comps):

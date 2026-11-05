@@ -60,6 +60,7 @@
     this.rows.forEach(function (row, i) {
       var fieldSel = h('select', {
         class: 'input field-sel',
+        'aria-label': '条件字段 ' + (i + 1),
         onchange: function (e) { row.field = e.target.value; }
       }, self.columns.map(function (c) {
         return h('option', { value: c, selected: c === row.field }, c);
@@ -67,6 +68,7 @@
 
       var opSel = h('select', {
         class: 'input op-sel',
+        'aria-label': '条件运算符 ' + (i + 1),
         onchange: function (e) { row.op = e.target.value; self.render(); }
       }, OPS.map(function (o) {
         return h('option', { value: o, selected: o === row.op }, o);
@@ -76,6 +78,7 @@
         : row.op === 'in' ? 'v1, v2, …（逗号分隔）' : '值';
       var valInput = h('input', {
         class: 'input mono val-input', type: 'text', value: row.value,
+        'aria-label': '条件值 ' + (i + 1),
         placeholder: placeholder, autocomplete: 'off', spellcheck: 'false',
         oninput: function (e) { row.value = e.target.value; }
       });
@@ -84,6 +87,7 @@
       if (i > 0) {
         joiner.append(h('select', {
           class: 'input', style: { fontSize: '12px', padding: '2px 4px' },
+          'aria-label': '条件连接方式 ' + (i + 1),
           onchange: function (e) { row.join = e.target.value; }
         },
           h('option', { value: 'AND', selected: row.join !== 'OR' }, 'AND'),
@@ -94,6 +98,7 @@
         joiner, fieldSel, opSel, valInput,
         h('button', {
           class: 'icon-btn', title: '删除此行',
+          'aria-label': '删除条件 ' + (i + 1),
           onclick: function () { self.removeRow(i); }
         }, '✕')));
     });

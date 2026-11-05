@@ -92,7 +92,7 @@
   IU.toast = toast;
 
   /* ---------- 格式化 ---------- */
-  var RE_INT = /^-?\d+$/;
+  var RE_INT = /^[-+]?\d+$/;
   var RE_FLOAT = /^[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?$/;
 
   /* 千分位整数；非有限数值原样返回 */
@@ -125,12 +125,23 @@
   function coerceValue(raw, colType) {
     var s = String(raw).trim();
     var t = (colType || '').toLowerCase();
+    if (t === 'bool' || t === 'boolean') {
+      if (/^(true|1)$/i.test(s)) return true;
+      if (/^(false|0)$/i.test(s)) return false;
+      return s;
+    }
     var numeric = t.indexOf('int') >= 0 || t.indexOf('real') >= 0 ||
                   t.indexOf('float') >= 0 || t.indexOf('double') >= 0 ||
-                  t.indexOf('numeric') >= 0 || t.indexOf('number') >= 0;
+                  t.indexOf('numeric') >= 0 || t.indexOf('decimal') >= 0 || t.indexOf('number') >= 0;
     if (numeric) {
-      if (RE_INT.test(s)) return parseInt(s, 10);
-      if (RE_FLOAT.test(s)) return parseFloat(s);
+      if (RE_INT.test(s)) {
+        var integer = Number(s);
+        return Number.isSafeInteger(integer) ? integer : s;
+      }
+      if (RE_FLOAT.test(s)) {
+        var decimal = Number(s);
+        return Number.isFinite(decimal) && (!Number.isInteger(decimal) || Number.isSafeInteger(decimal)) ? decimal : s;
+      }
     }
     return s;
   }

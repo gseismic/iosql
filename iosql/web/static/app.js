@@ -458,6 +458,7 @@ function renderFontScale() {
     var requestedTable = state.table;
     IU.api('/api/table/' + encodeURIComponent(requestedTable) + '/spec').then(function (specResp) {
       var requestedSpec = (specResp && specResp.spec) || {};
+      if (!requestedSpec.columns && specResp && specResp.columns) requestedSpec.columns = specResp.columns;
       state.specCache[requestedTable] = requestedSpec;
       if (state.table === requestedTable && parseHash().table === requestedTable) {
         IU.clear(content);

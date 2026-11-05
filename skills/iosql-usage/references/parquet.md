@@ -124,11 +124,13 @@ with Database("parquet://db/archive.iosql") as source:
 
 `tables` 可选全库、表名列表或 `{源表: 目标表}` 映射，`specs` 按源名调整目标分区/segment。
 本地源与目标不能相同或互相包含；行数校验要求选中目标表不存在或为空。
-迁移前确认源表有完整契约，释放读取流和缓冲上下文，并预留暂存与完整目标代际的空间。
+迁移前确认源表有完整契约，释放读取流和缓冲上下文，并预留暂存目标视图的空间。
 本地目标默认在目标文件系统暂存；如需自行选择位置，可用 `temp_dir` / `--temp-dir` 指定目标库之外的工作区。
 dry-run 只读源、不连接目标，不验证目标权限、已有契约或空表条件；可能创建源协调锁文件。
 
-迁移先转换、校验，再统一发布。成功时检查 `result.published` 与 `result.verified`；
+迁移先转换、校验，再统一发布；Parquet 表在发布后直接位于目标库根目录，与普通写入一致。
+旧版 Parquet 代目录库可作为源读取，但不能直接作为平坦发布的迁移目标；可迁移到新的目标。
+成功时检查 `result.published` 与 `result.verified`；
 `rows_copied` 可包含 ignore 跳过的行，实际写入量看 `rows_written`。失败时依据异常中的
 `operation_id`、`partial_result` 和 `recovery_path` 查明状态，再决定重试；
 详见[迁移错误排查](troubleshooting.md#统一迁移与协作锁)。

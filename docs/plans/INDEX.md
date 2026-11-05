@@ -24,3 +24,7 @@
 | 2026-11-05 22:13 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) / [结果](PLAN-20261105-007-model-unknown-web-lazy-loading-OUTCOME.md) | 已完成（WORKTREE） | 修复筛选防抖期间快速切换导致旧页复用；原库再次手测和 133 项回归通过。 |
 | 2026-11-05 22:38 | [Web 浏览与截面切换回归](PLAN-20261105-008-model-unknown-web-browse-switch.md) | 实施中 | 对照新旧脚本，在隔离库覆盖反复切换及请求中切换。 |
 | 2026-11-05 22:42 | [Web 浏览与截面切换回归](PLAN-20261105-008-model-unknown-web-browse-switch.md) / [结果](PLAN-20261105-008-model-unknown-web-browse-switch-OUTCOME.md) | 已完成（WORKTREE） | 旧脚本复现空表，当前脚本和 135 项相关测试通过；新增切换与延迟响应回归。 |
+| 2026-11-06 00:37 | [Web 通用图表与 mchart3 接入](PLAN-20261106-001-model-unknown-generic-charts.md) | 实施中 | 设计通用条件和坐标选择，保留原始点与旧图表接口。 |
+| 2026-11-06 01:22 | [Parquet 迁移目标目录与普通写入保持一致](PLAN-20261106-002-model-unknown-migration-flat-layout.md) | 实施中 | 评估安全发布方案，计划整理用户指定的单个已迁移库。 |
+| 2026-11-06 01:34 | [Web 通用图表与 mchart3 接入](PLAN-20261106-001-model-unknown-generic-charts.md) / [结果](PLAN-20261106-001-model-unknown-generic-charts-OUTCOME.md) | 已完成（WORKTREE） | 通用轴与筛选、按需加载、三种后端和原库核对完成；192 项相关测试通过。 |
+| 2026-11-06 01:52 | [Parquet 迁移目标目录与普通写入保持一致](PLAN-20261106-002-model-unknown-migration-flat-layout.md) / [结果](PLAN-20261106-002-model-unknown-migration-flat-layout-OUTCOME.md) | 已完成（WORKTREE） | 指定库完成无业务数据重编码的目录整理；新迁移平坦发布，完整回归及目标盘专项通过。 |

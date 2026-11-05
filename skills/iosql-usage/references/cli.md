@@ -49,7 +49,7 @@ python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 - 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写业务数据，所以不要求 `--yes`。转换期间保持源库独占锁；备份复制已发布快照并合并 WAL，支持跨文件系统；完成后通过代际指针统一发布。提交决定前失败目标不变，决定后的中断由恢复屏障完成发布。备份和转换需要额外磁盘空间。
 - `restore --replace --yes` 只允许覆盖有真实表级 manifest 和完整分区文件的 iosql 库；备份也须通过同样的校验，空库没有可靠身份标记，当前不支持从空目录恢复。伪造 meta 的普通目录、根/家目录、符号链接以及与备份互相包含的路径全部拒绝。替换前校验临时副本，失败保留原目标。
 - `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库和互相包含的本地路径，`--verify row-count` 要求所选目标表不存在或为空。正式迁移持源/目标独占租约，普通协作 API 立即报 `DatabaseBusy`；先关闭读取流、flush 缓冲并退出缓冲上下文，`--lock-timeout` 控制锁等待总时限。
-- `migrate --dry-run` 只读源库，不连接目标，不验证目标权限、已有表兼容性或空表条件，可能创建源协调锁文件。本地目标的工作区默认位于目标文件系统；`--temp-dir` 可显式覆盖，但不得位于目标库内。转换工作区和完整目标代际（含未选中目标表）需要额外磁盘空间。结果中的 `published` 表达正式发布状态，`rows_copied` 可包含 ignore 跳过的行。
+- `migrate --dry-run` 只读源库，不连接目标，不验证目标权限、已有表兼容性或空表条件，可能创建源协调锁文件。本地目标的工作区默认位于目标文件系统；`--temp-dir` 可显式覆盖，但不得位于目标库内。转换工作区和暂存目标视图（含未选中目标表）需要额外磁盘空间。Parquet 目标成功发布后，表位于数据库根目录。结果中的 `published` 表达正式发布状态，`rows_copied` 可包含 ignore 跳过的行。
 - `migrate --help` 提供可复制的迁移示例。命令将阶段、当前表的文件和行数进度以及耗时写入标准错误，最终 JSON 写入标准输出；单表计数不代表整个库的百分比。SQLite 到 Parquet 的正式迁移按文件统计并复制，在源表计数完成前显示已复制行数而不显示未知总数；预览仍单独统计全表，实际批次数可因分区边界与预览估计不同。
 - `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验；`--partition` 拼写错误会报错并列出可用分区（compact 同理）。
 - `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取并支持 UTF-8 BOM，坏 JSONL 行/CSV 字段数不匹配会报行号；中途失败输出 `rows_seen`/`rows_written`/`batches_committed` JSON 汇总，以退出码 1 结束。

@@ -1,5 +1,6 @@
 """浏览器回归：覆盖 Web 的真实交互和异步状态，而非仅检查静态资源。"""
 
+import json
 import re
 import socket
 import threading
@@ -34,8 +35,11 @@ def _demo_database(path):
                 rows.append({"symbol": "AAA" if i % 2 == 0 else "BBB",
                              "ts": BASE + day * DAY + i * 1000, "price": 100.0 + i})
         ticks.write(rows)
-        notes = db.table("notes", pk=["id"], columns={"id": "integer", "text": "text"})
-        notes.write([{"id": i, "text": f"note-{i}"} for i in range(3)])
+        notes = db.table("notes", pk=["id"], columns={
+            "id": "integer", "text": "text", "flag": "boolean", "date": "date", "compact_date": "date",
+        })
+        notes.write([{"id": i, "text": f"note-{i}", "flag": i % 2 == 0,
+                      "date": f"2025-01-0{i + 1}", "compact_date": f"2025010{i + 1}"} for i in range(3)])
 
 
 @pytest.fixture(scope="module")
@@ -104,6 +108,7 @@ def test_data_and_overview_load_expensive_statistics_only_on_demand(page, web_se
     assert not requests_to("stats")
     assert not requests_to("segments")
     assert not requests_to("count")
+    assert not requests_to("mchart3-0.5.0.min.js")
 
     page.get_by_role("link", name="打开 ticks 的数据").click()
     playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(180)
@@ -117,6 +122,7 @@ def test_data_and_overview_load_expensive_statistics_only_on_demand(page, web_se
     assert not requests_to("stats")
     assert not requests_to("segments")
     assert not requests_to("count")
+    assert not requests_to("mchart3-0.5.0.min.js")
 
     page.get_by_role("button", name="统计总行数").click()
     playwright.expect(page.locator(".pager-bar").last).to_have_text("总行数：90 · 1 个表头过滤已生效")
@@ -590,13 +596,328 @@ def test_cell_keyboard_detail_and_write_confirmation(page, web_servers):
 
 
 def test_charts_and_overview_empty_state(page, web_servers):
+    requests = []
+    engine_requests = []
+    page.on("request", lambda request: requests.append(request.url) if request.url.endswith("/chart") else None)
+    page.on("request", lambda request: engine_requests.append(request.url)
+            if request.url.endswith("/mchart3-0.5.0.min.js") else None)
     page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
-    playwright.expect(page.locator(".uplot")).to_be_visible()
+    playwright.expect(page.get_by_text("选择坐标并按需设置筛选条件", exact=False)).to_be_visible()
+    assert not requests and not engine_requests
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-canvas")).to_be_visible()
     playwright.expect(page.locator(".chart-note").last).to_contain_text("180 条原始记录")
+    assert len(engine_requests) == 1
     page.route("**/api/tables", lambda route: route.fulfill(json={"tables": []}))
     page.goto(web_servers["readonly"])
     playwright.expect(page.get_by_text("这个库还没有表")).to_be_visible()
     playwright.expect(page.get_by_role("button", name="复制示例")).to_be_visible()
+
+
+def test_chart_engine_load_failure_can_retry(page, web_servers):
+    calls = []
+    requests = []
+
+    def engine(route):
+        calls.append(1)
+        if len(calls) == 1:
+            route.fulfill(status=503, body="unavailable")
+        else:
+            route.continue_()
+
+    page.route("**/vendor/mchart3-0.5.0.min.js", engine)
+    page.on("request", lambda request: requests.append(request.url) if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.get_by_text("图表引擎加载失败", exact=False)).to_be_visible()
+    assert not requests
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("180 条原始记录")
+    assert len(calls) == 2 and len(requests) == 1
+
+
+def test_leaving_while_chart_engine_loads_does_not_start_query(page, web_servers):
+    requests = []
+    page.on("request", lambda request: requests.append(request.url) if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.evaluate("""() => {
+      const append = document.head.appendChild.bind(document.head);
+      document.head.appendChild = node => {
+        if (String(node.src || '').includes('mchart3-0.5.0.min.js')) {
+          window.__releaseChartEngine = () => append(node);
+          return node;
+        }
+        return append(node);
+      };
+    }""")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    page.wait_for_function("typeof window.__releaseChartEngine === 'function'")
+    assert page.evaluate("typeof window.IU.tabs.charts.cleanup") == "function"
+    page.get_by_role("tab", name="2Data").click()
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(180)
+    assert page.evaluate("window.IU.tabs.charts.cleanup === null")
+    assert not requests
+    page.evaluate("() => window.__releaseChartEngine()")
+    page.wait_for_function("window.MChart && typeof window.MChart.Figure === 'function'")
+    assert not requests
+
+
+@pytest.mark.parametrize("x,y", [("id", "text"), ("text", "id"), ("text", "text"), ("id", "compact_date")])
+def test_generic_chart_axes_work_for_a_table_without_symbol(page, web_servers, x, y):
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    page.get_by_role("combobox", name="X 轴").select_option(x)
+    page.get_by_role("combobox", name="Y 轴").select_option(y)
+    playwright.expect(page.get_by_text("当前图型：散点图", exact=False)).to_be_visible()
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-canvas")).to_be_visible()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("3 条原始记录")
+    assert not errors
+
+
+def test_chart_accepts_physical_columns_when_contract_is_absent(page, web_servers):
+    page.route("**/api/table/notes/spec", lambda route: route.fulfill(json={
+        "name": "notes", "spec": None, "columns": {"id": "bigint", "text": "text"},
+    }))
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    playwright.expect(page.get_by_role("combobox", name="X 轴")).to_have_value("id")
+    playwright.expect(page.get_by_role("combobox", name="Y 轴")).to_have_value("text")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("3 条原始记录")
+
+
+@pytest.mark.parametrize("column", ["date", "compact_date"])
+def test_date_axis_preserves_calendar_days_and_zooms_locally(page, web_servers, column):
+    requests = []
+    page.on("request", lambda request: requests.append(request.url) if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    page.add_script_tag(url=web_servers["readonly"] + "/vendor/mchart3-0.5.0.min.js")
+    page.evaluate("""() => {
+      const Original = window.MChart.Figure;
+      window.MChart = { Figure: class extends Original {
+        addSubplot(...args) {
+          const axes = super.addSubplot(...args), addLine = axes.addLineSeries.bind(axes);
+          axes.addLineSeries = (x, y, options) => {
+            window.__dateXs = [...x];
+            return addLine(x, y, options);
+          };
+          return axes;
+        }
+      }};
+    }""")
+    page.get_by_role("combobox", name="X 轴").select_option(column)
+    page.get_by_role("combobox", name="Y 轴").select_option("id")
+    playwright.expect(page.get_by_text("当前图型：折线图", exact=False)).to_be_visible()
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("本地缩放")
+    assert page.evaluate("window.__dateXs") == [BASE, BASE + DAY, BASE + 2 * DAY]
+    page.locator(".chart-canvas").hover()
+    page.mouse.wheel(0, -300)
+    page.wait_for_timeout(600)
+    assert len(requests) == 1
+
+
+def test_chart_zoom_reuses_drawn_conditions_and_double_click_resets(page, web_servers):
+    requests = []
+    page.on("request", lambda request: requests.append(request.post_data_json)
+            if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.locator(".cond-row .field-sel").select_option("symbol")
+    page.locator(".cond-row .val-input").fill("AAA")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("90 条原始记录")
+    assert requests[0]["where"] == [{"field": "symbol", "op": "==", "value": "AAA"}]
+
+    # 未点击绘制前修改条件，缩放仍应使用上一次绘制的筛选快照。
+    page.locator(".cond-row .val-input").fill("BBB")
+    page.locator(".chart-canvas").hover()
+    with page.expect_request(lambda request: request.url.endswith("/chart")):
+        page.mouse.wheel(0, -300)
+    playwright.expect(page.locator(".chart-note")).to_contain_text("可视区")
+    playwright.expect(page.locator(".chart-note")).not_to_contain_text("加载中")
+    playwright.expect(page.locator(".chart-note")).not_to_contain_text("失败")
+    assert requests[1]["where"][0]["value"] == "AAA"
+    assert {item["op"] for item in requests[1]["where"][1:]} == {">=", "<="}
+    with page.expect_request(lambda request: request.url.endswith("/chart")):
+        page.locator(".chart-canvas").dblclick()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("90 条原始记录")
+    assert requests[-1]["where"] == [{"field": "symbol", "op": "==", "value": "AAA"}]
+    page.wait_for_timeout(600)
+    assert len(requests) == 3
+
+
+def test_chart_preserves_nulls_and_duplicate_x_without_downsampling(page, web_servers):
+    events = [
+        {"type": "meta", "kind": "line", "x_type": "time", "y_type": "numeric",
+         "x_col": "ts", "value_cols": ["price"], "group_by": "symbol"},
+        {"type": "data", "group": "AAA", "points": [[BASE, 1], [BASE, None], [BASE + 1000, 2]]},
+        {"type": "done", "rows": 3, "series": [{"group": "AAA", "rows": 3}]},
+    ]
+    page.route("**/api/table/ticks/chart", lambda route: route.fulfill(
+        status=200, content_type="application/x-ndjson",
+        body="\n".join(json.dumps(event) for event in events) + "\n",
+    ))
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.add_script_tag(url=web_servers["readonly"] + "/vendor/mchart3-0.5.0.min.js")
+    page.evaluate("""() => {
+      const Original = window.MChart.Figure;
+      window.__lineData = [];
+      window.MChart = { Figure: class extends Original {
+        addSubplot(...args) {
+          const axes = super.addSubplot(...args);
+          const addLine = axes.addLineSeries.bind(axes);
+          axes.addLineSeries = (x, y, options) => {
+            window.__lineData.push({x: [...x], y: [...y], downsample: options.downsample});
+            return addLine(x, y, options);
+          };
+          return axes;
+        }
+      }};
+    }""")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("3 条原始记录")
+    assert page.evaluate("window.__lineData") == [{
+        "x": [BASE, BASE, BASE + 1000], "y": [1, None, 2], "downsample": False,
+    }]
+
+
+def test_chart_rejects_incomplete_stream(page, web_servers):
+    page.route("**/api/table/ticks/chart", lambda route: route.fulfill(
+        status=200, content_type="application/x-ndjson",
+        body=json.dumps({"type": "meta", "kind": "line", "x_type": "time",
+                         "y_type": "numeric", "value_cols": ["price"]}) + "\n",
+    ))
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.get_by_text("图表数据流未正常结束", exact=False)).to_be_visible()
+    playwright.expect(page.locator(".chart-canvas")).to_have_count(0)
+
+
+def test_chart_rejects_null_numeric_x_instead_of_drawing_zero(page, web_servers):
+    events = [
+        {"type": "meta", "kind": "scatter", "x_type": "numeric", "y_type": "numeric",
+         "value_cols": ["id"], "group_by": None},
+        {"type": "data", "group": None, "points": [[None, 2]]},
+        {"type": "done", "rows": 1, "series": [{"group": None, "rows": 1}]},
+    ]
+    page.route("**/api/table/notes/chart", lambda route: route.fulfill(
+        status=200, content_type="application/x-ndjson",
+        body="\n".join(json.dumps(event) for event in events) + "\n",
+    ))
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.get_by_text("图表 X 轴包含无效值", exact=False)).to_be_visible()
+    playwright.expect(page.locator(".chart-canvas")).to_have_count(0)
+
+
+def test_chart_log_axis_reports_hidden_nonpositive_values(page, web_servers):
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    page.get_by_role("combobox", name="Y 轴").select_option("id")
+    page.get_by_role("checkbox", name="对数轴").check()
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("对数轴不显示 1 个非正值")
+
+
+def test_chart_converts_time_inputs_and_condition_values(page, web_servers):
+    requests = []
+    page.on("request", lambda request: requests.append(request.post_data_json)
+            if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.locator(".cond-row .field-sel").select_option("ts")
+    page.locator(".cond-row .op-sel").select_option(">=")
+    page.locator(".cond-row .val-input").fill("2025-01-01T00:00:00Z")
+    page.get_by_role("textbox", name="时间结束").fill("2025-01-01T00:00:10Z")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("11 条原始记录")
+    assert requests[0]["where"] == [
+        {"field": "ts", "op": ">=", "value": BASE},
+        {"field": "ts", "op": "<=", "value": BASE + 10000},
+    ]
+
+
+def test_chart_filter_keeps_large_integer_input_exact(page, web_servers):
+    requests = []
+    page.on("request", lambda request: requests.append(request.post_data_json)
+            if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    page.get_by_role("combobox", name="条件字段 1").select_option("id")
+    page.get_by_role("textbox", name="条件值 1").fill("9007199254740993")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.get_by_text("没有匹配的数据", exact=False)).to_be_visible()
+    assert requests[0]["where"][0]["value"] == "9007199254740993"
+
+
+def test_chart_boolean_filter_and_category_axis(page, web_servers):
+    requests = []
+    page.on("request", lambda request: requests.append(request.post_data_json)
+            if request.url.endswith("/chart") else None)
+    page.goto(web_servers["readonly"] + "/#/table/notes/charts")
+    page.get_by_role("combobox", name="Y 轴").select_option("flag")
+    page.get_by_role("combobox", name="条件字段 1").select_option("flag")
+    page.get_by_role("textbox", name="条件值 1").fill("true")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("2 条原始记录")
+    assert requests[0]["where"][0]["value"] is True
+
+
+def test_chart_new_draw_cannot_be_overwritten_by_late_old_response(page, web_servers):
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.evaluate("""() => {
+      const original = window.fetch;
+      window.fetch = (url, opts) => {
+        if (String(url).endsWith('/chart') && !window.__oldChartStarted) {
+          window.__oldChartStarted = true;
+          return new Promise((resolve, reject) => {
+            window.__releaseOldChart = () => original(url, {...opts, signal: undefined})
+              .then(async response => {
+                const bytes = await response.arrayBuffer();
+                const stream = new ReadableStream({start(controller) {
+                  controller.enqueue(new Uint8Array(bytes));
+                  controller.close();
+                  window.__oldChartDelivered = true;
+                }});
+                resolve(new Response(stream, {status: response.status, headers: response.headers}));
+              }, reject);
+          });
+        }
+        return original(url, opts);
+      };
+    }""")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    page.wait_for_function("window.__oldChartStarted")
+    page.locator(".cond-row .field-sel").select_option("symbol")
+    page.locator(".cond-row .val-input").fill("AAA")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("90 条原始记录")
+    page.evaluate("() => window.__releaseOldChart()")
+    page.wait_for_function("window.__oldChartDelivered === true")
+    playwright.expect(page.locator(".chart-note")).to_contain_text("90 条原始记录")
+
+
+def test_chart_reset_cancels_pending_viewport_request(page, web_servers):
+    page.goto(web_servers["readonly"] + "/#/table/ticks/charts")
+    page.get_by_role("button", name="绘制", exact=True).click()
+    playwright.expect(page.locator(".chart-note")).to_contain_text("180 条原始记录")
+    page.evaluate("""() => {
+      const original = window.fetch;
+      window.fetch = (url, opts) => {
+        if (String(url).endsWith('/chart') && !window.__viewportSignal) {
+          window.__viewportSignal = opts.signal;
+          return new Promise((resolve, reject) => {
+            opts.signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+          });
+        }
+        return original(url, opts);
+      };
+    }""")
+    page.locator(".chart-canvas").hover()
+    page.mouse.wheel(0, -300)
+    page.wait_for_function("window.__viewportSignal")
+    playwright.expect(page.locator(".chart-note")).to_contain_text("可视区加载中")
+    page.locator(".chart-canvas").dblclick()
+    page.wait_for_function("window.__viewportSignal.aborted")
+    playwright.expect(page.locator(".chart-note")).to_contain_text("全范围 · 180 条原始记录")
 
 
 def test_refresh_recounts_and_arbitrary_names_remain_usable(page, web_servers):
@@ -651,7 +972,7 @@ def test_leaving_data_and_charts_cancels_inflight_requests(page, web_servers):
       window.fetch = (url, opts) => {
         const address = String(url);
         const key = address.endsWith('/rows') ? '__rowSignal' :
-                    address.includes('/chart?') ? '__chartSignal' : null;
+                    address.endsWith('/chart') ? '__chartSignal' : null;
         if (key && !window[key]) {
           window[key] = opts.signal;
           return new Promise((resolve, reject) => {
@@ -668,6 +989,7 @@ def test_leaving_data_and_charts_cancels_inflight_requests(page, web_servers):
     page.get_by_role("tab", name="2Data").click()
     playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(180)
     page.get_by_role("tab", name="4Charts").click()
+    page.get_by_role("button", name="绘制", exact=True).click()
     page.wait_for_function("window.__chartSignal")
     page.get_by_role("tab", name="2Data").click()
     page.wait_for_function("window.__chartSignal.aborted")

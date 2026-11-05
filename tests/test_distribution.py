@@ -28,6 +28,8 @@ def test_wheel_contains_web_assets_and_serves_them(tmp_path):
         "iosql/web/static/app.js",
         "iosql/web/static/js/components.js",
         "iosql/web/static/vendor/uplot.min.js",
+        "iosql/web/static/vendor/mchart3-0.5.0.min.js",
+        "iosql/web/static/vendor/mchart3-0.5.0.NOTICE.txt",
     } <= assets
 
     install_dir = tmp_path / "install"
@@ -47,7 +49,8 @@ import iosql
 from iosql.web import create_app
 assert Path(iosql.__file__).is_relative_to(Path(INSTALL_DIR))
 with TestClient(create_app(f'sqlite://{Path(INSTALL_DIR).parent / "smoke.iosql"}'), base_url='http://localhost') as client:
-    for route in ('/', '/style.css', '/app.js', '/js/components.js', '/vendor/uplot.min.js'):
+    for route in ('/', '/style.css', '/app.js', '/js/components.js', '/vendor/uplot.min.js',
+                  '/vendor/mchart3-0.5.0.min.js'):
         assert client.get(route).status_code == 200, route
 """
     env = os.environ.copy()

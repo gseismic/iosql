@@ -5,8 +5,11 @@
 - web /chart line 与 candle 路径逐行输出、不跨 symbol 聚合、窗口过滤和 null gap。
 """
 import json
+import os
 import shutil
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -23,10 +26,6 @@ except ImportError:
     pytest.skip("backend not integrated yet", allow_module_level=True)
 
 from fastapi.testclient import TestClient
-
-from iosql.web import app as web_app
-
-STATIC_DIR = Path(web_app.__file__).parent / "static"
 
 DAY_MS = 86_400_000
 BASE_TS = 1735689600000  # 2025-01-01 00:00:00 UTC
@@ -325,6 +324,51 @@ def chart_db_dir(tmp_path_factory) -> Path:
         {"d": f"2026-01-{10 + i:02d}", "k": i, "v": float(i)}
         for i in range(5)
     ])
+    metrics = db.table(
+        "metrics", time="ts", symbol_column=None, pk=["id"],
+        columns={"id": "integer", "ts": "integer", "device": "text",
+                 "state": "text", "reading": "float"},
+    )
+    metrics.write([
+        {"id": 1, "ts": BASE_TS, "device": "pump-a", "state": "ok", "reading": 1.0},
+        {"id": 2, "ts": BASE_TS + 1000, "device": "pump-b", "state": "warn", "reading": 2.0},
+        {"id": 3, "ts": BASE_TS + 2000, "device": "pump-a", "state": "idle", "reading": None},
+        {"id": 4, "ts": BASE_TS + 3000, "device": "", "state": "ok", "reading": 4.0},
+        {"id": 5, "ts": BASE_TS + 4000, "device": None, "state": "ok", "reading": 5.0},
+    ])
+    many = db.table(
+        "many_devices", time="ts", symbol_column=None, pk=["id"],
+        columns={"id": "integer", "ts": "integer", "device": "text", "reading": "float"},
+    )
+    many.write([
+        {"id": i, "ts": BASE_TS + i, "device": f"sensor-{i:02}", "reading": float(i)}
+        for i in range(33)
+    ])
+    flags = db.table(
+        "flags", pk=["id"], columns={"id": "integer", "enabled": "boolean"},
+    )
+    flags.write([{"id": 1, "enabled": True}, {"id": 2, "enabled": False}])
+    ids = db.table(
+        "big_ids", pk=["id"],
+        columns={"id": "integer", "device_id": "integer", "reading": "float"},
+    )
+    ids.write([
+        {"id": 1, "device_id": 9007199254740992, "reading": 1.0},
+        {"id": 2, "device_id": 9007199254740993, "reading": 2.0},
+    ])
+    daily = db.table(
+        "daily", pk=["d"], columns={"d": "text", "v": "float"},
+        partition="calendar(d,every=1day,timezone=UTC)",
+    )
+    daily.write([{"d": "2025-01-01", "v": 1.0}, {"d": "2025-01-02", "v": 2.0}])
+    bad_date = db.table("bad_date", pk=["id"], columns={"id": "integer", "d": "date", "v": "float"})
+    bad_date.write([{"id": 1, "d": "2025-02-30", "v": 1.0}])
+    compact_date = db.table("compact_date", pk=["id"], columns={"id": "integer", "d": "date", "v": "float"})
+    compact_date.write([{"id": 1, "d": "20250101", "v": 1.0}, {"id": 2, "d": "20250102", "v": 2.0}])
+    daily_ohlc = db.table("daily_ohlc", pk=["d"], columns={
+        "d": "date", "open": "float", "high": "float", "low": "float", "close": "float",
+    })
+    daily_ohlc.write([{"d": "2025-01-01", "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5}])
     db.close()
     return db_dir
 
@@ -454,50 +498,275 @@ class TestChartEndpointPushdown:
         assert groups["AAPL"][-1][0] == BASE_TS + DAY_MS
 
 
-class TestFrontendViewportLoading:
-    """PLAN-071 可视区按需加载：前端静态契约（与 test_plan062_web 同风格）。"""
+class TestGenericChartEndpoint:
+    def test_time_line_filters_and_groups_nonfinancial_data(self, chart_db_dir):
+        body = {
+            "x": "ts", "y": "reading", "group_by": "device",
+            "where": [{"or": [
+                {"field": "device", "op": "==", "value": "pump-a"},
+                {"field": "device", "op": "==", "value": "pump-b"},
+            ]}],
+        }
+        with _client(chart_db_dir) as client:
+            resp = client.post("/api/table/metrics/chart", json=body)
+        assert resp.status_code == 200
+        events = chart_events(resp)
+        assert (events[0]["kind"], events[0]["x_type"], events[0]["y_type"]) == (
+            "line", "time", "numeric",
+        )
+        points = {event["group"]: event["points"] for event in events if event["type"] == "data"}
+        assert points == {
+            "pump-a": [[BASE_TS, 1.0], [BASE_TS + 2000, None]],
+            "pump-b": [[BASE_TS + 1000, 2.0]],
+        }
+        assert events[-1]["rows"] == 3
 
-    def test_scale_hook_wired_for_viewport_refetch(self):
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "setScale" in text
-        assert "scheduleViewFetch" in text
-        assert "fetchView" in text
+    @pytest.mark.parametrize("x,y,x_type,y_type", [
+        ("id", "reading", "numeric", "numeric"),
+        ("state", "reading", "category", "numeric"),
+        ("id", "state", "numeric", "category"),
+        ("state", "device", "category", "category"),
+    ])
+    def test_type_driven_scatter_preserves_observations(self, chart_db_dir, x, y, x_type, y_type):
+        with _client(chart_db_dir) as client:
+            resp = client.post("/api/table/metrics/chart", json={"x": x, "y": y})
+        events = chart_events(resp)
+        assert resp.status_code == 200
+        assert (events[0]["kind"], events[0]["x_type"], events[0]["y_type"]) == (
+            "scatter", x_type, y_type,
+        )
+        points = [point for event in events if event["type"] == "data" for point in event["points"]]
+        assert len(points) == events[-1]["rows"] == 5
+        if y == "reading":
+            assert sum(point[1] is None for point in points) == 1
 
-    def test_viewport_fetch_debounced_and_deduped(self):
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "clearTimeout" in text          # 防抖
-        assert "closeWindow" in text           # 视口去重
-        assert "viewSeq" in text               # 过期响应守卫
+    def test_null_and_empty_group_are_distinct(self, chart_db_dir):
+        with _client(chart_db_dir) as client:
+            resp = client.post("/api/table/metrics/chart", json={
+                "x": "ts", "y": "reading", "group_by": "device",
+            })
+        events = chart_events(resp)
+        assert {event["group"] for event in events if event["type"] == "data"} == {
+            None, "", "pump-a", "pump-b",
+        }
+        assert events[-1]["rows"] == 5
 
-    def test_setdata_does_not_retrigger_fetch(self):
-        """setData 内部 setScale 必须被抑制，否则缩放重查会无限回环。"""
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "suppressScale" in text
-        assert "chart.setData(buildUData(seriesList), true)" in text
-        assert text.index("suppressScale = true") < text.index("chart.setData")
+    def test_many_groups_need_explicit_filter(self, chart_db_dir):
+        body = {"x": "ts", "y": "reading", "group_by": "device"}
+        with _client(chart_db_dir) as client:
+            too_many = chart_events(client.post("/api/table/many_devices/chart", json=body))
+            body["where"] = [{"field": "device", "op": "==", "value": "sensor-01"}]
+            filtered = chart_events(client.post("/api/table/many_devices/chart", json=body))
+        assert too_many[-1]["type"] == "error"
+        assert "32" in too_many[-1]["hint"]
+        assert filtered[-1]["type"] == "done" and filtered[-1]["rows"] == 1
+        assert next(event for event in filtered if event["type"] == "data")["group"] == "sensor-01"
 
-    def test_dblclick_reset_refetches_full_range(self):
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "fullScale" in text             # 初始全范围基准
-        assert "isFullReset" in text           # 复位 → 无窗口参数重查
-        # uPlot v1.6 无内置缩放复位：dblclick 由前端手动 setScale 回初始范围
-        assert "addEventListener('dblclick'" in text
-        assert "chart.setScale('x'" in text
+    def test_boolean_categories_follow_contract(self, chart_db_dir):
+        with _client(chart_db_dir) as client:
+            response = client.post("/api/table/flags/chart", json={"x": "enabled", "y": "id"})
+        events = chart_events(response)
+        points = [point for event in events if event["type"] == "data" for point in event["points"]]
+        assert points == [[False, 2.0], [True, 1.0]]
 
-    def test_viewport_params_sent_as_start_end(self):
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "winMs" in text                 # 视口毫秒窗口参数
+    def test_calendar_contract_uses_date_axis_and_rejects_invalid_date(self, chart_db_dir):
+        with _client(chart_db_dir) as client:
+            response = client.post("/api/table/daily/chart", json={"x": "d", "y": "v"})
+            invalid = client.post("/api/table/bad_date/chart", json={"x": "d", "y": "v"})
+            compact = client.post("/api/table/compact_date/chart", json={"x": "d", "y": "v"})
+            compact_groups = client.post("/api/table/compact_date/chart", json={
+                "x": "id", "y": "v", "group_by": "d",
+            })
+            compact_y = client.post("/api/table/compact_date/chart", json={"x": "id", "y": "d"})
+            ohlc = client.post("/api/table/daily_ohlc/chart", json={"x": "d", "y": "close", "kind": "ohlc"})
+        events = chart_events(response)
+        assert (events[0]["kind"], events[0]["x_type"]) == ("line", "date")
+        assert next(event for event in events if event["type"] == "data")["points"] == [
+            ["2025-01-01", 1.0], ["2025-01-02", 2.0],
+        ]
+        invalid_events = chart_events(invalid)
+        assert invalid_events[-1]["type"] == "error" and "无效日期" in invalid_events[-1]["detail"]
+        compact_events = chart_events(compact)
+        assert compact_events[0]["x_type"] == "date" and compact_events[-1]["rows"] == 2
+        assert next(event for event in compact_events if event["type"] == "data")["points"] == [
+            [20250101, 1.0], [20250102, 2.0],
+        ]
+        assert {event["group"] for event in chart_events(compact_groups) if event["type"] == "data"} == {
+            20250101, 20250102,
+        }
+        assert next(event for event in chart_events(compact_y) if event["type"] == "data")["points"] == [
+            [1, "20250101"], [2, "20250102"],
+        ]
+        ohlc_events = chart_events(ohlc)
+        assert (ohlc_events[0]["kind"], ohlc_events[0]["x_type"]) == ("ohlc", "date")
+        assert next(event for event in ohlc_events if event["type"] == "data")["points"] == [
+            ["2025-01-01", 1.0, 2.0, 0.5, 1.5],
+        ]
 
-    def test_loading_state_and_invalidation(self):
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "resetViewState" in text        # 重绘时作废在途请求
-        assert "可视区加载中" in text           # 加载态提示
+    @pytest.mark.parametrize("axis", ["x", "y"])
+    def test_excess_categories_fail_instead_of_truncating(self, tmp_path, axis):
+        uri = f"sqlite://{tmp_path / 'categories.iosql'}"
+        with Database(uri) as db:
+            table = db.table("observations", pk=["id"], columns={
+                "id": "integer", "category": "text", "value": "float",
+            })
+            table.write([
+                {"id": i, "category": f"c{i:04}", "value": float(i)} for i in range(1001)
+            ])
+        with TestClient(create_app(uri, "readonly"), base_url="http://localhost") as client:
+            body = {"x": "category", "y": "value"} if axis == "x" else {"x": "id", "y": "category"}
+            too_many = chart_events(client.post("/api/table/observations/chart", json=body))
+            body["where"] = [{"field": "category", "op": "<=", "value": "c0004"}]
+            filtered = chart_events(client.post("/api/table/observations/chart", json=body))
+        assert too_many[-1]["type"] == "error" and "类别过多" in too_many[-1]["detail"]
+        assert filtered[-1]["type"] == "done" and filtered[-1]["rows"] == 5
 
-    def test_raw_stream_has_no_sampling_control_and_preserves_nulls(self):
-        text = (STATIC_DIR / "js" / "tab-charts.js").read_text(encoding="utf-8")
-        assert "readChartStream" in text
-        assert "无抽样" in text
-        assert "bucketsIn" not in text
-        assert "value == null ? NaN" in text   # null 不能被 Number(null) 转成 0
-        assert "maxMultiplicity" in text      # 重复 x 也不能在多序列对齐时被去重
-        assert "expectedBySymbol" in text      # 流内逐 symbol 点数与服务端终值对账
+    def test_large_integer_groups_are_not_merged_or_rounded(self, chart_db_dir):
+        body = {"x": "id", "y": "reading", "group_by": "device_id"}
+        with _client(chart_db_dir) as client:
+            events = chart_events(client.post("/api/table/big_ids/chart", json=body))
+            body["where"] = [{"field": "device_id", "op": "==", "value": "9007199254740993"}]
+            selected = chart_events(client.post("/api/table/big_ids/chart", json=body))
+            unsafe_axis = chart_events(client.post("/api/table/big_ids/chart", json={
+                "x": "device_id", "y": "reading",
+            }))
+        assert {event["group"] for event in events if event["type"] == "data"} == {
+            "9007199254740992", "9007199254740993",
+        }
+        assert selected[-1]["rows"] == 1
+        assert next(event for event in selected if event["type"] == "data")["group"] == "9007199254740993"
+        assert unsafe_axis[-1]["type"] == "error" and "安全整数" in unsafe_axis[-1]["detail"]
+
+    def test_invalid_columns_and_filter_fail_before_streaming(self, chart_db_dir):
+        with _client(chart_db_dir) as client:
+            invalid_axis = client.post("/api/table/metrics/chart", json={"x": "missing", "y": "reading"})
+            invalid_filter = client.post("/api/table/metrics/chart", json={
+                "x": "ts", "y": "reading", "where": [{"field": "missing", "op": "==", "value": 1}],
+            })
+        assert invalid_axis.status_code == invalid_filter.status_code == 422
+
+    def test_ohlc_retains_original_values_with_generic_filter(self, chart_db_dir):
+        with _client(chart_db_dir) as client:
+            resp = client.post("/api/table/bars/chart", json={
+                "x": "ts", "y": "close", "kind": "ohlc", "group_by": "symbol",
+                "where": [{"field": "ts", "op": "<=", "value": BASE_TS + 60_000}],
+            })
+        events = chart_events(resp)
+        assert events[0]["kind"] == "ohlc"
+        assert events[-1]["rows"] == 2
+        assert next(event for event in events if event["type"] == "data")["points"] == [
+            [BASE_TS, 1.0, 2.0, 0.5, 1.5],
+            [BASE_TS + 60_000, 2.0, 3.0, 1.5, 2.5],
+        ]
+
+    @pytest.mark.parametrize("engine", ["sqlite", "parquet"])
+    def test_generic_query_uses_common_engine_contract(self, tmp_path, engine):
+        uri = f"{engine}://{tmp_path / 'generic.iosql'}"
+        with Database(uri) as db:
+            table = db.table(
+                "measurements", time="ts", symbol_column=None, pk=["id"],
+                columns={"id": "integer", "ts": "integer", "sensor": "text", "v": "float"},
+            )
+            table.write([
+                {"id": 1, "ts": BASE_TS, "sensor": "A", "v": 1.0},
+                {"id": 2, "ts": BASE_TS + 1000, "sensor": "B", "v": 2.0},
+            ])
+        with TestClient(create_app(uri, "readonly"), base_url="http://localhost") as client:
+            response = client.post("/api/table/measurements/chart", json={
+                "x": "ts", "y": "v", "group_by": "sensor",
+                "where": [{"field": "sensor", "op": "==", "value": "B"}],
+            })
+        events = chart_events(response)
+        assert events[-1]["rows"] == 1
+        assert next(event for event in events if event["type"] == "data")["points"] == [[BASE_TS + 1000, 2.0]]
+
+    @pytest.mark.parametrize("engine", ["sqlite", "parquet"])
+    def test_large_integer_filter_remains_exact_across_engines(self, tmp_path, engine):
+        uri = f"{engine}://{tmp_path / 'large.iosql'}"
+        with Database(uri) as db:
+            table = db.table("measurements", pk=["id"], columns={
+                "id": "integer", "device_id": "bigint", "v": "float",
+            })
+            table.write([
+                {"id": 1, "device_id": 9007199254740992, "v": 1.0},
+                {"id": 2, "device_id": 9007199254740993, "v": 2.0},
+            ])
+        with TestClient(create_app(uri, "readonly"), base_url="http://localhost") as client:
+            response = client.post("/api/table/measurements/chart", json={
+                "x": "id", "y": "v", "group_by": "device_id",
+                "where": [{"field": "device_id", "op": "==", "value": "9007199254740993"}],
+            })
+        events = chart_events(response)
+        assert events[-1]["rows"] == 1
+        assert next(event for event in events if event["type"] == "data")["group"] == "9007199254740993"
+
+    def test_generic_chart_postgresql_when_test_instance_is_configured(self):
+        base = os.environ.get("POSTGRES_DSN")
+        if not base:
+            pytest.skip("需要显式配置独立 PostgreSQL 测试实例")
+        psycopg2 = pytest.importorskip("psycopg2")
+        from psycopg2 import sql
+        from iosql.migration_postgresql import _stage_uri
+
+        schema = "iosql_chart_test_" + uuid.uuid4().hex
+        with closing(psycopg2.connect(base)) as connection:
+            connection.autocommit = True
+            with connection.cursor() as cursor:
+                cursor.execute(sql.SQL("CREATE SCHEMA {} ").format(sql.Identifier(schema)))
+        try:
+            uri = _stage_uri(base, schema)
+            with Database(uri) as db:
+                table = db.table("measurements", pk=["id"], columns={
+                    "id": "integer", "device_id": "bigint", "v": "float",
+                })
+                table.write([
+                    {"id": 1, "device_id": 9007199254740992, "v": 1.0},
+                    {"id": 2, "device_id": 9007199254740993, "v": 2.0},
+                ])
+            with closing(psycopg2.connect(base)) as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    cursor.execute(sql.SQL(
+                        'CREATE TABLE {}.decimals (id bigint PRIMARY KEY, g numeric, v double precision)'
+                    ).format(sql.Identifier(schema)))
+                    cursor.execute(sql.SQL(
+                        'INSERT INTO {}.decimals (id, g, v) VALUES (%s, %s, %s), (%s, %s, %s)'
+                    ).format(sql.Identifier(schema)), (1, "1.0000000000000001", 1.0,
+                                                       2, "1.0000000000000002", 2.0))
+                    cursor.execute(sql.SQL(
+                        'CREATE TABLE {}.dates (id bigint PRIMARY KEY, d date, v double precision)'
+                    ).format(sql.Identifier(schema)))
+                    cursor.execute(sql.SQL(
+                        'INSERT INTO {}.dates (id, d, v) VALUES (%s, %s, %s)'
+                    ).format(sql.Identifier(schema)), (1, "2025-01-01", 3.0))
+            with TestClient(create_app(uri, "readonly"), base_url="http://localhost") as client:
+                spec_response = client.get("/api/table/measurements/spec")
+                response = client.post("/api/table/measurements/chart", json={
+                    "x": "id", "y": "v", "group_by": "device_id",
+                    "where": [{"field": "device_id", "op": "==", "value": "9007199254740993"}],
+                })
+                decimal_response = client.post("/api/table/decimals/chart", json={
+                    "x": "id", "y": "v", "group_by": "g",
+                })
+                date_response = client.post("/api/table/dates/chart", json={"x": "d", "y": "v"})
+            assert spec_response.json()["spec"] is None
+            assert spec_response.json()["columns"]["device_id"] == "bigint"
+            assert response.status_code == 200, response.text
+            events = chart_events(response)
+            assert events[-1]["type"] == "done", events
+            assert events[-1]["rows"] == 1
+            assert next(event for event in events if event["type"] == "data")["group"] == "9007199254740993"
+            decimal_events = chart_events(decimal_response)
+            assert {event["group"] for event in decimal_events if event["type"] == "data"} == {
+                "1.0000000000000001", "1.0000000000000002",
+            }
+            date_events = chart_events(date_response)
+            assert (date_events[0]["kind"], date_events[0]["x_type"]) == ("line", "date")
+            assert next(event for event in date_events if event["type"] == "data")["points"] == [
+                ["2025-01-01", 3.0],
+            ]
+        finally:
+            with closing(psycopg2.connect(base)) as connection:
+                connection.autocommit = True
+                with connection.cursor() as cursor:
+                    cursor.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))

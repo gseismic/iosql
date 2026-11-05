@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import math
 import os
 import shutil
@@ -295,11 +296,16 @@ class LocalPublisher:
         self.retired = None
         self.previous_parts = {}
         self.decided = False
+        self.flat_table_names = None
+        self.flat_candidate = None
+        self.flat_cleanup = None
 
     def preflight(self, plans, verify):
         root = self.item.path
         if root.exists() and (not root.is_dir() or root.is_symlink()):
             raise UnsafeOperation('目标必须是普通 iosql 库目录')
+        if self.backend == 'parquet' and plans and self.previous != root:
+            raise UnsafeOperation('旧代目录需要先整理为普通 Parquet 目录后才能迁移到该库')
         if self.previous.exists() and any(self.previous.iterdir()):
             if not is_iosql_database(root, allow_empty=True, backend=self.backend, deep=True):
                 raise UnsafeOperation('目标不是完整的 iosql 数据库，拒绝接管')
@@ -318,6 +324,8 @@ class LocalPublisher:
                         raise BadArgument('row-count 校验失败：目标已存在表且非空；请使用空目标表')
 
     def prepare(self, plans):
+        if self.backend == 'parquet':
+            self.flat_table_names = [plan.target_name for plan in plans]
         payload = self.workspace / 'payload'
         if self.previous.is_dir():
             copy_snapshot(self.previous, payload)
@@ -350,6 +358,9 @@ class LocalPublisher:
                 raise MigrationVerificationError(f'目标暂存表完整性校验失败: {plan.target_name}')
 
     def publish(self, operation_id):
+        if self.flat_table_names is not None:
+            from ._parquet_flat_publish import publish
+            return publish(self, operation_id)
         root = self.item.path
         generations = root / '__iosql_generations__'
         root.mkdir(parents=True, exist_ok=True)
@@ -409,14 +420,46 @@ class LocalPublisher:
 
     def cleanup(self, published):
         if published:
+            if self.flat_cleanup is not None:
+                fd, name, identity, root_fd, parent_identity = self.flat_cleanup
+                self.flat_cleanup = None
+                try:
+                    item = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if [item.st_dev, item.st_ino] != identity:
+                        raise UnsafeOperation('暂存目录身份变化，拒绝清理')
+                    shutil.rmtree(name, dir_fd=fd)
+                    if root_fd is not None:
+                        try:
+                            parent = os.stat('__iosql_migrations__', dir_fd=root_fd, follow_symlinks=False)
+                            if [parent.st_dev, parent.st_ino] == parent_identity:
+                                os.rmdir('__iosql_migrations__', dir_fd=root_fd)
+                        except OSError as exc:
+                            if exc.errno not in (errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST):
+                                raise
+                finally:
+                    try:
+                        os.close(fd)
+                    finally:
+                        if root_fd is not None:
+                            os.close(root_fd)
             if self.retired is not None:
                 shutil.rmtree(self.retired)
-            shutil.rmtree(self.workspace)
+            # 目标为挂载点时，未退休的候选位于目标根内；解锁后不能按原路径删除。
+            if self.workspace != self.flat_candidate and self.workspace.exists():
+                shutil.rmtree(self.workspace)
+        elif self.flat_cleanup is not None:
+            os.close(self.flat_cleanup[0])
+            if self.flat_cleanup[3] is not None:
+                os.close(self.flat_cleanup[3])
+            self.flat_cleanup = None
 
 
 def recover_local(coordinator, state):
-    """唯一恢复动作是重放完整代际指针；业务数据没有逐表替换窗口。"""
+    """在独占租约内恢复代际指针或 Parquet 平坦目录发布。"""
     record = state.get('transaction') or {}
+    if record.get('state') == 'FLAT_COMMIT_DECIDED':
+        from ._parquet_flat_publish import recover
+        return recover(coordinator, state)
     if record.get('state') != 'COMMIT_DECIDED':
         return
     operation_id = record.get('operation_id')

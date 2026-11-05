@@ -217,7 +217,7 @@ class LocalCoordinator:
         transaction = value.get('transaction')
         if ((value.get('generation') is not None and not isinstance(value['generation'], str))
                 or transaction is not None and (not isinstance(transaction, dict)
-                or transaction.get('state') not in ('COMMIT_DECIDED', 'COMMITTED'))):
+                or transaction.get('state') not in ('COMMIT_DECIDED', 'FLAT_COMMIT_DECIDED', 'COMMITTED'))):
             raise MigrationRecoveryRequired('库控制记录格式非法，拒绝访问')
         _validated_root(self.resource.path, value.get('physical_root'))
         if value.get('physical_root') is not None and Path(value['physical_root']).name != value.get('generation'):
@@ -312,7 +312,7 @@ def _coordinator(item):
 
 def needs_recovery(state):
     transaction = state.get('transaction')
-    return bool(transaction and transaction.get('state') in ('COMMIT_DECIDED', 'PG_PENDING'))
+    return bool(transaction and transaction.get('state') in ('COMMIT_DECIDED', 'FLAT_COMMIT_DECIDED', 'PG_PENDING'))
 
 
 def _release_entry(held, key, entry):
