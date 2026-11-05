@@ -7,6 +7,16 @@
   'use strict';
   var IU = window.IU;
   var h = IU.h;
+  var DURATION_SCALES = {
+    milliseconds: 1, millisecond: 1, msecs: 1, msec: 1, ms: 1,
+    seconds: 1000, second: 1000, secs: 1000, sec: 1000, s: 1000,
+    minutes: 60000, minute: 60000, mins: 60000, min: 60000,
+    hours: 3600000, hour: 3600000, hrs: 3600000, hr: 3600000, h: 3600000,
+    days: 86400000, day: 86400000, d: 86400000,
+    weeks: 604800000, week: 604800000, w: 604800000,
+    months: 2592000000, month: 2592000000,
+    years: 31536000000, year: 31536000000
+  };
 
   IU.tabs = IU.tabs || {};
 
@@ -28,8 +38,10 @@
       var segBox = h('div', { class: 'card' });
       root.append(segBox);
 
-      loadParts(base, partsBox, ctx);
-      renderSegmentsCard(base, segBox);
+      var reloadSegments = renderSegmentsCard(base, segBox, ctx, function () {
+        if (partsBox.refreshDistribution) partsBox.refreshDistribution();
+      });
+      loadParts(base, partsBox, ctx, reloadSegments);
     }
   };
 
@@ -72,10 +84,13 @@
 
   /* ---------- 区块 B：逻辑分区 ----------
    * /parts 只提供 key 列表；行数/segment 分布来自 app.js 的 ctx.parts
-   * （/segments 客户端聚合，PLAN-064 D4）。分布未到达时先渲染可读 chips
-   * 并短暂轮询，到达后重绘为条形图；偏斜热点 amber 高亮；
+   * （/segments 客户端聚合，PLAN-064 D4）。分布未到达时先渲染可读 chips，
+   * 完成后重绘为条形图；偏斜热点 amber 高亮；
    * 点击分区行 → 跳 Data 并携带时间范围过滤（可分享 URL，Q2）。 */
-  function loadParts(base, box, ctx) {
+  function loadParts(base, box, ctx, reloadSegments) {
+    IU.clear(box);
+    box.append(h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '逻辑分区 · Parts'),
+      h('span', { class: 'spinner', style: { width: '11px', height: '11px' } })));
     IU.api(base + '/parts').then(function (resp) {
       var arr = IU.toArray(resp);
       var keys = arr.map(function (it) {
@@ -98,25 +113,32 @@
           h('span', { class: 'faint mono', style: { fontSize: '12px' } }, keys.length + ' 个')));
 
         if (!keys.length) {
-          box.append(h('div', { class: 'empty-state' }, '无分区信息'));
+          box.append(h('div', { class: 'empty-state' }, '暂无已写入的分区；写入数据后可在此查看分布。'));
           return;
         }
 
         if (!hasDist) {
           box.append(h('div', { class: 'chips' }, keys.map(partChip)));
-          if (!dist) {
+          if (!dist || dist.loading) {
             box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } },
               h('span', { class: 'spinner', style: { width: '11px', height: '11px' } }),
               ' 行数分布统计中…'));
-            scheduleRedraw();
+            ctx.requestParts(ctx.table).then(redrawIfConnected, redrawIfConnected);
           } else if (dist.error) {
             box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } },
-              '分区行数分布不可用（聚合失败）'));
+              '分区行数分布不可用。 ',
+              h('button', { class: 'btn sm', onclick: function () {
+                ctx.requestParts(ctx.table).catch(function () {});
+                if (reloadSegments) reloadSegments();
+                draw();
+              } }, '重试分布')));
+          } else {
+            box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } }, '暂无行数分布。'));
           }
           return;
         }
 
-        // 行数条形图（key 全为毫秒时间戳时按数值排序并推算下一分区上界）
+        // 行数条形图（key 全为毫秒时间戳时按数值排序）
         var allMs = keys.every(function (k) { return /^\d+$/.test(k) && Number(k) >= 1e12; });
         var order = hasDist ? dist.order.slice() : keys.slice();
         if (allMs) order.sort(function (a, b) { return Number(a) - Number(b); });
@@ -128,57 +150,63 @@
             segs: dist.segCount ? dist.segCount[k] : undefined
           };
         });
+        var seen = Object.create(null);
+        order.forEach(function (k) { seen[k] = true; });
         keys.forEach(function (k) {
-          if (order.indexOf(k) < 0) items.push({ key: k, rows: dist.byPart[k] || 0 });
+          if (!seen[k]) items.push({ key: k, rows: dist.byPart[k] || 0 });
         });
 
         var rowsList = items.map(function (it) { return it.rows || 0; });
-        var max = Math.max.apply(null, rowsList.concat([1]));
-        var sorted = rowsList.slice().sort(function (a, b) { return a - b; });
-        var median = sorted[Math.floor(sorted.length / 2)];
-        var skew = median > 0 ? max / median > 3 : max > 0;
+        var max = rowsList.reduce(function (a, b) { return Math.max(a, b); }, 0);
+        var skew = IU.partitionSkew(items.map(function (it) { return it.key; }), dist.byPart) > 4;
 
         var chart = h('div', { class: 'bar-chart' });
-        items.forEach(function (it, i) {
-          var pct = Math.max(1.5, ((it.rows || 0) / max) * 100);
+        var displayed = 0;
+        var more = h('button', { class: 'btn sm section-gap', onclick: appendItems });
+        function appendItems() {
+          var end = Math.min(displayed + 200, items.length);
+          items.slice(displayed, end).forEach(appendItem);
+          displayed = end;
+          more.hidden = displayed >= items.length;
+          more.textContent = '显示更多分区（已显示 ' + displayed + ' / ' + items.length + '）';
+        }
+        function appendItem(it) {
+          var pct = max ? ((it.rows || 0) / max) * 100 : 0;
           var isHot = skew && (it.rows || 0) === max;
           var readable = IU.fmt.date(it.key);
           var keyEl = h('span', { class: 'bar-key', title: it.key },
             readable ? h('span', { style: { color: 'var(--acc)' } }, readable) : it.key,
             readable ? h('span', { class: 'raw' }, it.key) : null);
-          var line = h('div', { class: 'bar-line part-link', title: partClickTitle(ctx) },
+          var target = partFilterHref(ctx, it.key);
+          var line = h(target ? 'a' : 'div', {
+            class: 'bar-line' + (target ? ' part-link' : ''),
+            href: target,
+            title: target ? '在 Data 页查看此分区的数据' : null
+          },
             keyEl,
             h('div', { class: 'bar-track' },
               h('div', { class: 'bar-fill' + (isHot ? ' hot' : ''), style: { width: pct + '%' } })),
             h('span', { class: 'bar-meta' },
               IU.fmt.int(it.rows || 0) + ' 行'
               + (it.segs !== undefined ? ' · ' + it.segs + ' segs' : '')));
-          if (allMs && it.segs !== undefined) {
-            line.addEventListener('click', function () { gotoDataWithPartFilter(ctx, items, i); });
-          }
           chart.append(line);
-        });
-        box.append(chart);
+        }
+        appendItems();
+        box.append(chart, more);
         box.append(h('div', { class: 'faint', style: { fontSize: '12px', marginTop: '6px' } },
-          (skew ? '琥珀 = 偏斜热点（最大/中位数 > 3）。' : '')
-          + (allMs ? '点击分区行 → Data 页按该时间范围过滤（URL 可分享）。' : '')));
+          (skew ? '琥珀 = 偏斜热点（最大/中位数 > 4）。' : '')
+          + (items.some(function (it) { return !!partFilterHref(ctx, it.key); })
+            ? '点击分区行 → Data 页按该分区范围过滤（URL 可分享）。' : '')));
       }
 
-      function scheduleRedraw() {
-        var tries = 0;
-        var timer = setInterval(function () {
-          var d = distNow();
-          if ((d && d.order && d.order.length) || d && d.error || ++tries > 20) {
-            clearInterval(timer);
-            if (box.isConnected) draw();
-          }
-        }, 700);
-      }
+      function redrawIfConnected() { if (box.isConnected) draw(); }
 
+      box.refreshDistribution = redrawIfConnected;
       draw();
     }).catch(function () {
       IU.clear(box);
-      box.append(h('div', { class: 'empty-state' }, '分区信息加载失败'));
+      box.append(h('div', { class: 'empty-state' }, '分区信息加载失败。 ',
+        h('button', { class: 'btn sm', onclick: function () { loadParts(base, box, ctx, reloadSegments); } }, '重试')));
     });
 
     function partChip(key) {
@@ -189,36 +217,48 @@
     }
   }
 
-  function partClickTitle(ctx) {
-    var timeCol = timeColOf(ctx);
-    return timeCol ? '点击：在 Data 页按该分区时间范围过滤' : '分区';
-  }
-
   function timeColOf(ctx) {
     var t = ctx.spec && ctx.spec.time;
     if (!t) return null;
     return typeof t === 'string' ? t : (IU.pick(t, 'column', 'col', 'field', 'name') || null);
   }
 
-  /* 跳转 Data 并带上该分区的时间范围过滤（between lo~hi，hi = 下一分区 key）。
-   * 过滤语法与表头过滤行一致，Data 页从 URL query 种子读取（可分享）。 */
-  function gotoDataWithPartFilter(ctx, items, idx) {
+  /* 与 duration 固定时长单位一致；无法精确识别时不提供分区跳转。 */
+  function durationIntervalMs(value) {
+    if (typeof value === 'number') return Number.isSafeInteger(value) && value > 0 ? value : null;
+    if (typeof value !== 'string') return null;
+    var text = value.trim().toLowerCase();
+    if (/^\d+$/.test(text)) {
+      var number = Number(text);
+      return Number.isSafeInteger(number) && number > 0 ? number : null;
+    }
+    var match = /^(\d*)([a-z]+)$/.exec(text);
+    if (!match) return null;
+    if (!Object.prototype.hasOwnProperty.call(DURATION_SCALES, match[2])) return null;
+    var count = match[1] ? Number(match[1]) : 1;
+    var width = count * DURATION_SCALES[match[2]];
+    return Number.isSafeInteger(count) && count > 0 && Number.isSafeInteger(width) ? width : null;
+  }
+
+  /* 仅 duration 且分区字段就是毫秒时间列时，可以从契约精确计算左闭右开边界。
+   * 不能用下一现存分区作为上界：中间可能有空分区，between 还会包含上界。 */
+  function partFilterHref(ctx, key) {
     var timeCol = timeColOf(ctx);
-    if (!timeCol) return;
-    var lo = items[idx].key;
-    var next = items[idx + 1];
-    var raw = next ? (lo + '~' + next.key) : '>=' + lo;
-    var q = 'f.' + encodeURIComponent(timeCol) + '=' + encodeURIComponent(raw);
-    location.hash = '#/table/' + encodeURIComponent(ctx.table) + '/data?' + q;
-    IU.toast('已按分区 ' + (IU.fmt.date(lo) || lo) + ' 过滤', 'ok');
+    var part = ctx.spec && ctx.spec.partition;
+    if (!part || part.kind !== 'duration' || part.column !== timeCol || part.time_unit !== 'ms') return null;
+    var lo = Number(key), width = durationIntervalMs(part.every), hi = lo + width;
+    if (!Number.isSafeInteger(lo) || !Number.isSafeInteger(width) || width <= 0 || !Number.isSafeInteger(hi)) return null;
+    var q = 'f.' + encodeURIComponent(timeCol) + '=' + encodeURIComponent(lo + '~<' + hi);
+    return '#/table/' + encodeURIComponent(ctx.table) + '/data?' + q;
   }
 
   /* ---------- 区块 C：物理 segment 表 ---------- */
-  function renderSegmentsCard(base, box) {
+  function renderSegmentsCard(base, box, ctx, onDistributionStart) {
     var includeObsolete = false;
 
     var tbodySlot = h('tbody');
     var tableWrap = h('div', { class: 'table-wrap' });
+    var requestSeq = 0;
 
     function draw() {
       IU.clear(box);
@@ -226,7 +266,7 @@
       toggle.checked = includeObsolete;
       toggle.addEventListener('change', function () {
         includeObsolete = toggle.checked;
-        fetchRows();
+        fetchRows(true);
       });
       box.append(
         h('div', { class: 'card-title' },
@@ -240,7 +280,7 @@
           headEl(), tbodySlot));
       }
       renderLoading();
-      fetchRows();
+      fetchRows(true);
     }
 
     function headEl() {
@@ -256,10 +296,15 @@
         h('td', { class: 'loading-cell', colspan: '6' }, h('span', { class: 'spinner' }), ' 加载中…')));
     }
 
-    function fetchRows() {
+    function fetchRows(refresh) {
+      var seq = ++requestSeq;
       renderLoading();
-      IU.api(base + '/segments?include_obsolete=' + (includeObsolete ? 'true' : 'false')).then(function (resp) {
-        var arr = IU.toArray(resp);
+      var request = includeObsolete
+        ? IU.api(base + '/segments?include_obsolete=true').then(IU.toArray)
+        : ctx.requestParts(ctx.table, refresh);
+      if (!includeObsolete && onDistributionStart) onDistributionStart();
+      request.then(function (arr) {
+        if (seq !== requestSeq || !box.isConnected) return;
         IU.clear(tbodySlot);
         if (!arr.length) {
           tbodySlot.append(h('tr', null,
@@ -271,9 +316,11 @@
           tbodySlot.append(segmentRow(sg));
         });
       }).catch(function () {
+        if (seq !== requestSeq || !box.isConnected) return;
         IU.clear(tbodySlot);
         tbodySlot.append(h('tr', null,
-          h('td', { class: 'empty-cell', colspan: '6' }, 'segment 加载失败')));
+          h('td', { class: 'empty-cell', colspan: '6' }, 'segment 加载失败。 ',
+            h('button', { class: 'btn sm', onclick: function () { fetchRows(true); } }, '重试'))));
       });
     }
 
@@ -342,5 +389,6 @@
     }
 
     draw();
+    return function () { if (!includeObsolete) fetchRows(); };
   }
 })();

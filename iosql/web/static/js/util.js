@@ -20,6 +20,7 @@
         if (v === null || v === undefined || v === false) return;
         if (k === 'class') el.className = String(v);
         else if (k === 'dataset') Object.assign(el.dataset, v);
+        else if (k === 'style' && typeof v === 'object') Object.assign(el.style, v);
         else if (k.slice(0, 2) === 'on' && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
         else if (v === true) el.setAttribute(k, '');
         else el.setAttribute(k, String(v));
@@ -163,18 +164,33 @@
    * - danger: 红色主题
    * - typeName: 提供后必须精确手输该名称才能点击确认（危险操作防呆）
    * 返回 Promise<boolean>。Esc / 遮罩点击 = 取消。 */
+  var modalCounter = 0;
   function confirmModal(cfg) {
     return new Promise(function (resolve) {
       var root = document.getElementById('modal-root');
       var settled = false;
+      var returnFocus = document.activeElement;
+      var titleId = 'modal-title-' + (++modalCounter);
       function done(ok) {
         if (settled) return;
         settled = true;
         document.removeEventListener('keydown', onKey);
         root.innerHTML = '';
+        if (returnFocus && returnFocus.isConnected) returnFocus.focus();
         resolve(ok);
       }
-      function onKey(e) { if (e.key === 'Escape') done(false); }
+      function onKey(e) {
+        if (e.key === 'Escape') { e.preventDefault(); done(false); return; }
+        if (e.key !== 'Tab') return;
+        var controls = Array.from(modal.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])'));
+        if (!controls.length) return;
+        var first = controls[0], last = controls[controls.length - 1];
+        if (e.shiftKey && (document.activeElement === first || !modal.contains(document.activeElement))) {
+          e.preventDefault(); last.focus();
+        } else if (!e.shiftKey && (document.activeElement === last || !modal.contains(document.activeElement))) {
+          e.preventDefault(); first.focus();
+        }
+      }
 
       var confirmBtn = h('button', { class: 'btn ' + (cfg.danger ? 'danger' : 'primary'), onclick: function () { done(true); } },
         cfg.confirmText || '确认');
@@ -198,8 +214,9 @@
         bodyKids.push(h('div', { class: 'confirm-input-row' }, input));
       }
 
-      var modal = h('div', { class: 'modal' + (cfg.danger ? ' danger' : '') },
-        h('h3', null, cfg.title || '确认操作'),
+      var modal = h('div', { class: 'modal' + (cfg.danger ? ' danger' : ''),
+        role: 'dialog', 'aria-modal': 'true', 'aria-labelledby': titleId },
+        h('h3', { id: titleId }, cfg.title || '确认操作'),
         bodyKids,
         h('div', { class: 'modal-actions' },
           h('button', { class: 'btn ghost', onclick: function () { done(false); } }, '取消'),
@@ -208,7 +225,7 @@
       var mask = h('div', { class: 'modal-mask', onclick: function (e) { if (e.target === mask) done(false); } }, modal);
       root.append(mask);
       document.addEventListener('keydown', onKey);
-      var firstInput = modal.querySelector('input');
+      var firstInput = modal.querySelector('input') || modal.querySelector('button');
       if (firstInput) firstInput.focus();
     });
   }
@@ -301,6 +318,8 @@
   function globalKeys(handler) {
     document.addEventListener('keydown', function (e) {
       var t = e.target;
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey ||
+          document.querySelector('#modal-root .modal') || document.body.classList.contains('detail-open')) return;
       if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
       handler(e);
     });
@@ -309,18 +328,41 @@
 
   /* ---------- 时间语义统一（PLAN-064 D3） ----------
    * 毫秒时间戳是存储细节，不该要求用户输入。接受三种写法：
-   *   2025-01-05 / 2025-01-05 10:30 / 1735689600000（≥12 位纯数字按毫秒）
+   *   2025-01-05 / 2025-01-05 10:30 按浏览器本地时间，
+   *   带时区的 ISO 时间和 ≥12 位纯数字毫秒按绝对时间。
    * 返回 {ok, ms, text}；解析失败 ok=false，调用方自行提示。 */
   function parseTimeInput(raw) {
     var s = String(raw == null ? '' : raw).trim();
     if (!s) return { ok: false, ms: null, text: s };
     if (/^-?\d+$/.test(s) && s.replace('-', '').length >= 12) {
       var n = Number(s);
-      return { ok: Number.isFinite(n), ms: n, text: s };
+      return { ok: Number.isSafeInteger(n) && !Number.isNaN(new Date(n).getTime()), ms: n, text: s };
     }
-    var iso = s.replace(' ', 'T');
+    var isoFormat = /^\d{4}-\d{2}-\d{2}(?:[ Tt]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[Zz]|[+-]\d{2}:?\d{2})?)?$/;
+    if (!isoFormat.test(s)) return { ok: false, ms: null, text: s };
+    var datePart = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ Tt]|$)/);
+    if (datePart) {
+      var year = Number(datePart[1]), month = Number(datePart[2]), day = Number(datePart[3]);
+      var leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+      var days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+      if (month < 1 || month > 12 || day < 1 || day > days[month - 1]) {
+        return { ok: false, ms: null, text: s };
+      }
+    }
+    // Date.parse 的纯日期默认 UTC，显式加本地零点与无时区日期时间保持一致。
+    var iso = /^\d{4}-\d{2}-\d{2}$/.test(s) ? s + 'T00:00:00' : s.replace(' ', 'T');
     var t = Date.parse(iso);
     if (Number.isNaN(t)) return { ok: false, ms: null, text: s };
+    // 夏令时跳变可能令本地时间不存在；拒绝浏览器静默顺延的结果。
+    var local = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:[ Tt](\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?)?$/);
+    if (local) {
+      var parsed = new Date(t);
+      if (parsed.getFullYear() !== Number(local[1]) || parsed.getMonth() + 1 !== Number(local[2]) ||
+          parsed.getDate() !== Number(local[3]) || parsed.getHours() !== Number(local[4] || 0) ||
+          parsed.getMinutes() !== Number(local[5] || 0) || parsed.getSeconds() !== Number(local[6] || 0)) {
+        return { ok: false, ms: null, text: s };
+      }
+    }
     return { ok: true, ms: t, text: s };
   }
   IU.parseTimeInput = parseTimeInput;
@@ -351,7 +393,7 @@
         parsed.textContent = '✓ ' + fmtTs(r.ms);
         parsed.className = 'tf-parsed ok';
       } else {
-        parsed.textContent = '无法解析，试试 2025-01-05 或毫秒时间戳';
+        parsed.textContent = '无法解析，检查日期、时间和时区，或使用毫秒时间戳';
         parsed.className = 'tf-parsed bad';
       }
     }

@@ -647,7 +647,7 @@ def _register_read_routes(app: FastAPI) -> None:
     @app.get("/api/table/{name}/stats")
     def get_stats(name: str, request: Request) -> dict:
         """单表统计（行数带 TTL 缓存；parts/segments 为目录列举）。
-        前端启动后逐表渐进拉取，避免首屏阻塞（PLAN-060）。"""
+        前端按需请求；旧式分区的行数统计可能访问数据文件。"""
         db = request.app.state.db
         table = get_table(db, name)
         return {

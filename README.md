@@ -995,9 +995,13 @@ iosql web -s database/market.iosql --write
 | Data | ✅ | ✅ | Browse 与 Query 合并后的工作区：条件构造器筛选、keyset 翻页、排序、Explain 裁剪可视化、时序查询、单元格详情、CSV/JSONL 导出 |
 | Structure | ✅ | ✅ | 表契约 / 逻辑分区 / 物理 segment 三层透视 |
 | Charts | ✅ | ✅ | 时序折线逐行流式绘制，不抽样；空 symbol 时每个标的分别成线，最多 32 个 symbol |
-| Maintain | ❌ | ✅ | layout_report → compact → validate → cleanup_obsolete 步骤流；重分区 |
+| Maintain | 查看开启方式 | ✅ | layout_report → compact → validate → cleanup_obsolete 步骤流；重分区 |
 
-安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝），并只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认（重分区无 dry-run 预览，确认后直接写入新库）。Data 的 keyset 分页在排序列含 NULL 时返回 422 并禁用该列排序，避免静默漏行。过滤计数的流式查询预算为 5000ms，超时返回 422；无筛选计数仍走 manifest 求和。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
+进入 Data 时只读取表契约和当前数据页。总览的行数统计和分区分布、Data 当前筛选结果的总行数均按需点击加载，统计不完整时不显示全库合计；Structure 在进入后加载物理 segment 明细。统计失败可重试，旧式 SQLite 分区可能需要扫描数据文件。行数可能受服务端缓存影响，延迟约 1 分钟；「重新加载」刷新表清单后需重新加载统计。Data 的表头筛选、可见列和当前视图保存在地址中，可复制链接恢复；高级条件、当前排序和页位不包含在链接中。Data 工作区可用方向键切换当前页（表格单元格聚焦时方向键用于移动单元格，Enter 查看详情）；窄屏可通过顶栏「表」按钮打开表列表。
+
+时序查询、截面和图表中，支持 `YYYY-MM-DD`、`YYYY-MM-DD HH:mm[:ss]`、带时区的 ISO 日期时间和毫秒时间戳；没有时区的输入按浏览器本地时间解析。不存在的日期及夏令时跳变中不存在的本地时间会被拒绝；若要指定夏令时重复时刻，请输入带偏移量的 ISO 日期时间。与旧版相比，纯日期现在表示本地零点，不再按 UTC 零点解析；浏览器曾宽松接受的斜杠日期等非 ISO 格式不再接受。
+
+安全模型：只读模式下服务端**不注册任何写路由**（写端点不存在而非被拒绝），默认只信任本机 Host（`localhost`/`127.0.0.1`/`[::1]`）；可修改模式下 truncate/delete/cleanup_obsolete/repartition 等危险操作均需手输表名确认（重分区无 dry-run 预览，确认后直接写入新库）。Data 的 keyset 分页在排序列含 NULL 时返回 422 并禁用该列排序，避免静默漏行。过滤计数的流式查询预算为 5000ms，超时返回 422；无筛选计数优先使用已有的 segment 行数，旧式分区需要计算行数。定位是本机 localhost 工具，请勿暴露到公网。设计细节见 `docs/design/ui-20260823-overview.md`。
 
 ## 存储结构
 

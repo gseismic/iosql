@@ -15,3 +15,10 @@
 | 2026-11-05 18:21 | [SQLite 到 Parquet 迁移性能优化](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance.md) | 实施中 | 优化源表计数与复制、列式导入及大量分区下的开销，保留校验与发布语义。 |
 | 2026-11-05 18:44 | [SQLite 到 Parquet 迁移性能优化](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance.md) / [结果](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance-OUTCOME.md) | 已完成（WORKTREE） | 优化逐文件统计与复制、列式写入和验证连接；跨盘样本全列一致，完整回归通过。 |
 | 2026-11-05 18:46 | [SQLite 到 Parquet 迁移性能优化](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance.md) / [结果](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance-OUTCOME.md) | 已完成（WORKTREE） | 补充验证 DuckDB 1.1.0，62 项相关测试通过。 |
+| 2026-11-05 20:20 | [Web 界面审查与优化](PLAN-20261105-006-model-unknown-web-ui-review.md) | 实施中 | 沿用既有结构，修复浏览、诊断和状态表达问题，优化可访问性与窄屏布局。 |
+| 2026-11-05 20:55 | [Web 界面审查与优化](PLAN-20261105-006-model-unknown-web-ui-review.md) / [结果](PLAN-20261105-006-model-unknown-web-ui-review-OUTCOME.md) | 已完成（WORKTREE） | 修复浏览、分区和时间输入问题，改善状态、键盘与窄屏体验；相关回归通过，独立 PostgreSQL 测试跳过。 |
+| 2026-11-05 21:30 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) | 实施中 | 将总览、分区明细和筛选计数改为按需加载，保留排序和分页语义。 |
+| 2026-11-05 21:42 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) / [结果](PLAN-20261105-007-model-unknown-web-lazy-loading-OUTCOME.md) | 已完成（WORKTREE） | 首屏仅请求数据页，统计按需执行；实际库副本和相关回归通过，记录有序首页剩余成本。 |
+| 2026-11-05 21:47 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) | 补充验证中 | 按用户要求手动测试原库，修复计数成功状态多余的 `null` 文本。 |
+| 2026-11-05 22:07 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) / [结果](PLAN-20261105-007-model-unknown-web-lazy-loading-OUTCOME.md) | 已完成（WORKTREE） | 指定原库手动测试通过，修复计数显示、响应式状态栏、筛选链接与 6 小时分区跳转。 |
+| 2026-11-05 22:13 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) / [结果](PLAN-20261105-007-model-unknown-web-lazy-loading-OUTCOME.md) | 已完成（WORKTREE） | 修复筛选防抖期间快速切换导致旧页复用；原库再次手测和 133 项回归通过。 |

@@ -79,13 +79,14 @@
     label: 'Charts',
 
     render: function (root, ctx) {
+      IU.tabs.charts.cleanup = null;
       var s = ensureState(ctx);
       destroyChart();
       IU.clear(root);
 
       if (!s.numericCols.length) {
         root.append(h('div', { class: 'card' },
-          h('div', { class: 'empty-state' }, '契约中未识别数值列，无法绘图')));
+          h('div', { class: 'empty-state' }, '契约中未识别可绘制的数值列，请选择包含数值列的表。')));
         return;
       }
 
@@ -103,19 +104,20 @@
       colSel.addEventListener('change', function (e) { s.col = e.target.value; });
 
       var symbolIn = h('input', {
-        class: 'input mono', placeholder: '留空=全部标的分别成线；多个用逗号分隔',
+        class: 'input mono', placeholder: '全部标的，逗号分隔',
+        title: '留空时全部标的分别成线；多个标的用逗号分隔',
         value: s.symbol, autocomplete: 'off'
       });
       symbolIn.addEventListener('input', function (e) { s.symbol = e.target.value; });
 
       var startIn = h('input', {
-        class: 'input mono', placeholder: 'start（2025-01-01 或毫秒）', value: s.start, autocomplete: 'off',
+        class: 'input mono', placeholder: '2025-01-01 或毫秒', value: s.start, autocomplete: 'off',
         title: '支持 2025-01-01 / 2025-01-01 10:30 / 毫秒时间戳（PLAN-064 D3）'
       });
       startIn.addEventListener('input', function (e) { s.start = e.target.value; });
 
       var endIn = h('input', {
-        class: 'input mono', placeholder: 'end（2025-04-30 或毫秒）', value: s.end, autocomplete: 'off',
+        class: 'input mono', placeholder: '2025-04-30 或毫秒', value: s.end, autocomplete: 'off',
         title: '支持 2025-04-30 / 2025-04-30 16:00 / 毫秒时间戳'
       });
       endIn.addEventListener('input', function (e) { s.end = e.target.value; });
@@ -134,7 +136,8 @@
           cfgField('end', endIn),
           h('label', { for: 'chart-log', style: { display: 'flex', gap: '6px', alignItems: 'center', cursor: 'pointer', fontSize: '13px', color: 'var(--tx1)', paddingBottom: '6px' } },
             logChk, '对数轴'),
-          h('button', { class: 'btn primary', onclick: draw }, '绘制'))));
+          h('button', { class: 'btn primary', onclick: draw }, '绘制')),
+        h('div', { class: 'chart-time-hint' }, '无时区的日期和时间按浏览器本地时间解析；也可输入毫秒或带时区的 ISO 时间。')));
 
       var chartBox = h('div', { class: 'chart-box' });
       root.append(chartBox);
@@ -206,6 +209,17 @@
         fullScale = null;
         active = null;
       }
+
+      IU.tabs.charts.cleanup = function () {
+        drawVersion++;
+        resetViewState();
+        if (resizeHandler === onResize) {
+          window.removeEventListener('resize', onResize);
+          resizeHandler = null;
+        }
+        destroyChart();
+        IU.tabs.charts.cleanup = null;
+      };
 
       /* 合并各 symbol 的 x 序列；union 保留每条序列的所有时间点，其他序列缺值填 null。 */
       function mergeXs(list) {
@@ -585,7 +599,7 @@
           // 时间轴交给 uPlot 原生渲染（可读日期）；仅非时间横轴才自定义整数刻度
           // （PLAN-064 Q3：原先强制 Math.round 覆盖导致 X 轴显示原始毫秒）。
           // 注意：isTime 时不传 space/values 键——旧版 uPlot 对 null 轴参数处理不佳
-          var xAxis = { stroke: '#5f6a82', grid: { stroke: 'rgba(255,255,255,.06)' } };
+          var xAxis = { stroke: '#8998ae', grid: { stroke: 'rgba(255,255,255,.06)' } };
           if (!viewXTime) {
             xAxis.space = 80;
             xAxis.values = function (u, ticks) {
@@ -603,7 +617,7 @@
             legend: { show: true },
             axes: [
               xAxis,
-              { stroke: '#5f6a82', grid: { stroke: 'rgba(255,255,255,.06)' },
+              { stroke: '#8998ae', grid: { stroke: 'rgba(255,255,255,.06)' },
                 values: function (u, ticks) {
                   return ticks.map(function (v) { return v == null ? '' : Number(v).toLocaleString('en-US', { maximumFractionDigits: 2 }); });
                 } }

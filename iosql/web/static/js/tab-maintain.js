@@ -3,7 +3,7 @@
  * Maintain 维护台（仅 --write 模式可用）：
  * 步骤流 layout_report → compact → validate → cleanup_obsolete(两步)
  * → repartition；危险区 delete / truncate 均需手输表名确认。
- * 只读模式下整 Tab 灰置并提示「只读模式下不可用」。
+ * 只读模式下显示开启维护模式的说明，不展示写操作。
  * ===================================================================== */
 (function () {
   'use strict';
@@ -27,12 +27,12 @@
             'compact / cleanup_obsolete / repartition / delete / truncate 仅在 --write 模式下开放，'),
           h('div', null, '且只读模式下服务端不注册任何写端点。'),
           h('div', { class: 'cmd-hint' },
-            h('span', null, 'iosql ui -s <库路径> --write'),
+            h('span', null, 'iosql web -s <库路径> --write'),
             h('button', {
               class: 'btn sm', title: '复制开启命令',
               onclick: function () {
                 if (navigator.clipboard && navigator.clipboard.writeText) {
-                  navigator.clipboard.writeText('iosql ui -s <库路径> --write')
+                  navigator.clipboard.writeText('iosql web -s <库路径> --write')
                     .then(function () { IU.toast('开启命令已复制', 'ok'); });
                 }
               }

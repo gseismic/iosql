@@ -46,13 +46,27 @@
   var st = null;
 
   function ensureState(ctx) {
-    var urlSeed = location.hash.slice(location.hash.indexOf('?') + 1);
+    var qi = location.hash.indexOf('?');
+    var urlSeed = qi < 0 ? '' : location.hash.slice(qi + 1);
     if (st && st.table === ctx.table && st.urlSeed === urlSeed) return st;
     var sameTable = st && st.table === ctx.table;
     if (sameTable) {
-      // 同表但 URL 种子变化（如从 Structure 分区行再次跳入）：重种 f.* 过滤
+      // 工作区切换会移除 query；恢复已有地址参数，保留当前筛选与页位。
+      if (!urlSeed) {
+        replaceUrlParams(st, new URLSearchParams(st.urlSeed));
+        return st;
+      }
+      // 同表通过带 query 的链接进入时，新条件覆盖同名参数，其余状态继续保留。
+      var retained = new URLSearchParams(st.urlSeed);
+      new URLSearchParams(urlSeed).forEach(function (value, key) {
+        // 空列清单与未知视图不会改变当前状态，也不应覆盖可分享的有效参数。
+        if (key === 'cols' && !value) return;
+        if (key === 'view' && value !== 'timeseries' && value !== 'latest') return;
+        retained.set(key, value);
+      });
       st.urlSeed = urlSeed;
       seedFromUrl(st);
+      replaceUrlParams(st, retained);
       st.chain = [null];
       st.pos = 0;
       st.refetchNeeded = true;
@@ -76,7 +90,7 @@
       view: 'browse',       // browse | timeseries | latest（D1 分段控件）
       sortCol: ds.col,
       sortDir: ds.dir,
-      filters: {},        // 列名 → 过滤输入原文（未解析）
+      filters: Object.create(null), // 列名 → 过滤输入原文（未解析）
       chain: [null],      // cursorChain[i] = 第 i+1 页的请求游标；第 1 页为 null
       pos: 0,
       nextCursor: null,
@@ -85,11 +99,11 @@
       tsReadable: loadTsReadable(),
       countCache: {},     // whereJSON → 行数（进程内缓存，-1 = 统计失败/超预算）
       countHint: {},      // whereJSON → 失败提示
-      badCols: {},        // 排序列 → 服务端 NULL 拒绝提示（禁用该列排序）
+      badCols: Object.create(null), // 排序列 → 服务端 NULL 拒绝提示
       lastSig: '',        // 最近一次成功渲染的条件签名
       lastNorm: null,     // 最近一次成功页数据（视图切换不重拉）
       shell: null,        // 表格骨架（thead 两行 + tbody），数据更新只换 tbody
-      hidden: {},         // D12 列选择器：隐藏列 → 1
+      hidden: Object.create(null), // D12 列选择器：隐藏列 → 1
       hiddenAuto: 0,      // 宽表自动隐藏的列数（提示用）
       limit: '200',
       urlSeed: urlSeed,
@@ -113,10 +127,10 @@
     if (vw === 'timeseries' || vw === 'latest') s.view = vw;
     var cols = params.get('cols');
     if (cols !== null && cols !== '') {
-      var keep = {};
+      var keep = Object.create(null);
       cols.split(',').forEach(function (c) { if (c !== '') keep[c] = 1; });
       if (Object.keys(keep).length) {
-        s.hidden = {};
+        s.hidden = Object.create(null);
         s.columns.forEach(function (c) { if (!keep[c]) s.hidden[c] = 1; });
       }
     }
@@ -127,16 +141,35 @@
     var qi = location.hash.indexOf('?');
     var params = new URLSearchParams(qi >= 0 ? location.hash.slice(qi + 1) : '');
     params.set('cols', visibleCols(s).join(','));
+    replaceUrlParams(s, params);
+  }
+
+  function replaceUrlParams(s, params) {
+    var qi = location.hash.indexOf('?');
     var base = qi >= 0 ? location.hash.slice(0, qi) : location.hash;
     var qs = params.toString();
-    if (history.replaceState) history.replaceState(null, '', base + '?' + qs);
-    s.urlSeed = qs; // 保持 ensureState 种子一致性
+    if (history.replaceState) history.replaceState(null, '', base + (qs ? '?' + qs : ''));
+    s.urlSeed = qs;
+  }
+
+  function syncFilterToUrl(s, col, value) {
+    var qi = location.hash.indexOf('?');
+    var params = new URLSearchParams(qi >= 0 ? location.hash.slice(qi + 1) : '');
+    if (value) params.set('f.' + col, value); else params.delete('f.' + col);
+    replaceUrlParams(s, params);
+  }
+
+  function syncViewToUrl(s, view) {
+    var qi = location.hash.indexOf('?');
+    var params = new URLSearchParams(qi >= 0 ? location.hash.slice(qi + 1) : '');
+    if (view === 'browse') params.delete('view'); else params.set('view', view);
+    replaceUrlParams(s, params);
   }
 
   /* 宽表默认隐藏（D12）：>20 列时只显示前 10 列 + 主键/时间列，其余进选择器 */
   function seedHiddenForWide(s) {
     if (s.columns.length <= WIDE_COLS_AUTO_HIDE) return;
-    var keep = {};
+    var keep = Object.create(null);
     s.columns.slice(0, WIDE_COLS_KEEP).forEach(function (c) { keep[c] = 1; });
     s.pkCols.forEach(function (c) { keep[c] = 1; });
     if (s.timeCol) keep[s.timeCol] = 1;
@@ -160,7 +193,7 @@
 
   /* 可读化候选列：time 契约列 ∪ 整型且名字像时间的列 */
   function detectTsCols(colTypes, spec) {
-    var set = {};
+    var set = Object.create(null);
     var tc = resolveTimeCol(spec);
     if (tc) set[tc] = true;
     Object.keys(colTypes).forEach(function (c) {
@@ -215,6 +248,14 @@
       var loText = s.slice(0, tilde).trim();
       var hiText = s.slice(tilde + 1).trim();
       if (!loText || !hiText) return { skip: true };
+      if (hiText[0] === '<') {
+        hiText = hiText.slice(1).trim();
+        if (!hiText) return { skip: true };
+        return { comps: [
+          { field: colName, op: '>=', value: IU.fmt.coerce(loText, colType) },
+          { field: colName, op: '<', value: IU.fmt.coerce(hiText, colType) }
+        ] };
+      }
       return {
         comp: {
           field: colName, op: 'between',
@@ -236,6 +277,7 @@
     Object.keys(st.filters).forEach(function (col) {
       var r = parseFilterInput(st.filters[col], col, st.colTypes[col]);
       if (r.comp) headerComps.push(r.comp);
+      if (r.comps) headerComps = headerComps.concat(r.comps);
     });
     var adv = st.builder.getWhere();
     if (!adv.ok) { IU.toast(adv.msg, 'err'); return undefined; }
@@ -248,6 +290,7 @@
     Object.keys(s.filters).forEach(function (col) {
       var r = parseFilterInput(s.filters[col], col, s.colTypes[col]);
       if (r.comp) parts.push(compText(r.comp));
+      if (r.comps) r.comps.forEach(function (comp) { parts.push(compText(comp)); });
     });
     var adv = s.builder.getWhere();
     if (adv.ok && adv.where && adv.where.length) parts.push(groupText(adv.where));
@@ -278,11 +321,7 @@
   }
 
   /* 供全局快捷键 ←/→ 调用 */
-  IU.browseNav = function (dir) {
-    if (!st || st.view !== 'browse') return;
-    if (dir > 0) gotoNext();
-    else gotoPrev();
-  };
+  IU.browseNav = null;
 
   IU.tabs = IU.tabs || {};
 
@@ -293,10 +332,15 @@
   };
 
   function renderTab(root, ctx) {
+    if (typeof IU.tabs.data.cleanup === 'function') IU.tabs.data.cleanup();
+    IU.tabs.data.cleanup = null;
     var s = ensureState(ctx);
     var base = '/api/table/' + encodeURIComponent(ctx.table);
     var spec = ctx.spec || {};
 
+    IU.browseNav = null;
+    IU.refreshData = null;
+    s.shell = null; // 旧骨架属于已移除的工作区，重新进入时必须重新挂载
     IU.clear(root);
 
     /* --- 页头：表名 + 分段控件（D1，仅时序表） --- */
@@ -310,8 +354,10 @@
       [['browse', '浏览'], ['timeseries', '时序'], ['latest', '截面']].forEach(function (v) {
         seg.append(h('button', {
           class: s.view === v[0] ? 'active' : '',
+          'aria-pressed': s.view === v[0] ? 'true' : 'false',
           onclick: function () {
             s.view = v[0];
+            syncViewToUrl(s, v[0]);
             renderTab(root, ctx); // 视图切换重画，st 保留筛选与数据
           }
         }, v[1]));
@@ -388,7 +434,7 @@
       }, 'Explain'),
       h('button', {
         class: 'btn ghost', title: '保持当前页位置与筛选，重新拉取（外部写入后同步）',
-        onclick: function () { fetchPage(lastWhere()); }
+        onclick: refreshPage
       }, '刷新'),
       h('span', { class: 'spacer' }),
       h('label', { class: 'chk', title: '把毫秒时间戳列显示为本地日期时间（悬停看原值）' },
@@ -456,9 +502,14 @@
     }
 
     function clearAllFilters() {
-      s.filters = {};
+      s.filters = Object.create(null);
       s.builder.reset();
       syncBuilderInputs();
+      tableBox.querySelectorAll('.filter-input').forEach(function (input) { input.value = ''; });
+      var qi = location.hash.indexOf('?');
+      var params = new URLSearchParams(qi >= 0 ? location.hash.slice(qi + 1) : '');
+      Array.from(params.keys()).forEach(function (key) { if (key.slice(0, 2) === 'f.') params.delete(key); });
+      replaceUrlParams(s, params);
       applyFilters();
     }
 
@@ -470,11 +521,21 @@
       if (where === undefined) return;
       s.chain = [null];
       s.pos = 0;
+      s.nextCursor = null;
       fetchPage(where);
     }
 
+    function refreshPage() {
+      var where = lastWhere();
+      var sig = JSON.stringify(where || []);
+      var recount = typeof s.countCache[sig] === 'number' && s.countCache[sig] >= 0;
+      delete s.countCache[sig];
+      delete s.countHint[sig];
+      fetchPage(where, recount);
+    }
+
     function gotoNext() {
-      if (!s.nextCursor) return;
+      if (loading || !s.nextCursor) return;
       var where = currentWhere();
       if (where === undefined) return;
       s.pos++;
@@ -483,7 +544,7 @@
     }
 
     function gotoPrev() {
-      if (s.pos === 0) return;
+      if (loading || s.pos === 0) return;
       var where = currentWhere();
       if (where === undefined) return;
       s.pos--; // 回到上一页（chain[s.pos] 即上一页游标；首页为 null）
@@ -495,6 +556,26 @@
     /* aborter：新请求自动取消上一个（PLAN-069 P4），大表排序不必干等 */
     var aborter = null;
     var loadTicker = null;
+    var loading = false;
+    var countSeq = 0;
+    var countBusy = false;
+    var countAborter = null;
+
+    IU.browseNav = function (dir) {
+      if (!tableBox.isConnected || st !== s || s.view !== 'browse') return;
+      if (dir > 0) gotoNext(); else gotoPrev();
+    };
+    IU.refreshData = refreshPage;
+    IU.tabs.data.cleanup = function () {
+      pageSeq++;
+      countSeq++;
+      stopLoadTicker();
+      if (aborter) aborter.abort();
+      if (countAborter) countAborter.abort();
+      IU.browseNav = null;
+      IU.refreshData = null;
+      IU.tabs.data.cleanup = null;
+    };
 
     function stopLoadTicker() {
       if (loadTicker) { clearInterval(loadTicker); loadTicker = null; }
@@ -504,17 +585,27 @@
       stopLoadTicker();
       var start = Date.now();
       loadTicker = setInterval(function () {
+        if (!tableBox.isConnected) { stopLoadTicker(); return; }
         var el = tableBox.querySelector('.load-elapsed');
         if (el) el.textContent = ((Date.now() - start) / 1000).toFixed(1) + 's';
       }, 100);
     }
 
-    function fetchPage(where) {
+    function fetchPage(where, recount) {
       var seq = ++pageSeq;
       if (aborter) aborter.abort();
       aborter = ('AbortController' in window) ? new AbortController() : null;
       var signal = aborter ? aborter.signal : undefined;
+      loading = true;
+      s.refetchNeeded = true;
+      countSeq++; // 旧条件的计数不能覆盖新查询
+      if (countAborter) countAborter.abort();
+      countAborter = null;
+      countBusy = false;
       renderBodyLoading();
+      renderPager();
+      IU.clear(infoBar);
+      infoBar.append(h('span', { class: 'faint' }, '查询中…'));
       startLoadTicker();
       refreshWherePreview();
       var body = { where: where || [], order_by: orderByStr(s), limit: s.pageSize };
@@ -522,8 +613,11 @@
       if (cursor !== null && cursor !== undefined) body.cursor = cursor;
 
       IU.api(base + '/rows', { method: 'POST', body: body, signal: signal }).then(function (resp) {
-        if (seq !== pageSeq) return; // 过期响应：丢弃
+        if (seq !== pageSeq) return;
         stopLoadTicker();
+        if (!tableBox.isConnected || st !== s) return;
+        loading = false;
+        s.refetchNeeded = false;
         var norm = IU.normalizeRows(resp);
         s.nextCursor = IU.pick(resp || {}, 'next_cursor', 'nextCursor') || null;
         s.appliedOrderBy = String(IU.pick(resp || {}, 'order_by', 'orderBy') || body.order_by);
@@ -532,12 +626,18 @@
         syncColumns(norm);
         renderBody(norm);
         renderPager();
-        fetchCount(where);
+        renderInfo(s.lastSig);
+        if (recount) fetchCount(where);
       }).catch(function (err) {
         if (seq !== pageSeq) return;
         stopLoadTicker();
-        if (err && err.aborted) {
-          renderBodyCurrent(); // 已被更新请求取代：回退到上一份数据
+        if (!tableBox.isConnected || st !== s) return;
+        loading = false;
+        s.nextCursor = null;
+        IU.clear(infoBar);
+        infoBar.append(h('span', { class: 'faint' }, '查询未完成'));
+        if (err && (err.aborted || err.name === 'AbortError')) {
+          renderBodyError('查询已取消。');
           renderPager();
           return;
         }
@@ -589,22 +689,32 @@
       });
     }
 
-    /* 总行数异步统计：按 where 签名缓存；服务端扫描预算超限时显示提示 */
-    var countSeq = 0;
+    /* 用户按需统计：按 where 签名缓存；服务端扫描预算超限时允许重试。 */
     function fetchCount(where) {
       var sig = JSON.stringify(where || []);
-      if (s.countCache[sig] !== undefined) { renderInfo(sig); return; }
+      if (countBusy) return;
       var seq = ++countSeq;
-      IU.api(base + '/count', { method: 'POST', body: { where: where || [] } }).then(function (resp) {
+      countBusy = true;
+      countAborter = ('AbortController' in window) ? new AbortController() : null;
+      renderInfo(sig);
+      IU.api(base + '/count', { method: 'POST', body: { where: where || [] },
+        signal: countAborter ? countAborter.signal : undefined }).then(function (resp) {
+        if (seq !== countSeq || !tableBox.isConnected || st !== s) return;
         var n = IU.pick(resp || {}, 'count', 'total', 'rows');
-        if (n !== undefined) s.countCache[sig] = Number(n);
-        if (seq === countSeq) renderInfo(sig);
+        if (typeof n !== 'number' || !Number.isFinite(n) || n < 0) throw new Error('统计结果无效');
+        s.countCache[sig] = n;
+        delete s.countHint[sig];
+        countBusy = false;
+        countAborter = null;
+        renderInfo(sig);
       }).catch(function (err) {
-        if (seq === countSeq) {
+        if (seq === countSeq && tableBox.isConnected && st === s) {
+          countBusy = false;
+          countAborter = null;
           s.countCache[sig] = -1; // 失败/超预算占位：不显示错误数字
           s.countHint[sig] = (err && (err.hint || err.message)) || '统计失败';
+          renderInfo(sig);
         }
-        renderInfo(sig);
       });
     }
 
@@ -612,23 +722,29 @@
       IU.clear(infoBar);
       var n = s.countCache[sig];
       var failed = n === -1;
-      // 大表未过滤首页提示（服务端排序尚未下推时全量物化排序可能很慢）
+      // 大表未过滤首页提示：时间或分区过滤可减少扫描范围。
       var bigUnfiltered = !failed && typeof n === 'number' &&
         n > BIG_ROWS_HINT && String(sig) === '[]';
       infoBar.append(
         h('span', null, '总行数：',
           n === undefined
-            ? h('span', { class: 'spinner', style: { width: '11px', height: '11px' } })
+            ? (countBusy ? h('span', { class: 'spinner', style: { width: '11px', height: '11px' } }) : '未统计')
             : failed
               ? h('b', { class: 'mono' }, '—')
               : h('b', { class: 'mono' }, IU.fmt.int(n)),
-          h('span', { class: 'faint' }, n === undefined
-            ? ' 统计中…'
+          h('span', { class: 'faint' }, countBusy ? ' 统计中…'
             : (failed ? ' ' + (s.countHint[sig] || '统计失败') : '')),
           bigUnfiltered
             ? h('span', { class: 'faint' }, ' · 大表未过滤：如需更快可加表头过滤缩小扫描范围')
             : null,
+          n === undefined && String(sig) === '[]'
+            ? h('span', { class: 'faint' }, ' · 可按分区或时间筛选，缩小扫描范围')
+            : null,
           activeFilterHint()));
+      if (!countBusy && (n === undefined || failed)) {
+        infoBar.append(h('button', { class: 'btn sm', title: '统计当前筛选条件的准确行数，可能扫描数据文件',
+          onclick: function () { fetchCount(JSON.parse(sig)); } }, failed ? '重试统计' : '统计总行数'));
+      }
     }
 
     function activeFilterHint() {
@@ -655,7 +771,7 @@
       var tbody = h('tbody');
       var table = h('table', { class: 'data-table browse-table' },
         h('thead', null, titleTr, filterTr), tbody);
-      tableBox.append(h('div', { class: 'table-wrap' }, table));
+      tableBox.append(h('div', { class: 'table-wrap browse-wrap' }, table));
       s.shell = { cols: cols.join('\u0001'), tbody: tbody, titleTr: titleTr };
       return s.shell;
     }
@@ -668,10 +784,18 @@
           (bad ? ' sort-bad' : '') +
           (isFilteredCol(c) ? ' filtered' : '') +
           (IU.isNumericCol(c, s.colTypes) ? ' num' : ''),
+        tabindex: '0',
+        'aria-sort': sorted ? (s.sortDir === 'desc' ? 'descending' : 'ascending') : 'none',
         title: bad
           ? ('该列含 NULL，无法分页排序：' + bad)
           : '点击按 ' + c + ' 排序（重置到第一页）',
-        onclick: function () {
+        onclick: sortColumn,
+        onkeydown: function (e) {
+          if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); sortColumn(); }
+        }
+      }, c, sorted ? (s.sortDir === 'desc' ? ' ↓' : ' ↑') : '');
+
+      function sortColumn() {
           if (bad) {
             IU.toast('该列含 NULL，keyset 分页不可用；请更换排序列', 'warn', bad);
             return;
@@ -680,8 +804,7 @@
           else { s.sortCol = c; s.sortDir = 'asc'; }
           s.shell = null; // 重建骨架以刷新列头排序箭头（过滤输入由 st.filters 恢复）
           applyFilters();
-        }
-      }, c, sorted ? (s.sortDir === 'desc' ? ' ↓' : ' ↑') : '');
+      }
     }
 
     function isFilteredCol(c) {
@@ -695,16 +818,18 @@
       var input = h('input', {
         class: 'input filter-input', type: 'text',
         value: st.filters[c] || '',
+        'aria-label': '筛选列 ' + c,
         placeholder: hint, autocomplete: 'off', spellcheck: 'false',
-        title: '语法：裸词精确 · >v >=v <v <=v · =v 原文 · !=v 排除 · a~b 范围 · a,b,c 任一',
+        title: '语法：裸词精确 · >v >=v <v <=v · =v 原文 · !=v 排除 · a~b 含两端 · a~<b 不含上界 · a,b,c 任一',
         dataset: { col: c }
       });
       var timer = null;
       input.addEventListener('input', function () {
         st.filters[c] = input.value;
+        syncFilterToUrl(s, c, input.value);
         refreshWherePreview(); // 预览条即时跟随（不触发请求）
         if (timer) clearTimeout(timer);
-        timer = setTimeout(function () { applyFilters(); }, DEBOUNCE_MS);
+        timer = setTimeout(function () { if (input.isConnected && st === s) applyFilters(); }, DEBOUNCE_MS);
       });
       input.addEventListener('keydown', function (e) {
         if (e.key === 'Enter') {
@@ -716,6 +841,7 @@
           e.preventDefault();
           input.value = '';
           st.filters[c] = '';
+          syncFilterToUrl(s, c, '');
           refreshWherePreview();
           applyFilters();
         }
@@ -811,24 +937,24 @@
           h('button', {
             class: 'btn sm', title: '显示全部列',
             onclick: function () {
-              s.hidden = {}; label(); syncColsToUrl(s); s.shell = null; if (s.lastNorm) renderBody(s.lastNorm); buildList();
+              s.hidden = Object.create(null); label(); syncColsToUrl(s); s.shell = null; if (s.lastNorm) renderBody(s.lastNorm); buildList();
             }
           }, '全部显示'),
           h('button', {
             class: 'btn sm', title: '回到本 Tab 打开时的默认列集',
             onclick: function () {
-              s.hidden = {}; s.hiddenAuto = 0; seedHiddenForWide(s);
+              s.hidden = Object.create(null); s.hiddenAuto = 0; seedHiddenForWide(s);
               label(); syncColsToUrl(s); s.shell = null; if (s.lastNorm) renderBody(s.lastNorm); buildList();
             }
           }, '恢复默认'),
           h('button', {
             class: 'btn sm', title: '只显示主键列与时间列',
             onclick: function () {
-              var keep = {};
+              var keep = Object.create(null);
               s.pkCols.forEach(function (c) { keep[c] = 1; });
               if (s.timeCol) keep[s.timeCol] = 1;
               Object.keys(s.tsCols).forEach(function (c) { keep[c] = 1; });
-              s.hidden = {};
+              s.hidden = Object.create(null);
               s.columns.forEach(function (c) { if (!keep[c]) s.hidden[c] = 1; });
               label(); syncColsToUrl(s); s.shell = null; if (s.lastNorm) renderBody(s.lastNorm); buildList();
             }
@@ -855,9 +981,11 @@
       IU.clear(tbody);
 
       if (!norm.rows.length) {
+        var hasFilter = s.lastSig !== '[]';
         tbody.append(h('tr', null, h('td', {
           class: 'loading-cell', colspan: String(Math.max(visibleCols(s).length, 1))
-        }, '无命中行：调整表头过滤或高级筛选后重试')));
+        }, hasFilter ? '没有匹配的行。' : '这张表还没有数据。',
+        hasFilter ? h('button', { class: 'btn sm', onclick: clearAllFilters }, '清空筛选') : null)));
         refreshTitleMarks();
         return;
       }
@@ -869,6 +997,8 @@
         });
         tbody.append(tr);
       });
+      var firstCell = tbody.querySelector('td[tabindex]');
+      if (firstCell) firstCell.setAttribute('tabindex', '0');
       refreshTitleMarks();
     }
 
@@ -894,7 +1024,29 @@
       } else {
         td = h('td', { title: typeof v === 'string' && v.length > 60 ? v : null }, String(v));
       }
-      td.addEventListener('click', function () { openDetail(c, v); });
+      td.setAttribute('tabindex', '-1');
+      var accessibleValue = v === null || v === undefined ? 'NULL' : td.textContent;
+      if (accessibleValue.length > 120) accessibleValue = accessibleValue.slice(0, 120) + '…';
+      td.setAttribute('aria-label', c + '：' + accessibleValue + '；按 Enter 查看详情');
+      td.addEventListener('focus', function () {
+        var previous = td.closest('tbody').querySelector('td[tabindex="0"]');
+        if (previous && previous !== td) previous.setAttribute('tabindex', '-1');
+        td.setAttribute('tabindex', '0');
+      });
+      td.addEventListener('click', function () { td.focus(); openDetail(c, v); });
+      td.addEventListener('keydown', function (e) {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault(); e.stopPropagation(); openDetail(c, v); return;
+        }
+        var row = td.parentElement, target = null;
+        if (e.key === 'ArrowLeft') target = td.previousElementSibling;
+        else if (e.key === 'ArrowRight') target = td.nextElementSibling;
+        else if (e.key === 'ArrowUp' && row.previousElementSibling) target = row.previousElementSibling.children[td.cellIndex];
+        else if (e.key === 'ArrowDown' && row.nextElementSibling) target = row.nextElementSibling.children[td.cellIndex];
+        else return;
+        e.preventDefault(); e.stopPropagation();
+        if (target && target.hasAttribute('tabindex')) target.focus();
+      });
       return td;
     }
 
@@ -907,7 +1059,7 @@
         note: note,
         actions: [{
           label: '以此值过滤',
-          onClick: function () { filterByValue(c, v); }
+          onClick: function () { IU.DetailPanel.close(); filterByValue(c, v); }
         }]
       });
     }
@@ -921,10 +1073,11 @@
       }
       var text = '=' + (typeof v === 'object' ? JSON.stringify(v) : String(v));
       st.filters[c] = text;
+      syncFilterToUrl(s, c, text);
       // 骨架不重建（防焦点丢失），这里需手动同步对应输入框的显示值
       var esc = window.CSS && CSS.escape ? CSS.escape(c) : c;
       var inp = tableBox.querySelector('.filter-input[data-col="' + esc + '"]');
-      if (inp) inp.value = text;
+      if (inp) { inp.value = text; inp.focus(); }
       refreshWherePreview();
       applyFilters();
       IU.toast('已在 ' + c + ' 列应用精确过滤', 'ok');
@@ -963,19 +1116,20 @@
       IU.clear(shell.tbody);
       shell.tbody.append(h('tr', null,
         h('td', { class: 'loading-cell', colspan: String(Math.max(visibleCols(s).length, 1)) },
-          msg || '加载失败，请重试（错误详情见右下角提示）')));
+          msg || '加载失败，请重试（错误详情见右下角提示）。', ' ',
+          h('button', { class: 'btn sm', onclick: function () { fetchPage(lastWhere()); } }, '重试'))));
     }
 
     function renderPager() {
       IU.clear(pagerBar);
       pagerBar.append(
         h('button', {
-          class: 'btn sm', disabled: s.pos === 0,
+          class: 'btn sm', disabled: loading || s.pos === 0,
           onclick: gotoPrev
         }, '← 上一页'),
         h('span', null, '第 ', h('b', { class: 'mono' }, String(s.pos + 1)), ' 页'),
         h('button', {
-          class: 'btn sm', disabled: !s.nextCursor,
+          class: 'btn sm', disabled: loading || !s.nextCursor,
           onclick: gotoNext
         }, '下一页 →'),
         h('span', { class: 'faint' }, '·'),
@@ -987,14 +1141,20 @@
 
     refreshWherePreview();
 
-    /* 有缓存页（视图切回）直接重画；首次/被 URL 种子刷新时拉第一页 */
-    if (s.lastNorm && !s.refetchNeeded) {
+    /* 仅复用与当前条件一致的缓存页；防抖期间切换视图时重置旧游标。 */
+    var whereNow = currentWhereSafe();
+    var sameWhere = s.lastSig === JSON.stringify(whereNow || []);
+    if (s.lastNorm && !sameWhere) {
+      s.chain = [null];
+      s.pos = 0;
+      s.nextCursor = null;
+    }
+    if (s.lastNorm && !s.refetchNeeded && sameWhere) {
       renderBody(s.lastNorm);
       renderPager();
       renderInfo(s.lastSig);
     } else {
-      fetchPage(currentWhereSafe());
-      s.refetchNeeded = false;
+      fetchPage(whereNow);
     }
 
     function currentWhereSafe() {
@@ -1058,7 +1218,7 @@
     root.append(h('div', { class: 'card section-gap' },
       h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, '时序快捷查询'),
         IU.badge('timeseries', 'info'),
-        h('span', { class: 'faint', style: { fontSize: '12px' } }, '时间支持 2025-01-01 / 2025-01-01 10:30 / 毫秒时间戳')),
+        h('span', { class: 'faint', style: { fontSize: '12px' } }, '无时区的日期和时间按浏览器本地时间解析；也可输入毫秒或带时区的 ISO 时间')),
       h('div', { class: 'quick-grid' },
         fStart.node, fEnd.node, fDate.node, fSession.node, fSymbols.node),
       h('div', { class: 'toolbar' }, btn),
@@ -1103,7 +1263,7 @@
     root.append(h('div', { class: 'card section-gap' },
       h('div', { class: 'card-title' }, h('span', { class: 'micro-label' }, 'Latest 最新截面'),
         IU.badge('as-of', 'info'),
-        h('span', { class: 'faint', style: { fontSize: '12px' } }, '所有 symbol 截至某时刻的最新一行')),
+        h('span', { class: 'faint', style: { fontSize: '12px' } }, '所有 symbol 截至某时刻的最新一行；无时区时间按浏览器本地时间解析')),
       h('div', { class: 'quick-grid' },
         fSymbols.node, fAsOf.node, fBy.node, fCols.node),
       h('div', { class: 'toolbar' }, btn),

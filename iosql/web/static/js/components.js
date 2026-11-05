@@ -214,6 +214,7 @@
   var DetailPanel = {
     open: function (colName, value, opts) {
       opts = opts || {};
+      this._returnFocus = document.activeElement;
       var pre = document.getElementById('detail-pre');
       document.getElementById('detail-colname').textContent = colName || '';
       pre.textContent = prettyValue(value);
@@ -231,9 +232,20 @@
       noteEl.style.display = opts.note ? '' : 'none';
 
       document.body.classList.add('detail-open');
+      var panel = document.getElementById('detail-panel');
+      panel.removeAttribute('inert');
+      panel.setAttribute('aria-hidden', 'false');
+      document.getElementById('detail-close').focus();
       this._current = value;
     },
-    close: function () { document.body.classList.remove('detail-open'); },
+    close: function () {
+      if (!document.body.classList.contains('detail-open')) return;
+      document.body.classList.remove('detail-open');
+      var panel = document.getElementById('detail-panel');
+      panel.setAttribute('inert', '');
+      panel.setAttribute('aria-hidden', 'true');
+      if (this._returnFocus && this._returnFocus.isConnected) this._returnFocus.focus();
+    },
     _current: null
   };
 
@@ -255,10 +267,20 @@
   // 标题承诺的 Esc 关闭；输入框内的 Esc（如过滤行清空本列）已 stopPropagation，
   // 不会误关；确认弹窗打开时优先让弹窗响应，不穿透关闭面板
   document.addEventListener('keydown', function (e) {
-    if (e.key !== 'Escape') return;
     var modalRoot = document.getElementById('modal-root');
     if (modalRoot && modalRoot.childElementCount) return;
-    DetailPanel.close();
+    if (!document.body.classList.contains('detail-open')) return;
+    if (e.key === 'Escape') { e.preventDefault(); DetailPanel.close(); return; }
+    if (e.key !== 'Tab') return;
+    var panel = document.getElementById('detail-panel');
+    var controls = Array.from(panel.querySelectorAll('button:not([disabled])'));
+    if (!controls.length) return;
+    var first = controls[0], last = controls[controls.length - 1];
+    if (e.shiftKey && (document.activeElement === first || !panel.contains(document.activeElement))) {
+      e.preventDefault(); last.focus();
+    } else if (!e.shiftKey && (document.activeElement === last || !panel.contains(document.activeElement))) {
+      e.preventDefault(); first.focus();
+    }
   });
   document.getElementById('detail-copy').addEventListener('click', function () {
     var text = document.getElementById('detail-pre').textContent;

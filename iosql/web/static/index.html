@@ -6,11 +6,12 @@
   <title>iosql Web</title>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2345c6ff'/%3E%3Cpath d='M4 4h8v3H7v2h5v3H4V9h5V7H4z' fill='%230a0d13'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="vendor/uplot.min.css">
-  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="style.css?v=20261105-6">
 </head>
 <body>
   <!-- 顶栏：品牌 | DB URI 只读展示 | 模式徽章（app.js 填充）；产品名 iosql Web（PLAN-067） -->
   <header id="topbar">
+    <button id="sidebar-toggle" class="sidebar-toggle" type="button" aria-controls="sidebar" aria-expanded="false" aria-label="打开表列表">☰ <span>表</span></button>
     <div class="brand">
       <div class="brand-mark"></div>
       <span class="brand-name">iosql<em>Web</em></span>
@@ -24,11 +25,12 @@
   <div id="layout">
     <!-- 左侧栏：总览入口 + 表列表（app.js 填充） -->
     <nav id="sidebar" aria-label="表列表"></nav>
+    <div id="sidebar-backdrop" aria-hidden="true"></div>
 
     <!-- 主区：Tab 栏 + 工作区 + 状态栏（快捷键提示吸收进状态栏，PLAN-064 P10） -->
     <main id="main">
       <div id="tabbar" role="tablist"></div>
-      <div id="content"></div>
+      <div id="content" role="tabpanel"></div>
       <div id="statusbar">
         <span id="status-left" class="mono"></span>
         <span id="font-scale-slot" class="fs-ctl"></span>
@@ -42,12 +44,12 @@
 
   <!-- 单元格详情侧滑面板 -->
   <div id="detail-mask"></div>
-  <aside id="detail-panel" aria-label="单元格详情">
+  <aside id="detail-panel" role="dialog" aria-modal="true" aria-label="单元格详情" aria-hidden="true" inert>
     <div class="detail-head">
       <span class="micro-label">单元格详情 · <span class="detail-colname" id="detail-colname"></span></span>
       <span id="detail-actions" class="detail-actions"></span>
       <button class="btn sm ghost" id="detail-copy">复制值</button>
-      <button class="icon-btn" id="detail-close" title="关闭 (Esc)">✕</button>
+      <button class="icon-btn" id="detail-close" title="关闭 (Esc)" aria-label="关闭单元格详情">✕</button>
     </div>
     <div class="detail-body">
       <div id="detail-note" class="detail-note mono" style="display:none"></div>
@@ -61,13 +63,13 @@
 
   <!-- 零构建链：顺序 script 标签（defer 保持执行顺序），全局命名空间 IU -->
   <script src="vendor/uplot.min.js"></script>
-  <script src="js/util.js" defer></script>
-  <script src="js/components.js" defer></script>
-  <script src="js/tab-overview.js" defer></script>
-  <script src="js/tab-data.js" defer></script>
-  <script src="js/tab-structure.js" defer></script>
-  <script src="js/tab-charts.js" defer></script>
-  <script src="js/tab-maintain.js" defer></script>
-  <script src="app.js" defer></script>
+  <script src="js/util.js?v=20261105-5" defer></script>
+  <script src="js/components.js?v=20261105-5" defer></script>
+  <script src="js/tab-overview.js?v=20261105-5" defer></script>
+  <script src="js/tab-data.js?v=20261105-8" defer></script>
+  <script src="js/tab-structure.js?v=20261105-6" defer></script>
+  <script src="js/tab-charts.js?v=20261105-5" defer></script>
+  <script src="js/tab-maintain.js?v=20261105-5" defer></script>
+  <script src="app.js?v=20261105-6" defer></script>
 </body>
 </html>
