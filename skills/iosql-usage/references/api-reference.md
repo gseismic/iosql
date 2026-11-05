@@ -83,14 +83,22 @@ with Database("sqlite://db/test.iosql") as db:
 | `column_descriptions` | `dict`/`None` | 列名到业务说明的映射 |
 | `column_ranges` | `dict`/`None` | 数值列到 `{"low": 下界, "high": 上界}` 的映射，只存声明，不校验写入 |
 
-已有表上再次传 `spec=`（或快捷参数）时，声明的绑定字段
+SQLite/Parquet 已有表上再次传 `spec=`（或快捷参数）时，声明的绑定字段
 （`order_key`/`symbol_column`/`session_column`/`conflict`/`schema_policy`）会通过
 `TableSpecConflict` 校验并写回持久化契约：存量仍为默认值或未声明时可被覆盖，
-否则报 `TableSpecConflict`（含修复提示）。快捷参数路径省略 `force_partition` 时按 False 处理；`spec=` 路径省略时保留契约原值，显式传入与契约冲突的值会报错。`force_partition=True` 会跳过分区冲突检查并把新分区契约落盘。
+否则报 `TableSpecConflict`（含修复提示）。快捷参数路径省略 `force_partition` 时按 False 处理；`spec=` 路径省略时保留契约原值，显式传入与契约冲突的值会报错。存在物理分区时，不能通过 `force_partition=True` 或低层写入改分区；没有物理分区的空表可显式 force。历史混合布局通过 `validate(deep=True)` 诊断并迁移到新目标，重复主键应先人工核对。PostgreSQL 验证既有边界和契约摘要；无持久契约的旧表须核对原策略，首次写入需要表所有者权限。
 
 #### `Database.timeseries(table_name, time, pk=None, primary_key=None, columns=None, *, partition_every='1day', timezone='UTC', symbol_column='symbol', session_column=None, partition=None, segment=None, order_key=None, conflict='append', schema_policy='evolve', force_partition=False, partition_kind=None, time_unit=None, target_rows_per_file=None, min_rows_per_file=None, max_rows_per_file=None, description=None, column_descriptions=None, column_ranges=None)`
 
 时序语法糖：`table()` 的薄封装，duration 场景等价于 `db.table(..., partition=Partition.duration(time, every=partition_every), order_key=time, time=time)`。calendar 场景传 `partition=Partition.calendar(...)`。
+
+显式同时传入非 `None` 的 `partition` 和 `partition_every` 时，`partition` 生效，`partition_every` 被忽略并触发 `UserWarning`；请移除 `partition_every` 并在 `partition` 中设置期望的分区规则。只传 `partition` 不会触发该警告。
+
+日期时序表可使用 `Partition.calendar(...)` 或等价的 `calendar(...)` 字符串。旧版可能已经保存错误时间契约，升级不会自动改写；检查 `table.spec().time`，必要时参照 README 的全表复制和逐行核验示例恢复。
+
+默认时区是 UTC；绝对时刻建议写入对应单位的 UTC Unix 时间戳，PostgreSQL 可用 `timestamptz`。SQLite/Parquet 不自动将任意原始输入转换为 UTC；日历分区仍按显式业务时区确定边界。夏令时切换日的 PostgreSQL 日内 calendar 布局合并为一个物理日分区；旧子分区与新布局冲突时需迁移。
+
+SQLite/Parquet 新建纯日期 calendar 表采用 `date_key=local`。旧表的 `legacy`/无版本路由原样保留；迁移默认沿用源路由，可在目标 `partition` 表达式或 `PartitionSpec` 指定 `date_key=local`，复制到新目标升级。`date_key` 仅适用于纯日期 calendar 分区，迁移应核对源目标数据。
 
 废弃参数（触发 `DeprecationWarning`，行为等价迁移）：`partition_kind='calendar'` / `time_unit='date'` → 改传 `partition=Partition.calendar(...)`；`target/min/max_rows_per_file` → 改传 `segment=Segment.rows(...)`。
 

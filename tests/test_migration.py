@@ -275,6 +275,10 @@ class FakePagingCursor(FakeCursor):
             self.fetchone_result = (len(self._rows),)
             self.results = []
             return
+        if 'pg_get_expr' in text or 'pg_constraint' in text:
+            self.results = []
+            self.fetchone_result = None
+            return
         if any(marker in text for marker in self._CATALOG_MARKERS):
             self.results = [(name,) for name in self.catalog_names]
             self.fetchone_result = None

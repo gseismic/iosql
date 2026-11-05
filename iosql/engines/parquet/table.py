@@ -104,7 +104,8 @@ class Table(DirectoryTable):
         return super()._overwrite_table_meta(meta)
 
     def _use_contract_locked(self, contract):
-        contract = TableContract.ensure(contract)
+        # 空表会在本层立即落盘，必须与父类使用同一个日期路由契约。
+        contract = self._date_key_contract(TableContract.ensure(contract))
         for type_ in contract.columns.values():
             _sql_type(type_)
         result = super()._use_contract_locked(contract)
@@ -379,9 +380,8 @@ class Table(DirectoryTable):
             raise TableSpecConflict('Parquet 表的主键不能变更')
         previous_partition = (current or {}).get('partition')
         new_partition = partition.to_meta() if partition else None
-        if previous_partition != new_partition and previous_partition is not None:
-            if not (kwargs.get('table_contract') or {}).get('force_partition'):
-                raise TableSpecConflict('Parquet 表的分区契约不能变更，请使用 repartition_to')
+        if current is not None and previous_partition != new_partition:
+            raise TableSpecConflict('Parquet 表的分区契约不能变更，请使用 repartition_to')
         for index, row in enumerate(part_data):
             if not isinstance(row, dict):
                 raise BadArgument(f'row[{index}] 必须是 dict')

@@ -8,17 +8,20 @@ import warnings
 import itertools
 import time
 import sys
+import json
+from decimal import Decimal, InvalidOperation
 from contextlib import contextmanager
 from typing import Any, Dict, List
 import arrow
 import psycopg2
+from dateutil.tz import resolve_imaginary
 from psycopg2 import sql
 
 from ...table import BaseTable, resolve_select_fields
 from ...partition import Partition, CalendarPartition
 from ...core.query import Where
 from ...migration import OMITTED
-from ...exception import BadArgument, SchemaConflict
+from ...exception import BadArgument, SchemaConflict, TableSpecConflict
 from ...utils.schema import parse_db_schema
 from ...logger import default_logger as logger
 from ...spec import TableContract, WriteResult
@@ -68,6 +71,8 @@ _PG_TYPE_MAP = {
 _FIELD_IDENTIFIER_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_$]*$')
 # pg_get_expr(relpartbound) 形如 FOR VALUES FROM ('a') TO ('b')
 _PARTITION_BOUNDS_RE = re.compile(r'FROM \((.*)\) TO \((.*)\)', re.IGNORECASE)
+_PARTITION_MARKER_PREFIX = '__iosql_part_v1_'
+_CALENDAR_TRANSITION_PREFIX = 'iosql_tzday_'
 
 
 def _pg_identifier(name):
@@ -539,6 +544,14 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             self._primary_key = list(contract.primary_key)
             self._declared_column_types = dict(contract.columns or {})
             self.create_table(contract.columns, pk=contract.primary_key, partition=self._partition)
+            if self._partition is not None:
+                children = self._inspect_native_layout(self._partition)
+                old = previous[1]
+                if (old is not None and self._partition_contract_meta(old) != self._partition_contract_meta(self._partition)
+                        and (children or not contract.force_partition)):
+                    raise TableSpecConflict('已有分区与请求的 partition 不一致；请使用 migrate_to/repartition_to')
+                self._check_partition_marker(self._partition, children)
+                self._check_control_partition(self._partition, children)
         except BaseException:
             (self._contract, self._partition, self._primary_key,
              self._declared_column_types, self._table_created) = previous
@@ -752,6 +765,10 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         
         if partition is None:
             partition = self._partition
+        if self._contract is not None:
+            expected = self._contract.to_partition()
+            if self._partition_contract_meta(expected) != self._partition_contract_meta(partition):
+                raise TableSpecConflict('写入 partition 与已绑定的分区契约不一致；请使用 migrate_to/repartition_to')
         if pk is None:
             pk = self._primary_key
         if isinstance(pk, str):
@@ -786,6 +803,16 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         partitioned_data = None
         # 整批写入放在一个显式事务中：失败不留半批脏数据
         with self._transaction(commit):
+            if partition is not None:
+                self._lock_partition_layout()
+                # 持有父表原生锁，使绕过 iosql 的并发 DDL 不能穿过布局检查。
+                with self.connect().cursor() as cursor:
+                    cursor.execute(sql.SQL('LOCK TABLE ONLY {} IN ROW EXCLUSIVE MODE').format(
+                        sql.Identifier(self._schema_name(), self._table_name)))
+                children = self._inspect_native_layout(partition)
+                self._check_partition_marker(partition, children)
+                self._check_control_partition(partition, children, update=True)
+                self._ensure_partition_marker(partition, children)
             if partition is None:
                 # No partitioning - insert all into single table
                 self._insert_into_table(
@@ -805,6 +832,8 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                     partitioned_data[key].append(row)
                 
                 for part_key, part_rows in partitioned_data.items():
+                    self._check_legacy_transition_overlap(partition, part_key, part_rows, children)
+                    self._repair_legacy_calendar_boundaries(partition, part_key, part_rows, children)
                     self._insert_partition(
                         part_key,
                         part_rows,
@@ -812,6 +841,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                         pk=pk,
                         replace=replace,
                         ignore=ignore,
+                        children=children,
                     )
         return WriteResult(
             rows_seen=len(data),
@@ -823,24 +853,65 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             ),
         )
 
-    def _native_partition_key(self, partition, row):
-        """calendar 墙上时间按本地边界路由，保证负时区 DATE 与小时 TIMESTAMP 可写。"""
+    def _native_partition_key(self, partition, row, *, merge_transition_day=True):
+        """墙上时间按本地边界路由，时钟变化日使用不重叠的整日分区。"""
         if isinstance(partition, CalendarPartition):
-            kind = self._pg_column_type(self._partition_column_type(partition))
-            if kind in ('DATE', 'TIMESTAMP', 'TEXT'):
-                value = row[partition.TS_COL]
-                if getattr(value, 'tzinfo', None) is None and not (
-                    isinstance(value, str) and re.search(r'(Z|[+-]\d{2}:?\d{2})$', value)
-                ):
-                    if isinstance(value, str) and value.isdigit():
-                        formats = {4: 'YYYY', 6: 'YYYYMM', 8: 'YYYYMMDD',
-                                   10: 'YYYYMMDDHH', 12: 'YYYYMMDDHHmm', 14: 'YYYYMMDDHHmmss'}
-                        parsed = arrow.get(value, formats.get(len(value), partition.fmt))
-                    else:
-                        parsed = arrow.get(value)
-                    parsed = parsed.replace(tzinfo=partition.tz)
-                    return partition.get_key({partition.TS_COL: parsed})
+            parsed = self._calendar_native_local(partition, row[partition.TS_COL])
+            if merge_transition_day and self._calendar_transition_enabled(partition):
+                start, end = self._calendar_day_bounds(parsed)
+                if self._calendar_day_has_transition(start, end):
+                    return _CALENDAR_TRANSITION_PREFIX + start.format('YYYYMMDD')
+            return partition.get_key({partition.TS_COL: parsed})
         return partition.get_key(row)
+
+    def _calendar_native_local(self, partition, value):
+        kind = self._pg_column_type(self._partition_column_type(partition))
+        if kind in ('DATE', 'TIMESTAMP', 'TEXT') and getattr(value, 'tzinfo', None) is None and not (
+            isinstance(value, str) and re.search(r'(Z|[+-]\d{2}:?\d{2})$', value)
+        ):
+            if isinstance(value, str) and value.isdigit():
+                formats = {4: 'YYYY', 6: 'YYYYMM', 8: 'YYYYMMDD',
+                           10: 'YYYYMMDDHH', 12: 'YYYYMMDDHHmm', 14: 'YYYYMMDDHHmmss'}
+                parsed = arrow.get(value, formats.get(len(value), partition.fmt))
+            else:
+                parsed = arrow.get(value)
+            return parsed.replace(tzinfo=partition.tz)
+        return partition._datetime(value)
+
+    @staticmethod
+    def _calendar_transition_enabled(partition):
+        unit = partition._every_unit
+        minutes = partition._every_count * (60 if unit == 'hour' else 1)
+        return not partition._utc_timezone and unit in ('hour', 'minute') and minutes <= 24 * 60
+
+    @staticmethod
+    def _calendar_day_bounds(dt):
+        start = dt.floor('day')
+        end = start.shift(days=1)
+        # 某些时区在午夜前拨，00:00 不存在；使用当天第一个真实时刻。
+        return (arrow.get(resolve_imaginary(start.datetime)),
+                arrow.get(resolve_imaginary(end.datetime)))
+
+    @staticmethod
+    def _calendar_day_has_transition(start, end):
+        return (end.to('UTC') - start.to('UTC')).total_seconds() != 24 * 60 * 60
+
+    def _check_legacy_transition_overlap(self, partition, part_key, rows, children):
+        legacy = [child for child in children if child.get('legacy_tzday')]
+        if not legacy:
+            return
+        new_start, new_end = self._partition_bounds(partition, part_key, rows)
+        column_type = self._pg_column_type(self._partition_column_type(partition))
+        compare = sql.SQL('SELECT %s::{} < %s::{} AND %s::{} < %s::{}').format(
+            *(sql.SQL(column_type),) * 4)
+        with self.connect().cursor() as cursor:
+            for child in legacy:
+                old_start, old_end = child['bounds']
+                cursor.execute(compare, (new_start, old_end, old_start, new_end))
+                if cursor.fetchone()[0]:
+                    raise TableSpecConflict(
+                        '旧版夏令时切换日包含重叠的细粒度分区；请使用 migrate_to 迁移'
+                    )
     
     def _union_columns(self, data: List[Dict]):
         """按首次出现顺序取整批行的列并集；缺列在参数里补 None。
@@ -915,7 +986,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
     
     def _insert_partition(self, part_key, data: List[Dict], partition: Partition,
                          pk=None,
-                         replace=False, ignore=False):
+                         replace=False, ignore=False, children=None):
         """Insert data into a specific native partition."""
         self._insert_into_native_partition(
             part_key,
@@ -924,11 +995,12 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             pk=pk,
             replace=replace,
             ignore=ignore,
+            children=children,
         )
     
     def _insert_into_native_partition(self, part_key, data: List[Dict], partition: Partition,
                                     pk=None,
-                                    replace=False, ignore=False):
+                                    replace=False, ignore=False, children=None):
         """Insert into a native PostgreSQL partition.
 
         分区不存在则创建；同名分区已存在时校验边界，边界不一致立即报错，
@@ -943,9 +1015,22 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             part_key,
             rows=data,
         )
+        # 旧版或外部创建的子表可能使用不同名称；边界一致时交给父表路由。
+        if any(child['bounds'] == (start_bound, end_bound) and child['legacy_bounds'] is None
+               for child in children or []):
+            self._insert_into_table(data, self._table_name, pk=pk, replace=replace, ignore=ignore)
+            return
         existing_bound = self._existing_partition_bounds(partition_name)
+        if (existing_bound is not None and
+                not self._partition_bounds_equal(existing_bound, start_bound, end_bound, partition=partition) and
+                any(child['schema'] == self._schema_name() and child['name'] == partition_name
+                    for child in children or [])):
+            # 旧版负数分区可能占用正数的名称，使用确定性后缀避开冲突。
+            suffix = '_h' + hashlib.sha256(str(part_key).encode()).hexdigest()[:12]
+            partition_name = _fit_identifier(partition_name, suffix)
+            existing_bound = self._existing_partition_bounds(partition_name)
         if existing_bound is not None:
-            if not self._partition_bounds_equal(existing_bound, start_bound, end_bound):
+            if not self._partition_bounds_equal(existing_bound, start_bound, end_bound, partition=partition):
                 raise BadArgument(
                     f'分区 `{partition_name}` 已存在但边界与期望不一致: '
                     f'{existing_bound!r}，期望 FROM ({start_bound!r}) TO ({end_bound!r})。'
@@ -1008,10 +1093,215 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         row = cursor.fetchone()
         return row[0] if row else None
 
-    def _partition_bounds_equal(self, existing_expr, start_bound, end_bound):
+    def _lock_partition_layout(self):
+        """同一父表的布局检查与写入在事务中串行化，锁随事务释放。"""
+        identity = f'{len(self._schema_name())}:{self._schema_name()}:{self._table_name}'
+        key = int.from_bytes(hashlib.sha256(f'iosql-partition:{identity}'.encode()).digest()[:8],
+                             'big', signed=True)
+        with self.connect().cursor() as cursor:
+            cursor.execute('SELECT pg_advisory_xact_lock(%s)', (key,))
+
+    @staticmethod
+    def _partition_contract_meta(partition):
+        if partition is None:
+            return None
+        meta = partition.to_meta()
+        if meta.get('date_key') == 'local':
+            # 原生 DATE/TEXT 按业务日期路由，目录文件路由版本与 PG 布局无关。
+            meta.pop('date_key')
+            if meta.get('time_unit') == 'date':
+                meta.pop('time_unit')
+        return meta
+
+    @staticmethod
+    def _partition_marker(partition):
+        payload = json.dumps(Table._partition_contract_meta(partition), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
+        return _PARTITION_MARKER_PREFIX + hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+    def _partition_markers(self):
+        with self.connect().cursor() as cursor:
+            cursor.execute('''SELECT conname, pg_get_constraintdef(oid) FROM pg_constraint
+                              WHERE conrelid=to_regclass(%s) AND contype='c'
+                                AND left(conname, %s)=%s''',
+                           (self._qualified_relation(), len(_PARTITION_MARKER_PREFIX),
+                            _PARTITION_MARKER_PREFIX))
+            rows = cursor.fetchall()
+        for name, definition in rows:
+            if (not re.fullmatch(re.escape(_PARTITION_MARKER_PREFIX) + r'[0-9a-f]{32}', name)
+                    or re.sub(r'\s+', '', definition).lower() != 'check(true)'):
+                raise TableSpecConflict(f'约束 `{name}` 占用了 iosql 分区契约名称，请检查后再操作')
+        return [name for name, _ in rows]
+
+    def _check_partition_marker(self, partition, children):
+        markers = self._partition_markers()
+        expected = self._partition_marker(partition)
+        if (markers and markers != [expected] and
+                (children or self._contract is None or not self._contract.force_partition)):
+            raise TableSpecConflict('已有表的分区契约与请求的 partition 不一致；请使用 migrate_to/repartition_to')
+        return markers
+
+    def _control_partition_contract(self):
+        """读取旧迁移已保存的契约；没有控制表或当前关系未登记时返回 None。"""
+        with self.connect().cursor() as cursor:
+            cursor.execute("SELECT to_regclass('__iosql_control.table_contracts')")
+            row = cursor.fetchone()
+            if not row or row[0] is None:
+                return None
+            cursor.execute('''SELECT contract FROM __iosql_control.table_contracts
+                              WHERE schema_name=%s AND table_name=%s
+                                AND relation_oid=to_regclass(%s)''',
+                           (self._schema_name(), self._table_name, self._qualified_relation()))
+            row = cursor.fetchone()
+        if not row:
+            return None
+        payload = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+        return TableContract.from_dict(payload)
+
+    def _check_control_partition(self, partition, children, update=False):
+        stored = self._control_partition_contract()
+        if stored is None:
+            return
+        previous = stored.to_partition()
+        if self._partition_contract_meta(previous) == self._partition_contract_meta(partition):
+            return
+        if children or self._contract is None or not self._contract.force_partition:
+            raise TableSpecConflict('历史迁移保存的分区契约与请求不一致；请使用 migrate_to/repartition_to')
+        from ...database import Database
+        Database._ensure_contract_core_compatible(stored, self._contract)
+        if stored.time != self._contract.time:
+            raise TableSpecConflict('空表变更分区不能同时修改历史时间契约；请重新声明原时间语义或迁移')
+        if update:
+            updated = stored.to_dict()
+            updated['partition'] = self._contract.partition.to_dict() if self._contract.partition else None
+            updated['force_partition'] = True
+            with self.connect().cursor() as cursor:
+                cursor.execute('''UPDATE __iosql_control.table_contracts SET contract=%s
+                                  WHERE schema_name=%s AND table_name=%s
+                                    AND relation_oid=to_regclass(%s)''',
+                               (json.dumps(updated), self._schema_name(),
+                                self._table_name, self._qualified_relation()))
+
+    def _ensure_partition_marker(self, partition, children):
+        markers = self._check_partition_marker(partition, children)
+        expected = self._partition_marker(partition)
+        if markers == [expected]:
+            return
+        # 无子分区时尚无数据布局，可以替换空表上遗留的旧摘要。
+        parent = sql.Identifier(self._schema_name(), self._table_name)
+        with self.connect().cursor() as cursor:
+            for marker in markers:
+                cursor.execute(sql.SQL('ALTER TABLE {} DROP CONSTRAINT {}').format(
+                    parent, sql.Identifier(marker)))
+            try:
+                cursor.execute(sql.SQL('ALTER TABLE {} ADD CONSTRAINT {} CHECK (TRUE)').format(
+                    parent, sql.Identifier(expected)))
+            except psycopg2.errors.InsufficientPrivilege as exc:
+                raise TableSpecConflict(
+                    '首次写入需要表所有者权限以固定分区契约，请联系表所有者授权或迁移到新表'
+                ) from exc
+
+    @staticmethod
+    def _bound_text(raw_value):
+        text = str(raw_value or '').strip()
+        text = re.sub(r'::[A-Za-z_][A-Za-z0-9_ ]*$', '', text).strip()
+        if text.startswith("'") and text.endswith("'"):
+            text = text[1:-1].replace("''", "'")
+        return text
+
+    def _inspect_native_layout(self, partition):
+        """验证全部子分区；识别旧版可能跨年的多日 calendar 边界。"""
+        with self.connect().cursor() as cursor:
+            cursor.execute('''SELECT n.nspname, c.relname, pg_get_expr(c.relpartbound, c.oid)
+                              FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+                              JOIN pg_namespace n ON n.oid=c.relnamespace
+                              WHERE i.inhparent=to_regclass(%s) ORDER BY n.nspname,c.relname''',
+                           (self._qualified_relation(),))
+            rows = cursor.fetchall()
+        children = []
+        kind = self._pg_column_type(self._partition_column_type(partition))
+        for schema, name, expression in rows:
+            match = _PARTITION_BOUNDS_RE.search(str(expression or ''))
+            if not match:
+                raise TableSpecConflict(f'分区 `{schema}.{name}` 的边界无法验证；请迁移到新表')
+            text = self._bound_text(match.group(1))
+            try:
+                value = int(text) if kind == 'BIGINT' else float(text) if kind == 'DOUBLE PRECISION' else text
+                sample = {partition.TS_COL: value}
+                key = self._native_partition_key(partition, sample)
+                bounds = self._partition_bounds(partition, key, [sample])
+                legacy_bounds = (self._calendar_partition_bounds(partition, key, [sample], legacy=True)
+                                 if isinstance(partition, CalendarPartition) else None)
+            except (BadArgument, TypeError, ValueError, OverflowError, KeyError) as exc:
+                raise TableSpecConflict(f'无法验证分区 `{schema}.{name}` 的边界；请迁移到新表') from exc
+            legacy = False
+            legacy_tzday = None
+            if not self._partition_bounds_equal(expression, *bounds, partition=partition):
+                if isinstance(key, str) and key.startswith(_CALENDAR_TRANSITION_PREFIX):
+                    old_key = self._native_partition_key(partition, sample, merge_transition_day=False)
+                    old_bounds = self._calendar_partition_bounds(partition, old_key, [sample], legacy=True)
+                    if self._partition_bounds_equal(expression, *old_bounds, partition=partition):
+                        bounds = old_bounds
+                        legacy_tzday = key
+                legacy = (legacy_bounds is not None and bounds != legacy_bounds and
+                          self._partition_bounds_equal(expression, *legacy_bounds, partition=partition))
+                if not legacy and legacy_tzday is None:
+                    raise TableSpecConflict(
+                        f'已有分区 `{schema}.{name}` 的边界与请求的 partition 不一致；'
+                        '请使用 migrate_to/repartition_to'
+                    )
+            children.append({'schema': schema, 'name': name, 'bounds': bounds,
+                             'legacy_bounds': legacy_bounds if legacy else None,
+                             'legacy_tzday': legacy_tzday})
+        return children
+
+    def _repair_legacy_calendar_boundaries(self, partition, part_key, rows, children):
+        legacy = [child for child in children if child['legacy_bounds'] is not None]
+        if not legacy:
+            return
+        new_start, new_end = self._partition_bounds(partition, part_key, rows)
+        column_type = self._pg_column_type(self._partition_column_type(partition))
+        for child in legacy:
+            start, clipped_end = child['bounds']
+            old_end = child['legacy_bounds'][1]
+            with self.connect().cursor() as cursor:
+                compare = sql.SQL('SELECT %s::{} < %s::{} AND %s::{} < %s::{}').format(
+                    *(sql.SQL(column_type),) * 4)
+                cursor.execute(compare, (new_start, old_end, clipped_end, new_end))
+                overlaps = cursor.fetchone()[0]
+                if not overlaps and child['bounds'] != (new_start, new_end):
+                    continue
+                parent = sql.Identifier(self._schema_name(), self._table_name)
+                child_name = sql.Identifier(child['schema'], child['name'])
+                cursor.execute(sql.SQL('LOCK TABLE ONLY {} IN ACCESS EXCLUSIVE MODE').format(parent))
+                # 外部 DDL 不遵循 advisory 锁；获得原生锁后重新检查边界。
+                current = {(item['schema'], item['name']): item
+                           for item in self._inspect_native_layout(partition)}
+                latest = current.get((child['schema'], child['name']))
+                if latest is None or latest['legacy_bounds'] != child['legacy_bounds']:
+                    raise TableSpecConflict('历史分区布局在检查时发生变化，请重试或迁移到新表')
+                cursor.execute(sql.SQL('SELECT EXISTS (SELECT 1 FROM ONLY {} WHERE {} >= %s)').format(
+                    child_name, sql.Identifier(partition.TS_COL)), (clipped_end,))
+                if cursor.fetchone()[0]:
+                    raise TableSpecConflict('历史跨年分区包含越界数据，无法自动调整；请使用 migrate_to 迁移')
+                try:
+                    cursor.execute(sql.SQL('ALTER TABLE {} DETACH PARTITION {}').format(parent, child_name))
+                    cursor.execute(sql.SQL('ALTER TABLE {} ATTACH PARTITION {} FOR VALUES FROM (%s) TO (%s)').format(
+                        parent, child_name), (start, clipped_end))
+                except psycopg2.Error as exc:
+                    raise TableSpecConflict(
+                        '无法安全调整历史跨年分区；事务将回滚，请检查表权限或使用 migrate_to 迁移'
+                    ) from exc
+                child['legacy_bounds'] = None
+
+    def _partition_bounds_equal(self, existing_expr, start_bound, end_bound, *, partition=None):
         match = _PARTITION_BOUNDS_RE.search(str(existing_expr or ''))
         if not match:
             return False
+        partition = partition or self._partition
+        if partition is not None and self._pg_column_type(self._partition_column_type(partition)) == 'TEXT':
+            # TEXT 的原生范围按字符串排序，不能把不同文本当成同一个时间或数字。
+            return (self._bound_text(match.group(1)) == str(start_bound) and
+                    self._bound_text(match.group(2)) == str(end_bound))
         return (
             self._bound_value_equal(match.group(1), start_bound)
             and self._bound_value_equal(match.group(2), end_bound)
@@ -1019,15 +1309,12 @@ class Table(PostgreSQLQueryMixin, BaseTable):
 
     @staticmethod
     def _bound_value_equal(raw_value, expected):
-        text = str(raw_value or '').strip()
-        text = re.sub(r'::[A-Za-z_][A-Za-z0-9_ ]*$', '', text).strip()
-        if text.startswith("'") and text.endswith("'"):
-            text = text[1:-1].replace("''", "'")
+        text = Table._bound_text(raw_value)
         if str(expected) == text:
             return True
         try:
-            return float(text) == float(expected)
-        except (TypeError, ValueError):
+            return Decimal(text) == Decimal(str(expected))
+        except (InvalidOperation, TypeError, ValueError):
             pass
         try:
             return arrow.get(text) == arrow.get(expected)
@@ -1044,9 +1331,28 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         partition: CalendarPartition,
         part_key,
         rows=None,
+        legacy=False,
     ):
-        start = arrow.get(str(part_key), partition.fmt, tzinfo=partition.tz)
-        end = start.shift(**partition._shift_kwargs())
+        key = str(part_key)
+        if key.startswith(_CALENDAR_TRANSITION_PREFIX):
+            day = arrow.get(key[len(_CALENDAR_TRANSITION_PREFIX):], 'YYYYMMDD', tzinfo=partition.tz)
+            start, end = self._calendar_day_bounds(day)
+        else:
+            start = arrow.get(key, partition.fmt, tzinfo=partition.tz)
+            end = start.shift(**partition._shift_kwargs()) if legacy else partition._bucket_end(start)
+            if not legacy and rows and self._calendar_transition_enabled(partition):
+                sample = self._calendar_sample_value(partition, rows)
+                if sample is not None:
+                    local = self._calendar_native_local(partition, sample)
+                    day_start, day_end = self._calendar_day_bounds(local)
+                    if start < day_start:
+                        previous_start, previous_end = self._calendar_day_bounds(start)
+                        if self._calendar_day_has_transition(previous_start, previous_end):
+                            start = day_start
+                    if end > day_end:
+                        following_start, following_end = self._calendar_day_bounds(day_end)
+                        if self._calendar_day_has_transition(following_start, following_end):
+                            end = day_end
         column_type = self._partition_column_type(partition)
         normalized = str(column_type or 'text').strip().lower()
 
@@ -1115,11 +1421,18 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         return None
 
     def _partition_table_name(self, part_key):
-        suffix = re.sub(r'[^0-9A-Za-z_]+', '_', str(part_key))
-        suffix = suffix.strip('_') or 'all'
-        if suffix[0].isdigit():
-            suffix = f'p_{suffix}'
-        return f'{self._table_name}_p_{suffix}'
+        if isinstance(part_key, int) and not isinstance(part_key, bool) and part_key < 0:
+            suffix = f'n_{abs(part_key)}'
+        else:
+            suffix = re.sub(r'[^0-9A-Za-z_]+', '_', str(part_key)).strip('_') or 'all'
+            if suffix[0].isdigit():
+                suffix = f'p_{suffix}'
+        name = f'{self._table_name}_p_{suffix}'
+        if len(name.encode('utf-8')) <= _IDENTIFIER_MAX_BYTES:
+            return name
+        # PostgreSQL 会静默截断标识符；使用完整名称的摘要避免不同分区撞名。
+        digest = '_h' + hashlib.sha256(name.encode()).hexdigest()[:16]
+        return _fit_identifier(name, digest)
     
     def select_all(self, fields='*', where=None, limit=None, **kwargs):
         warnings.warn(

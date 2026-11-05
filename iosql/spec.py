@@ -1,9 +1,12 @@
 import math
 import numbers
+import re
 from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
 import arrow
+from dateutil.tz import resolve_imaginary
 
 from .exception import BadArgument, PartitionSpecError
 from .partition import (
@@ -271,7 +274,7 @@ def _parse_partition_expr_options(kind: str, tokens: List[str]) -> tuple[str, Di
 
     allowed = {
         "duration": {"every"},
-        "calendar": {"every", "timezone", "fmt"},
+        "calendar": {"every", "timezone", "fmt", "date_key"},
         "range": {"width"},
     }[kind]
     unknown = sorted(set(options) - allowed)
@@ -308,6 +311,7 @@ def _parse_partition_expr(text: str) -> "PartitionSpec":
             kind="calendar",
             timezone=options.get("timezone"),
             fmt=options.get("fmt"),
+            date_key=options.get("date_key"),
         )
 
     every: Any = options.get("every", "1day")
@@ -397,6 +401,8 @@ def format_partition_spec(value: Any) -> str:
             parts.append(f"timezone={_format_partition_value(spec.timezone)}")
         if spec.fmt and _calendar_every_from_fmt(spec.fmt) is None:
             parts.append(f"fmt={_format_partition_value(spec.fmt)}")
+        if spec.date_key:
+            parts.append(f"date_key={_format_partition_value(spec.date_key)}")
         return f"calendar({','.join(parts)})"
     if spec.kind == "duration":
         return (
@@ -404,6 +410,23 @@ def format_partition_spec(value: Any) -> str:
             f"every={_format_partition_value(_format_duration_every(spec.every))})"
         )
     raise PartitionSpecError(f"Unsupported partition kind `{spec.kind}`")
+
+
+def _natural_day_bounds(local):
+    """业务时区自然日的两个真实边界，兼容午夜不存在的时区切换。"""
+    start = local.floor('day')
+    end = start.shift(days=1)
+    return (arrow.get(resolve_imaginary(start.datetime)),
+            arrow.get(resolve_imaginary(end.datetime)))
+
+
+def _epoch_ceiling(value, unit):
+    """返回不早于边界的最小整数时间单位，避免负时间戳向零截断。"""
+    delta = value.to('UTC').datetime - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    microseconds = ((delta.days * 86400 + delta.seconds) * 1_000_000
+                    + delta.microseconds)
+    divisor = 1000 if unit == 'ms' else 1_000_000
+    return -(-microseconds // divisor)
 
 
 @dataclass
@@ -421,6 +444,11 @@ class TimeColumn:
         if value is None:
             return None
         if self.unit == "date":
+            if isinstance(value, date) and not isinstance(value, datetime):
+                value = value.isoformat()
+            if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                # 纯日期不是 UTC 时刻；保留调用方指定的业务日。
+                return arrow.get(value, 'YYYY-MM-DD').format('YYYY-MM-DD')
             # date 语义必须先按契约时区换算，否则 UTC 晚间的值在
             # Asia/Shanghai 下会被归一成前一天
             return arrow.get(value).to(self.timezone).format("YYYY-MM-DD")
@@ -439,8 +467,15 @@ class TimeColumn:
             normalized = self.normalize_value(value)
             return normalized, normalized
 
-        start, end = arrow.get(value).to(self.timezone).span("day")
-        return self.normalize_value(start), self.normalize_value(end)
+        if isinstance(value, date) and not isinstance(value, datetime):
+            value = value.isoformat()
+        if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+            local = arrow.get(value, 'YYYY-MM-DD', tzinfo=self.timezone)
+        else:
+            local = arrow.get(value).to(self.timezone)
+        start, next_day = _natural_day_bounds(local)
+        return (_epoch_ceiling(start, self.unit),
+                _epoch_ceiling(next_day, self.unit) - 1)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -638,6 +673,7 @@ class PartitionSpec:
     time_unit: Optional[str] = None
     timezone: Optional[str] = None
     fmt: Optional[str] = None
+    date_key: Optional[str] = None
 
     def __post_init__(self):
         self.column = str(self.column or "").strip()
@@ -651,6 +687,14 @@ class PartitionSpec:
                 f"{', '.join(sorted(_PARTITION_KINDS))}"
             )
         self.time_unit = _normalize_time_unit(self.time_unit)
+        if self.date_key not in (None, 'legacy', 'local'):
+            raise PartitionSpecError('calendar date_key must be legacy or local')
+        if self.date_key is not None and self.kind != 'calendar':
+            raise PartitionSpecError('date_key is only supported for calendar partitions')
+        if self.date_key is not None and self.time_unit not in (None, 'date'):
+            raise PartitionSpecError('date_key requires a date time unit')
+        if self.date_key is not None and self.time_unit is None:
+            self.time_unit = 'date'
         if self.timezone is not None:
             self.timezone = str(self.timezone)
         if self.fmt is not None:
@@ -688,6 +732,8 @@ class PartitionSpec:
     def to_partition(self, time: Optional[TimeColumn] = None) -> RuntimePartition:
         spec = self.with_time(time)
         unit = spec.time_unit
+        if spec.date_key is not None and time and time.name == spec.column and time.unit != 'date':
+            raise PartitionSpecError('date_key requires a date time column')
         if spec.kind == "range":
             width = _to_int_every(spec.every)
             return RangePartition(width=width, column=spec.column)
@@ -699,6 +745,7 @@ class PartitionSpec:
                 ts_col=spec.column,
                 every=spec.every,
                 time_unit=(time.unit if time and time.name == spec.column else spec.time_unit),
+                date_key=spec.date_key,
             )
         if unit not in [None, "ms"]:
             raise PartitionSpecError(
@@ -712,7 +759,7 @@ class PartitionSpec:
         return sorted({part_obj.get_key(row) for row in rows})
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        result = {
             "column": self.column,
             "every": self.every,
             "kind": self.kind,
@@ -720,6 +767,9 @@ class PartitionSpec:
             "timezone": self.timezone,
             "fmt": self.fmt,
         }
+        if self.date_key is not None:
+            result['date_key'] = self.date_key
+        return result
 
     @classmethod
     def by_time(cls, column: str, every: Any = "1day",
@@ -757,6 +807,7 @@ class PartitionSpec:
             time_unit=data.get("time_unit"),
             timezone=data.get("timezone"),
             fmt=data.get("fmt"),
+            date_key=data.get("date_key"),
         )
 
     @classmethod
@@ -809,6 +860,7 @@ class PartitionSpec:
                 time_unit=meta.get("time_unit", "date"),
                 timezone=meta.get("tz", "UTC"),
                 fmt=fmt,
+                date_key=meta.get("date_key"),
             )
         raise PartitionSpecError(
             f"Unknown partition type `{partition_type}`；"

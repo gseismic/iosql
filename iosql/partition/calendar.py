@@ -1,5 +1,5 @@
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from functools import lru_cache
 from typing import Any, Dict
 import arrow
@@ -71,7 +71,7 @@ class CalendarPartition(Partition):
     }
     
     def __init__(self, fmt: str, tz: str, ts_col: str, every: Any = None,
-                 *, time_unit=None):
+                 *, time_unit=None, date_key=None):
         """
         Args:
             fmt: Date format string (e.g., 'YYYYMMDD', 'YYYYMM', 'YYYYMMDDHH')
@@ -89,10 +89,18 @@ class CalendarPartition(Partition):
             )
         self.fmt = fmt
         self.tz = tz
+        self._utc_timezone = str(tz).upper() in ('UTC', 'ETC/UTC', 'GMT', 'ETC/GMT', 'Z')
         self.TS_COL = ts_col
         if time_unit not in (None, 'date', 'ms', 's'):
             raise PartitionSpecError('calendar time_unit 必须是 ms/s/date')
         self.time_unit = time_unit
+        if date_key not in (None, 'legacy', 'local'):
+            raise PartitionSpecError('calendar date_key 必须是 legacy 或 local')
+        if date_key is not None and time_unit not in (None, 'date'):
+            raise PartitionSpecError('calendar date_key 需要 date 时间单位')
+        if date_key is not None and time_unit is None:
+            self.time_unit = 'date'
+        self.date_key = date_key
         self.every = self.normalize_every(every) if every else None
         count, unit = self.parse_every(self.every or self.default_every_for_fmt(fmt))
         self._every_count = count
@@ -181,12 +189,25 @@ class CalendarPartition(Partition):
             'minute': 'minutes',
         }[self._every_unit]
         return {plural: self._every_count}
+
+    def _bucket_end(self, start):
+        """与按年重置的多日桶保持一致，避免年末范围跨入下一年的桶。"""
+        end = start.shift(**self._shift_kwargs())
+        if self._every_unit == 'day' and self._every_count <= 366 and end.year != start.year:
+            next_year = arrow.get(start.year + 1, 1, 1, tzinfo=self.tz)
+            end = min(end, next_year)
+        return end
     
     def _key_for_value_uncached(self, value: Any) -> str:
         dt = self._datetime(value)
         return self._bucket_start(dt).format(self.fmt)
 
     def _datetime(self, value):
+        if self.time_unit == 'date' and self.date_key == 'local':
+            if isinstance(value, date) and not isinstance(value, datetime):
+                value = value.isoformat()
+            if isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
+                return arrow.get(value, 'YYYY-MM-DD', tzinfo=self.tz)
         if self.time_unit in ('ms', 's') and isinstance(value, (int, float)):
             seconds = value / 1000 if self.time_unit == 'ms' else value
             # 显式单位避免 Arrow 把早期 epoch 毫秒猜成秒。
@@ -220,9 +241,24 @@ class CalendarPartition(Partition):
             Tuple of (start_timestamp_ms, end_timestamp_ms)
         """
         start_dt = arrow.get(key, self.fmt, tzinfo=self.tz)
-        end_dt = start_dt.shift(**self._shift_kwargs())
+        end_dt = self._bucket_end(start_dt)
+        start_ms = int(start_dt.to('UTC').timestamp() * 1000)
+        if self._every_unit in ('hour', 'minute') and not self._utc_timezone:
+            # 前拨时缺失的墙上时间会被解析到更晚的实际时刻；向前保守覆盖跳跃量。
+            try:
+                before = start_dt.shift(days=-2).utcoffset()
+                after = start_dt.shift(days=2).utcoffset()
+            except (ValueError, OverflowError):
+                before = after = None
+            if before is not None and after is not None:
+                start_ms -= max(0, int((after - before).total_seconds() * 1000))
+        if self._every_unit in ('hour', 'minute') and not self._utc_timezone and end_dt.ambiguous:
+            # 回拨后同一墙上时间出现两次；范围必须覆盖较晚的结束时刻。
+            later = end_dt.replace(fold=1)
+            if later.timestamp() > end_dt.timestamp():
+                end_dt = later
         return (
-            int(start_dt.to('UTC').timestamp() * 1000),
+            start_ms,
             int(end_dt.to('UTC').timestamp() * 1000)
         )
     
@@ -250,6 +286,9 @@ class CalendarPartition(Partition):
             meta['every'] = self.every
         if self.time_unit in ('ms', 's'):
             meta['time_unit'] = self.time_unit
+        if self.time_unit == 'date' and self.date_key == 'local':
+            meta['time_unit'] = 'date'
+            meta['date_key'] = 'local'
         return meta
     
     @classmethod
@@ -278,4 +317,5 @@ class CalendarPartition(Partition):
             ts_col=meta['ts_col'],
             every=meta.get('every'),
             time_unit=meta.get('time_unit'),
+            date_key=meta.get('date_key'),
         )

@@ -29,7 +29,7 @@ def render_sql(query):
     if isinstance(query, sql.SQL):
         return query.string
     if isinstance(query, sql.Identifier):
-        return '"' + query.string.replace('"', '""') + '"'
+        return '.'.join('"' + part.replace('"', '""') + '"' for part in query.strings)
     if isinstance(query, sql.Composed):
         return ''.join(render_sql(part) for part in query.seq)
     string = getattr(query, 'string', None)
@@ -109,6 +109,8 @@ class FakeConnection:
 @pytest.fixture
 def fake_pg(monkeypatch):
     conn = FakeConnection()
+    # 该轻量假连接不模拟独立的迁移控制表；控制表行为由真实 PG 回归覆盖。
+    monkeypatch.setattr(pg_module.Table, '_control_partition_contract', lambda self: None)
     monkeypatch.setattr(
         pg_module.psycopg2,
         'connect',
@@ -771,6 +773,8 @@ class TestContractDriftP2:
                 cursor.fetchone_result = (['symbol', 'ts'],)
             elif 'pg_partitioned_table' in lower:
                 cursor.fetchone_result = (('r', 1, 'ts') if 'partstrat' in lower else (1,)) if partitioned else None
+            elif 'pg_inherits' in lower or 'pg_constraint' in lower:
+                cursor.results = []
             elif 'pg_class' in lower:
                 cursor.fetchone_result = (1,) if relation_exists else None
         return responder

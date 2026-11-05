@@ -4,6 +4,7 @@ import threading
 import warnings
 import weakref
 from dataclasses import replace
+from functools import wraps
 from .coordination import guard_database_class
 
 from .utils.schema import parse_db_schema
@@ -16,14 +17,10 @@ from .exception import (
 )
 from .engines import sqlite
 from .partition import Partition
-from .spec import Segment, TableContract, TimeColumn, PartitionSpec
+from .spec import Segment, TableContract, TimeColumn, PartitionSpec, parse_partition_spec
 from .utils.storage_identity import (
     iosql_table_names, is_iosql_database, is_iosql_scaffold, is_iosql_table,
 )
-
-
-def _is_calendar_partition(partition):
-    return getattr(partition, 'PARTITION_TYPE', None) == 'calendar'
 
 
 _RENAME_BACKUP_SUFFIX = '.__rename_tmp__'
@@ -54,6 +51,22 @@ def _forbidden_rename_target_reason(path):
 
 def _binding_fields():
     return ('order_key', 'symbol_column', 'session_column', 'conflict', 'schema_policy')
+
+
+def _warn_ignored_partition_every(function):
+    """在不改变公开默认值的情况下识别调用方显式提供的关键字参数。"""
+    @wraps(function)
+    def wrapped(self, *args, **kwargs):
+        if kwargs.get('partition') is not None and 'partition_every' in kwargs:
+            warnings.warn(
+                f"Database.timeseries: 显式指定的 partition_every={kwargs['partition_every']!r} "
+                "被忽略，分区由 partition 决定；请移除 partition_every，"
+                "并在 partition 中设置期望的分区规则。",
+                UserWarning,
+                stacklevel=3,
+            )
+        return function(self, *args, **kwargs)
+    return wrapped
 
 
 _DEFAULT_MAX_OPEN_PARTITIONS = 5
@@ -374,6 +387,15 @@ class Database(object):
         这里补齐 order_key/symbol_column/session_column/conflict/schema_policy
         的校验与落盘，避免 `spec=` 绑定被静默忽略。
         """
+        if hasattr(table, '_mutation_lock'):
+            # 检查、绑定和元数据更新必须与同表写入共用一把锁。
+            with table._mutation_lock():
+                return self._bind_contract_locked(table, contract, force_partition)
+        return self._bind_contract_locked(table, contract, force_partition)
+
+    def _bind_contract_locked(self, table, contract, force_partition):
+        if hasattr(table, '_date_key_contract'):
+            contract = table._date_key_contract(contract)
         stored = table.spec()
         if stored is not None:
             conflicts = []
@@ -400,15 +422,20 @@ class Database(object):
                     "symbol/session/order_key/conflict，请新建表后 repartition_to"
                 )
 
-        if force_partition and stored is not None:
-            # force_partition 显式允许分区契约变更：跳过引擎分区冲突检查，
-            # 直接绑定并落盘，保证 write()/query() 立即使用新契约
+        if force_partition and stored is not None and hasattr(table, '_mutation_lock'):
+            # force 只允许修改尚无物理分区的表；已有数据必须显式迁移。
             self._ensure_contract_core_compatible(stored, contract)
+            previous_partition = stored.to_partition()
+            requested_partition = contract.to_partition()
+            previous_meta = previous_partition.to_meta() if previous_partition else None
+            requested_meta = requested_partition.to_meta() if requested_partition else None
+            if previous_meta != requested_meta and table.table_parts():
+                raise TableSpecConflict(
+                    f'Partition conflict: current={previous_meta} new={requested_meta}；'
+                    '已有物理分区，不能原地修改；请使用 repartition_to() 或 migrate_to()'
+                )
             if hasattr(table, '_declared_spec'):
                 table._declared_spec = contract
-            if hasattr(table, '_contract'):
-                # PG 引擎的运行时契约字段
-                table._contract = contract
             table._partition = contract.to_partition()
         else:
             table.use_contract(contract)
@@ -462,8 +489,8 @@ class Database(object):
             if getattr(stored, field_name) != getattr(contract, field_name):
                 merged[field_name] = getattr(contract, field_name)
                 changed = True
-        if force_partition and contract.partition is not None:
-            merged['partition'] = contract.partition.to_dict()
+        if force_partition:
+            merged['partition'] = contract.partition.to_dict() if contract.partition else None
             merged['force_partition'] = True
             changed = True
         if not changed:
@@ -472,10 +499,12 @@ class Database(object):
         if not meta:
             return
         meta['table_contract'] = merged
-        if force_partition and contract.partition is not None:
-            meta['partition'] = contract.partition.to_partition().to_meta()
+        if force_partition:
+            partition = contract.to_partition()
+            meta['partition'] = partition.to_meta() if partition else None
         table._overwrite_table_meta(meta)
 
+    @_warn_ignored_partition_every
     def timeseries(self, table_name, time, pk=None, primary_key=None,
                    columns=None, *, partition_every='1day', timezone='UTC',
                    symbol_column='symbol', session_column=None,
@@ -491,6 +520,8 @@ class Database(object):
         等价于 `db.table(..., partition=Partition.duration(time, every=partition_every),
         order_key=time, time=time, ...)`；calendar 场景传
         `partition=Partition.calendar(...)`。
+        同时显式传入非 `None` 的 `partition` 和 `partition_every` 时，使用 `partition`，
+        并发出 `UserWarning` 提示 `partition_every` 被忽略。
 
         `description`、`column_descriptions`、`column_ranges` 与 `table()` 相同，
         会随时序契约传递。
@@ -515,7 +546,7 @@ class Database(object):
                 "timeseries(partition_kind=...) 已废弃：calendar 场景请传 "
                 "partition=Partition.calendar(...)，duration 为默认行为",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=4,
             )
             use_calendar = str(partition_kind).strip().lower() == 'calendar'
         if time_unit is not None:
@@ -523,7 +554,7 @@ class Database(object):
                 "timeseries(time_unit=...) 已废弃：date 场景请使用 calendar 分区 "
                 "(partition=Partition.calendar(...) 或 db.table(partition=...))",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=4,
             )
             if str(time_unit).strip().lower() == 'date':
                 use_calendar = True
@@ -536,7 +567,7 @@ class Database(object):
                 "timeseries(target/min/max_rows_per_file=...) 已废弃：请改传 "
                 "segment=Segment.rows(max_rows=..., target_rows=..., min_rows=...)",
                 DeprecationWarning,
-                stacklevel=2,
+                stacklevel=4,
             )
             if segment is None:
                 segment = Segment.rows(
@@ -570,10 +601,14 @@ class Database(object):
                 ).to_partition()
 
         if isinstance(time, str):
-            if _is_calendar_partition(partition):
+            partition_spec = parse_partition_spec(partition)
+            if (partition_spec.kind == 'calendar' or
+                    partition_spec.kind == 'duration' and partition_spec.time_unit == 'date'):
                 # calendar 分区以自身 tz 为准，避免与显式 partition 的时区漂移
-                tz = getattr(partition, 'tz', None) or timezone
-                time_column = TimeColumn(time, unit='date', timezone=tz)
+                tz = partition_spec.timezone or timezone
+                time_column = TimeColumn(
+                    time, unit=partition_spec.time_unit or 'date', timezone=tz,
+                )
             else:
                 time_column = TimeColumn(time, unit='ms', timezone=timezone)
         else:

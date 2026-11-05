@@ -398,7 +398,7 @@ def test_spec_order_key_conflict_raises_with_hint(tmp_path):
         db.close()
 
 
-def test_force_partition_shortcut_skips_partition_conflict(tmp_path):
+def test_force_partition_shortcut_rejects_existing_partition_change(tmp_path):
     db_path = tmp_path / "force.iosql"
     db = Database(_uri(db_path))
     try:
@@ -409,23 +409,21 @@ def test_force_partition_shortcut_skips_partition_conflict(tmp_path):
         table.write({"ts": 1000, "v": 1})
         assert table.table_parts() == [0]
 
-        forced = db.table(
-            "t", pk=["ts"], columns={"ts": "integer", "v": "integer"},
-            partition=Partition.duration("ts", every="1hour"),
-            force_partition=True,
-        )
-        assert forced.spec().force_partition is True
-        assert forced.spec().partition.to_partition().interval_ms == 3_600_000
-        forced.write({"ts": 7_200_000, "v": 2})
-        assert forced.table_parts() == [0, 7_200_000]
+        with pytest.raises(TableSpecConflict, match="repartition_to"):
+            db.table(
+                "t", pk=["ts"], columns={"ts": "integer", "v": "integer"},
+                partition=Partition.duration("ts", every="1hour"),
+                force_partition=True,
+            )
+        assert table.spec().partition.to_partition().interval_ms == 86_400_000
+        assert table.select() == [{"ts": 1000, "v": 1}]
     finally:
         db.close()
 
     reopened = Database(_uri(db_path))
     try:
         spec = reopened.table("t").spec()
-        assert spec.partition.to_partition().interval_ms == 3_600_000
-        assert spec.force_partition is True
+        assert spec.partition.to_partition().interval_ms == 86_400_000
     finally:
         reopened.close()
 

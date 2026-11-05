@@ -286,7 +286,47 @@ table = db.timeseries(
 )
 ```
 
-calendar（日期字符串）场景直接传 `partition=Partition.calendar(...)`。以下旧参数已废弃（触发 `DeprecationWarning`，行为等价）：
+calendar（日期字符串）场景可以传 `partition=Partition.calendar(...)`，也可以使用 `calendar(...)` 字符串或等价的 `PartitionSpec`。如果同时显式传入非 `None` 的 `partition` 和 `partition_every`，使用 `partition` 并发出 `UserWarning`，提示 `partition_every` 被忽略；请移除 `partition_every` 并在 `partition` 中设置期望的分区规则。只传 `partition` 不会触发该警告。
+
+默认时区是 UTC。表示具体时刻时，建议写入 UTC Unix 时间戳（按 `TimeColumn.unit` 指定秒或毫秒），或在 PostgreSQL 使用 `timestamptz`；SQLite/Parquet 不会把任意写入行自动转换成 UTC，需在调用前统一输入。显式设置的 `timezone` 决定日历桶和 `query(date=...)` 的业务自然日；纯日期则保留为日期，不强行解释成某个 UTC 时刻。跨后端的 `start`/`end` 查询若表示绝对时刻，使用 UTC 时间戳或带明确偏移的时间字符串。
+
+SQLite/Parquet 新建的纯日期 calendar 表按日期本身路由，例如纽约时区的 `2024-11-03` 放入 `20241103`。旧表继续沿用原路由：旧版负偏移时间区域可能把此日期放入 `20241102`；重开和更新时不会自动移动数据。`table.spec().partition.date_key` 为 `local` 表示新路由，为 `legacy` 或 `None` 表示旧路由。若要升级旧布局，可迁移到新库并显式指定 `date_key=local`：
+
+```python
+db.migrate_to(
+    "parquet://database/upgraded.iosql",  # 使用一个新的目标库
+    specs={"events": {"partition": "calendar(d,every=1day,timezone=America/New_York,date_key=local)"}},
+    verify="row-count",
+)
+```
+
+请将表名、日期列、周期和时区替换为原表设置，再核对源库和目标库的数据；迁移默认保留源路由，只有明确指定 `date_key=local` 才升级。此参数用于纯日期 calendar 分区，不改变原始行的存储值。
+
+旧版用 `calendar(...)` 字符串创建的表可能已保存错误的时间单位或时区。升级不会猜测并覆盖旧契约；请检查 `table.spec().time`。确认为日期文本却保存了毫秒时间语义时，可以全表复制到使用正确契约的新库：
+
+```python
+from itertools import zip_longest
+from iosql import Database
+
+# 目标必须是新的空库；列、主键和其他业务配置应与源表一致。
+with Database("sqlite://old.iosql") as source, Database("sqlite://fixed.iosql") as target:
+    old = source.table("events")
+    fixed = target.timeseries(
+        "events", time="d", pk=["d"], columns={"d": "text", "v": "integer"},
+        symbol_column=None, partition="calendar(d,every=1day,timezone=Asia/Shanghai)",
+    )
+    for batch in old.iter_batches(batch_size=10_000):  # 全表扫描，不使用可能错误的时间过滤
+        fixed.write(batch)
+    sentinel = object()
+    for before, after in zip_longest(old.iter_select(order_by="d"),
+                                    fixed.iter_select(order_by="d"), fillvalue=sentinel):
+        if before != after:
+            raise RuntimeError("复制结果不一致，请保留源库并检查数据")
+```
+
+示例按单列主键排序比对全部行；复合主键需要按完整主键比对。确认结果后再切换使用新库，源库不会被修改。`migrate_to()` 保留源时间语义，不用于修正该历史时间契约。
+
+以下旧参数已废弃（触发 `DeprecationWarning`，行为等价）：
 
 | 废弃参数 | 迁移写法 |
 | --- | --- |
@@ -654,6 +694,14 @@ rows = events.query(date="2026-01-06").to_list()
 | 新闻/公告 | `event_ts` 毫秒时间戳或 `published_date` 日期 | duration 或 calendar | `symbol, event_ts, event_id` |
 
 ### 布局诊断和重分区
+
+已有物理分区的表不能原地更换分区策略，`force_partition=True` 和低层 `insert_all(partition=...)` 也不能绕过检查；需要改变布局时使用 `repartition_to()` 或 `migrate_to()`。没有物理分区的空表可以显式使用 `force_partition=True` 修改策略。
+
+旧版已经强制改过布局的 SQLite/Parquet 表可先运行 `validate(deep=True)`，检查 `partition_row_mismatch` 和 `partition_contract_mismatch`。确认后迁移到新库并校验；如果历史混合布局已经产生重复主键，默认 `append` 迁移会失败，需要先人工核对和解决冲突，不能仅按行数判断数据一致。
+
+PostgreSQL 会核对已保存的契约和原生分区边界，并在分区父表上用恒真 CHECK 约束保存策略摘要；首次写入旧表需要表所有者权限。缺少旧契约的历史表，其有限分区边界不能唯一推断原策略，请明确绑定原策略。多日 calendar 的旧跨年分区在需要时仅于越界范围没有数据的情况下事务性收窄；若已有越界行，写入会拒绝并提示迁移，源数据不变。
+
+UTC 没有夏令时。显式使用存在时钟切换的业务时区时，SQLite/Parquet 按保守范围裁剪以兼容重复或跳过的墙上时间；PostgreSQL 将时钟切换当天的日内 calendar 分区合并为一个物理分区。旧版当天已有细粒度原生分区时，可读取并迁移；新写入与旧布局冲突时会明确拒绝并提示迁移。
 
 ```python
 report = table.layout_report()

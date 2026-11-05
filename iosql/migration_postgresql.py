@@ -174,33 +174,11 @@ class PostgreSQLPublisher:
             row = cursor.fetchone()
             if row:
                 stored = row[0] if isinstance(row[0], dict) else json.loads(row[0])
-                validate_contract(TableContract.from_dict(stored), plan.target_spec)
-                return
-            if table._partition is None:
-                return
-            cursor.execute('''SELECT pg_get_expr(c.relpartbound, c.oid)
-                FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
-                WHERE i.inhparent=to_regclass(%s)''', (table._qualified_relation(),))
-            expressions = [item[0] for item in cursor.fetchall()]
-        # 旧表没有 iosql 持久契约时，对每个已有子分区验证边界。
-        from .engines.postgresql.table import _PARTITION_BOUNDS_RE
-        for expression in expressions:
-            match = _PARTITION_BOUNDS_RE.search(expression)
-            if match is None:
-                raise BadArgument('目标包含无法确认布局的分区，请改用新的目标表')
-            start = match.group(1).strip().split('::')[0].strip().strip("'")
-            try:
-                value = float(start) if '.' in start else int(start)
-            except ValueError:
-                value = start
-            sample = {table._partition.TS_COL: value}
-            try:
-                key = table._native_partition_key(table._partition, sample)
-                bounds = table._partition_bounds(table._partition, key, [sample])
-            except (TypeError, ValueError) as exc:
-                raise BadArgument('无法确认目标已有分区布局，请改用新的目标表') from exc
-            if not table._partition_bounds_equal(expression, *bounds):
-                raise BadArgument('目标已有分区边界与最终 specs 不兼容，请改用新的目标表')
+                validate_contract(TableContract.from_dict(stored), plan.target_spec, native_pg=True)
+        if table._partition is not None:
+            # 持久契约不能替代物理边界检查；复用普通写入的边界与摘要校验。
+            children = table._inspect_native_layout(table._partition)
+            table._check_partition_marker(table._partition, children)
 
     def prepare(self, plans):
         self.coordinator.begin_operation(self.operation_id, self.stage_schema)

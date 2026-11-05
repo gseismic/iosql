@@ -12,7 +12,7 @@ import time
 import uuid
 import warnings
 from contextlib import ExitStack, closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ._migration_progress import counting, emit
@@ -82,8 +82,8 @@ def _mapping(owner, tables):
 
 def _target_spec(source, value):
     if value is OMITTED:
-        return TableContract.from_dict(source.to_dict())
-    if isinstance(value, dict):
+        target = TableContract.from_dict(source.to_dict())
+    elif isinstance(value, dict):
         unknown = set(value) - _LAYOUT_FIELDS
         if unknown:
             raise BadArgument(f'specs 布局覆盖含未知字段: {sorted(unknown)}')
@@ -106,16 +106,29 @@ def _target_spec(source, value):
             raise BadArgument('迁移 specs 只能改变分区与物理布局，不能改变列、主键或时间含义')
     if target.partition and target.partition.column not in source.columns:
         raise BadArgument(f'目标分区列未声明: {target.partition.column}')
+    if (target.partition and target.partition.kind in ('calendar', 'duration') and target.time
+            and target.time.unit == 'date' and target.partition.column == target.time.name
+            and target.partition.time_unit in (None, 'date')
+            and target.partition.date_key is None):
+        # 迁移默认保持旧版日期路由；需要升级时显式声明 date_key=local。
+        target = replace(target, partition=replace(target.partition, kind='calendar', date_key='legacy'))
     return target
 
 
-def validate_contract(stored, requested):
+def validate_contract(stored, requested, *, native_pg=False):
     """已有正式目标必须兼容最终契约；不得把 replace 解释成重建。"""
     from .database import Database
     Database._ensure_contract_core_compatible(stored, requested)
     old = stored.to_partition()
     new = requested.to_partition()
-    if (old.to_meta() if old else None) != (new.to_meta() if new else None):
+    if native_pg:
+        from .engines.postgresql.table import Table as PostgreSQLTable
+        previous = PostgreSQLTable._partition_contract_meta(old)
+        desired = PostgreSQLTable._partition_contract_meta(new)
+    else:
+        previous = old.to_meta() if old else None
+        desired = new.to_meta() if new else None
+    if previous != desired:
         raise TableSpecConflict('目标分区与 specs 不兼容；请指定新的目标库或目标表')
 
 

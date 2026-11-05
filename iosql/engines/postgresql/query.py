@@ -8,7 +8,7 @@ import arrow
 from ...core.query.timeseries import TimeseriesQueryMixin
 from ...exception import BadArgument
 from ...coordination import guard_query
-from ...spec import QueryPlan, QuerySpec
+from ...spec import QueryPlan, QuerySpec, _natural_day_bounds
 from ..sqlite.query_util import _quote_sql_identifier
 
 
@@ -65,7 +65,8 @@ class _TimeColumn:
         return value.format(self._text_format)
 
     def normalize_date_range(self, value):
-        start, end = self._value(value).span('day')
+        start, next_day = _natural_day_bounds(self._value(value))
+        end = next_day.to('UTC').shift(microseconds=-1)
         return self.normalize_value(start), self.normalize_value(end)
 
 

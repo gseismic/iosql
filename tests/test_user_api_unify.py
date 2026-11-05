@@ -4,6 +4,9 @@
 以及第八节"期望的用户接口"关键片段。
 """
 
+import inspect
+import warnings
+
 import pytest
 
 from iosql import (
@@ -60,6 +63,136 @@ def test_timeseries_equivalent_to_table_contract(tmp_path):
             order_key="ts", time="ts", symbol_column="symbol",
         ).spec().to_dict()
         assert sugar == explicit
+
+
+@pytest.mark.parametrize("engine", ["sqlite", "parquet"])
+@pytest.mark.parametrize("every", ["1day", "1hour", None])
+@pytest.mark.parametrize("as_string", [False, True])
+def test_timeseries_warns_when_explicit_interval_is_ignored(
+    tmp_path, engine, every, as_string,
+):
+    uri = f"{engine}://{tmp_path / 'partition-warning.iosql'}"
+    args = {
+        "time": "ts", "pk": ["symbol", "ts"], "columns": _TICK_COLUMNS,
+    }
+    with Database(uri) as db:
+        db.timeseries("ticks", partition_every="1hour", **args).write(_TICK_ROWS)
+
+    partition = (
+        "duration(ts,every=1hour)" if as_string
+        else Partition.duration("ts", every="1hour")
+    )
+    with Database(uri) as db, warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        call_line = inspect.currentframe().f_lineno + 1
+        ticks = db.timeseries(
+            "ticks", partition=partition, partition_every=every, **args,
+        )
+
+        assert len(caught) == 1
+        warning = caught[0]
+        assert warning.category is UserWarning
+        assert f"partition_every={every!r}" in str(warning.message)
+        assert "被忽略" in str(warning.message)
+        assert "partition 决定" in str(warning.message)
+        assert "移除" in str(warning.message)
+        assert warning.filename == __file__
+        assert warning.lineno == call_line
+        assert ticks.spec().partition.to_string() == "duration(ts,every=1hour)"
+        assert ticks.select(order_by="ts, symbol") == _TICK_ROWS
+        where = {
+            "field": "ts", "op": "==", "value": _TICK_ROWS[0]["ts"],
+        }
+        assert ticks.select(where=where) == _TICK_ROWS[:1]
+        assert ticks.explain_select(where=where).scanned_partitions == [
+            ticks.spec().to_partition().get_key(_TICK_ROWS[0]),
+        ]
+
+
+@pytest.mark.parametrize("engine", ["sqlite", "parquet"])
+def test_new_calendar_timeseries_warns_and_uses_partition(tmp_path, engine):
+    uri = f"{engine}://{tmp_path / 'calendar-warning.iosql'}"
+    with Database(uri) as db:
+        with pytest.warns(UserWarning, match="partition_every=.*被忽略"):
+            events = db.timeseries(
+                "events", time="event_date", pk=["event_date"],
+                columns={"event_date": "text", "value": "integer"},
+                symbol_column=None,
+                partition=Partition.calendar(
+                    "event_date", every="1month", timezone="Asia/Shanghai",
+                ),
+                partition_every="1day",
+            )
+        events.write({"event_date": "2025-01-06", "value": 1})
+        assert events.spec().partition.kind == "calendar"
+        assert events.spec().time.timezone == "Asia/Shanghai"
+        assert events.query(date="2025-01-06").to_list() == [
+            {"event_date": "2025-01-06", "value": 1},
+        ]
+
+
+@pytest.mark.parametrize("engine", ["sqlite", "parquet"])
+def test_timeseries_partition_defaults_do_not_warn(tmp_path, engine):
+    uri = f"{engine}://{tmp_path / 'partition-default.iosql'}"
+    args = {
+        "time": "ts", "pk": ["symbol", "ts"], "columns": _TICK_COLUMNS,
+    }
+    with Database(uri) as db, warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        by_partition = db.timeseries(
+            "by_partition", partition=Partition.duration("ts", every="1hour"),
+            **args,
+        )
+        by_every = db.timeseries("by_every", partition_every="1hour", **args)
+        explicit_none = db.timeseries(
+            "explicit_none", partition=None, partition_every="1hour", **args,
+        )
+        by_default = db.timeseries("by_default", **args)
+
+        assert not caught
+        for table in (by_partition, by_every, explicit_none):
+            assert table.spec().partition.to_string() == "duration(ts,every=1hour)"
+        assert by_default.spec().partition.to_string() == "duration(ts,every=1day)"
+
+
+def test_timeseries_warning_precedes_table_binding_and_preserves_signature(tmp_path):
+    parameter = inspect.signature(Database.timeseries).parameters["partition_every"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default == "1day"
+
+    with Database(_uri(tmp_path)) as db:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            with pytest.raises(UserWarning, match="partition_every=.*被忽略"):
+                db.timeseries(
+                    "ticks", time="ts", pk=["symbol", "ts"],
+                    columns=_TICK_COLUMNS,
+                    partition=Partition.duration("ts", every="1hour"),
+                    partition_every="1day",
+                )
+        assert db.table_names() == []
+        assert "ticks" not in db._tables
+
+
+@pytest.mark.parametrize("legacy,time,column_type", [
+    ({"partition_kind": "calendar"}, "event_date", "text"),
+    ({"time_unit": "date"}, "event_date", "text"),
+    ({"target_rows_per_file": 400_000}, "ts", "integer"),
+])
+def test_timeseries_deprecation_warning_points_to_caller(
+    tmp_path, legacy, time, column_type,
+):
+    with Database(_uri(tmp_path)) as db, warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", DeprecationWarning)
+        call_line = inspect.currentframe().f_lineno + 1
+        db.timeseries(
+            "ticks", time=time, pk=[time], columns={time: column_type},
+            symbol_column=None, **legacy,
+        )
+        assert len(caught) == 1
+        assert caught[0].category is DeprecationWarning
+        assert caught[0].filename == __file__
+        assert caught[0].lineno == call_line
 
 
 # ---------------------------------------------------------------

@@ -247,7 +247,11 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 - URI 必须 `sqlite://` / `parquet://` / `postgresql://` 前缀，直接传文件路径报 `InvalidUriSchema`。
 - Parquet 写入成本、读取流生命周期、支持的维护操作和后端差异见 [Parquet 使用指南](references/parquet.md)。
 - 每行必须含完整 pk 字段，缺列抛 `BadArgument`（不会退回 rowid 自增）。
-- 已存在的表用 `db.table("name")` 获取引用；重新声明不同契约抛 `TableSpecConflict`。
+- SQLite/Parquet 已存在的表用 `db.table("name")` 获取引用；重新声明不兼容的契约抛 `TableSpecConflict`。PostgreSQL 重开时须重新绑定原契约，iosql 检查持久摘要、已有迁移契约和原生边界；没有持久契约的旧表需由使用者核对原策略，首次写入需要表所有者权限。
+- 已有物理分区的表不能使用 `force_partition=True` 或低层 `insert_all(partition=...)` 切换分区；迁移到新库。旧版混合布局可用 `validate(deep=True)` 检测，再全量迁移和核验；若已有重复主键，先人工解决冲突。
+- 日期时序表支持 `Partition.calendar(...)` 和等价的 `calendar(...)` 字符串。旧版错误时间契约不会被自动改写；检查 `table.spec().time`，必要时参照 README 全表复制到正确契约的新库并逐行核对。
+- 默认 UTC；绝对时刻优先使用 UTC Unix 时间戳（单位与时间契约一致），PostgreSQL 可用 `timestamptz`。SQLite/Parquet 不会自动将任意输入行转为 UTC；业务时区控制日历分桶，纯日期不是绝对时刻。显式夏令时时区在切换日的 PostgreSQL 日内 calendar 分区合并为一个物理日分区，旧布局冲突时迁移到新表。
+- SQLite/Parquet 新纯日期表使用 `date_key=local`；旧表保留 `legacy` 或无版本路由，避免更新时产生跨分区重复。可在迁移到新目标时通过 `calendar(d,every=1day,timezone=America/New_York,date_key=local)` 显式升级，并核对源目标数据。
 - `select()`/`iter_select*()` 不接受 `symbols/start/end/date/session`（抛 BadArgument）；业务过滤用 `query()`。
 - `select()` 默认返回 dict 行；要 tuple 显式 `to_dict=False`。
 - `query(symbols=)`/`latest(symbols=)` 要求建表时显式 `symbol_column="symbol"`（timeseries 默认已带）。

@@ -16,10 +16,11 @@ from dataclasses import replace
 
 # from itertools import chain
 from collections import OrderedDict
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from functools import lru_cache
 
 import arrow
+from dateutil.tz import resolve_imaginary
 
 from ...migration import OMITTED
 from ..._migration_progress import count_reporter
@@ -707,6 +708,42 @@ class Table(TimeseriesQueryMixin, BaseTable):
         with self._mutation_lock():
             self._set_partition_locked(value)
 
+    def _date_key_contract(self, contract):
+        """新日期表使用本地日期键；缺少版本的旧布局保留原键。"""
+        part, clock = contract.partition, contract.time
+        if not (part and part.kind in ('calendar', 'duration') and clock and clock.unit == 'date'
+                and part.time_unit in (None, 'date') and part.column == clock.name
+                and part.date_key is None):
+            return contract
+        meta = self.get_table_meta()
+        previous = TableContract.from_table_meta(meta) if meta else self._declared_spec
+        if previous and previous.partition and previous.partition.kind in ('calendar', 'duration'):
+            mode = previous.partition.date_key or 'legacy'
+        elif meta is not None:
+            mode = 'legacy'
+        else:
+            mode = 'local'
+        return replace(contract, partition=replace(part, kind='calendar', date_key=mode))
+
+    @staticmethod
+    def _resolve_date_key_partition(partition, contract):
+        """未指定内部版本的低层分区对象沿用已声明的版本。"""
+        if partition is None or contract is None:
+            return partition
+        current = contract.to_partition()
+        if current is None or getattr(current, 'date_key', None) != 'local':
+            return partition
+        requested = partition.to_meta()
+        expected = current.to_meta()
+        if getattr(partition, 'date_key', None) is not None or 'date_key' in requested:
+            return partition
+        expected.pop('date_key', None)
+        if expected.get('time_unit') == 'date':
+            expected.pop('time_unit')
+        if requested == expected and getattr(partition, 'time_unit', None) in (None, 'date'):
+            return current
+        return partition
+
     def _set_partition_locked(self, value: Partition | None):
         """Set the partition object for this table and persist to metadata.
 
@@ -716,6 +753,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         Raises:
             TableSpecConflict: 已有数据且分区配置与持久化配置不兼容时
         """
+        value = self._resolve_date_key_partition(value, self.spec())
         meta = self.get_table_meta()
         current_meta = None
         if meta is not None and meta.get("partition"):
@@ -744,7 +782,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             return self._use_contract_locked(contract)
 
     def _use_contract_locked(self, contract):
-        contract = TableContract.ensure(contract)
+        contract = self._date_key_contract(TableContract.ensure(contract))
         current_contract = self.spec()
         if current_contract:
             self._ensure_spec_compatible(current_contract, contract)
@@ -1238,7 +1276,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
                     raise SchemaConflict(f'严格 schema 禁止新增列: {sorted(unknown)}')
             self._ensure_contract_type_compatible(contract, data)
             pk = pk if pk is not None else contract.primary_key
-            partition = partition if partition is not None else contract.to_partition()
+            partition = (self._resolve_date_key_partition(partition, contract)
+                         if partition is not None else contract.to_partition())
             column_type = dict(contract.columns or {})
             column_type.update(kwargs.pop('column_type', {}) or {})
             kwargs['column_type'] = column_type
@@ -1508,6 +1547,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             deep=bool(deep),
             include_obsolete=bool(include_obsolete),
         )
+        if deep:
+            self._validate_partition_metadata(result)
         # 一次取全量 refs：校验用可见部分，孤儿扫描必须带 obsolete
         all_refs = self._physical_part_refs(include_obsolete=True)
         self._validate_compact_generations(all_refs, result)
@@ -1520,6 +1561,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             self._validate_segment_ref(ref, result)
             if deep:
                 self._validate_segment_ref_deep(ref, result)
+                self._validate_partition_rows(ref, result)
         # 反向扫描孤儿文件：manifest 不引用但磁盘存在的 segment（旧报告 S-M8）
         for path in self._orphan_segment_files(all_refs):
             result.add_warning(
@@ -1528,6 +1570,56 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 path=path,
             )
         return result
+
+    def _validate_partition_metadata(self, result):
+        meta = self.get_table_meta()
+        contract = self.spec()
+        if not meta or not contract:
+            return
+        partition = contract.to_partition()
+        expected = partition.to_meta() if partition else None
+        actual = meta.get('partition')
+        if expected != actual:
+            result.add_error(
+                'partition_contract_mismatch',
+                '表契约与物理分区元数据不一致；请检查后迁移到新表',
+                expected=expected, actual=actual,
+            )
+
+    def _validate_partition_rows(self, ref, result):
+        contract = self.spec()
+        partition = contract.to_partition() if contract else None
+        if partition is None or not os.path.isfile(ref.path) or not self._is_safe_part_path(ref.path):
+            return
+        field = self._quote_identifier(partition.TS_COL)
+        table_name = self._quote_identifier(_PART_DATA_TABLE_NAME)
+        try:
+            with self._part_db(ref.path, auto_commit=False) as db:
+                scope = db.get_connection() if hasattr(db, 'get_connection') else nullcontext(db.conn)
+                with scope as conn:
+                    cursor = conn.execute(f'SELECT {field} FROM {table_name}')
+                    try:
+                        while True:
+                            rows = cursor.fetchmany(10_000)
+                            if not rows:
+                                break
+                            for row in rows:
+                                key = partition.get_key({partition.TS_COL: row[0]})
+                                if self._part_token(key) != self._part_token(ref.logical_part):
+                                    self._add_segment_issue(
+                                        result, ref, 'partition_row_mismatch',
+                                        '数据行与当前分区契约不一致；请迁移到新表',
+                                        expected=ref.logical_part, actual=key,
+                                    )
+                                    return
+                    finally:
+                        if cursor is not conn:
+                            cursor.close()
+        except (BadArgument, UnsafeOperation, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+            self._add_segment_issue(
+                result, ref, 'partition_validation_failed',
+                f'无法验证数据行的分区归属: {exc}',
+            )
 
     def cleanup_obsolete(self, partition=None, dry_run=True, validate=True):
         if dry_run:
@@ -3970,11 +4062,50 @@ class Table(TimeseriesQueryMixin, BaseTable):
             case_min = case_min * 1000 if case_min is not None else None
             case_max = case_max * 1000 if case_max is not None else None
         excluded_parts = set()
+        contract = self.spec()
         for info in infos:
             part = info["part"]
             if info["column"] == case.field:
                 column_min = info.get("column_min")
                 column_max = info.get("column_max")
+                partition = self._partition
+                if (getattr(partition, 'PARTITION_TYPE', None) == 'calendar'
+                        and getattr(partition, '_every_unit', None) in ('hour', 'minute')
+                        and not partition._utc_timezone
+                        and case.field == partition.TS_COL):
+                    # 旧库可能保存了夏令时回拨前的较窄范围，读取时取保守并集。
+                    try:
+                        safe_min, safe_max = partition.get_range(str(part))
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if isinstance(column_min, (int, float)):
+                        column_min = min(column_min, safe_min)
+                    if isinstance(column_max, (int, float)):
+                        column_max = max(column_max, safe_max)
+                if (getattr(partition, 'PARTITION_TYPE', None) == 'calendar'
+                        and contract and contract.time and contract.time.unit == 'date'
+                        and contract.time.name == case.field and partition.TS_COL == case.field):
+                    # 旧版纯日期以 UTC 午夜计算分区键。仅当下一日确实落入
+                    # 本桶时扩展范围，避免正时区日期查询无谓地扫描邻桶。
+                    try:
+                        if partition._every_unit in ('hour', 'minute'):
+                            raise ValueError('date 日内分区需要保守范围')
+                        start = arrow.get(str(part), partition.fmt, tzinfo=partition.tz)
+                        end = partition._bucket_end(start)
+                        first_day = start.format('YYYY-MM-DD')
+                        last_day = end.shift(days=-1).format('YYYY-MM-DD')
+                        next_day = end.format('YYYY-MM-DD')
+                        if partition.get_key({partition.TS_COL: next_day}) == str(part):
+                            last_day = next_day
+                        safe_min, _ = self._date_value_partition_bounds(contract.time, first_day)
+                        _, safe_max = self._date_value_partition_bounds(contract.time, last_day)
+                        if isinstance(column_min, (int, float)):
+                            column_min = min(column_min, safe_min)
+                        if isinstance(column_max, (int, float)):
+                            column_max = max(column_max, safe_max)
+                    except (TypeError, ValueError, OverflowError, arrow.parser.ParserError):
+                        # 无法推导日期边界时保守扫描，不能漏掉历史数据。
+                        continue
                 if not self._is_numeric_range(
                     case_min, case_max, column_min, column_max
                 ):
@@ -4037,12 +4168,14 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _date_value_partition_bounds(self, time_column, value):
         normalized = time_column.normalize_value(value)
-        start = arrow.get(
+        local_start = arrow.get(
             normalized,
             'YYYY-MM-DD',
             tzinfo=time_column.timezone,
-        ).to('UTC')
-        end = start.shift(days=1)
+        )
+        local_end = local_start.shift(days=1)
+        start = arrow.get(resolve_imaginary(local_start.datetime)).to('UTC')
+        end = arrow.get(resolve_imaginary(local_end.datetime)).to('UTC')
         return (
             int(start.timestamp() * 1000),
             int(end.timestamp() * 1000),
@@ -4798,6 +4931,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
         part_obj = partition
         if part_obj is None:
             part_obj = self._partition
+        else:
+            part_obj = self._resolve_date_key_partition(part_obj, self.spec())
 
         table_spec = kwargs.get("table_contract") or kwargs.get("table_spec")
         segment_spec = TableContract.ensure(table_spec) if table_spec is not None else None
@@ -4828,6 +4963,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         segment_kwargs.pop("table_spec", None)
 
         with self._mutation_lock():
+            self._ensure_write_partition_compatible(part_obj, segment_spec)
             for part_key, part_data in partitioned_data.items():
                 if use_segment:
                     self._do_insert_segmented(
@@ -4858,6 +4994,23 @@ class Table(TimeseriesQueryMixin, BaseTable):
         logger.debug(f"Insert Time: {_t2 - _t1}")
         keys = list(partitioned_data)
         return keys if len(keys) <= 1 else sorted(keys)
+
+    def _ensure_write_partition_compatible(self, partition, declared_contract=None):
+        """锁内检查持久布局及尚未落盘的声明，不能由低层写入覆盖。"""
+        meta = self.get_table_meta()
+        if meta is not None:
+            previous = meta.get('partition')
+        elif self._declared_spec is not None or declared_contract is not None:
+            current = (self._declared_spec or declared_contract).to_partition()
+            previous = current.to_meta() if current else None
+        else:
+            return
+        requested = partition.to_meta() if partition else None
+        if previous != requested:
+            raise TableSpecConflict(
+                f'PartitionCanNotChange: current={previous} new={requested}；'
+                '请保持原分区，或使用 repartition_to() / migrate_to()'
+            )
 
     def _do_insert_segmented(
         self,
@@ -5019,23 +5172,11 @@ class Table(TimeseriesQueryMixin, BaseTable):
         # Compare partition meta dicts - only check if table already exists
         prev_partition_meta = current_meta.get("partition") if current_meta else None
         curr_partition_meta = partition.to_meta() if partition else None
-        if (
-            prev_partition_meta is not None
-            and prev_partition_meta != curr_partition_meta
-        ):
-            table_contract = kwargs.get("table_contract") or {}
-            force = table_contract.get("force_partition", False)
-            if force:
-                logger.warning(
-                    f"强制使用新分区: prev={prev_partition_meta} curr={curr_partition_meta}"
-                )
-                current_meta["partition"] = curr_partition_meta
-                self._overwrite_table_meta(current_meta)
-            else:
-                raise TableSpecConflict(
-                    f"PartitionCanNotChange: "
-                    f"prev={prev_partition_meta} curr={curr_partition_meta}"
-                )
+        if current_meta is not None and prev_partition_meta != curr_partition_meta:
+            raise TableSpecConflict(
+                f"PartitionCanNotChange: "
+                f"prev={prev_partition_meta} curr={curr_partition_meta}"
+            )
 
         part_dbfile = self._get_part_dbfile(part)
         try:
