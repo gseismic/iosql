@@ -162,7 +162,7 @@ def test_help_examples_can_be_copied_and_executed(tmp_path, invoke_separate, mon
     assert help_result.exit_code == 0, help_result.stdout
     commands = [line.strip() for line in help_result.stdout.splitlines()
                 if line.strip().startswith('iosql migrate ')]
-    assert len(commands) == 4, help_result.stdout
+    assert len(commands) == 5, help_result.stdout
     for command in commands:
         result = invoke_separate(app, *shlex.split(command)[1:])
         assert result.exit_code == 0, (command, result.stdout, result.stderr, result.exception)

@@ -449,37 +449,41 @@ class Table(TimeseriesQueryMixin, BaseTable):
                     self._mutation_lock_state.depth -= 1
                 return
 
-            lock_path = os.path.join(self.table_path, '.iosql.write.lock')
-            if os.path.islink(lock_path):
-                raise UnsafeOperation(f'表锁文件不能是符号链接: {lock_path}')
-            fd = os.open(
-                lock_path,
-                os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0),
-                0o600,
-            )
-            try:
+            # 已有句柄也须校验库身份；旧库首次修改时持久化身份。
+            from ...utils.storage_identity import ensure_storage_engine, storage_engine_lock
+            ensure_storage_engine(self._uri, claim=True)
+            with storage_engine_lock(self._uri, exclusive=False):
+                lock_path = os.path.join(self.table_path, '.iosql.write.lock')
+                if os.path.islink(lock_path):
+                    raise UnsafeOperation(f'表锁文件不能是符号链接: {lock_path}')
+                fd = os.open(
+                    lock_path,
+                    os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0),
+                    0o600,
+                )
                 try:
-                    import fcntl
-                except ImportError:
-                    import msvcrt
-                    if os.fstat(fd).st_size == 0:
-                        os.write(fd, b'\0')
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-                    def unlock():
-                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    fcntl.flock(fd, fcntl.LOCK_EX)
-                    def unlock():
-                        fcntl.flock(fd, fcntl.LOCK_UN)
-                self._mutation_lock_state.depth = 1
-                try:
-                    yield
+                    try:
+                        import fcntl
+                    except ImportError:
+                        import msvcrt
+                        if os.fstat(fd).st_size == 0:
+                            os.write(fd, b'\0')
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                        def unlock():
+                            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                        def unlock():
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                    self._mutation_lock_state.depth = 1
+                    try:
+                        yield
+                    finally:
+                        self._mutation_lock_state.depth = 0
+                        unlock()
                 finally:
-                    self._mutation_lock_state.depth = 0
-                    unlock()
-            finally:
-                os.close(fd)
+                    os.close(fd)
 
     @staticmethod
     def _positive_int_option(name, value):
@@ -1761,12 +1765,13 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def migrate_to(self, target_uri, tables=OMITTED, mode='append',
                    batch_size=10_000, verify=None, dry_run=False, *,
-                   specs=None, temp_dir=None, lock_timeout=30.0, target_table=OMITTED):
+                   specs=None, temp_dir=None, lock_timeout=30.0, target_table=OMITTED,
+                   target_engine=None):
         """保留源表并复制到目标；tables 与 Database 相同，specs 支持目标重新分区。"""
         from ...migration import migrate_table
         return migrate_table(self, target_uri, tables, mode, batch_size, verify, dry_run,
                              specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
-                             target_table=target_table)
+                             target_table=target_table, target_engine=target_engine)
 
     def _compact_target_rows(self, spec, target_rows):
         layout = spec.physical_layout

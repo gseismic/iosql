@@ -28,3 +28,7 @@
 | 2026-11-06 01:22 | [Parquet 迁移目标目录与普通写入保持一致](PLAN-20261106-002-model-unknown-migration-flat-layout.md) | 实施中 | 评估安全发布方案，计划整理用户指定的单个已迁移库。 |
 | 2026-11-06 01:34 | [Web 通用图表与 mchart3 接入](PLAN-20261106-001-model-unknown-generic-charts.md) / [结果](PLAN-20261106-001-model-unknown-generic-charts-OUTCOME.md) | 已完成（WORKTREE） | 通用轴与筛选、按需加载、三种后端和原库核对完成；192 项相关测试通过。 |
 | 2026-11-06 01:52 | [Parquet 迁移目标目录与普通写入保持一致](PLAN-20261106-002-model-unknown-migration-flat-layout.md) / [结果](PLAN-20261106-002-model-unknown-migration-flat-layout-OUTCOME.md) | 已完成（WORKTREE） | 指定库完成无业务数据重编码的目录整理；新迁移平坦发布，完整回归及目标盘专项通过。 |
+| 2026-11-06 04:33 | [自动识别本地库引擎与 URI 兼容](PLAN-20261106-003-model-unknown-auto-engine-uri.md) | 实施中 | 统一路径识别与显式前缀，防止本地库混用存储引擎。 |
+| 2026-11-06 05:22 | [自动识别本地库引擎与 URI 兼容](PLAN-20261106-003-model-unknown-auto-engine-uri.md) / [结果](PLAN-20261106-003-model-unknown-auto-engine-uri-OUTCOME.md) | 已完成（WORKTREE） | 自动识别和显式前缀兼容、类型冲突保护、Parquet 绘图与完整回归完成。 |
+| 2026-11-06 05:34 | [修复 URI、迁移和 Parquet 绘图的 Review 问题](PLAN-20261106-004-model-unknown-uri-review-fixes.md) | 实施中 | 修复六项并发、超时、空库和 Parquet 图表回归。 |
+| 2026-11-06 05:49 | [修复 URI、迁移和 Parquet 绘图的 Review 问题](PLAN-20261106-004-model-unknown-uri-review-fixes.md) / [结果](PLAN-20261106-004-model-unknown-uri-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 六项问题及源库识别超时一并修复，完整回归和浏览器测试通过。 |

@@ -97,6 +97,33 @@ python -m pip install -e ".[postgresql]"
 
 Parquet 后端随默认依赖安装，普通安装和开发安装均包含 DuckDB，无需额外 extra。
 
+### 数据库位置与存储类型
+
+已有的 SQLite 或 Parquet 目录库可以直接传路径，iosql 根据库的元数据识别存储类型：
+
+```python
+from iosql import Database
+
+with Database("db/market.iosql") as db:  # 已有库，读写使用同一位置
+    print(db.engine)                    # sqlite 或 parquet
+    bars = db.table("bars")
+
+# 明确创建新库；已有库或非空目录不会被覆盖
+with Database.create("db/archive.iosql", engine="parquet") as db:
+    pass
+```
+
+绝对路径也可以写为 `iosql:///absolute/path.iosql`。保留 `sqlite://`、`sqlite3://`、
+`parquet://` 和 PostgreSQL URI，并支持 `iosql+sqlite://`、`iosql+sqlite3://`、
+`iosql+parquet://`、`iosql+postgresql://`。显式前缀可指定新库类型，打开已有库时
+必须与实际类型一致；不一致会报错，不会隐式转换或返回空库。`db.uri` 返回解析后的
+后端 URI。普通路径的库不存在或无法识别时应先指定类型，不能根据文件名猜测。
+
+新库以库级 `__iosql_database__.json` 标记持久化类型；旧库可从表级元数据识别，只读访问不会
+自动写入标记。混合类型、无效标记或不能识别的库会报错。初始化和后续写入使用
+协作锁保护类型；识别时会等待正在进行的表修改，不同表仍可并行写入。直接修改文件或使用
+未实现该约束的旧客户端不受保护。
+
 ### Parquet 后端
 
 ```python
@@ -152,7 +179,21 @@ iosql migrate \
 
 命令运行时会在标准错误显示统计源表、逐表复制、统计暂存目标和发布等阶段；耗时较长时定期显示当前阶段和耗时。SQLite 到 Parquet 的正式迁移按源文件统计并复制，在全部源文件统计完之前显示已复制行数和已检查文件数，不预报未知的源表总行数。预览仍会单独统计全表；由于正式复制可能按分区边界调整批次，实际批次数可与预览的预计值不同。文件和行数进度针对当前表，并非整个库的百分比。最终 JSON 仍写入标准输出，例如可用 `iosql migrate ... > result.json` 保存结果，同时在终端查看进度。
 
-正式命令成功后，检查 JSON 输出中的 `published: true`、`verified: true` 和相等的 `source_rows`、`target_rows`。行数校验不能替代逐行内容校验；迁移失败或中断时先检查错误和恢复状态，再决定如何重试。迁移后的副本使用 `parquet://` URI 打开。
+正式命令成功后，检查 JSON 输出中的 `published: true`、`verified: true` 和相等的 `source_rows`、`target_rows`。行数校验不能替代逐行内容校验；迁移失败或中断时先检查错误和恢复状态，再决定如何重试。迁移后的副本可直接用本地路径或 `parquet://` URI 打开。
+
+已有源库和目标库也可使用本地路径自动识别；新目标须用 `sqlite://`、`parquet://`、
+对应的 `iosql+` 前缀，或显式指定 `--target-engine sqlite|parquet`。例如：
+
+```bash
+iosql migrate -s db/market.iosql --target db/archive.iosql \
+  --target-engine parquet --verify row-count
+```
+
+Python 对应 `db.migrate_to("db/archive.iosql", target_engine="parquet")`；
+`save_as` 也接受 `target_engine`。`dry_run` 不检查目标，因此使用无类型的本地目标
+路径预览时也必须指定目标类型。
+
+带有效类型标记的空 SQLite 库也可备份和恢复；没有标记的普通空目录不能作为备份或覆盖目标。
 
 Parquet 的 append/ignore 追加写为不可变数据片，通过原子清单发布，不重写历史完整行；
 主键查重仍可能扫描历史键列。修改和删除会重写受影响的物理集合。
@@ -160,9 +201,10 @@ Parquet 的 append/ignore 追加写为不可变数据片，通过原子清单发
 segment 表沿用现有 upsert/replace 限制。读取流存活期间，同表写入会等待；
 同一线程写入前应先耗尽或关闭读取流。单个物理集合的清单原子切换，跨文件写入没有统一事务。
 
-支持 Python 数据与维护接口、表重命名和 CLI `migrate`。其余 CLI 命令、Web
-工作区发现、数据库目录重命名、SQLite PRAGMA、持久化索引、`commit=False`
-与 `aggregate_by_bucket()` 暂不支持 Parquet。只接管 iosql 创建的目录库，
+支持 Python 数据与维护接口、表重命名、常用 CLI 命令和 Web 浏览及图表。CLI 的
+`doctor`、`index`、`repartition`、`backup`、`restore` 和 `rename-database`，以及数据库
+目录重命名、SQLite PRAGMA、持久化索引、`commit=False` 与 `aggregate_by_bucket()`
+暂不支持 Parquet。只接管 iosql 创建的目录库，
 不会自动注册任意已有 Parquet 文件。
 
 完整 Parquet 后端示例：[14_parquet_backend.py](examples/14_parquet_backend.py)。
@@ -854,7 +896,7 @@ with Database("sqlite://database/market.iosql") as source:
 
 CLI 对应 `--specs '{"kline_1m":{"partition":"duration(ts,every=1hour)"}}'`，也支持 `--specs @布局.json`。布局可以修改 partition/segment，不会隐式改变列、主键或时间单位。已有目标需要与最终布局兼容；`mode="replace"` 仍是主键冲突策略，不能用于清空目标。
 
-正式迁移全程禁止源、目标的协作读写，取得不到锁的普通 API 立即抛 `DatabaseBusy`；迁移等待独占锁的总时限由 `lock_timeout=30.0` 控制。请先关闭读取流、flush 缓冲并结束未提交事务或缓冲写入上下文。锁在持久发布后释放，临时数据清理在锁外进行。本地目标默认在目标文件系统的管理目录内转换；目标为 PostgreSQL 时，本地源默认在源库内暂存，PostgreSQL 源使用系统临时目录。可用 `temp_dir=` 或 `--temp-dir` 更改。SQLite 目标使用完整代际发布；Parquet 目标将表发布到库根目录。两者都先转换、校验再发布，中断后的 iosql 读写会检查恢复屏障。失败的暂存保留供检查。
+正式迁移全程禁止源、目标的协作读写，取得不到锁的普通 API 立即抛 `DatabaseBusy`；`lock_timeout=30.0` 控制锁等待的总时限，包括迁移期间的库类型识别和源表预检，CLI 从源库识别开始计算。请先关闭读取流、flush 缓冲并结束未提交事务或缓冲写入上下文。锁在持久发布后释放，临时数据清理在锁外进行。本地目标默认在目标文件系统的管理目录内转换；目标为 PostgreSQL 时，本地源默认在源库内暂存，PostgreSQL 源使用系统临时目录。可用 `temp_dir=` 或 `--temp-dir` 更改。SQLite 目标使用完整代际发布；Parquet 目标将表发布到库根目录。两者都先转换、校验再发布，中断后的 iosql 读写会检查恢复屏障。失败的暂存保留供检查。
 
 旧内容和暂存优先在解锁前移入父目录协调空间的任务专属退休目录；目标根是独立挂载点时，支持的平台使用已打开的目录句柄安全清理，否则保留暂存并给出警告。合法空表可作为迁移目标，未写入表的当前实例声明在发布刷新后仍可用。库级协调层在 Windows 使用原生共享/独占文件锁；Windows 尚未进行原机和断电验证，不承诺 POSIX 目录 fsync 的同等持久性。
 
@@ -977,6 +1019,9 @@ python -m pip install -e ".[web]"
 ```bash
 iosql web -s database/market.iosql
 # iosql Web: http://127.0.0.1:8686 (READ-ONLY)
+
+# 已有 Parquet 库同样直接使用路径；Charts 支持筛选并绘图
+iosql web -s db/archive.iosql
 ```
 
 开启可修改模式（写入与布局维护操作）：
@@ -1022,6 +1067,7 @@ Charts 先选择 X、Y、可选分组和筛选条件，再点击「绘制」；�
 ```text
 database/
 └── market.iosql/
+    ├── __iosql_database__.json      # 库级存储类型
     └── ticks/
         ├── meta.sqlite3            # 表元数据、分区信息、segment 清单
         └── data/
@@ -1074,7 +1120,7 @@ Parquet 目标迁移后，表目录仍直接位于数据库根目录，与普通
 | 文件布局维护 | `segments` / `compact` / `validate` / `cleanup_obsolete` / `layout_report` / `repartition_to` | 同 SQLite | 无文件级维护 |
 | 元数据 | `describe` / `update_metadata` | 同 SQLite | `describe` 读取绑定契约 |
 | 迁移 | `migrate_to`，目标可为三种后端 | 同 SQLite | `migrate_to`；源表需绑定契约 |
-| CLI / Web | 支持 | CLI 仅 `migrate`，Web 暂不支持 | CLI 仅迁移目标，Web 暂不支持 |
+| CLI / Web | 支持 | 常用 CLI、迁移和 Web 浏览/图表；部分 SQLite 专用维护命令不支持 | CLI 仅迁移目标，Web 暂不支持 |
 
 PostgreSQL 14+ 可作为在线时序存储。`query/latest/asof` 的筛选、排序、limit 和分组取最新值均由数据库执行。`query().iter_batches()` / `.iter_rows()` 使用命名游标；`select()` / `.to_list()` 会物化完整结果。start/end/as_of 包含边界，latest 保持请求 symbol 顺序；同时间按剩余主键升序决胜。指定 symbol 且有 symbol/time 前缀索引时，单分组 latest 使用 LATERAL LIMIT 1；其他分组使用 DISTINCT ON。单个 Table 使用一条连接，消费期间应先关闭流再执行其他会结束事务的操作。
 

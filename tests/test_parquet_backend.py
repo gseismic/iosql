@@ -216,21 +216,17 @@ def test_publish_failure_preserves_original_and_cleans_temporary(tmp_path, monke
 def test_wrong_backend_and_plain_directory_are_rejected(tmp_path):
     with Database(_uri(tmp_path)) as db:
         _table(db).write({'id': 1, 'value': 1.0})
-    with Database(_uri(tmp_path, backend='sqlite')) as db:
-        assert db.table_names() == []
-        with pytest.raises(UnsafeOperation):
-            db.table('records')
+    with pytest.raises(UnsafeOperation, match='存储类型不匹配'):
+        Database(_uri(tmp_path, backend='sqlite'))
     with Database(_uri(tmp_path, 'sqlite.iosql', 'sqlite')) as db:
         _table(db).write({'id': 1, 'value': 1.0})
-    with Database(_uri(tmp_path, 'sqlite.iosql')) as db:
-        with pytest.raises(UnsafeOperation):
-            db.table('records')
+    with pytest.raises(UnsafeOperation, match='存储类型不匹配'):
+        Database(_uri(tmp_path, 'sqlite.iosql'))
     plain = tmp_path / 'plain.iosql' / 'records'
     plain.mkdir(parents=True)
     (plain / 'keep.txt').write_text('业务文件')
-    with Database(_uri(tmp_path, 'plain.iosql')) as db:
-        with pytest.raises(UnsafeOperation):
-            db.table('records')
+    with pytest.raises(UnsafeOperation):
+        Database(_uri(tmp_path, 'plain.iosql'))
     assert not (plain / 'meta.sqlite3').exists()
 
 

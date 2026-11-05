@@ -123,7 +123,7 @@ class BaseTable(metaclass=ABCMeta):
 
     def save_as(self, target_uri, tables=None, mode='append',
                 batch_size=10_000, verify=None, dry_run=False, *,
-                specs=None, temp_dir=None, lock_timeout=30.0):
+                specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None):
         """将当前表另存为独立副本，保留源数据、契约和当前对象的 URI。
 
         参数、发布与锁语义同 migrate_to，返回 TableMigrationResult。
@@ -133,7 +133,7 @@ class BaseTable(metaclass=ABCMeta):
         return self.migrate_to(
             target_uri, tables=tables, mode=mode, batch_size=batch_size,
             verify=verify, dry_run=dry_run, specs=specs, temp_dir=temp_dir,
-            lock_timeout=lock_timeout,
+            lock_timeout=lock_timeout, target_engine=target_engine,
         )
 
     def describe(self):

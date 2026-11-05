@@ -1,5 +1,6 @@
 import re
 from typing import Dict, Tuple, Optional, Union
+from urllib.parse import unquote
 
 __all__ = ['parse_db_schema']
 
@@ -69,22 +70,36 @@ def parse_db_schema(uri: str) -> Tuple[str, Dict[str, Union[str, int, bool, None
         ValueError: If URI format is invalid
     """
     # Parse version parameter
+    encoded_local_path = False
     if '?' in uri:
         uri, version_part = uri.strip().split('?', 1)
-        if '=' in version_part:
+        if version_part == 'iosql_path_encoding=percent':
+            encoded_local_path = True
+            version = '1'
+        elif '=' in version_part:
             version = version_part.split('=', 1)[1]
         else:
             version = '1'
     else:
         version = '1'
     
-    uri = uri.strip().rstrip('/')
+    uri = uri.strip()
+    # 保留本地根路径的分隔符；直接 rstrip('/') 会把 sqlite:/// 变为 sqlite:。
+    scheme_and_detail = uri.split('://', 1)
+    if len(scheme_and_detail) != 2 or scheme_and_detail[1].strip('/'):
+        uri = uri.rstrip('/')
     options = {'version': version}
     
     # Split schema and detail parts
     parts = uri.split('://', 1)
     _raise_if_not(len(parts) == 2, None, uri)
     schema, detail = parts
+    # iosql+ 前缀只声明使用 iosql 接口，不改变底层连接协议。
+    if schema.startswith('iosql+'):
+        schema = schema[len('iosql+'):]
+    if encoded_local_path:
+        _raise_if_not(schema in ('sqlite', 'sqlite3', 'parquet'), schema, uri)
+        detail = unquote(detail)
 
     # Parse based on schema type
     if schema in ('mysql', 'postgresql'):
@@ -121,6 +136,9 @@ def parse_db_schema(uri: str) -> Tuple[str, Dict[str, Union[str, int, bool, None
             options['memory'] = True
         else:
             options['memory'] = False
+            if detail and not detail.strip('/'):
+                options.update({'path': '/', 'db': ''})
+                return schema, options
             # Split path and database name
             last_slash = detail.rfind('/')
             if last_slash == -1:

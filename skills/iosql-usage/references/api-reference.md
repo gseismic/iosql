@@ -16,9 +16,13 @@
 
 ## 核心入口
 
-### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32, max_ordered_read_connections=128)`
+### `Database(uri, verbose=0, pragma_dict=None, max_open_partitions=5, max_connections_per_file=1, max_process_connections=32, max_ordered_read_connections=128, engine=None)`
 
-数据库入口。支持 `sqlite://`、`parquet://` 和 `postgresql://` URI。
+数据库入口。已有本地库可用路径或 `iosql:///绝对路径` 自动识别；新库使用
+`sqlite://`、`parquet://` 或 `engine=` 指定类型。也支持 `iosql+sqlite://`、
+`iosql+parquet://` 等别名及 `postgresql://`。显式类型与已有库冲突时拒绝。
+`Database.create(path, engine="sqlite"|"parquet")` 显式初始化新库，拒绝已有库或非空目录；
+`db.engine` 返回实际类型，`db.uri` 返回解析后的后端 URI。
 Parquet 后端随 iosql 默认依赖提供 DuckDB，业务数据为 `data/*.parquet`，元数据为 SQLite。
 Parquet 支持分区、segment、读写、流式排序、维护和迁移；追加、修改和删除会重写受影响文件。
 Parquet 不支持 PRAGMA、持久化索引、`commit=False`、数据库目录 rename 和
@@ -40,6 +44,7 @@ python -m pip install "iosql[postgresql]"
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` 或 `"postgresql://user:pass@localhost:5432/mydb"` |
+| `engine` | `str`/`None` | 本地库可选 `sqlite` 或 `parquet`；对已有库仅作一致性校验 |
 | `verbose` | `int` | 日志详细度，`0`=静默 |
 | `pragma_dict` | `dict`/`None` | 仅 SQLite；覆盖默认 balanced PRAGMA，例如 `{"synchronous": "full"}` |
 | `max_open_partitions` | `int` | 仅 SQLite；每张表最多缓存的打开分区数据库数，默认 `5` |
@@ -138,7 +143,7 @@ native partition 模式下会同步重命名旧表名前缀的子分区表。
 返回 SQLite 进程级连接预算状态，包括 `max_process_connections`、
 `open_process_connections` 和 `registered_pools`。
 
-#### `Database.save_as(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> MigrationResult`
+#### `Database.save_as(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None) -> MigrationResult`
 
 将当前库另存为独立副本。`Table.save_as()` 使用同一规范签名，只允许选择当前表，
 返回 `TableMigrationResult`。源业务数据、契约及对象 URI 保留，不自动切换 engine；
@@ -155,9 +160,11 @@ Table 新接口只提供规范的 `tables` 选择及改名，不提供旧入口�
 目标已有数据时按 `mode` 处理冲突，不自动清空；`verify="row-count"` 要求选中目标表
 不存在或为空。性能比较示例见 [18_save_as_compare_engines.py](../examples/18_save_as_compare_engines.py)。
 
-#### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> MigrationResult`
+#### `Database.migrate_to(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None) -> MigrationResult`
 
 把当前 iosql 库复制到目标库并保留源库，支持 SQLite、Parquet、PostgreSQL 之间的迁移。
+新本地目标可用前缀或 `target_engine` 指定类型；已有本地目标可自动识别。预览不检查目标，
+所以无类型目标路径在预览时也必须指定 `target_engine`。
 Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parquet.md)。
 
 ```python
@@ -202,7 +209,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 
 由 `Database.table()` 返回的表格对象提供以下方法：
 
-`save_as(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0)`
+`save_as(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None)`
 将当前表另存为独立副本，返回 `TableMigrationResult`。`tables=None` 选择当前表，
 `tables={"bars": "archived_bars"}` 改目标名，不能选择其他源表；其余参数见上述库级另存和迁移说明。
 
@@ -258,7 +265,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 | `cleanup_obsolete` | `(partition=None, dry_run=True, validate=True) -> CleanupResult` | 清理 obsolete segment 文件 |
 | `count_rows` | `() -> int` | 统计当前可见行数（无参，各后端一致） |
 | `rename` | `(new_name, exist_ok=False, overwrite=False) -> Table` | 重命名当前逻辑表 |
-| `migrate_to` | `(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0) -> TableMigrationResult` | 迁移单表 |
+| `migrate_to` | `(target_uri, tables=None, mode='append', batch_size=10_000, verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None) -> TableMigrationResult` | 迁移单表 |
 | `repartition_to` | `(target_uri, table_name=None, spec=None, mode='append', batch_size=10_000) -> RepartitionResult` | 重分区结果 |
 | `create_index` | `(column, order='asc', exist_ok=True)` | 创建索引 |
 | `drop_index` | `(column)` | 删除所有分区上的列索引 |

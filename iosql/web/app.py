@@ -1014,6 +1014,9 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
             "value": str(end_val) if x_is_text else end_val,
         })
 
+    if x_is_text and getattr(table, '_storage_engine', None) == 'parquet':
+        _validate_parquet_numeric_text_axis(table, x_col, comps)
+
     if kind == "candle":
         assert ohlc is not None
         if spec is not None and spec.columns:
@@ -1031,7 +1034,7 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
 
     # text x 只允许 YYYYMMDD 等纯数字日期字符串。探测仅在文本轴启用，
     # 继续在响应开始前给 ISO 日期与混合类型返回标准 HTTP 422。
-    if x_is_text:
+    if x_is_text and getattr(table, '_storage_engine', None) != 'parquet':
         probe = table.aggregate_by_bucket(
             x_col, [col], 1, where=comps or None,
         )
@@ -1055,6 +1058,30 @@ def _chart_endpoint(name: str, request: Request, col: str, symbol: str,
         table, x_col, col, sym_col, group_by_symbol, comps,
         time_col=spec.time.name if spec and spec.time else None,
     )
+
+
+def _validate_parquet_numeric_text_axis(table: Any, x_col: str,
+                                        comps: list[dict[str, Any]]) -> None:
+    """响应开始前在 Parquet 内检查数字文本及 64 位范围，沿用分区裁剪。"""
+    from ..coordination import operation
+
+    field = table._quote_identifier(x_col)
+    value = f'TRIM(CAST({field} AS VARCHAR))'
+    with operation(table):
+        columns = table.spec().columns
+        where = table._build_where(comps or None)
+        for ref, query in table._select_queries_for_where([x_col], where, columns):
+            table._ensure_ref_file_present(ref)
+            sql = (f'SELECT 1 FROM ({query.sql.rstrip(";")}) AS chart_source '
+                   f'WHERE {field} IS NOT NULL AND '
+                   f'(NOT regexp_full_match({value}, \'-?[0-9]+\') '
+                   f'OR TRY_CAST({value} AS BIGINT) IS NULL) LIMIT 1')
+            with table._part_db(ref.path, auto_commit=False) as part:
+                if part['data'].query(sql, params=query.params):
+                    raise _bad_request(
+                        f"x 轴列 `{x_col}` 是非数字文本或超出 64 位整数范围，无法绘图",
+                        hint="支持 64 位整数及 YYYYMMDD 等纯数字日期字符串；ISO 日期请改用 duration 毫秒时间戳分区表",
+                    )
 
 
 def _chart_stream_response(events: Iterator[str]) -> StreamingResponse:
@@ -1354,7 +1381,7 @@ def _numeric_text_chart_batches(table, fields, x_col, order, comps):
     with operation(table):
         column_types = table.spec().columns
         projections = ','.join(
-            f'CAST({table._quote_identifier(field)} AS INTEGER) AS {table._quote_identifier(field)}'
+            f'CAST({table._quote_identifier(field)} AS BIGINT) AS {table._quote_identifier(field)}'
             if field == x_col else table._quote_identifier(field) for field in fields)
         order_sql = ','.join(table._quote_identifier(field) + ' ASC' for field, _ in order)
         specs = []

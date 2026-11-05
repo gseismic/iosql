@@ -3,6 +3,8 @@
 import json
 import re
 import socket
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -612,6 +614,57 @@ def test_charts_and_overview_empty_state(page, web_servers):
     page.goto(web_servers["readonly"])
     playwright.expect(page.get_by_text("这个库还没有表")).to_be_visible()
     playwright.expect(page.get_by_role("button", name="复制示例")).to_be_visible()
+
+
+def test_cli_web_auto_detects_parquet_and_renders_chart(page, tmp_path):
+    """从真实 CLI 入口启动 Parquet 库，验证浏览器请求和绘制结果。"""
+    path = tmp_path / 'parquet.iosql'
+    with Database(f'parquet://{path}') as db:
+        table = db.timeseries(
+            'bars', time='ts', pk=['symbol', 'ts'],
+            columns={'symbol': 'text', 'ts': 'integer', 'close': 'float'},
+            partition_every='1day',
+        )
+        table.write([
+            {'symbol': 'BTCUSDT', 'ts': BASE + i * 1000, 'close': 100.0 + i}
+            for i in range(5)
+        ])
+    sock = socket.socket()
+    sock.bind(('127.0.0.1', 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    process = subprocess.Popen(
+        [sys.executable, '-c', 'from iosql.cli import app; app()',
+         'web', '-s', str(path), '--port', str(port), '--no-browser'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                pytest.fail('Parquet Web 进程提前退出')
+            try:
+                with socket.create_connection(('127.0.0.1', port), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            pytest.fail('Parquet Web 进程未启动')
+        page.goto(f'http://127.0.0.1:{port}/#/table/bars/charts')
+        page.get_by_role('combobox', name='X 轴').select_option('ts')
+        page.get_by_role('combobox', name='Y 轴').select_option('close')
+        page.get_by_role('combobox', name='条件字段 1').select_option('symbol')
+        page.get_by_role('textbox', name='条件值 1').fill('BTCUSDT')
+        page.get_by_role('button', name='绘制', exact=True).click()
+        playwright.expect(page.locator('.chart-canvas')).to_be_visible()
+        playwright.expect(page.locator('.chart-note')).to_contain_text('5 条原始记录')
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
 
 
 def test_chart_engine_load_failure_can_retry(page, web_servers):

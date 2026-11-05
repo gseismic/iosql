@@ -376,6 +376,8 @@ def test_migrate_verify_row_count_on_fresh_target(tmp_path, invoke_separate):
         source,
         "--target",
         target,
+        "--target-engine",
+        "sqlite",
         "-t",
         "ticks",
         "--verify",

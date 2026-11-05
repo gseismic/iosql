@@ -563,11 +563,11 @@ def _renaming(function):
         resolve = getattr(self, '_resolve_rename_database_target', None)
         if resolve is not None:
             target = resolve(destination)
-            from .database import _forbidden_rename_target_reason
+            from .database import _forbidden_rename_target_reason, _sqlite_uri_from_path
             reason = _forbidden_rename_target_reason(target)
             if reason:
                 raise UnsafeOperation(f'rename target must not be a {reason}: {target}')
-            uris.append('sqlite://' + str(target))
+            uris.append(_sqlite_uri_from_path('sqlite', target))
         with exclusive_resources(uris, timeout=0.0):
             with operation(self):
                 return function(self, destination, *args, **kwargs)
@@ -592,7 +592,18 @@ def _constructing(function):
             result = function(self, *args, **kwargs)
         else:
             with operation(self, uri=uri):
-                result = function(self, *args, **kwargs)
+                # 在空库中声明第一张表之前固定引擎，避免不同后端各自创建表。
+                if resource(uri).backend != 'memory':
+                    if getattr(self, '_storage_engine', None) == 'parquet':
+                        # 缺少依赖时不能先创建库目录和身份标记。
+                        from .engines.parquet.table import _duckdb
+                        _duckdb()
+                    from .utils.storage_identity import ensure_storage_engine, storage_engine_lock
+                    ensure_storage_engine(uri)
+                    with storage_engine_lock(uri, exclusive=True):
+                        result = function(self, *args, **kwargs)
+                else:
+                    result = function(self, *args, **kwargs)
         self._iosql_constructor = (args, dict(kwargs))
         self._iosql_explicitly_closed = False
         return result

@@ -1,8 +1,8 @@
 # iosql CLI
 
 `migrate` 支持 SQLite/Parquet 源库，并可写入 SQLite、Parquet 或 PostgreSQL 目标库。
-Parquet URI 必须显式传 `parquet://`；DuckDB 随 iosql 默认依赖安装。
-其他 CLI 运维命令仍只支持 SQLite。
+已有本地库可传路径自动识别，显式 URI 包括 `sqlite://`、`parquet://` 及 `iosql+` 别名。
+DuckDB 随 iosql 默认依赖安装。
 
 > 版本对齐：iosql v0.3.x。可视化管理台见 [ui.md](ui.md)。
 
@@ -13,7 +13,9 @@ iosql --help
 python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 ```
 
-常规 CLI 运维命令的 `--source` 只支持 SQLite 目录库，可传本地路径或 `sqlite://...` / `sqlite3://...`。`migrate` 是例外：它接受 SQLite 路径/URI 或 `parquet://...` 源库，并接受 SQLite、Parquet 或 PostgreSQL 目标。
+常用查询、导入导出和 Web 可访问 SQLite/Parquet；`doctor`、`index`、`repartition`、
+`backup`、`restore`、`rename-database` 仍限 SQLite。新迁移目标须指定后端前缀或
+`--target-engine sqlite|parquet`；已有目标可自动识别。
 
 ## 命令速查表
 
@@ -37,19 +39,19 @@ python -m cli --help  # 源码树内兼容入口，真实实现位于 iosql.cli
 | **诊断维护** | `iosql doctor -s DB [-t TABLE] [--fix]` | 检查布局和主键索引；`--fix` 只修索引；重分区建议会优先推荐业务时间列 |
 | | `iosql compact -s DB -t TABLE [--partition PART]` | 整理 row segment，生成新 generation；`--partition` 会校验分区存在并列可用分区 |
 | | `iosql cleanup-obsolete -s DB -t TABLE [--yes]` | dry-run 或确认清理 obsolete segment 文件；`--partition` 同样校验（含仅存在于 obsolete 的分区） |
-| | `iosql migrate -s DB --target parquet://... [--dry-run] [--verify row-count]` | SQLite/Parquet 源库迁移到 SQLite、Parquet 或 PostgreSQL；Parquet 源和目标使用显式 URI；拒绝同库/嵌套目标；行数校验要求所选目标表不存在或为空；--specs JSON 可改变目标分区，--temp-dir/--lock-timeout 控制暂存与锁等待 |
+| | `iosql migrate -s DB --target TARGET [--target-engine parquet] [--dry-run] [--verify row-count]` | SQLite/Parquet 源库迁移到 SQLite、Parquet 或 PostgreSQL；新本地目标须指定类型；拒绝同库/嵌套目标；--specs JSON 可改变目标分区，--temp-dir/--lock-timeout 控制暂存与锁等待 |
 | | `iosql repartition -s DB -t TABLE --partition 'duration(ts,every=1hour)' --target TARGET` | 按新分区策略写入目标库；`--dry-run` 也校验 interval/timezone 与目标父目录，目标不能等于/嵌套源库 |
 | | `iosql backup -s DB --target BACKUP` | 目录级备份；拒绝与源库互相包含的路径 |
-| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；备份和覆盖目标均须有真实表级 manifest 且分区文件完整，空目录不能作为备份；覆盖需 `--replace --yes`；复制后的副本会再次校验，替换失败回滚 |
+| | `iosql restore --backup BACKUP --target DB` | 目录级恢复；备份和覆盖目标须有完整表级 manifest，或是带有效 SQLite 类型标记的空库；普通空目录不可用；覆盖需 `--replace --yes` |
 | | `iosql index list/check/create/drop ...` | 检查、创建或删除物理分区索引；`index create` 校验列存在，`index check` 未通过退出码 2 |
 
 ## CLI 安全规则
 
 - `repartition` 默认必须提供 `--target` 或 `--replace-source`，不会隐式替换源库。`--dry-run` 也会先解析 interval/timezone 并校验目标父目录，且拒绝目标等于源库/位于源库内部。
 - 需要替换源库时必须使用 `--replace-source --yes`；`--dry-run` 不写业务数据，所以不要求 `--yes`。转换期间保持源库独占锁；备份复制已发布快照并合并 WAL，支持跨文件系统；完成后通过代际指针统一发布。提交决定前失败目标不变，决定后的中断由恢复屏障完成发布。备份和转换需要额外磁盘空间。
-- `restore --replace --yes` 只允许覆盖有真实表级 manifest 和完整分区文件的 iosql 库；备份也须通过同样的校验，空库没有可靠身份标记，当前不支持从空目录恢复。伪造 meta 的普通目录、根/家目录、符号链接以及与备份互相包含的路径全部拒绝。替换前校验临时副本，失败保留原目标。
-- `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库和互相包含的本地路径，`--verify row-count` 要求所选目标表不存在或为空。正式迁移持源/目标独占租约，普通协作 API 立即报 `DatabaseBusy`；先关闭读取流、flush 缓冲并退出缓冲上下文，`--lock-timeout` 控制锁等待总时限。
-- `migrate --dry-run` 只读源库，不连接目标，不验证目标权限、已有表兼容性或空表条件，可能创建源协调锁文件。本地目标的工作区默认位于目标文件系统；`--temp-dir` 可显式覆盖，但不得位于目标库内。转换工作区和暂存目标视图（含未选中目标表）需要额外磁盘空间。Parquet 目标成功发布后，表位于数据库根目录。结果中的 `published` 表达正式发布状态，`rows_copied` 可包含 ignore 跳过的行。
+- `restore --replace --yes` 只允许覆盖表级 manifest 和分区文件完整的 iosql 库，或带有效 SQLite 类型标记的空库；备份也须通过同样的校验。没有标记的普通空目录、伪造 meta 的普通目录、根/家目录、符号链接以及与备份互相包含的路径全部拒绝。替换前校验临时副本，失败保留原目标。
+- `rename-database --overwrite --yes` 同样校验目标身份与特殊路径；`migrate` 拒绝同库和互相包含的本地路径，`--verify row-count` 要求所选目标表不存在或为空。正式迁移持源/目标独占租约，普通协作 API 立即报 `DatabaseBusy`；先关闭读取流、flush 缓冲并退出缓冲上下文，`--lock-timeout` 控制包含库类型识别和源表预检的锁等待总时限。
+- `migrate --dry-run` 只读源库，不连接目标，不验证目标权限、已有表兼容性或空表条件；无类型目标路径必须指定 `--target-engine`。可能创建源协调锁文件。本地目标的工作区默认位于目标文件系统；`--temp-dir` 可显式覆盖，但不得位于目标库内。转换工作区和暂存目标视图（含未选中目标表）需要额外磁盘空间。Parquet 目标成功发布后，表位于数据库根目录。结果中的 `published` 表达正式发布状态，`rows_copied` 可包含 ignore 跳过的行。
 - `migrate --help` 提供可复制的迁移示例。命令将阶段、当前表的文件和行数进度以及耗时写入标准错误，最终 JSON 写入标准输出；单表计数不代表整个库的百分比。SQLite 到 Parquet 的正式迁移按文件统计并复制，在源表计数完成前显示已复制行数而不显示未知总数；预览仍单独统计全表，实际批次数可因分区边界与预览估计不同。
 - `cleanup-obsolete` 默认 dry-run；只有传 `--yes` 才删除文件，删除前默认执行当前可见 segment 深度校验；`--partition` 拼写错误会报错并列出可用分区（compact 同理）。
 - `import` 使用 `table.write()`，目标表必须已有 `TableSpec/TableContract`；JSONL/CSV 按 `--batch-size` 流式读取并支持 UTF-8 BOM，坏 JSONL 行/CSV 字段数不匹配会报行号；中途失败输出 `rows_seen`/`rows_written`/`batches_committed` JSON 汇总，以退出码 1 结束。

@@ -31,9 +31,9 @@ import typer
 
 from iosql import Database, PartitionSpec, format_partition_spec
 from iosql._migration_progress import observe as _observe_migration
-from iosql.coordination import exclusive_resources, lease, physical_path, resource
+from iosql.coordination import exclusive_resources, lease, physical_path, resource, timeout_value
 from iosql.migration import backup_snapshot, publish_snapshot
-from iosql.exception import IosqlError, PartitionSpecError
+from iosql.exception import DatabaseBusy, IosqlError, MigrationLockTimeout, PartitionSpecError
 from iosql.utils.mysqlite import Database as MyDatabase
 from iosql.utils.storage_identity import is_iosql_database
 
@@ -155,6 +155,9 @@ def _guard_command_errors(callback):
                 if source:
                     source_uri = _parse_uri(source)
                     _uri_to_path(source_uri)
+                    if callback.__name__ in {'doctor', 'index_list', 'index_check',
+                                             'index_create', 'index_drop'}:
+                        _require_sqlite_backend(source_uri, callback.__name__)
                     try:
                         resource(source_uri)
                     except ValueError as exc:
@@ -190,38 +193,28 @@ def _install_error_guards(typer_app: typer.Typer) -> None:
             command_info.callback = _guard_command_errors(command_info.callback)
 
 
-def _parse_uri(raw: str) -> str:
-    value = str(raw or "").strip()
-    if not value:
-        _fail("数据库路径不能为空")
-    if value.startswith(("sqlite://", "sqlite3://")):
-        return value
-    if "://" in value:
-        _fail("CLI 目前只支持 sqlite://、sqlite3:// 或本地路径")
-    return f"sqlite://{value}"
+def _parse_uri(raw: str, *, recover: bool = True, lock_deadline: Optional[float] = None) -> str:
+    from .utils.uri import resolve_database_uri
+    return resolve_database_uri(raw, allow_missing=True, recover=recover, lock_deadline=lock_deadline)
 
 
-def _parse_migration_target_uri(raw: str) -> str:
-    value = str(raw or "").strip()
-    if not value:
-        _fail("目标 URI 不能为空")
-    if value.startswith(("sqlite://", "sqlite3://", "postgresql://", "parquet://")):
-        return value
-    if "://" in value:
-        _fail("migrate 目标只支持 sqlite://、sqlite3://、postgresql:// 或 parquet://")
-    return f"sqlite://{value}"
+def _parse_sqlite_target_uri(raw: str) -> str:
+    from .utils.uri import resolve_database_uri
+    return resolve_database_uri(raw, engine='sqlite', allow_missing=True,
+                                inspect_existing=False)
+
+
+def _require_sqlite_backend(uri: str, command: str) -> None:
+    if resource(uri).backend not in ('sqlite', 'sqlite3'):
+        _fail(f'{command} 目前只支持 SQLite 库')
 
 
 def _uri_to_path(uri: str) -> Path:
-    for prefix in ("sqlite://", "sqlite3://"):
-        if uri.startswith(prefix):
-            raw_path = uri[len(prefix):].strip()
-            if not raw_path:
-                # 空路径会被 Path('') 解释为当前目录，必须显式拒绝
-                _fail(f"SQLite URI 缺少数据库路径: {uri}")
-            return Path(raw_path)
-    _fail(f"不支持的 SQLite URI: {uri}")
-    raise AssertionError("unreachable")
+    from .utils.uri import _local_location, normalize_uri
+    _, raw_path = _local_location(normalize_uri(uri))
+    if raw_path is None or raw_path == ':memory:':
+        _fail('此命令只支持本地持久数据库路径')
+    return Path(raw_path)
 
 
 def _real_path(path: Path) -> Path:
@@ -268,13 +261,14 @@ def _remove_empty_dirs(dirs: List[Path]) -> None:
             break
 
 
-def _require_source(source: str) -> tuple[str, Path]:
-    source_uri = _parse_uri(source)
+def _require_source(source: str, *, recover: bool = True,
+                    lock_deadline: Optional[float] = None) -> tuple[str, Path]:
+    source_uri = _parse_uri(source, recover=recover, lock_deadline=lock_deadline)
     source_path = _uri_to_path(source_uri)
     if not source_path.exists():
         _fail(f"数据库不存在: {source_path}")
     if not source_path.is_dir():
-        _fail(f"iosql SQLite 数据库必须是目录: {source_path}")
+        _fail(f"iosql 数据库必须是目录: {source_path}")
     return source_uri, source_path
 
 
@@ -285,7 +279,7 @@ def _backup_path(source_path: Path) -> Path:
 
 
 def _is_iosql_like_database(path: Path) -> bool:
-    """只接受有完整表级 manifest 的非空 iosql 库。"""
+    """接受完整表级 manifest 或持有有效库类型标记的空库。"""
     return is_iosql_database(path, deep=True)
 
 
@@ -417,7 +411,7 @@ def _resolve_rename_target_path(target: str, source_path: Path) -> Path:
     if not value:
         _fail("目标路径不能为空")
     if "://" in value:
-        return _uri_to_path(_parse_uri(value))
+        return _uri_to_path(_parse_sqlite_target_uri(value))
     if os.path.isabs(value) or os.sep in value or (os.altsep and os.altsep in value):
         return Path(os.path.abspath(value))
     return Path(os.path.abspath(os.path.join(os.path.dirname(str(source_path)), value)))
@@ -1142,6 +1136,7 @@ def rename_database(
 ):
     """重命名 SQLite 目录库。"""
     source_uri, source_path = _require_source(source)
+    _require_sqlite_backend(source_uri, 'rename-database')
     if overwrite and not yes:
         _fail("覆盖已有目标目录需要同时传 --overwrite --yes")
 
@@ -1489,12 +1484,13 @@ def cleanup_obsolete(
 
 @app.command()
 def migrate(
-    source: str = typer.Option(..., "--source", "-s", help="SQLite/Parquet 源库 URI，或 SQLite 路径"),
+    source: str = typer.Option(..., "--source", "-s", help="SQLite/Parquet 源库 URI 或本地路径（自动识别）"),
     target: str = typer.Option(
         ...,
         "--target",
-        help="目标库 URI，支持 postgresql://、sqlite:// 或 parquet://",
+        help="目标库 URI 或路径；新本地库需指定后端前缀或 --target-engine",
     ),
+    target_engine: Optional[str] = typer.Option(None, "--target-engine", help="新本地目标类型：sqlite 或 parquet"),
     table: List[str] = typer.Option(
         None,
         "--table",
@@ -1521,6 +1517,8 @@ def migrate(
         iosql migrate -s src --target parquet://dst --dry-run
       迁移全部表并校验行数：
         iosql migrate -s src --target parquet://dst --verify row-count
+      新目标用路径和独立引擎参数：
+        iosql migrate -s src --target p --target-engine parquet --verify row-count
       只迁移 ticks 表：
         iosql migrate -s src -t ticks --target parquet://one --verify row-count
       Parquet → SQLite：
@@ -1528,14 +1526,15 @@ def migrate(
 
     迁移进度写入标准错误，完成后的 JSON 结果写入标准输出。
     """
-    if str(source).startswith('parquet://'):
-        source_uri = str(source).strip()
-        source_path = Path(source_uri[len('parquet://'):])
-        if not source_path.is_dir():
-            _fail(f'Parquet 源库目录不存在: {source_path}')
-    else:
-        source_uri, source_path = _require_source(source)
-    target_uri = _parse_migration_target_uri(target)
+    from .utils.uri import _local_location, normalize_uri
+    lock_deadline = time.monotonic() + timeout_value(lock_timeout)
+    _, raw_source_path = _local_location(normalize_uri(source))
+    if raw_source_path is not None and Path(raw_source_path).is_symlink():
+        _fail('源/目标库目录不能是符号链接')
+    try:
+        source_uri, _ = _require_source(source, recover=not dry_run, lock_deadline=lock_deadline)
+    except DatabaseBusy as exc:
+        raise MigrationLockTimeout('等待源库识别锁超过 lock_timeout') from exc
     write_mode = _normalize_write_mode(mode)
     verify_mode = _normalize_verify_mode(verify)
     table_arg = _parse_table_mapping(table or [])
@@ -1543,7 +1542,10 @@ def migrate(
         _fail("batch-size 必须大于 0")
 
     with _MigrationProgress() as progress, _observe_migration(progress):
-        db = Database(source_uri)
+        try:
+            db = Database(source_uri, _recover=not dry_run, _lock_deadline=lock_deadline)
+        except DatabaseBusy as exc:
+            raise MigrationLockTimeout('等待源库识别锁超过 lock_timeout') from exc
         try:
             layout_specs = None
             if specs:
@@ -1553,12 +1555,14 @@ def migrate(
                 except ValueError as exc:
                     _fail(f"specs JSON 错误: {exc}")
             result = db.migrate_to(
-                target_uri,
+                target,
                 tables=table_arg,
                 mode=write_mode,
                 batch_size=batch_size,
                 verify=verify_mode,
-                dry_run=dry_run, specs=layout_specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+                dry_run=dry_run, specs=layout_specs, temp_dir=temp_dir,
+                lock_timeout=max(0.0, lock_deadline - time.monotonic()),
+                target_engine=target_engine,
             )
         finally:
             db.close()
@@ -1894,6 +1898,7 @@ def repartition(
         _fail("替换源库必须同时提供 --replace-source --yes")
 
     source_uri, source_path = _require_source(source)
+    _require_sqlite_backend(source_uri, 'repartition')
     db = Database(source_uri)
     try:
         t = _require_table(db, table)
@@ -1924,7 +1929,7 @@ def repartition(
         db.close()
 
     if target:
-        final_target_uri = _parse_uri(target)
+        final_target_uri = _parse_sqlite_target_uri(target)
         final_target_path = _uri_to_path(final_target_uri)
         source_real = _real_path(source_path)
         target_real = _real_path(final_target_path)
@@ -1937,7 +1942,8 @@ def repartition(
         tmp_path = source_path.with_name(
             f"{source_path.name}.repartition_tmp_{stamp}_{os.getpid()}"
         )
-        final_target_uri = f"sqlite://{tmp_path}"
+        from .utils.uri import _typed_local_uri
+        final_target_uri = _typed_local_uri('sqlite', str(tmp_path))
         final_target_path = tmp_path
 
     # 备份路径预检：与源库重叠会在替换阶段自毁数据
@@ -2033,7 +2039,8 @@ def backup(
     target: str = typer.Option("", "--target", help="备份目录，默认自动生成"),
 ):
     """备份 SQLite 目录库。"""
-    _, source_path = _require_source(source)
+    source_uri, source_path = _require_source(source)
+    _require_sqlite_backend(source_uri, 'backup')
     target_path = Path(target) if target else _backup_path(source_path)
     source_real = _real_path(source_path)
     target_real = _real_path(target_path)
@@ -2045,7 +2052,7 @@ def backup(
         _fail(f"备份目标不能包含源库: {target_path}")
     if target_path.exists():
         _fail(f"备份目标已存在: {target_path}")
-    backup_snapshot(f"sqlite://{source_path}", target_path)
+    backup_snapshot(source_uri, target_path)
     _echo_json({"source": str(source_path), "backup": str(target_path)})
 
 
@@ -2058,7 +2065,7 @@ def restore(
 ):
     """从备份恢复 SQLite 目录库。
 
-    覆盖恢复前会校验备份和目标的真实表级 manifest，
+    覆盖恢复前会校验备份和目标的表级 manifest 或空库类型标记，
     并拒绝根/家目录、符号链接、以及与备份互相包含的路径。复制成功后
     通过物理代际指针统一发布；已决定提交的中断由下一次操作恢复。"""
     if not backup_path.exists() or not backup_path.is_dir():
@@ -2066,7 +2073,7 @@ def restore(
     if backup_path.is_symlink():
         _fail(f"备份目录是符号链接，拒绝使用: {backup_path}")
 
-    target_uri = _parse_uri(target)
+    target_uri = _parse_sqlite_target_uri(target)
     target_path = _uri_to_path(target_uri)
     backup_real = _real_path(backup_path)
     target_real = _real_path(target_path)
@@ -2086,7 +2093,9 @@ def restore(
     if _is_within(backup_real, target_real):
         _fail(f"备份目录不能位于恢复目标内部: {target_path}")
 
-    with exclusive_resources((f"sqlite://{backup_path.resolve()}", target_uri), timeout=30.0):
+    from .utils.uri import _typed_local_uri
+    backup_uri = _typed_local_uri('sqlite', str(backup_path.resolve()))
+    with exclusive_resources((backup_uri, target_uri), timeout=30.0):
         # 路径检查到加锁之间目标可能被创建；必须在独占范围重新检查授权。
         target_exists = target_path.exists()
         if not _is_iosql_like_database(backup_path):
@@ -2107,7 +2116,7 @@ def restore(
         if str(target_parent) and not target_parent.exists():
             _fail(f"目标父目录不存在: {target_parent}")
 
-        publish_snapshot(f"sqlite://{backup_path.resolve()}", target_uri)
+        publish_snapshot(backup_uri, target_uri)
 
     _echo_json({"backup": str(backup_path), "target": str(target_path)})
 
@@ -2122,10 +2131,7 @@ def web(
     no_browser: bool = typer.Option(False, "--no-browser", help="启动后不自动打开浏览器"),
 ):
     """启动本地 Web 管理台。"""
-    source_uri = _parse_uri(source)
-    source_path = _uri_to_path(source_uri)
-    if not source_path.exists():
-        raise typer.BadParameter(f"数据库不存在: {source_path}")
+    source_uri, _ = _require_source(source)
 
     # 惰性导入：Web 依赖属于 [web] extra（旧名 [ui] 仍可用），未安装时给出安装指引
     try:

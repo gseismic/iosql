@@ -307,6 +307,12 @@ class LocalPublisher:
         if self.backend == 'parquet' and plans and self.previous != root:
             raise UnsafeOperation('旧代目录需要先整理为普通 Parquet 目录后才能迁移到该库')
         if self.previous.exists() and any(self.previous.iterdir()):
+            from .utils.storage_identity import _check_engine, detect_storage_engine
+            try:
+                actual = detect_storage_engine(self.previous)
+            except UnsafeOperation as exc:
+                raise UnsafeOperation(f'目标不是完整的 iosql 数据库: {exc}') from exc
+            _check_engine(actual, self.backend, root)
             if not is_iosql_database(root, allow_empty=True, backend=self.backend, deep=True):
                 raise UnsafeOperation('目标不是完整的 iosql 数据库，拒绝接管')
         if self.previous.is_dir():
@@ -331,7 +337,8 @@ class LocalPublisher:
             copy_snapshot(self.previous, payload)
         else:
             payload.mkdir()
-        uri = self.item.backend + '://' + str(payload)
+        from .utils.uri import _typed_local_uri
+        uri = _typed_local_uri(self.item.backend, str(payload))
         self.stage_db = self.factory(uri)
         for plan in plans:
             table = self.stage_db.table(plan.target_name, spec=plan.target_spec)
@@ -563,13 +570,47 @@ def _copy(plans, publisher, source, batch_size, mode):
 
 def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
             verify=None, dry_run=False, *, specs=None, temp_dir=None, lock_timeout=30.0,
-            _same_database=False):
+            target_engine=None, _same_database=False):
     from .database import Database, _normalize_migration_verify
+    from .utils.storage_identity import storage_engine_lock
+    from .utils.uri import _local_location, normalize_uri, resolve_database_uri
+    timeout = timeout_value(lock_timeout)
+    lock_deadline = time.monotonic() + timeout
+    # 先按物理位置拒绝自迁移；即使目标前缀错误，也不应先触碰目标库。
+    source_resource = resource(owner.uri)
+    _, source_path_text = _local_location(normalize_uri(owner.uri))
+    declared_target, target_path_text = _local_location(normalize_uri(target_uri))
+    for raw_path in (source_path_text, target_path_text):
+        if raw_path not in (None, ':memory:') and Path(raw_path).is_symlink():
+            raise UnsafeOperation('源/目标库目录不能是符号链接')
+    if source_resource.path is not None and target_path_text not in (None, ':memory:'):
+        target_path = Path(os.path.realpath(target_path_text))
+        try:
+            common = Path(os.path.commonpath((source_resource.path, target_path)))
+        except ValueError:  # Windows 不同盘符没有共同路径。
+            common = None
+        if (_same_database and source_resource.path == target_path
+                and isinstance(tables, dict) and set(tables) & set(tables.values())):
+            raise BadArgument('repartition_to requires a different target uri or table')
+        if source_resource.path == target_path and not _same_database:
+            raise BadArgument('源库与目标库不能相同；请指定新的目标库')
+        if common == source_resource.path and source_resource.path != target_path:
+            raise BadArgument('目标库不能位于源库内部')
+        if common == target_path and source_resource.path != target_path:
+            raise BadArgument('源库不能位于目标库内部')
+    try:
+        target_uri = resolve_database_uri(
+            target_uri, engine=target_engine, allow_missing=True,
+            inspect_existing=(not dry_run and declared_target is None and target_engine is None),
+            lock_deadline=lock_deadline,
+        )
+    except DatabaseBusy as exc:
+        from .exception import MigrationLockTimeout
+        raise MigrationLockTimeout('等待目标库识别锁超过 lock_timeout') from exc
     source_uri = owner.uri
     batch_size = _batch_size(batch_size)
     verify = _normalize_migration_verify(verify)
     mode = Database._normalize_migration_mode(mode)
-    timeout = timeout_value(lock_timeout)
     if temp_dir is not None:
         try:
             temp_dir = os.fspath(temp_dir)
@@ -606,7 +647,6 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
     publisher = None
     published = False
     stage = 'waiting-locks'
-    lock_deadline = time.monotonic() + timeout
     def plan_sources():
         if owner.uri != source_uri:
             raise UnsafeOperation('源对象 URI 在迁移预检后发生变化，请重新发起迁移')
@@ -626,8 +666,11 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
                 if owner.uri != source_uri:
                     raise UnsafeOperation('源对象 URI 在迁移预检后发生变化，请重新发起迁移')
                 with operation(owner, uri=source_uri, recover=not dry_run):
-                    stage = 'planning'
-                    plans = plan_sources()
+                    # 源表目录扫描也需要类型锁；同样受调用方的总等待预算约束。
+                    deadline = time.monotonic() if dry_run else lock_deadline
+                    with storage_engine_lock(source_uri, exclusive=True, deadline=deadline):
+                        stage = 'planning'
+                        plans = plan_sources()
                     if dry_run:
                         for plan in plans:
                             plan.result.source_rows = _count_rows(plan, 'source', plan.source.count_rows)
@@ -753,14 +796,15 @@ def migrate(owner, target_uri, tables=None, mode='append', batch_size=10_000,
 
 def migrate_table(owner, target_uri, tables=OMITTED, mode='append', batch_size=10_000,
                   verify=None, dry_run=False, *, specs=None, temp_dir=None,
-                  lock_timeout=30.0, target_table=OMITTED):
+                  lock_timeout=30.0, target_table=OMITTED, target_engine=None):
     if target_table is not OMITTED:
         if tables is not OMITTED:
             raise BadArgument('tables 与 target_table 不能同时传入')
         tables = {owner.table_name: target_table or owner.table_name}
     return migrate(owner, target_uri, tables=None if tables is OMITTED else tables,
                    mode=mode, batch_size=batch_size, verify=verify, dry_run=dry_run,
-                   specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout)
+                   specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+                   target_engine=target_engine)
 
 
 def publish_snapshot(source_uri, target_uri, *, lock_timeout=30.0):
@@ -854,8 +898,19 @@ def rename_published_database(database, target_uri):
 def repartition(owner, target_uri, table_name=None, spec=None, mode='append', batch_size=10_000):
     """旧接口沿用返回类型，所有数据转换复用安全迁移。"""
     from .spec import RepartitionResult
+    from .utils.uri import _local_location, normalize_uri, resolve_database_uri
     target_name = table_name or owner.table_name
     from .database import Database
+    declared, path = _local_location(normalize_uri(target_uri))
+    if path not in (None, ':memory:') and Path(path).is_symlink():
+        raise UnsafeOperation('源/目标库目录不能是符号链接')
+    source_item = resource(owner.uri)
+    if (source_item.path is not None and path not in (None, ':memory:')
+            and source_item.path == Path(os.path.realpath(path))
+            and target_name == owner.table_name):
+        raise BadArgument('repartition_to requires a different target uri or table')
+    target_uri = resolve_database_uri(target_uri, allow_missing=True,
+                                      inspect_existing=declared is None)
     with exclusive_resources((owner.uri, target_uri)):
         try:
             result = migrate(owner, target_uri, tables={owner.table_name: target_name}, mode=mode,

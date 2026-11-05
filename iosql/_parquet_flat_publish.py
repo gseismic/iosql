@@ -9,7 +9,9 @@ import warnings
 from contextlib import closing
 from .coordination import atomic_json, ensure_directory, sync_directory
 from .exception import MigrationRecoveryRequired, UnsafeOperation
-from .utils.storage_identity import is_iosql_table
+from .utils.storage_identity import (
+    _check_engine, _marker_engine, _write_marker, detect_storage_engine, is_iosql_table,
+)
 
 
 def _identity(path, kind, *, missing=False):
@@ -262,6 +264,10 @@ def _recover(coordinator, state):
     for name in names:
         if not is_iosql_table(root / name, deep=True, backend='parquet'):
             raise MigrationRecoveryRequired(f'平坦发布后的表完整性校验失败: {name}')
+    # 只有提交决定落盘后才写入库级身份；崩溃时本恢复流程可幂等重放。
+    _check_engine(detect_storage_engine(root), 'parquet', root)
+    if _marker_engine(root) is None:
+        _write_marker(root, 'parquet')
     op = record['operation_id']
     coordinator.write_state(op, {'state': 'COMMITTED', 'operation_id': op}, physical_root=None)
 

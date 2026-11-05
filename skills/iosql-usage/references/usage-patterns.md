@@ -657,7 +657,7 @@ with Database("sqlite://db/market.iosql") as source:
 ```
 
 Parquet → SQLite 的方向只需把源和目标 URI 对调。CLI 用 `iosql migrate -s SOURCE --target TARGET`；
-Parquet URI 显式使用 `parquet://`；DuckDB 随 iosql 默认依赖安装，无需 extra。
+已有本地库可用路径自动识别；新本地目标使用 `parquet://` 或 `--target-engine parquet`；DuckDB 随 iosql 默认依赖安装，无需 extra。
 文件重写成本、流式读取生命周期和其他后端边界见 [Parquet 使用指南](parquet.md)。
 
 正式迁移持有源/目标独占租约，协作 API 在此期间报 `DatabaseBusy`。

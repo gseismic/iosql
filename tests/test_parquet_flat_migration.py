@@ -32,7 +32,7 @@ def test_new_parquet_migration_has_the_normal_root_layout(tmp_path):
         _table(source, 'trades', {'id': 2, 'value': 'second'})
         result = source.migrate_to(_uri(target), verify='row-count')
     assert result.published and result.verified
-    assert sorted(path.name for path in target.iterdir()) == ['bars', 'trades']
+    assert sorted(path.name for path in target.iterdir()) == ['__iosql_database__.json', 'bars', 'trades']
     assert (target / 'bars' / 'meta.sqlite3').is_file()
     assert (target / 'bars' / 'data').is_dir()
     assert physical_root(_uri(target)) == target
@@ -58,7 +58,7 @@ def test_existing_target_preserves_idle_metadata_connection_and_unselected_table
         assert keep.select() == [{'id': 3, 'value': 'preserved'}]
         old.write({'id': 4, 'value': 'after'})
         assert old.count_rows() == 3
-        assert sorted(path.name for path in target.iterdir()) == ['bars', 'keep']
+        assert sorted(path.name for path in target.iterdir()) == ['__iosql_database__.json', 'bars', 'keep']
 
 
 def test_repeated_migration_keeps_flat_layout(tmp_path):
@@ -74,7 +74,7 @@ def test_repeated_migration_keeps_flat_layout(tmp_path):
             assert current.select(order_by='id') == [
                 {'id': 1, 'value': 'first'}, {'id': 2, 'value': 'second'},
             ]
-            assert sorted(path.name for path in target.iterdir()) == ['bars']
+            assert sorted(path.name for path in target.iterdir()) == ['__iosql_database__.json', 'bars']
 
 
 @pytest.mark.parametrize(('mode', 'expected'), [('ignore', 'old'), ('replace', 'new'), ('upsert', 'new')])
@@ -103,7 +103,7 @@ def test_predecision_failure_leaves_existing_target_unchanged(tmp_path, monkeypa
             source.migrate_to(target.uri)
         assert failure.value.partial_result.published is False
         assert original.select() == [{'id': 1, 'value': 'old'}]
-        assert sorted(path.name for path in (tmp_path / 'target').iterdir()) == ['bars']
+        assert sorted(path.name for path in (tmp_path / 'target').iterdir()) == ['__iosql_database__.json', 'bars']
 
 
 def test_old_generation_can_be_source_but_not_flat_migration_target(tmp_path):
@@ -121,7 +121,7 @@ def test_old_generation_can_be_source_but_not_flat_migration_target(tmp_path):
     with Database(destination) as source:
         with pytest.raises(UnsafeOperation, match='旧代目录'):
             source.migrate_to(old)
-    assert sorted(p.name for p in (tmp_path / 'destination').iterdir()) == ['bars']
+    assert sorted(p.name for p in (tmp_path / 'destination').iterdir()) == ['__iosql_database__.json', 'bars']
 
 
 def test_explicit_cross_filesystem_workspace_still_publishes_flat(tmp_path):
@@ -135,7 +135,7 @@ def test_explicit_cross_filesystem_workspace_still_publishes_flat(tmp_path):
             result = source.migrate_to(_uri(target), temp_dir=temporary, verify='row-count')
         assert result.published and result.verified
         assert list(Path(temporary).iterdir()) == []
-    assert sorted(path.name for path in target.iterdir()) == ['bars']
+    assert sorted(path.name for path in target.iterdir()) == ['__iosql_database__.json', 'bars']
     with Database(_uri(target)) as db:
         assert db.table('bars').select() == [{'id': 1, 'value': 'first'}]
 
@@ -155,7 +155,7 @@ def test_target_workspace_inside_root_is_removed_after_publish(tmp_path, monkeyp
     with Database(_uri(tmp_path / 'source', 'sqlite')) as source:
         _table(source, 'bars', {'id': 1, 'value': 'first'})
         assert source.migrate_to(_uri(target), verify='row-count').verified
-    assert sorted(path.name for path in target.iterdir()) == ['bars']
+    assert sorted(path.name for path in target.iterdir()) == ['__iosql_database__.json', 'bars']
 
 
 @pytest.mark.skipif(os.name != 'posix' or not shutil.rmtree.avoids_symlink_attacks
@@ -183,7 +183,7 @@ def test_mountpoint_workspace_cleanup_removes_empty_management_directory(tmp_pat
     with Database(_uri(tmp_path / 'source', 'sqlite')) as source:
         _table(source, 'bars', {'id': 1, 'value': 'first'})
         assert source.migrate_to(_uri(target), verify='row-count').verified
-    assert sorted(path.name for path in target.iterdir()) == ['bars']
+    assert sorted(path.name for path in target.iterdir()) == ['__iosql_database__.json', 'bars']
 
 
 def test_mountpoint_without_safe_cleanup_preserves_staging_and_warns(tmp_path, monkeypatch):

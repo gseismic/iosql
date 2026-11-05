@@ -22,7 +22,9 @@ python -m pip install -e .
 
 ## 打开、建表与查询
 
-Parquet 目录库使用 `parquet://` URI。建表、查询和 SQLite 后端使用相同的契约 API：
+创建 Parquet 目录库可使用 `parquet://` 或 `iosql+parquet://` URI，也可调用
+`Database.create(path, engine="parquet")`；已有库可直接传本地路径自动识别。
+建表、查询和 SQLite 后端使用相同的契约 API：
 
 ~~~python
 from iosql import Database, Segment
@@ -52,7 +54,7 @@ with Database("parquet://db/archive.iosql") as db:
 
 ## 存储布局与写入语义
 
-每张表的 `meta.sqlite3` 保存契约和 manifest，业务数据保存在
+新库的 `__iosql_database__.json` 标识存储类型，每张表的 `meta.sqlite3` 保存契约和 manifest，业务数据保存在
 `<table>/data/*.parquet` 入口及其专属隐藏数据片目录，文件使用 ZSTD 压缩。
 追加后由 `<入口>.manifest.json` 列出可见文件；应通过 API、备份或迁移复制完整集合，
 不要只复制入口文件。iosql 只识别自己管理的目录库，不会
@@ -135,7 +137,7 @@ dry-run 只读源、不连接目标，不验证目标权限、已有契约或空
 `operation_id`、`partial_result` 和 `recovery_path` 查明状态，再决定重试；
 详见[迁移错误排查](troubleshooting.md#统一迁移与协作锁)。
 
-CLI 只为 `migrate` 提供 Parquet URI 支持：
+CLI 可自动识别已有 Parquet 源库，也可显式传 `parquet://`：
 
 ~~~bash
 iosql migrate -s sqlite://db/market.iosql \
@@ -145,7 +147,9 @@ iosql migrate -s parquet://db/archive.iosql \
   --target sqlite://db/restored.iosql --verify row-count
 ~~~
 
-其他 CLI 运维命令与 Web 工作区仍使用 SQLite 目录库。SQLite → Parquet 的单向迁移示例见
+`iosql web -s db/archive.iosql` 支持数据浏览和图表；新迁移目标可传
+`--target-engine parquet`。`doctor`、`index`、`repartition`、`backup`、`restore` 和
+`rename-database` 仍限 SQLite。SQLite → Parquet 的单向迁移示例见
 [16_sqlite_to_parquet.py](../examples/16_sqlite_to_parquet.py)；Parquet 后端和双向迁移的完整示例见
 [14_parquet_backend.py](../examples/14_parquet_backend.py)。
 

@@ -257,26 +257,26 @@ if result.layout_warnings:
 
 ## 目录与 URI 错误
 
-### InvalidUriSchema
+### 本地库类型无法识别或不匹配
 
-**症状**：`Database("data.sqlite3")` 报 `InvalidUriSchema`。
+**症状**：路径不存在、库缺少可识别的类型，或显式 URI 与库的实际类型不匹配。
 
-**原因**：主 API 要求 `sqlite://`、`parquet://` 或 `postgresql://` 前缀的 URI 格式。
+**原因**：已有库按元数据识别；新库必须显式选择 SQLite/Parquet，且不能覆盖不同类型的库。
 
 **排查**：
 
 ```python
-# 正确：SQLite 使用 sqlite:// 前缀
+# 新建 SQLite 时可使用 sqlite:// 前缀
 db = Database("sqlite://db/market.iosql")
 
 # 正确：PostgreSQL 使用 postgresql:// 前缀
 db = Database("postgresql://user:pass@localhost:5432/mydb")
 
-# 正确：Parquet 使用 parquet:// 前缀
+# 新建 Parquet 时可使用 parquet:// 前缀
 db = Database("parquet://db/archive.iosql")
 
-# 错误：直接传文件路径（低层 mysqlite 才接受）
-db = Database("db/market.iosql")  # 报 InvalidUriSchema
+# 已有本地目录库自动识别存储类型
+db = Database("db/market.iosql")
 ```
 
 ### EngineNotExist

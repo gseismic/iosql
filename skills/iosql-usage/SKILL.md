@@ -12,7 +12,7 @@ iosql：支持本地 SQLite、Parquet 与 PostgreSQL 的时序数据存储库。
 ```python
 from iosql import Database
 
-with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前缀；with 自动 close
+with Database("sqlite://db/market.iosql") as db:        # 新库显式选择 SQLite；with 自动 close
     bars = db.timeseries(
         "kline_1m",
         time="ts",
@@ -35,7 +35,8 @@ with Database("sqlite://db/market.iosql") as db:        # 必须 sqlite:// 前�
 默认依赖安装，无需额外 extra。建表、查询和迁移沿用主 API；Parquet 追加采用不可变数据片，
 修改和删除重写受影响集合，适合批量归档。先看 [Parquet 使用指南](references/parquet.md) 了解性能和接口边界，再运行
 [SQLite → Parquet 迁移示例](examples/16_sqlite_to_parquet.py) 或
-[Parquet 后端完整示例](examples/14_parquet_backend.py)。CLI 目前只有 `migrate` 支持 Parquet URI。
+[Parquet 后端完整示例](examples/14_parquet_backend.py)。已有库可直接以路径自动识别；
+CLI 常用查询、迁移和 Web 的数据浏览及图表支持 Parquet。
 
 ```
 带时间戳/日期的数据（K线、tick、orderbook、财报、新闻）
@@ -225,7 +226,7 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 
 | 类别 | API | 要点 |
 |------|-----|------|
-| 入口 | `Database(uri)` | `sqlite://`、`parquet://` 或 `postgresql://` 前缀必带 |
+| 入口 | `Database(uri)` | 已有本地库可传路径自动识别；新库显式用 `sqlite://`/`parquet://` 或 `Database.create(path, engine=...)`；支持 `iosql+` 前缀 |
 | | `db.table(name, pk, columns, partition=, segment=, order_key=, symbol_column=, session_column=)` | 核心建表入口 |
 | | `db.timeseries(name, time=, pk=, partition_every=)` | 时序语法糖（table 的薄封装） |
 | | `db.table_names()` / `db.close()` | 列表 / 关闭 |
@@ -244,7 +245,7 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 
 ## 关键规则（违反即抛异常）
 
-- URI 必须 `sqlite://` / `parquet://` / `postgresql://` 前缀，直接传文件路径报 `InvalidUriSchema`。
+- 已有本地库可直接传路径或 `iosql:///绝对路径`；新库必须指定 SQLite/Parquet 引擎，显式类型与已有库不一致时拒绝。PostgreSQL 使用连接 URI。
 - Parquet 写入成本、读取流生命周期、支持的维护操作和后端差异见 [Parquet 使用指南](references/parquet.md)。
 - 每行必须含完整 pk 字段，缺列抛 `BadArgument`（不会退回 rowid 自增）。
 - SQLite/Parquet 已存在的表用 `db.table("name")` 获取引用；重新声明不兼容的契约抛 `TableSpecConflict`。PostgreSQL 重开时须重新绑定原契约，iosql 检查持久摘要、已有迁移契约和原生边界；没有持久契约的旧表需由使用者核对原策略，首次写入需要表所有者权限。

@@ -117,7 +117,7 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 
 ## 反模式（避免）
 
-- ❌ 直接传文件路径给主 API（如 `Database("db/market.iosql")`）→ 必须用 `sqlite://` 前缀
+- 已有本地库可直接传目录路径自动识别；新库须用显式引擎或 `Database.create(path, engine=...)`，显式类型与已有库不一致时拒绝。
 - ❌ `from iosql import DurationPartition` → 顶层已不导出分区类，用 `Partition.duration(...)` 工厂
 - ❌ 对已存在表重复声明不同契约 → 用 `db.table("name")` 获取引用而非重新声明
 - ❌ 在写入前未声明 `pk` 或写入行缺主键字段 → 会抛 `BadArgument`（不会退回 rowid 自增），每行必须补齐主键

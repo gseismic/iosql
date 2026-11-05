@@ -19,7 +19,8 @@ from .engines import sqlite
 from .partition import Partition
 from .spec import Segment, TableContract, TimeColumn, PartitionSpec, parse_partition_spec
 from .utils.storage_identity import (
-    iosql_table_names, is_iosql_database, is_iosql_scaffold, is_iosql_table,
+    _check_engine, _marker_engine, detect_storage_engine, iosql_table_names, is_iosql_database,
+    is_iosql_scaffold, is_iosql_table, storage_engine_lock,
 )
 
 
@@ -106,7 +107,8 @@ def _sqlite_path_from_uri(uri):
 
 
 def _sqlite_uri_from_path(schema, path):
-    return f"{schema}://{os.path.abspath(path)}"
+    from .utils.uri import _typed_local_uri
+    return _typed_local_uri(schema, os.path.abspath(path))
 
 
 @guard_database_class
@@ -124,7 +126,14 @@ class Database(object):
         max_connections_per_file=_DEFAULT_MAX_CONNECTIONS_PER_FILE,
         max_process_connections=_DEFAULT_MAX_PROCESS_CONNECTIONS,
         max_ordered_read_connections=_DEFAULT_MAX_ORDERED_READ_CONNECTIONS,
+        engine=None,
+        _recover=True,
+        _lock_deadline=None,
     ):
+        from .utils.uri import resolve_database_uri
+
+        uri = resolve_database_uri(uri, engine=engine, allow_missing=True, recover=_recover,
+                                   lock_deadline=_lock_deadline)
         self._uri = uri
         self._table_cls = Database.get_engine(uri)
         self._tables = {}
@@ -169,6 +178,34 @@ class Database(object):
     def uri(self):
         return self._uri
 
+    @property
+    def engine(self):
+        """实际使用的存储引擎，SQLite 的 sqlite3 别名统一显示为 sqlite。"""
+        return 'sqlite' if self._uri_schema == 'sqlite3' else self._uri_schema
+
+    @classmethod
+    def create(cls, uri, *, engine, **options):
+        """显式初始化新的本地目录库；已有库或非空目录不会被覆盖。"""
+        from .coordination import lease, physical_root, resource
+        from .utils.storage_identity import ensure_storage_engine
+        from .utils.uri import resolve_database_uri
+
+        resolved = resolve_database_uri(uri, engine=engine, allow_missing=True)
+        item = resource(resolved)
+        if item.path is None or item.backend not in ('sqlite', 'sqlite3', 'parquet'):
+            raise BadArgument('Database.create 仅支持本地持久 SQLite 或 Parquet 库')
+        if item.backend == 'parquet':
+            from .engines.parquet.table import _duckdb
+            _duckdb()
+        # 先验证所有构造参数，失败时不能留下已声明类型的新库。
+        database = cls(resolved, **options)
+        with lease(resolved, exclusive=True, timeout=30.0):
+            root = physical_root(resolved)
+            if root.exists() and (not root.is_dir() or any(root.iterdir())):
+                raise UnsafeOperation(f'数据库目标已存在或目录非空: {root}')
+            ensure_storage_engine(resolved, claim=True)
+        return database
+
     def _reload_after_migration(self):
         """让外部持有的旧表对象在下一次使用时也能重新绑定。"""
         if self._uri_schema == 'postgresql':
@@ -202,6 +239,19 @@ class Database(object):
                 table_name = self._table_cls._validate_table_name(table_name)
             table = self._tables.get(table_name)
             if table is not None:
+                if self._uri_schema in ["sqlite", "sqlite3", "parquet"]:
+                    from .coordination import physical_root, resource
+                    if resource(self._uri).path is not None:
+                        root = physical_root(self._uri)
+                        backend = 'parquet' if self._uri_schema == 'parquet' else 'sqlite'
+                        # 标记由原子替换发布，检查缓存对象无需等待其他表的写入。
+                        _check_engine(_marker_engine(root), backend, root)
+                        table_path = root / table_name
+                        if os.path.lexists(table_path) and (
+                                table_path.is_symlink() or not table_path.is_dir()):
+                            raise UnsafeOperation(f"表路径不是普通目录: {table_path}")
+                        if (table_path / 'meta.sqlite3').is_symlink():
+                            raise UnsafeOperation(f"表元数据不能是符号链接: {table_path}")
                 return table
             table_options = {
                 "table_name": table_name,
@@ -218,15 +268,17 @@ class Database(object):
                 db_path = str(physical_path(db_path))
                 table_path = os.path.join(db_path, table_name)
                 backend = 'parquet' if self._uri_schema == 'parquet' else 'sqlite'
-                if os.path.lexists(table_path):
-                    if os.path.islink(table_path) or not os.path.isdir(table_path):
-                        raise UnsafeOperation(f"表路径不是普通目录: {table_path}")
-                    if os.listdir(table_path) and not (
-                        is_iosql_table(table_path, backend=backend) or is_iosql_scaffold(table_path)
-                    ):
-                        raise UnsafeOperation(
-                            f"目录不是有效 iosql 表，拒绝在其中创建元数据: {table_path}"
-                        )
+                with storage_engine_lock(self._uri, exclusive=True):
+                    _check_engine(detect_storage_engine(db_path, verify_tables=False), backend, db_path)
+                    if os.path.lexists(table_path):
+                        if os.path.islink(table_path) or not os.path.isdir(table_path):
+                            raise UnsafeOperation(f"表路径不是普通目录: {table_path}")
+                        if os.listdir(table_path) and not (
+                            is_iosql_table(table_path, backend=backend) or is_iosql_scaffold(table_path)
+                        ):
+                            raise UnsafeOperation(
+                                f"目录不是有效 iosql 表，拒绝在其中创建元数据: {table_path}"
+                            )
             if self._uri_schema in ["sqlite", "sqlite3", "parquet"]:
                 table_options.update({
                     "max_open_partitions": self._max_open_partitions,
@@ -670,9 +722,11 @@ class Database(object):
         db_path = os.path.join(options.get('path') or '', options.get('db') or '')
         if not os.path.isdir(db_path):
             return []
-        return iosql_table_names(
-            db_path, backend='parquet' if self._uri_schema == 'parquet' else 'sqlite'
-        )
+        from .coordination import physical_path
+        backend = 'parquet' if self._uri_schema == 'parquet' else 'sqlite'
+        with storage_engine_lock(self._uri, exclusive=True):
+            _check_engine(detect_storage_engine(physical_path(db_path)), backend, db_path)
+            return iosql_table_names(db_path, backend=backend)
 
     def rename(self, new_uri_or_name, exist_ok=False, overwrite=False):
         """重命名当前 SQLite 目录库。
@@ -802,10 +856,10 @@ class Database(object):
         if not value:
             raise BadArgument("rename target must not be empty")
         if "://" in value:
-            schema, _ = parse_db_schema(value)
-            if schema not in ["sqlite", "sqlite3"]:
-                raise BadArgument("Database.rename target must be sqlite:// or sqlite3://")
-            return _sqlite_path_from_uri(value)
+            from .utils.uri import resolve_database_uri
+            target_uri = resolve_database_uri(value, engine='sqlite', allow_missing=True,
+                                               inspect_existing=False)
+            return _sqlite_path_from_uri(target_uri)
 
         source_path = _sqlite_path_from_uri(self._uri)
         if os.path.isabs(value) or os.sep in value or (os.altsep and os.altsep in value):
@@ -868,15 +922,16 @@ class Database(object):
 
     def migrate_to(self, target_uri, tables=None, mode='append',
                    batch_size=10_000, verify=None, dry_run=False, *,
-                   specs=None, temp_dir=None, lock_timeout=30.0):
+                   specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None):
         """保留源库，隔离转换后统一发布；specs 按源表名覆盖目标布局。"""
         from .migration import migrate
         return migrate(self, target_uri, tables, mode, batch_size, verify, dry_run,
-                       specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout)
+                       specs=specs, temp_dir=temp_dir, lock_timeout=lock_timeout,
+                       target_engine=target_engine)
 
     def save_as(self, target_uri, tables=None, mode='append',
                 batch_size=10_000, verify=None, dry_run=False, *,
-                specs=None, temp_dir=None, lock_timeout=30.0):
+                specs=None, temp_dir=None, lock_timeout=30.0, target_engine=None):
         """将库另存为独立副本，保留源数据、契约和当前对象的 URI。
 
         参数、发布与锁语义同 migrate_to，返回 MigrationResult。
@@ -886,7 +941,7 @@ class Database(object):
         return self.migrate_to(
             target_uri, tables=tables, mode=mode, batch_size=batch_size,
             verify=verify, dry_run=dry_run, specs=specs, temp_dir=temp_dir,
-            lock_timeout=lock_timeout,
+            lock_timeout=lock_timeout, target_engine=target_engine,
         )
 
     @staticmethod
