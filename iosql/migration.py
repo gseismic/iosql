@@ -335,7 +335,8 @@ class LocalPublisher:
     def finish_stage(self, plans):
         for plan in plans:
             target = self.table(plan)
-            plan.result.target_rows = _count_rows(plan, 'target', target.count_rows)
+            count = getattr(target, '_count_migration_rows', target.count_rows)
+            plan.result.target_rows = _count_rows(plan, 'target', count)
             previous = self.previous_parts.get(plan.name, set())
             plan.result.partitions_created = [part for part in target.table_parts() if part not in previous]
             if plan.result.verify:
@@ -462,16 +463,32 @@ def _count_rows(plan, phase, count):
 
 
 def _copy(plans, publisher, source, batch_size, mode):
+    from .engines.sqlite.table import Table as SQLiteTable
+
     for plan in plans:
-        plan.result.source_rows = _count_rows(
-            plan, 'source', lambda: source.count(plan) if source else plan.source.count_rows())
         target = publisher.table(plan)
+        counted_reader = None
+        if (source is None and type(plan.source) is SQLiteTable
+                and 'iter_batches' not in vars(plan.source)
+                and 'count_rows' not in vars(plan.source)
+                and getattr(target, '_storage_engine', None) == 'parquet'):
+            from ._migration_sqlite_parquet import CountedSQLiteReader
+            align = (plan.source_spec.partition == plan.target_spec.partition
+                     and plan.source_spec.segment is None and plan.target_spec.segment is None)
+            counted_reader = CountedSQLiteReader(plan.source, batch_size, plan.name,
+                                                align_partitions=align)
+            emit('count_start', phase='source', table=plan.name)
+        else:
+            plan.result.source_rows = _count_rows(
+                plan, 'source', lambda: source.count(plan) if source else plan.source.count_rows())
         if (getattr(target, '_storage_engine', None) == 'sqlite'
                 and hasattr(plan.source, '_logical_indexes')):
             for definition in plan.source._logical_indexes():
                 target.create_index(definition['column_name'], definition['sort_order'])
         emit('copy_start', table=plan.name, total=plan.result.source_rows)
-        iterator = source.batches(plan, batch_size) if source else plan.source.iter_batches(batch_size=batch_size)
+        iterator = (iter(counted_reader) if counted_reader is not None else
+                    source.batches(plan, batch_size) if source else
+                    plan.source.iter_batches(batch_size=batch_size))
         try:
             with closing(iterator):
                 for rows in iterator:
@@ -492,6 +509,11 @@ def _copy(plans, publisher, source, batch_size, mode):
             exc.target_table = plan.target_name
             exc.batch = plan.result.batches + 1
             raise
+        if counted_reader is not None:
+            if not counted_reader.complete:
+                raise UnsafeOperation(f'源表读取尚未完成: {plan.name}')
+            plan.result.source_rows = counted_reader.source_rows
+            emit('count_done', phase='source', table=plan.name, rows=plan.result.source_rows)
         emit('copy_done', table=plan.name, rows=plan.result.rows_copied,
              total=plan.result.source_rows)
 

@@ -114,7 +114,11 @@ class _MigrationProgress:
                 status = f'{side} {table} 统计完成：{details["rows"]:,} 行'
         elif event.startswith('copy_'):
             rows = details.get('rows', 0)
-            status = f'复制表 {details["table"]}：{rows:,}/{details["total"]:,} 行'
+            total = details.get('total')
+            if total is None:
+                status = f'复制表 {details["table"]}：已复制 {rows:,} 行，源表总行数统计中'
+            else:
+                status = f'复制表 {details["table"]}：{rows:,}/{total:,} 行'
             if event == 'copy_done':
                 status += '，复制完成'
         else:

@@ -36,7 +36,7 @@ def test_migrate_progress_keeps_json_on_stdout(tmp_path, invoke_separate, monkey
     assert '统计源表 ticks：已检查文件 1/2，累计 2 行' in result.stderr
     assert '统计源表 ticks：已检查文件 2/2，累计 3 行' in result.stderr
     assert '源表 ticks 统计完成：3 行' in result.stderr
-    assert '复制表 ticks：1/3 行' in result.stderr
+    assert '复制表 ticks：已复制 1 行，源表总行数统计中' in result.stderr
     assert '复制表 ticks：3/3 行，复制完成' in result.stderr
     assert '暂存目标表 ticks 统计完成：3 行' in result.stderr
     assert '发布目标库' in result.stderr
@@ -70,6 +70,10 @@ def test_count_events_reflect_actual_files_and_observer_is_scoped(tmp_path):
     counts = [data for event, data in events
               if event == 'count_progress' and data['phase'] == 'source']
     assert [(item['done'], item['total'], item['rows']) for item in counts] == [(1, 2, 2), (2, 2, 3)]
+    first_copy = next(index for index, (event, _) in enumerate(events) if event == 'copy_progress')
+    second_count = next(index for index, (event, data) in enumerate(events)
+                        if event == 'count_progress' and data['phase'] == 'source' and data['done'] == 2)
+    assert first_copy < second_count
     assert not any(data.get('message') == '订阅结束后不再收到' for _, data in events)
 
 

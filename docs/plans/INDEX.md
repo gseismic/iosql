@@ -12,3 +12,6 @@
 | 2026-11-05 17:39 | [迁移命令进度与帮助示例](PLAN-20261105-004-model-unknown-migration-progress.md) | 实施中 | 增加阶段、文件与行数进度，并保留标准输出 JSON。 |
 | 2026-11-05 17:48 | [迁移命令进度与帮助示例](PLAN-20261105-004-model-unknown-migration-progress.md) / [结果](PLAN-20261105-004-model-unknown-migration-progress-OUTCOME.md) | 已完成 | 阶段、文件和行数进度写入标准错误；帮助示例、JSON 输出及跨后端回归通过。 |
 | 2026-11-05 18:20 | [修复五项分区正确性问题](PLAN-20261105-002-model-unknown-partition-integrity.md) / [结果](PLAN-20261105-002-model-unknown-partition-integrity-OUTCOME.md) | 已完成（WORKTREE） | 修复五项问题及复核发现的日期、时区、并发和兼容问题；全量测试通过，性能优化待评估。 |
+| 2026-11-05 18:21 | [SQLite 到 Parquet 迁移性能优化](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance.md) | 实施中 | 优化源表计数与复制、列式导入及大量分区下的开销，保留校验与发布语义。 |
+| 2026-11-05 18:44 | [SQLite 到 Parquet 迁移性能优化](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance.md) / [结果](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance-OUTCOME.md) | 已完成（WORKTREE） | 优化逐文件统计与复制、列式写入和验证连接；跨盘样本全列一致，完整回归通过。 |
+| 2026-11-05 18:46 | [SQLite 到 Parquet 迁移性能优化](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance.md) / [结果](PLAN-20261105-005-model-unknown-sqlite-parquet-migration-performance-OUTCOME.md) | 已完成（WORKTREE） | 补充验证 DuckDB 1.1.0，62 项相关测试通过。 |

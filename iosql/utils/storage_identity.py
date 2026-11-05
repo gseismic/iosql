@@ -16,7 +16,8 @@ def is_iosql_table(path, *, deep=False, backend='sqlite'):
         return False
     try:
         # mode=ro 保证发现过程不会在普通目录内创建数据库。
-        with closing(sqlite3.connect(f"{meta_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
+        with closing(_DataFileValidator(backend)) as validator, \
+                closing(sqlite3.connect(f"{meta_path.resolve().as_uri()}?mode=ro", uri=True)) as conn:
             if deep and conn.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 return False
             row = conn.execute(
@@ -55,31 +56,74 @@ def is_iosql_table(path, *, deep=False, backend='sqlite'):
                         segmented_parts.add(str(part))
                         suffix = '.parquet' if backend == 'parquet' else '.sqlite3'
                         candidate = data_dir / f"{part_key}{suffix}"
-                        if not part_key or candidate.parent != data_dir or not _valid_data_file(
-                            candidate, expected_rows=row_count, backend=backend,
+                        if not part_key or candidate.parent != data_dir or not validator.valid(
+                            candidate, expected_rows=row_count,
                         ):
                             return False
                 for (part,) in parts:
                     if str(part) not in segmented_parts:
                         suffix = '.parquet' if backend == 'parquet' else '.sqlite3'
                         candidate = data_dir / f"{part}{suffix}"
-                        if candidate.parent != data_dir or not _valid_data_file(candidate, backend=backend):
+                        if candidate.parent != data_dir or not validator.valid(candidate):
                             return False
         return True
     except (OSError, sqlite3.Error, ValueError, TypeError, KeyError):
         return False
+    except Exception as exc:
+        # 连接关闭失败与原来逐文件连接关闭失败一样，均视为校验失败。
+        if backend == 'parquet':
+            try:
+                import duckdb
+            except ImportError:
+                pass
+            else:
+                if isinstance(exc, duckdb.Error):
+                    return False
+        raise
 
 
-def _valid_data_file(path, *, expected_rows=None, backend='sqlite'):
+class _DataFileValidator:
+    """在一次表级检查内复用 DuckDB 连接，不共享到其他调用或线程。"""
+
+    def __init__(self, backend):
+        self.backend = backend
+        self._parquet_conn = None
+
+    def valid(self, path, *, expected_rows=None):
+        if self.backend != 'parquet':
+            return _valid_data_file(path, expected_rows=expected_rows, backend=self.backend)
+        path = Path(path)
+        if path.is_symlink() or not path.is_file():
+            return False
+        if self._parquet_conn is None:
+            try:
+                import duckdb
+                self._parquet_conn = duckdb.connect(config={'threads': 1})
+            except (ImportError, OSError, ValueError):
+                return False
+            except duckdb.Error:
+                return False
+        return _valid_data_file(path, expected_rows=expected_rows, backend=self.backend,
+                                parquet_conn=self._parquet_conn)
+
+    def close(self):
+        if self._parquet_conn is not None:
+            self._parquet_conn.close()
+
+
+def _valid_data_file(path, *, expected_rows=None, backend='sqlite', parquet_conn=None):
     path = Path(path)
     if path.is_symlink() or not path.is_file():
         return False
     if backend == 'parquet':
         try:
             import duckdb
-            with closing(duckdb.connect(config={'threads': 1})) as conn:
-                actual = conn.read_parquet(str(path)).count('*').fetchone()[0]
-                return expected_rows is None or actual == int(expected_rows)
+            if parquet_conn is not None:
+                actual = parquet_conn.read_parquet(str(path)).count('*').fetchone()[0]
+            else:
+                with closing(duckdb.connect(config={'threads': 1})) as conn:
+                    actual = conn.read_parquet(str(path)).count('*').fetchone()[0]
+            return expected_rows is None or actual == int(expected_rows)
         except (ImportError, OSError, ValueError):
             return False
         except duckdb.Error:

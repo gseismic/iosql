@@ -5405,13 +5405,12 @@ class Table(TimeseriesQueryMixin, BaseTable):
     def table_parts(self):
         try:
             parts = self.table_meta_db[_TABLE_PART_TABLE_NAME].query(
-                f'select * from {_TABLE_PART_TABLE_NAME} where table_name = ?',
+                f'select part from {_TABLE_PART_TABLE_NAME} where table_name = ?',
                 params=[self._table_name],
-                to_dict=True,
             )
         except NoSuchTable:
             return []
-        return sorted([item["part"] for item in parts])
+        return sorted([item[0] for item in parts])
 
     def upsert_part_column_range(self, part, column, column_min, column_max):
         """某个表格的各分区: 各个字段允许的的最大/最小数值"""

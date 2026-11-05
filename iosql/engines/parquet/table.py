@@ -13,14 +13,18 @@ import uuid
 import warnings
 from contextlib import contextmanager
 
+from ..._migration_progress import count_reporter
 from ...migration import OMITTED
 from ...coordination import atomic_json, sync_directory
 from ...exception import BadArgument, SchemaConflict, TableSpecConflict, UnsafeOperation
 from ...spec import PhysicalLayout, SegmentInfo, TableContract
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite.connection_pool import reserve_process_connections, release_process_connections
+from ...utils.mysqlite.exception import NoSuchTable
 from ..sqlite.table import Table as DirectoryTable, _canon_sqlite_type
+from ..sqlite.const import _TABLE_PART_TABLE_NAME
 from ..sqlite.query_util import build_delete_query, build_select_count_query
+from ._bulk import try_insert as _try_bulk_insert
 
 
 def _duckdb():
@@ -320,6 +324,18 @@ class Table(DirectoryTable):
     def _fragment_directory(path):
         return os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.parts')
 
+    def _part_is_registered(self, part):
+        """检查单个逻辑分区，避免每次写入都物化并排序全部分区。"""
+        try:
+            rows = self.table_meta_db[_TABLE_PART_TABLE_NAME].query(
+                f'SELECT part FROM {_TABLE_PART_TABLE_NAME} WHERE table_name = ? AND part = ? LIMIT 1',
+                params=[self._table_name, self._part_meta_value(part)],
+            )
+        except NoSuchTable:
+            return False
+        # SQL 的列亲和性可能匹配不同类型；保留原来 Python 成员检查的语义。
+        return bool(rows) and rows[0][0] == self._part_meta_value(part)
+
     def _publish(self, conn, path, append=False):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         if os.path.islink(path):
@@ -395,7 +411,7 @@ class Table(DirectoryTable):
                 raise SchemaConflict(f'列 `{column}` 的持久化类型不能变更')
         proposed = self.suggest_column_types(part_data, {**column_types, **declared})
         new_columns = set(proposed) - set(column_types)
-        if current and self.table_parts() and new_columns and not kwargs.get('alter', False):
+        if current and new_columns and not kwargs.get('alter', False) and self.table_parts():
             raise SchemaConflict(f'严格 schema 禁止新增列: {sorted(new_columns)}')
         column_types.update(proposed)
         for type_ in column_types.values():
@@ -407,7 +423,8 @@ class Table(DirectoryTable):
                 meta['column_info'][column] = info
         self._sync_contract_columns(meta)
         path = self._get_part_dbfile(part)
-        if (self._part_meta_value(part) in self.table_parts() or self._manifest_references_part_key(part)) and not os.path.isfile(path):
+        if (not os.path.isfile(path)
+                and (self._part_is_registered(part) or self._manifest_references_part_key(part))):
             raise UnsafeOperation(f'manifest 引用的 Parquet 数据文件缺失: {path}')
         fields = ', '.join(self._quote_identifier(column) for column in column_types)
         placeholders = ', '.join('?' for _ in column_types)
@@ -416,10 +433,13 @@ class Table(DirectoryTable):
             with self._connection() as conn:
                 conn.execute('BEGIN TRANSACTION')
                 self._mutable_table(conn, path if replace else None, column_types, pk)
-                conn.executemany(
-                    f'INSERT{action} INTO data ({fields}) VALUES ({placeholders})',
-                    [[row.get(column) for column in column_types] for row in part_data],
-                )
+                if (replace or ignore or not _try_bulk_insert(
+                        conn, part_data, list(column_types),
+                        [_sql_type(type_) for type_ in column_types.values()], fields)):
+                    conn.executemany(
+                        f'INSERT{action} INTO data ({fields}) VALUES ({placeholders})',
+                        [[row.get(column) for column in column_types] for row in part_data],
+                    )
                 if not replace and os.path.exists(path) and pk:
                     conn.read_parquet(self._parquet_files(path), union_by_name=True).create_view('existing_data')
                     predicate = ' AND '.join(
@@ -517,6 +537,30 @@ class Table(DirectoryTable):
 
     def iter_batches(self, batch_size=10_000):
         yield from self.iter_select_batches(batch_size=batch_size)
+
+    def _count_migration_rows(self):
+        """对隔离的迁移暂存表复用连接计数，保留每个物理文件的读取锁。"""
+        refs = self._physical_part_refs(lightweight=True)
+        if not refs:
+            return 0
+        report = count_reporter()
+        total = 0
+        with self._connection() as conn:
+            for index, ref in enumerate(refs, 1):
+                self._ensure_ref_file_present(ref)
+                path = self._get_part_dbfile(ref.part_key)
+                with self._read_lease(path):
+                    if not os.path.isfile(path) or os.path.islink(path):
+                        raise UnsafeOperation(f'Parquet 数据文件缺失或为符号链接: {path}')
+                    try:
+                        total += conn.read_parquet(
+                            self._parquet_files(path), union_by_name=True,
+                        ).count('*').fetchone()[0]
+                    except _duckdb().Error as exc:
+                        raise UnsafeOperation(f'Parquet 查询失败 {path}: {exc}') from exc
+                if report is not None:
+                    report(index, len(refs), total)
+        return total
 
     def _data_file_column_bounds(self, part_key, column):
         path = self._get_part_dbfile(part_key)

@@ -35,3 +35,7 @@ timeseries 先统一解析分区字符串、对象、字典和 PartitionSpec，�
 ## 2026-11-05 18:25 跨后端验证
 
 模型：Codex，基于 GPT-6；实际模型 ID 未提供。`WORKTREE` 基准为 `35275e989349ce55a65268f0da6d5fbb5c3300b9`。并行工作随后调整了 `iosql/migration.py` 并新增 `iosql/_migration_sqlite_parquet.py`；当前工作区上旧日期路由的双向跨后端升级及重开测试 4 passed，迁移与安全迁移测试 60 passed。状态不变。
+
+## 2026-11-05 18:50 修复提交
+
+模型：Codex，基于 GPT-6；实际模型 ID 未提供。已验证的修复版本为提交 `0bf5c9af250cde1a0a281e42eb3a3b78bd4c895e`；提交快照的隔离 PostgreSQL 18 全量测试为 1345 passed、19 skipped。状态保持“已解决”。本条为提交后的追加记录，尚未另行提交。
