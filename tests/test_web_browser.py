@@ -275,6 +275,80 @@ def test_data_view_switch_keeps_url_in_sync(page, web_servers):
     playwright.expect(page.get_by_role("textbox", name="筛选列 symbol")).to_have_value("AAA")
 
 
+def test_browse_survives_repeated_latest_view_switches(page, web_servers):
+    errors = []
+    page.on("pageerror", lambda error: errors.append(str(error)))
+    page.goto(web_servers["readonly"] + "/#/table/ticks/data")
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(180)
+    page.get_by_role("button", name="截面", exact=True).click()
+    page.get_by_role("button", name="浏览", exact=True).click()
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(180)
+    page.get_by_role("textbox", name="筛选列 symbol").fill("AAA")
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(90)
+
+    for iteration in range(4):
+        page.get_by_role("button", name="截面", exact=True).click()
+        if iteration == 0:
+            page.get_by_placeholder("逗号分隔：AAPL,MSFT").fill("AAA")
+            with page.expect_response(lambda response: response.url.endswith("/latest")) as response:
+                page.get_by_role("button", name="最新截面").click()
+            assert response.value.ok
+            playwright.expect(page.get_by_text("/latest 截面结果")).to_be_visible()
+        page.get_by_role("button", name="浏览", exact=True).click()
+        playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(90)
+        playwright.expect(page.get_by_role("textbox", name="筛选列 symbol")).to_have_value("AAA")
+        assert "f.symbol=AAA" in page.url and "view=" not in page.url
+        assert page.locator(".browse-table tbody tr").evaluate_all(
+            "rows => rows.every(row => row.cells[0].textContent === 'AAA')"
+        )
+
+    assert not errors
+
+
+def test_browse_recovers_when_switching_views_during_a_request(page, web_servers):
+    page.goto(web_servers["readonly"] + "/#/table/ticks/data")
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(180)
+    page.get_by_role("textbox", name="筛选列 symbol").fill("AAA")
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(90)
+
+    # 模拟请求离开视图后才完成，即使底层响应未及时停止也不能覆盖新条件。
+    page.evaluate("""() => {
+      const original = window.fetch;
+      window.fetch = (url, opts) => {
+        if (String(url).endsWith('/rows') && !window.__oldRowsSignal) {
+          window.__oldRowsSignal = opts.signal;
+          return new Promise((resolve, reject) => {
+            window.__releaseOldRows = () => original(url, {...opts, signal: undefined})
+              .then(response => {
+                const read = response.text.bind(response);
+                response.text = async () => {
+                  const result = await read();
+                  window.__oldRowsParsed = true;
+                  return result;
+                };
+                resolve(response);
+              }, reject);
+          });
+        }
+        return original(url, opts);
+      };
+    }""")
+    page.get_by_role("button", name="刷新", exact=True).click()
+    page.wait_for_function("window.__oldRowsSignal")
+    page.get_by_role("button", name="截面", exact=True).click()
+    page.wait_for_function("window.__oldRowsSignal.aborted")
+    page.get_by_role("button", name="浏览", exact=True).click()
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(90)
+    page.get_by_role("textbox", name="筛选列 symbol").fill("BBB")
+    playwright.expect(page.locator(".browse-table tbody tr")).to_have_count(90)
+    playwright.expect(page.locator(".browse-table tbody tr").first.locator("td").first).to_have_text("BBB")
+    page.evaluate("() => window.__releaseOldRows()")
+    page.wait_for_function("window.__oldRowsParsed === true")
+    assert page.locator(".browse-table tbody tr").evaluate_all(
+        "rows => rows.every(row => row.cells[0].textContent === 'BBB')"
+    )
+
+
 @pytest.mark.parametrize("navigation", ["structure", "timeseries"])
 def test_filter_before_debounce_is_applied_when_returning(page, web_servers, navigation):
     page.goto(web_servers["readonly"] + "/#/table/ticks/data")

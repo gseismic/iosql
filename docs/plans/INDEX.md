@@ -22,3 +22,5 @@
 | 2026-11-05 21:47 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) | 补充验证中 | 按用户要求手动测试原库，修复计数成功状态多余的 `null` 文本。 |
 | 2026-11-05 22:07 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) / [结果](PLAN-20261105-007-model-unknown-web-lazy-loading-OUTCOME.md) | 已完成（WORKTREE） | 指定原库手动测试通过，修复计数显示、响应式状态栏、筛选链接与 6 小时分区跳转。 |
 | 2026-11-05 22:13 | [Web 大表按需加载](PLAN-20261105-007-model-unknown-web-lazy-loading.md) / [结果](PLAN-20261105-007-model-unknown-web-lazy-loading-OUTCOME.md) | 已完成（WORKTREE） | 修复筛选防抖期间快速切换导致旧页复用；原库再次手测和 133 项回归通过。 |
+| 2026-11-05 22:38 | [Web 浏览与截面切换回归](PLAN-20261105-008-model-unknown-web-browse-switch.md) | 实施中 | 对照新旧脚本，在隔离库覆盖反复切换及请求中切换。 |
+| 2026-11-05 22:42 | [Web 浏览与截面切换回归](PLAN-20261105-008-model-unknown-web-browse-switch.md) / [结果](PLAN-20261105-008-model-unknown-web-browse-switch-OUTCOME.md) | 已完成（WORKTREE） | 旧脚本复现空表，当前脚本和 135 项相关测试通过；新增切换与延迟响应回归。 |
