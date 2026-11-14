@@ -1,22 +1,23 @@
-"""高级：仅按行数滚动物理 segment，并处理晚到数据。"""
+"""用 row segment 保存并查询晚到数据。
+
+运行：在本文件所在目录执行 python 06_row_segment_late_data.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出 segment 统计、查询结果和裁剪信息。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database, Segment
 
 
-DB_PATH = Path(__file__).resolve().parent / "runtime" / "06_row_segment_late_data.iosql"
+DB_PATH = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "06_row_segment_late_data.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         events = db.table(

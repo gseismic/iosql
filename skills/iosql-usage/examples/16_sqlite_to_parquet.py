@@ -1,13 +1,18 @@
-"""将 SQLite 引擎中的时序表迁移到 Parquet 引擎。"""
+"""将 SQLite 时序表迁移到 Parquet。
+
+运行：在本文件所在目录执行 python 16_sqlite_to_parquet.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出迁移预览、校验结果和 Parquet 中的行情。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-
-from _example_support import reset_database as reset_demo_path
+from uuid import uuid4
 
 from iosql import Database
 
 
-RUNTIME = Path(__file__).resolve().parent / 'runtime'
+RUNTIME = Path(__file__).resolve().parent / 'runtime' / f'16_migration_{uuid4().hex}'
 SQLITE_PATH = RUNTIME / '16_sqlite_source.iosql'
 PARQUET_PATH = RUNTIME / '16_parquet_archive.iosql'
 BASE_TIME = 1735689600000
@@ -52,9 +57,8 @@ def migrate_sqlite_to_parquet(source_uri, target_uri, tables=None, specs=None):
 
 
 def run():
-    # 只清理本示例自己生成的目录，保证重复运行时目标库为空。
-    for path in [SQLITE_PATH, PARQUET_PATH]:
-        reset_demo_path(path)
+    # 每次运行使用独立目录，保证目标为空并保留已有运行结果。
+    RUNTIME.mkdir(parents=True, exist_ok=True)
 
     sqlite_uri = f'sqlite://{SQLITE_PATH}'
     parquet_uri = f'parquet://{PARQUET_PATH}'
@@ -90,6 +94,7 @@ def run():
         print('Parquet 数据文件:', [item['path'] for item in migrated_bars.segments()])
 
     print('SQLite → Parquet 迁移和目标校验完成')
+    print('演示数据目录:', RUNTIME)
 
 
 if __name__ == '__main__':

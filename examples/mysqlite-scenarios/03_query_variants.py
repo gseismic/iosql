@@ -1,21 +1,19 @@
-"""mysqlite 场景 03：各类查询方法。
+"""使用 mysqlite 执行条件、聚合和参数化查询。
 
-运行: python examples/mysqlite-scenarios/03_query_variants.py
+运行：在本文件所在目录执行 python 03_query_variants.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出不同查询方法的结果。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql.utils.mysqlite import Database
 
 
-DB_DIR = Path(__file__).resolve().parents[1] / "runtime" / "mysqlite-scenarios" / "03_query_variants"
+DB_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "03_query_variants"
 DB_FILE = DB_DIR / "query.sqlite3"
-
-
-def reset_database():
-    shutil.rmtree(DB_DIR, ignore_errors=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def seed(db):
@@ -42,7 +40,7 @@ def seed(db):
 
 
 def run():
-    reset_database()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(str(DB_FILE), auto_commit=True, verbose=0)
     seed(db)
     bars = db["bars"]

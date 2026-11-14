@@ -1,25 +1,23 @@
-"""mysqlite 场景 04：表重命名与表信息查询（含 _meta 元数据）。
+"""查看 mysqlite 表信息并用原生 SQL 重命名。
 
-运行: python examples/mysqlite-scenarios/04_rename_and_table_info.py
+运行：在本文件所在目录执行 python 04_rename_and_table_info.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出表结构、重命名结果及元数据注意事项。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql.utils.mysqlite import Database
 
 
-DB_DIR = Path(__file__).resolve().parents[1] / "runtime" / "mysqlite-scenarios" / "04_rename_and_info"
+DB_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "04_rename_and_info"
 DB_FILE = DB_DIR / "info.sqlite3"
 
 
-def reset_database():
-    shutil.rmtree(DB_DIR, ignore_errors=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(str(DB_FILE), auto_commit=True, verbose=0)
 
     print("== create_table：声明式建表并登记元数据")

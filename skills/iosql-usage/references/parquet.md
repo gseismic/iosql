@@ -150,8 +150,8 @@ iosql migrate -s parquet://db/archive.iosql \
 `iosql web -s db/archive.iosql` 支持数据浏览和图表；新迁移目标可传
 `--target-engine parquet`。`doctor`、`index`、`repartition`、`backup`、`restore` 和
 `rename-database` 仍限 SQLite。SQLite → Parquet 的单向迁移示例见
-[16_sqlite_to_parquet.py](../examples/16_sqlite_to_parquet.py)；Parquet 后端和双向迁移的完整示例见
-[14_parquet_backend.py](../examples/14_parquet_backend.py)。
+[16_sqlite_to_parquet.py](../examples/16_sqlite_to_parquet.py)；Parquet 写入与重开查询见
+[14_parquet_backend.py](../examples/14_parquet_backend.py)。上面的 CLI 片段展示反向迁移。
 
 ## 常见问题
 

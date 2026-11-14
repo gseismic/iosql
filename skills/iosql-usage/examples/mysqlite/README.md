@@ -20,4 +20,4 @@ python examples/mysqlite/02_bulk_query_and_conflict.py
 python examples/mysqlite/03_connection_pool_cleanup.py
 ```
 
-运行时数据写入 `examples/runtime/mysqlite/`，脚本会在开始和结束时清理自己的目录。
+每次运行在脚本所在目录的 `runtime/` 下创建独立目录并保留结果；每个脚本可以单独复制运行。

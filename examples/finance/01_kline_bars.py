@@ -1,23 +1,24 @@
-"""金融入门：写入 K 线 OHLCV，并按标的和时间段查询。"""
+"""写入 K 线 OHLCV，查询时间窗口与最新截面。
+
+运行：在本文件所在目录执行 python 01_kline_bars.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出写入行数、窗口 K 线和最新价格。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database
 
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = EXAMPLES_DIR / "runtime" / "finance" / "01_kline.iosql"
+EXAMPLE_DIR = Path(__file__).resolve().parent
+DB_PATH = EXAMPLE_DIR / "runtime" / uuid4().hex / "01_kline.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         bars = db.timeseries(

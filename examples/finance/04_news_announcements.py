@@ -1,23 +1,24 @@
-"""金融高级：保存新闻/公告事件，并按事件时间和类型快速查询。"""
+"""保存新闻和公告并按时间及类型查询。
+
+运行：在本文件所在目录执行 python 04_news_announcements.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出事件分区、扫描计划和当日公告。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database, Segment
 
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = EXAMPLES_DIR / "runtime" / "finance" / "04_news.iosql"
+EXAMPLE_DIR = Path(__file__).resolve().parent
+DB_PATH = EXAMPLE_DIR / "runtime" / uuid4().hex / "04_news.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         events = db.timeseries(

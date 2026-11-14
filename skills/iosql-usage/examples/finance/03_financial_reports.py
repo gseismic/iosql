@@ -1,23 +1,24 @@
-"""金融进阶：用日期/日历分区保存财报指标，并按披露日期查询。"""
+"""按月度日历分区保存财报并按披露日期查询。
+
+运行：在本文件所在目录执行 python 03_financial_reports.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出月度分区、扫描计划和二月财报。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database, Partition
 
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = EXAMPLES_DIR / "runtime" / "finance" / "03_reports.iosql"
+EXAMPLE_DIR = Path(__file__).resolve().parent
+DB_PATH = EXAMPLE_DIR / "runtime" / uuid4().hex / "03_reports.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         reports = db.timeseries(

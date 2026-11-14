@@ -1,21 +1,22 @@
-"""高级：验证逻辑分区 + 物理 row segment 布局。"""
+"""观察逻辑分区、物理 segment 和查询裁剪。
+
+运行：在本文件所在目录执行 python 05_partition_segments_smoke.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出分区、segment 概览和窗口查询行数。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database, Partition, Segment
 
 
-DB_PATH = Path(__file__).resolve().parent / "runtime" / "05_partition_segments.iosql"
+DB_PATH = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "05_partition_segments.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 TOTAL_DAYS = 6
 ROWS_PER_DAY = 48
 SYMBOLS = ["AAPL", "MSFT", "NVDA", "TSLA"]
-
-
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def build_rows():
@@ -35,7 +36,7 @@ def build_rows():
 
 
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         ticks = db.table(

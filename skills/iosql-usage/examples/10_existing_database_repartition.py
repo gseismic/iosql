@@ -1,16 +1,23 @@
-"""已有库：读取原表契约，离线重分区到新的目标库。"""
+"""读取已有表契约并重分区到独立目标库。
+
+运行：在本文件所在目录执行 python 10_existing_database_repartition.py。
+准备：已安装 iosql 及其默认依赖。
+可选 IOSQL_SOURCE_URI、IOSQL_TARGET_URI 和 IOSQL_EXISTING_TABLE；目标库必须为空。
+预期：输出源和目标的分区及行数。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 import os
 from pathlib import Path
-
-from _example_support import reset_database as reset_demo_path
+from uuid import uuid4
 
 from iosql import Database
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
-DEFAULT_SOURCE_PATH = EXAMPLE_DIR / "runtime" / "10_existing_source.iosql"
-DEFAULT_TARGET_PATH = EXAMPLE_DIR / "runtime" / "10_existing_hourly.iosql"
+RUNTIME_DIR = EXAMPLE_DIR / "runtime" / f"10_repartition_{uuid4().hex}"
+DEFAULT_SOURCE_PATH = RUNTIME_DIR / "source.iosql"
+DEFAULT_TARGET_PATH = RUNTIME_DIR / "hourly.iosql"
 EXTERNAL_SOURCE_URI = os.environ.get("IOSQL_SOURCE_URI")
 EXTERNAL_TARGET_URI = os.environ.get("IOSQL_TARGET_URI")
 SOURCE_URI = EXTERNAL_SOURCE_URI or f"sqlite://{DEFAULT_SOURCE_PATH}"
@@ -18,11 +25,17 @@ TARGET_URI = EXTERNAL_TARGET_URI or f"sqlite://{DEFAULT_TARGET_PATH}"
 TABLE_NAME = os.environ.get("IOSQL_EXISTING_TABLE", "ticks")
 
 
+def check_prerequisites():
+    if EXTERNAL_SOURCE_URI:
+        with Database(EXTERNAL_SOURCE_URI) as source:
+            if TABLE_NAME not in source.table_names():
+                raise SystemExit("IOSQL_SOURCE_URI 中未找到指定表，请设置已有源库及表名。")
+
+
 def prepare_demo_source():
     """构造并关闭源库，重分区阶段只通过持久化契约重新打开。"""
     if EXTERNAL_SOURCE_URI:
         return
-    reset_demo_path(DEFAULT_SOURCE_PATH)
     DEFAULT_SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
@@ -44,9 +57,8 @@ def prepare_demo_source():
 
 
 def run():
+    check_prerequisites()
     prepare_demo_source()
-    if not EXTERNAL_TARGET_URI:
-        reset_demo_path(DEFAULT_TARGET_PATH)
 
     with Database(
         SOURCE_URI,

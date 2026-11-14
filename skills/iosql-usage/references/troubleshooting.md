@@ -270,7 +270,7 @@ if result.layout_warnings:
 db = Database("sqlite://db/market.iosql")
 
 # 正确：PostgreSQL 使用 postgresql:// 前缀
-db = Database("postgresql://user:pass@localhost:5432/mydb")
+db = Database("postgresql://user@localhost:5432/mydb")
 
 # 新建 Parquet 时可使用 parquet:// 前缀
 db = Database("parquet://db/archive.iosql")
@@ -361,7 +361,7 @@ dry-run 只读源契约和行数，不连接目标。目标连接、权限、已
 
 库锁文件拒绝符号链接及 Windows 重解析点，快照根与子项同样拒绝链接/junction。
 检查源库、目标和锁文件是否为预期路径；不要通过删除锁文件或绕过检查来继续迁移。
-演示见 [17_safe_migration_and_paths.py](../examples/17_safe_migration_and_paths.py)。
+SQLite 目录库备份用法见 [备份示例](../examples/17_safe_migration_and_paths.py)。
 
 ### 缺少 psycopg2
 
@@ -391,7 +391,7 @@ python -m pip install "iosql[postgresql]"
 
 ```python
 source.to_postgresql(
-    "postgresql://user:pass@localhost:5432/market",
+    "postgresql://user@localhost:5432/market",
     batch_size=50_000,
 )
 ```
@@ -400,7 +400,7 @@ CLI：
 
 ```bash
 iosql migrate -s sqlite://db/market.iosql \
-  --target postgresql://user:pass@localhost:5432/market \
+  --target postgresql://user@localhost:5432/market \
   --batch-size 50000
 ```
 

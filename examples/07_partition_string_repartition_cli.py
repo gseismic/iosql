@@ -1,29 +1,28 @@
-"""高级：用字符串 partition 和 CLI 执行安全重分区。"""
+"""使用 CLI 和分区表达式将数据重分区到新库。
+
+运行：在本文件所在目录执行 python 07_partition_string_repartition_cli.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出 CLI 结果和目标库分区。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
 import subprocess
 import sys
-
-from _example_support import reset_database as reset_demo_path
+from uuid import uuid4
 
 from iosql import Database
 
 
-RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
+RUNTIME_DIR = Path(__file__).resolve().parent / "runtime" / f"07_repartition_{uuid4().hex}"
 SOURCE_PATH = RUNTIME_DIR / "07_partition_string_source.iosql"
 TARGET_PATH = RUNTIME_DIR / "07_partition_string_hourly.iosql"
 SOURCE_URI = f"sqlite://{SOURCE_PATH}"
 TARGET_URI = f"sqlite://{TARGET_PATH}"
 
 
-def reset_database():
-    reset_demo_path(SOURCE_PATH)
-    reset_demo_path(TARGET_PATH)
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
         ticks = db.table(
@@ -66,6 +65,7 @@ def run():
         target = target_db.table("ticks")
         print("目标库分区:", target.spec().partition.to_string())
         print("目标库分区键:", target.table_parts())
+        print("演示数据目录:", RUNTIME_DIR)
 
 
 if __name__ == "__main__":

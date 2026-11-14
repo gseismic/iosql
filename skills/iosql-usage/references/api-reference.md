@@ -33,7 +33,8 @@ Parquet 不支持 PRAGMA、持久化索引、`commit=False`、数据库目录 re
 
 **Parquet URI 格式**：`parquet://path/database_name.iosql`
 
-**PostgreSQL URI 格式**：`postgresql://user:pass@host:port/dbname`
+**PostgreSQL URI 示例**：`postgresql://user@host:port/dbname`。密码可通过
+`PGPASSWORD` 或 PostgreSQL 标准密码文件 `PGPASSFILE` 提供，见[示例运行说明](../examples/README.md#postgresql-示例)。
 
 PostgreSQL 功能需要安装可选依赖：
 
@@ -43,7 +44,7 @@ python -m pip install "iosql[postgresql]"
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` 或 `"postgresql://user:pass@localhost:5432/mydb"` |
+| `uri` | `str` | 数据库 URI，如 `"sqlite://db/test.iosql"` 或 `"postgresql://user@localhost:5432/mydb"` |
 | `engine` | `str`/`None` | 本地库可选 `sqlite` 或 `parquet`；对已有库仅作一致性校验 |
 | `verbose` | `int` | 日志详细度，`0`=静默 |
 | `pragma_dict` | `dict`/`None` | 仅 SQLite；覆盖默认 balanced PRAGMA，例如 `{"synchronous": "full"}` |
@@ -170,7 +171,7 @@ Parquet 的安装、写入成本和迁移示例见 [Parquet 使用指南](parque
 ```python
 source = Database("sqlite://db/market.iosql")
 result = source.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
+    "postgresql://user@localhost:5432/market",
     tables=["daily_bars", "kline_1m"],  # None 表示全库
     batch_size=50_000,
     verify="row-count",
@@ -839,6 +840,6 @@ db.close()
 - `create_index(column=None, order='asc', exist_ok=True, *, columns=None)` 支持复合 B-tree；与主键等价时复用。`drop_index(column=None, *, columns=None)` 仅删除当前表带 iosql 标记且定义匹配的二级索引；不能按名称误删用户索引或约束索引。
 - 重开物理表验证声明列类型、主键顺序、分区形态和 RANGE 单列键；分区主键必须包含分区列。
 - upsert_all 按输入主键增量合并，缺字段保留旧值，显式 None 写 NULL，重复主键按输入顺序合并。count_rows 是精确计数，可能全表扫描。
-- 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
+- PostgreSQL 基础读写：`examples/01_quickstart_postgresql.py`；查询计划与索引：`examples/15_postgresql_timeseries_query.py`；最新截面：`examples/finance/01_kline_bars.py`；字段级更新：`examples/03_partial_upsert.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
 
 迁移新增字段说明：`partitions_created` 是本次新增目标分区列表；`source_spec/target_spec` 是转换前后完整契约；`stage/source_table/target_table/batch` 在迁移错误中提供定位信息。已有 PG 绑定对象跨发布可只读重连并恢复绑定，新打开 PG 对象仍需显式 spec。

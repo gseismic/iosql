@@ -1,22 +1,23 @@
-"""进阶：批量缓冲写入，并查看查询计划中的分区裁剪结果。"""
+"""缓冲批量写入并查看查询分区裁剪。
+
+运行：在本文件所在目录执行 python 03_buffered_ingest_and_query_plan.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出候选分区、实际扫描分区和行情。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database, Partition, Segment
 
 
-DB_PATH = Path(__file__).resolve().parent / "runtime" / "03_buffered.iosql"
+DB_PATH = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "03_buffered.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         ticks = db.table(

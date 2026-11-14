@@ -141,7 +141,7 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - `create_index(column=None, order='asc', exist_ok=True, *, columns=None)` 支持复合 B-tree；与主键等价时复用。`drop_index(column=None, *, columns=None)` 仅删除当前表带 iosql 标记且定义匹配的二级索引；不能按名称误删用户索引或约束索引。
 - 重开物理表验证声明列类型、主键顺序、分区形态和 RANGE 单列键；分区主键必须包含分区列。
 - upsert_all 按输入主键增量合并，缺字段保留旧值，显式 None 写 NULL，重复主键按输入顺序合并。count_rows 是精确计数，可能全表扫描。
-- 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
+- PostgreSQL 基础读写：`examples/01_quickstart_postgresql.py`；查询计划与索引：`examples/15_postgresql_timeseries_query.py`；最新截面：`examples/finance/01_kline_bars.py`；字段级更新：`examples/03_partial_upsert.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
 
 指定 symbols 的单 symbol 分组 latest 会在目录确认有效 symbol/time B-tree 前缀索引后使用 LATERAL LIMIT 1；无索引/多维分组/无 symbols 时使用 DISTINCT ON。
 

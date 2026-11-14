@@ -1,22 +1,23 @@
-"""入门：创建一个毫秒时间戳时序表，写入数据并按时间窗口查询。"""
+"""创建时序表并按标的和时间窗口查询。
+
+运行：在本文件所在目录执行 python 01_quickstart_timeseries.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出写入行数、分区和两条 AAPL 行情。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database
 
 
-DB_PATH = Path(__file__).resolve().parent / "runtime" / "01_quickstart.iosql"
+DB_PATH = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "01_quickstart.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         # timeseries() 是 table() 的薄语法糖，等价于

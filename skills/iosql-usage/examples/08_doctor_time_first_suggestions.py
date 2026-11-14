@@ -1,29 +1,26 @@
-"""高级：doctor 对历史 partition_key 表优先给出时间分区建议。
+"""对历史分区表运行 doctor 并查看时间分区建议。
 
-高级用法仍可直接构造 TableContract/PhysicalLayout；本例演示用
-db.table() 快捷参数表达同样的契约。
+运行：在本文件所在目录执行 python 08_doctor_time_first_suggestions.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出诊断问题和时间优先的分区建议。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 import subprocess
 import sys
 
 from iosql import Database, Segment, TimeColumn
 
 
-RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
+RUNTIME_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex
 SOURCE_PATH = RUNTIME_DIR / "08_doctor_time_first.iosql"
 SOURCE_URI = f"sqlite://{SOURCE_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(SOURCE_PATH, ignore_errors=True)
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
         table = db.table(
@@ -75,7 +72,15 @@ def run():
         text=True,
         capture_output=True,
     )
-    print(completed.stdout.strip())
+    if completed.stdout:
+        print(completed.stdout.strip())
+    if completed.stderr:
+        print(completed.stderr.strip(), file=sys.stderr)
+    if completed.returncode == 2:
+        print("doctor 已发现待处理问题，详见上方建议。")
+    elif completed.returncode != 0:
+        print(f"doctor 执行失败，退出码: {completed.returncode}", file=sys.stderr)
+        raise SystemExit(completed.returncode)
 
 
 if __name__ == "__main__":

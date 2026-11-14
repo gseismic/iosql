@@ -1,29 +1,75 @@
-"""SQLite 与 PostgreSQL 之间的双向转换示例。"""
+"""将 SQLite 数据经 PostgreSQL 迁回新 SQLite 库。
+
+运行：在本文件所在目录执行 python 12_sqlite_postgresql_roundtrip.py。
+准备：已安装 iosql；实际迁移还需 PostgreSQL 依赖、14+ 测试库和建表权限。
+驱动安装：python -m pip install "psycopg2-binary>=2.9"。
+设置：POSTGRES_DSN 可不设（仅 dry-run）；设置后通过 PGPASSWORD 或 PGPASSFILE 提供密码。
+目标表原子创建；发生错误时已创建的表可能保留，检查后再处理。
+预期：未配置目标时输出 dry-run；配置后输出双向迁移行数和校验结果。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 import os
+import uuid
+from contextlib import closing
 from pathlib import Path
-
-from _example_support import reset_database as reset_demo_path
 
 from iosql import Database, Partition, Segment
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
-SOURCE_PATH = EXAMPLE_DIR / "runtime" / "12_sqlite_source.iosql"
-ROUNDTRIP_PATH = EXAMPLE_DIR / "runtime" / "12_roundtrip_from_postgresql.iosql"
+RUNTIME_DIR = EXAMPLE_DIR / "runtime" / f"12_roundtrip_{uuid.uuid4().hex}"
+SOURCE_PATH = RUNTIME_DIR / "source.iosql"
+ROUNDTRIP_PATH = RUNTIME_DIR / "roundtrip.iosql"
 SOURCE_URI = f"sqlite://{SOURCE_PATH}"
 ROUNDTRIP_URI = f"sqlite://{ROUNDTRIP_PATH}"
 POSTGRES_DSN = os.environ.get("POSTGRES_DSN")
 PG_TABLE = os.environ.get(
     "IOSQL_POSTGRES_ROUNDTRIP_TABLE",
-    "iosql_example_roundtrip_ticks",
+    "iosql_example_roundtrip_" + uuid.uuid4().hex[:12],
 )
 SQLITE_TABLE = "ticks"
 ROUNDTRIP_TABLE = "ticks_from_postgresql"
 
 
+def check_prerequisites():
+    """配置目标时，先检查驱动和数据库连接；未配置时允许 dry-run。"""
+    if not POSTGRES_DSN:
+        return
+    try:
+        import psycopg2
+    except ImportError:
+        raise SystemExit('请先安装 PostgreSQL 驱动：python -m pip install "psycopg2-binary>=2.9"。') from None
+    try:
+        with closing(psycopg2.connect(POSTGRES_DSN)) as connection:
+            if connection.server_version < 140000:
+                raise SystemExit("需要 PostgreSQL 14 或更高版本的测试库。")
+    except psycopg2.Error:
+        raise SystemExit("无法连接 PostgreSQL，请检查测试库、连接参数和凭据。") from None
+
+
+def reserve_postgresql_table(uri, table_name):
+    """原子创建与源契约兼容的空表；同名关系由 PostgreSQL 拒绝。"""
+    import psycopg2
+    from psycopg2 import sql
+
+    try:
+        with closing(psycopg2.connect(uri)) as conn, conn:
+            with conn.cursor() as cursor:
+                cursor.execute("SHOW max_identifier_length")
+                if len(table_name.encode("utf-8")) > int(cursor.fetchone()[0]):
+                    raise SystemExit("目标表名过长，请选择较短的名称。")
+                cursor.execute(sql.SQL(
+                    "CREATE TABLE {} (symbol text, ts bigint, price double precision, "
+                    "PRIMARY KEY (symbol, ts)) PARTITION BY RANGE (ts)"
+                ).format(sql.Identifier(table_name)))
+    except psycopg2.Error as error:
+        if error.pgcode in ("42P07", "42710", "23505"):
+            raise SystemExit(f"目标名称 {table_name} 已存在或被占用，请选择新表名。") from None
+        raise
+
+
 def prepare_sqlite_source():
-    reset_demo_path(SOURCE_PATH)
     SOURCE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(SOURCE_URI) as db:
@@ -44,51 +90,33 @@ def prepare_sqlite_source():
         return ticks.spec()
 
 
-def drop_postgresql_table(uri, table_name):
-    try:
-        import psycopg2
-        from psycopg2 import sql
-    except ImportError as exc:
-        raise RuntimeError(
-            'PostgreSQL 示例需要安装: python -m pip install "iosql[postgresql]"'
-        ) from exc
-
-    with psycopg2.connect(uri) as conn:
-        conn.autocommit = True
-        with conn.cursor() as cursor:
-            cursor.execute(
-                sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(
-                    sql.Identifier(table_name)
-                )
-            )
-
-
 def run():
+    check_prerequisites()
     spec = prepare_sqlite_source()
-    reset_demo_path(ROUNDTRIP_PATH)
-
     with Database(SOURCE_URI) as sqlite_source:
         dry_run = sqlite_source.migrate_to(
-            POSTGRES_DSN or "postgresql://user:pass@localhost:5432/market",
+            POSTGRES_DSN or "postgresql://user@localhost:5432/market",
             tables={SQLITE_TABLE: PG_TABLE},
             dry_run=True,
             batch_size=2,
         )
-        print("sqlite -> postgresql dry-run:", dry_run.to_dict())
+        print("sqlite -> postgresql dry-run 源行数:", dry_run.source_rows)
 
         if not POSTGRES_DSN:
             print("未设置 POSTGRES_DSN，已完成 SQLite 源库准备和 dry-run。")
             print("设置 POSTGRES_DSN 后会继续执行 sqlite -> postgresql -> sqlite。")
             return
 
-        drop_postgresql_table(POSTGRES_DSN, PG_TABLE)
+        # 原子占用新表名；默认表名带随机后缀，适合反复运行。
+        reserve_postgresql_table(POSTGRES_DSN, PG_TABLE)
         to_pg = sqlite_source.migrate_to(
             POSTGRES_DSN,
             tables={SQLITE_TABLE: PG_TABLE},
             verify="row-count",
             batch_size=2,
         )
-        print("sqlite -> postgresql:", to_pg.to_dict())
+        print("PostgreSQL 目标表:", PG_TABLE, "迁移行数:", to_pg.rows_copied,
+              "行数校验:", to_pg.verified)
 
     with Database(POSTGRES_DSN) as pg_source:
         # PostgreSQL 作为迁移源时，需要给逻辑表绑定同一份表契约。
@@ -99,7 +127,8 @@ def run():
             verify="row-count",
             batch_size=2,
         )
-        print("postgresql -> sqlite:", to_sqlite.to_dict())
+        print("postgresql -> sqlite 行数:", to_sqlite.rows_copied,
+              "行数校验:", to_sqlite.verified)
 
     with Database(ROUNDTRIP_URI) as roundtrip:
         table = roundtrip.table(ROUNDTRIP_TABLE)
@@ -111,6 +140,7 @@ def run():
         )
         print("roundtrip AAPL rows:", rows)
         print("roundtrip row count:", table.count_rows())
+        print("本地演示数据:", RUNTIME_DIR)
 
 
 if __name__ == "__main__":

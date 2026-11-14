@@ -1,23 +1,24 @@
-"""金融进阶：批量写入 orderbook 快照，并按时间窗口读取盘口。"""
+"""缓冲写入 orderbook 快照并查询盘口。
+
+运行：在本文件所在目录执行 python 02_orderbook_snapshots.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出分区、扫描计划和盘口窗口。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql import Database, Segment
 
 
-EXAMPLES_DIR = Path(__file__).resolve().parents[1]
-DB_PATH = EXAMPLES_DIR / "runtime" / "finance" / "02_orderbook.iosql"
+EXAMPLE_DIR = Path(__file__).resolve().parent
+DB_PATH = EXAMPLE_DIR / "runtime" / uuid4().hex / "02_orderbook.iosql"
 DB_URI = f"sqlite://{DB_PATH}"
 
 
-def reset_database():
-    shutil.rmtree(DB_PATH, ignore_errors=True)
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
         book = db.timeseries(

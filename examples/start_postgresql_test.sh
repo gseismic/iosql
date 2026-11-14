@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# 复用已安装的 PostgreSQL，准备可重复运行示例的本机独立测试库。
+# 在本文件所在目录执行 bash start_postgresql_test.sh。
+# 需要本机 PostgreSQL 14+；可用 POSTGRES_BIN 指定其程序目录。
+# 启动 127.0.0.1:55478 的无密码测试实例，并在 runtime/ 保留数据与连接配置。
 set -euo pipefail
 umask 077
 
@@ -65,6 +67,6 @@ dsn='postgresql://iosql@127.0.0.1:55478/postgres'
 # 文件由示例按自身路径读取；其他示例/基准可 source 环境文件。
 printf '%s\n' "$dsn" > "$runtime_dir/postgresql-test.dsn"
 printf "export POSTGRES_DSN='%s'\n" "$dsn" > "$runtime_dir/postgresql-test.env"
-printf '%s\n' '本机测试库已就绪，可直接运行 15_postgresql_timeseries_query.py。'
+printf '%s\n' '本机测试库已就绪，请加载环境配置后运行 PostgreSQL 示例。'
 printf '连接：%s\n' "$dsn"
 printf '其他脚本的环境配置：source "%s/postgresql-test.env"\n' "$runtime_dir"

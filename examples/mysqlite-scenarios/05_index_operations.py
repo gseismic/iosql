@@ -1,26 +1,24 @@
-"""mysqlite 场景 05：索引的创建、查询与删除。
+"""创建、查询和删除 mysqlite 索引。
 
-运行: python examples/mysqlite-scenarios/05_index_operations.py
+运行：在本文件所在目录执行 python 05_index_operations.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出索引变化及约束索引不能删除的提示。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 import sqlite3
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql.utils.mysqlite import Database
 
 
-DB_DIR = Path(__file__).resolve().parents[1] / "runtime" / "mysqlite-scenarios" / "05_index_ops"
+DB_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "05_index_ops"
 DB_FILE = DB_DIR / "index.sqlite3"
 
 
-def reset_database():
-    shutil.rmtree(DB_DIR, ignore_errors=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(str(DB_FILE), auto_commit=True, verbose=0)
     ticks = db["ticks"]
     ticks.create_table(

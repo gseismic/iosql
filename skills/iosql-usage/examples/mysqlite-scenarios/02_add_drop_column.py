@@ -1,29 +1,31 @@
-"""mysqlite 场景 02：增加列与删除列。
+"""使用 mysqlite 增列并用 SQLite 原生 SQL 删列。
 
-运行: python examples/mysqlite-scenarios/02_add_drop_column.py
+运行：在本文件所在目录执行 python 02_add_drop_column.py。
+准备：已安装 iosql 及其默认依赖。
+需要 SQLite 3.35 或更高版本以支持 DROP COLUMN。
+预期：输出列缓存、预期限制和实际表结构。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 import sqlite3
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql.utils.mysqlite import Database
 
 
-DB_DIR = Path(__file__).resolve().parents[1] / "runtime" / "mysqlite-scenarios" / "02_add_drop_column"
+DB_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "02_add_drop_column"
 DB_FILE = DB_DIR / "schema.sqlite3"
 
 
-def reset_database():
-    shutil.rmtree(DB_DIR, ignore_errors=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def run():
+def check_prerequisites():
     if sqlite3.sqlite_version_info < (3, 35, 0):
         raise SystemExit(f"需要 SQLite >= 3.35 支持 DROP COLUMN, 当前 {sqlite3.sqlite_version}")
 
-    reset_database()
+
+def run():
+    check_prerequisites()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(str(DB_FILE), auto_commit=True, verbose=0)
     events = db["events"]
 

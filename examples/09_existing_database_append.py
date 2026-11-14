@@ -1,24 +1,37 @@
-"""已有库：读取持久化契约，不重新声明表结构，继续增量写入。"""
+"""重开已有表并复用持久化契约增量写入。
+
+运行：在本文件所在目录执行 python 09_existing_database_append.py。
+准备：已安装 iosql 及其默认依赖。
+可选 IOSQL_EXISTING_URI 和 IOSQL_EXISTING_TABLE；设置后会向指定测试表写入示例记录。
+预期：输出已有契约、写入结果及最新记录。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 import os
-import shutil
+from uuid import uuid4
 from pathlib import Path
 
 from iosql import Database
 
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = EXAMPLE_DIR / "runtime" / "09_existing_source.iosql"
+DEFAULT_DB_PATH = EXAMPLE_DIR / "runtime" / uuid4().hex / "09_existing_source.iosql"
 EXTERNAL_DB_URI = os.environ.get("IOSQL_EXISTING_URI")
 DB_URI = EXTERNAL_DB_URI or f"sqlite://{DEFAULT_DB_PATH}"
 TABLE_NAME = os.environ.get("IOSQL_EXISTING_TABLE", "ticks")
+
+
+def check_prerequisites():
+    if EXTERNAL_DB_URI:
+        with Database(EXTERNAL_DB_URI) as db:
+            if TABLE_NAME not in db.table_names():
+                raise SystemExit("IOSQL_EXISTING_URI 中未找到指定表，请设置已有测试库及表名。")
 
 
 def prepare_demo_database():
     """准备阶段结束后关闭连接，后续代码面对的就是一个已有库。"""
     if EXTERNAL_DB_URI:
         return
-    shutil.rmtree(DEFAULT_DB_PATH, ignore_errors=True)
     DEFAULT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     with Database(DB_URI) as db:
@@ -36,6 +49,7 @@ def prepare_demo_database():
 
 
 def run():
+    check_prerequisites()
     prepare_demo_database()
 
     # 直接信任 API 的错误路径：无契约时 write() 会给出修复指引，

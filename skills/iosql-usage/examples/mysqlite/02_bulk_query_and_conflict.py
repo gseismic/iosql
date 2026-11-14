@@ -1,22 +1,23 @@
-"""mysqlite：批量写入、聚合查询和冲突处理。"""
+"""使用 mysqlite 批量写入、处理冲突并聚合查询。
+
+运行：在本文件所在目录执行 python 02_bulk_query_and_conflict.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出主键、明细和按 SKU 汇总结果。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
+"""
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql.utils.mysqlite import Database
 
 
-DB_DIR = Path(__file__).resolve().parents[1] / "runtime" / "mysqlite" / "02_bulk_query"
+DB_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "02_bulk_query"
 DB_FILE = DB_DIR / "demo.sqlite3"
 
 
-def reset_database():
-    shutil.rmtree(DB_DIR, ignore_errors=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
 
     db = Database(str(DB_FILE), auto_commit=True, verbose=0)
     orders = db["orders"]
@@ -43,7 +44,6 @@ def run():
     print("明细:", rows)
     print("汇总:", summary)
     db.close()
-    reset_database()
 
 
 if __name__ == "__main__":

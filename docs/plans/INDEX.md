@@ -32,3 +32,11 @@
 | 2026-11-06 05:22 | [自动识别本地库引擎与 URI 兼容](PLAN-20261106-003-model-unknown-auto-engine-uri.md) / [结果](PLAN-20261106-003-model-unknown-auto-engine-uri-OUTCOME.md) | 已完成（WORKTREE） | 自动识别和显式前缀兼容、类型冲突保护、Parquet 绘图与完整回归完成。 |
 | 2026-11-06 05:34 | [修复 URI、迁移和 Parquet 绘图的 Review 问题](PLAN-20261106-004-model-unknown-uri-review-fixes.md) | 实施中 | 修复六项并发、超时、空库和 Parquet 图表回归。 |
 | 2026-11-06 05:49 | [修复 URI、迁移和 Parquet 绘图的 Review 问题](PLAN-20261106-004-model-unknown-uri-review-fixes.md) / [结果](PLAN-20261106-004-model-unknown-uri-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 六项问题及源库识别超时一并修复，完整回归和浏览器测试通过。 |
+| 2026-11-15 01:07 | [示例场景梳理与 PostgreSQL 入门示例](PLAN-20261115-001-model-unknown-example-audit.md) | 实施中 | 梳理场景频率和示例边界，新增 PostgreSQL 基础读写，同步技能并隔离验证。 |
+| 2026-11-15 01:24 | [示例场景梳理与 PostgreSQL 入门示例](PLAN-20261115-001-model-unknown-example-audit.md) / [结果](PLAN-20261115-001-model-unknown-example-audit-OUTCOME.md) | 已完成（WORKTREE） | 35 个示例独立运行，新增 PostgreSQL 和部分更新示例；技能同步，55 项专项验证通过。 |
+| 2026-11-15 01:44 | [PostgreSQL 凭据环境变量与密码文件示例](PLAN-20261115-002-model-unknown-postgresql-credentials.md) | 实施中 | 验证 libpq 环境变量及密码文件，并更新示例和技能说明。 |
+| 2026-11-15 01:51 | [PostgreSQL 凭据环境变量与密码文件示例](PLAN-20261115-002-model-unknown-postgresql-credentials.md) / [结果](PLAN-20261115-002-model-unknown-postgresql-credentials-OUTCOME.md) | 已完成（WORKTREE） | 标准环境变量和密码文件通过 SCRAM 认证，示例与技能更新；专项及示例回归通过。 |
+| 2026-11-15 01:56 | [PostgreSQL 环境变量密码独立示例](PLAN-20261115-003-model-unknown-postgresql-env-example.md) | 实施中 | 新增环境变量凭据的单文件写入、查询示例并同步技能。 |
+| 2026-11-15 02:01 | [PostgreSQL 环境变量密码独立示例](PLAN-20261115-003-model-unknown-postgresql-env-example.md) / [结果](PLAN-20261115-003-model-unknown-postgresql-env-example-OUTCOME.md) | 已完成（WORKTREE） | 独立环境变量示例和技能同步，SCRAM 认证及示例回归通过。 |
+| 2026-11-15 02:33 | [修复全部示例检查问题](PLAN-20261115-004-model-unknown-example-review-fixes.md) | 实施中 | 修复数据清理、并发、流式读取、诊断、凭据、跨平台和单文件说明，并同步 skill。 |
+| 2026-11-15 02:57 | [修复全部示例检查问题](PLAN-20261115-004-model-unknown-example-review-fixes.md) / [结果](PLAN-20261115-004-model-unknown-example-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 八项检查问题修复并同步 skill；隔离 PostgreSQL 和相关回归 154 通过、6 项 Windows 原机测试跳过。 |

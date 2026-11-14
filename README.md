@@ -207,7 +207,7 @@ segment 表沿用现有 upsert/replace 限制。读取流存活期间，同表�
 暂不支持 Parquet。只接管 iosql 创建的目录库，
 不会自动注册任意已有 Parquet 文件。
 
-完整 Parquet 后端示例：[14_parquet_backend.py](examples/14_parquet_backend.py)。
+Parquet 写入与重开示例：[14_parquet_backend.py](examples/14_parquet_backend.py)。
 SQLite → Parquet 单向迁移示例：[16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py)，
 覆盖 dry-run、行数校验和目标库查询。
 
@@ -820,6 +820,8 @@ with Database("sqlite://db/market.iosql") as source:
 
 `Database.migrate_to()` 与 `Table.migrate_to()` 支持 SQLite、Parquet 和 PostgreSQL 之间的迁移，默认复用源契约，也可通过 `specs` 调整目标布局。源业务数据和契约保留；协调文件与临时工作区由库管理。CLI 的源库支持 SQLite/Parquet；以 PostgreSQL 为源时使用 Python API 并先绑定表契约。
 
+下面的 PostgreSQL URI 不含密码；请先通过 `PGPASSWORD` 或 `PGPASSFILE` 配置凭据，见[示例运行说明](examples/README.md#postgresql-示例)。
+
 ```python
 from iosql import Database
 
@@ -829,7 +831,7 @@ with Database("sqlite://database/market.iosql") as source:
         "batch_size": 50_000,
         "verify": "row-count",
     }
-    target_uri = "postgresql://user:pass@localhost:5432/market"
+    target_uri = "postgresql://user@localhost:5432/market"
     plan = source.migrate_to(target_uri, dry_run=True, **options)
     print(plan.source_rows, plan.batches)           # 预览不连接目标库
 
@@ -843,7 +845,7 @@ with Database("sqlite://database/market.iosql") as source:
 with Database("sqlite://database/market.iosql") as source:
     ticks = source.table("kline_1m")
     result = ticks.migrate_to(
-        "postgresql://user:pass@localhost:5432/market",
+        "postgresql://user@localhost:5432/market",
         tables={"kline_1m": "pg_kline_1m"},
         batch_size=50_000,
     )
@@ -854,7 +856,7 @@ PostgreSQL 作为源库写回 SQLite 时，需要重新绑定同一份表契约�
 ```python
 with Database("sqlite://database/market.iosql") as source:
     spec = source.table("kline_1m").spec()
-with Database("postgresql://user:pass@localhost:5432/market") as pg:
+with Database("postgresql://user@localhost:5432/market") as pg:
     pg.table("pg_kline_1m", spec=spec)
     result = pg.migrate_to(
         "sqlite://database/from-postgresql.iosql",
@@ -869,7 +871,7 @@ CLI：
 ```bash
 iosql migrate \
   -s sqlite://database/market.iosql \
-  --target postgresql://user:pass@localhost:5432/market \
+  --target postgresql://user@localhost:5432/market \
   --table kline_1m:pg_kline_1m \
   --batch-size 50000 \
   --verify row-count
@@ -900,7 +902,7 @@ CLI 对应 `--specs '{"kline_1m":{"partition":"duration(ts,every=1hour)"}}'`，�
 
 旧内容和暂存优先在解锁前移入父目录协调空间的任务专属退休目录；目标根是独立挂载点时，支持的平台使用已打开的目录句柄安全清理，否则保留暂存并给出警告。合法空表可作为迁移目标，未写入表的当前实例声明在发布刷新后仍可用。库级协调层在 Windows 使用原生共享/独占文件锁；Windows 尚未进行原机和断电验证，不承诺 POSIX 目录 fsync 的同等持久性。
 
-[安全迁移与路径示例](examples/17_safe_migration_and_paths.py) 演示大小写目录、SQLite→Parquet 迁移与备份、快照 junction 和库锁符号链接拒绝。运行 `uv run --with-editable . python examples/17_safe_migration_and_paths.py`；示例会清理自己的临时目录，平台能力不足时明确跳过对应场景。
+[SQLite 目录库备份示例](examples/17_safe_migration_and_paths.py) 使用公开的 `iosql backup` 命令创建并查询备份，运行后自动清理临时数据。
 
 `verify="row-count"` 要求所有选中目标表不存在或为空，在发布前比较真实行数。`dry_run=True` 只持源共享锁，不连接目标，不创建业务临时目录；它不会验证目标连接、权限或已有表兼容性。源协调锁文件可以产生，待恢复的源库会报错。多个独立查询跨越发布时间可能分别读到旧版和新版。
 
@@ -936,71 +938,42 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 
 ## 示例
 
-示例位于 `examples/`，按学习顺序编号：
+常用场景优先列在前面；完整目录按用途和预估频率整理，见[示例索引](examples/README.md)。频率是场景估计，不是访问统计；原有文件编号保留以兼容已有链接。
 
-| 文件 | 场景 |
+| 想做什么 | 示例 |
 | --- | --- |
-| `01_quickstart_table.py` | 普通 `Table` + `Partition.duration(...)` 写入、查询和 explain。 |
-| `01_quickstart_timeseries.py` | `Database.timeseries()` helper 版写入和查询。 |
-| `02_calendar_events_table.py` | 普通 `Table` + `Partition.calendar(...)` 处理日期字符串分区。 |
-| `02_calendar_events.py` | `Database.timeseries()` 快捷版处理日期字符串和 calendar 分区。 |
-| `03_buffered_ingest_and_query_plan.py` | 批量缓冲写入、row segment 和查询计划。 |
-| `04_layout_report_and_repartition.py` | 布局诊断和重分区。 |
-| `05_partition_segments_smoke.py` | 逻辑分区 + 物理 segment 拆分和二级查询计划。 |
-| `06_row_segment_late_data.py` | 纯 row segment、晚到数据和 stats pruning。 |
-| `07_partition_string_repartition_cli.py` | 字符串 partition 和 CLI `repartition --partition`。 |
-| `08_doctor_time_first_suggestions.py` | `doctor` 对历史 `partition_key` 表优先推荐时间分区。 |
-| `09_existing_database_append.py` | 独立模拟已有库，重新打开持久化契约后继续增量写入。 |
-| `10_existing_database_repartition.py` | 独立模拟已有源库，重新打开后重分区到新目标库。 |
-| `11_sqlite_to_postgresql_migration.py` | SQLite 源库 dry-run、迁移到 PostgreSQL、row-count 校验和目标侧查询。 |
-| `12_sqlite_postgresql_roundtrip.py` | SQLite -> PostgreSQL -> SQLite 双向转换和 row-count 校验。 |
-| [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py) | 跨分区全局排序，用 `query().iter_rows()` 惰性读取。 |
-| [14_parquet_backend.py](examples/14_parquet_backend.py) | Parquet 分区、segment、重开与 SQLite 双向迁移。 |
-| [15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) | PostgreSQL 时间窗、latest/asof、原生计划与复合索引。 |
-| [16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py) | SQLite → Parquet 预览、迁移、校验与目标查询。 |
-| [17_safe_migration_and_paths.py](examples/17_safe_migration_and_paths.py) | 大小写路径、安全迁移与备份、链接路径拒绝。 |
-| [18_save_as_compare_engines.py](examples/18_save_as_compare_engines.py) | `save_as()` 保留源库，校验副本后比较 SQLite/Parquet 相同查询的耗时。 |
+| SQLite 写入并按时间查询 | [01_quickstart_timeseries.py](examples/01_quickstart_timeseries.py) |
+| PostgreSQL 写入并查询 | [01_quickstart_postgresql.py](examples/01_quickstart_postgresql.py) |
+| PostgreSQL 环境变量密码 | [01_postgresql_env_password.py](examples/01_postgresql_env_password.py) |
+| Parquet 写入、重开并查询 | [14_parquet_backend.py](examples/14_parquet_backend.py) |
+| 已有库增量写入 | [09_existing_database_append.py](examples/09_existing_database_append.py) |
+| 条件查询和分区裁剪 | [01_quickstart_table.py](examples/01_quickstart_table.py) |
+| 更新部分字段 | [03_partial_upsert.py](examples/03_partial_upsert.py) |
+| 缓冲写入 | [03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
+| 大结果集逐行读取 | [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py) |
+| 金融 K 线和最新截面 | [finance/01_kline_bars.py](examples/finance/01_kline_bars.py) |
 
-各示例的运行条件和环境配置见[完整示例索引](examples/README.md)。
-
-金融场景示例位于 `examples/finance/`：
-
-| 文件 | 场景 |
-| --- | --- |
-| `01_kline_bars.py` | K 线 OHLCV 写入和时间窗口查询。 |
-| `02_orderbook_snapshots.py` | orderbook 快照批量写入和复合主键。 |
-| `03_financial_reports.py` | 财报日期字段、月度日历分区和日期范围查询。 |
-| `04_news_announcements.py` | 新闻/公告事件按时间和类型过滤。 |
-
-运行：
+在仓库根目录安装并运行：
 
 ```bash
-python examples/01_quickstart_table.py
+python -m pip install -e .
 python examples/01_quickstart_timeseries.py
-python examples/02_calendar_events_table.py
-python examples/02_calendar_events.py
-python examples/03_buffered_ingest_and_query_plan.py
-python examples/04_layout_report_and_repartition.py
-python examples/05_partition_segments_smoke.py
-python examples/06_row_segment_late_data.py
-python examples/07_partition_string_repartition_cli.py
-python examples/08_doctor_time_first_suggestions.py
-python examples/09_existing_database_append.py
-python examples/10_existing_database_repartition.py
-python examples/11_sqlite_to_postgresql_migration.py
-python examples/12_sqlite_postgresql_roundtrip.py
-python examples/13_streaming_ordered_query.py
-python examples/14_parquet_backend.py
-python examples/16_sqlite_to_parquet.py
-uv run --with-editable . python examples/17_safe_migration_and_paths.py
-uv run --with-editable . python examples/18_save_as_compare_engines.py
-PYTHONPATH=. python examples/finance/01_kline_bars.py
 ```
 
-`11_sqlite_to_postgresql_migration.py` 未设置 `POSTGRES_DSN` 时只执行 SQLite 源库准备和 dry-run；设置 `POSTGRES_DSN` 后会重建 PostgreSQL 示例表 `iosql_example_migration_ticks` 并执行真实迁移。
-`12_sqlite_postgresql_roundtrip.py` 未设置 `POSTGRES_DSN` 时只执行 dry-run；设置后会演示 `sqlite -> postgresql -> sqlite` 双向转换。
+PostgreSQL 示例需要可选依赖和测试数据库：
 
-低层 SQLite 工具示例位于 `examples/mysqlite/`，用于 `iosql.utils.mysqlite` 的 schema-on-write、批量写入、冲突处理和连接池清理。它们不是新的主 API 入口。
+```bash
+python -m pip install -e ".[postgresql]"
+export POSTGRES_DSN='postgresql://user@localhost:5432/testdb'
+IFS= read -r -s -p 'PostgreSQL 密码: ' PGPASSWORD
+printf '\n'
+export PGPASSWORD
+env -u PGSERVICE python examples/01_quickstart_postgresql.py
+env -u PGSERVICE python examples/01_postgresql_env_password.py
+unset PGPASSWORD
+```
+
+上述命令让 PostgreSQL 驱动从 `PGPASSWORD` 读取密码，不写入 URI；也可使用密码文件 `PGPASSFILE`。环境变量示例拒绝 service 配置，并需要密码认证的测试库才能验证密码来源。`PGPASSWORD` 在部分系统上可能被其他进程读取，密码文件同样保存明文，具体配置见[示例说明](examples/README.md#postgresql-示例)。两个 PostgreSQL 示例分别保留 `iosql_example_ticks` 和 `iosql_example_env_quotes` 表，以 `ignore` 跳过重复主键。金融、分区维护、迁移和 mysqlite 低层场景也在示例索引中按用途列出。
 
 ## 可视化管理台（Web）
 
@@ -1091,7 +1064,7 @@ Parquet 目标迁移后，表目录仍直接位于数据库根目录，与普通
 - 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment，可用 `compact()` 显式整理为新的 sealed generation，再用 `validate(deep=True)` / `cleanup_obsolete()` 释放旧文件。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
 - `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
-- PostgreSQL URI 格式为 `postgresql://user:pass@host:port/dbname`；SQLite 到 PostgreSQL 迁移优先使用 `Database.migrate_to()` / `to_postgresql()` 或 `iosql migrate`，生产迁移建议先 `--dry-run`，再用 `--verify row-count` 校验。
+- PostgreSQL 可使用不含密码的 URI `postgresql://user@host:port/dbname`，密码由 `PGPASSWORD` 或 `PGPASSFILE` 提供；SQLite 到 PostgreSQL 迁移优先使用 `Database.migrate_to()` / `to_postgresql()` 或 `iosql migrate`，生产迁移建议先 `--dry-run`，再用 `--verify row-count` 校验。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。
 
 ### partition 一词三义对照表
@@ -1142,9 +1115,9 @@ bars.create_index(columns=['symbol', 'ts'])  # 等价主键索引会被复用
 
 重开表会验证声明列的真实类型、主键顺序、分区形态与单列 RANGE 键。分区主键必须包含分区列。原生 date/timestamp/timestamptz 查询按契约时区绑定边界；calendar text 使用统一定长 compact 或无偏移 ISO 格式，查询精度独立于分区周期；带偏移时间使用 timestamptz。
 
-运行示例：`POSTGRES_DSN=... uv run --extra postgresql examples/15_postgresql_timeseries_query.py`。查询基准：`POSTGRES_DSN=... uv run --extra postgresql benchmarks/benchmark_postgresql_query.py`，默认覆盖百万/千万行。结果和环境见 [基准报告](benchmarks/results/postgresql-query-20261002.md)。
+基本读写示例：[01_quickstart_postgresql.py](examples/01_quickstart_postgresql.py)；查询计划与索引示例：[15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py)。查询基准：`POSTGRES_DSN=... uv run --extra postgresql benchmarks/benchmark_postgresql_query.py`，默认覆盖百万/千万行。结果和环境见 [基准报告](benchmarks/results/postgresql-query-20261002.md)。
 
-本机已有 PostgreSQL 程序时，可先执行 `bash examples/start_postgresql_test.sh`，再直接运行 `p3 examples/15_postgresql_timeseries_query.py`（p3 是本机 python3 别名）。示例会自动读取本地测试连接文件，显式 POSTGRES_DSN 优先；重启电脑后重新执行启动脚本即可。详细配置、其他脚本的环境文件和停止命令见 [示例运行说明](examples/README.md#postgresql-本机查询示例)。
+本机已有 PostgreSQL 程序时，可先执行 `bash examples/start_postgresql_test.sh`，再运行 `source examples/runtime/postgresql-test.env` 设置连接。重启电脑后重新执行启动脚本即可。详细配置和停止命令见 [示例运行说明](examples/README.md#postgresql-示例)。
 
 ### 动态扩列（schema_policy='evolve'）语义
 

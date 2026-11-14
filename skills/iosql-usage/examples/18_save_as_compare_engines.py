@@ -1,18 +1,19 @@
-"""另存 SQLite 为 Parquet，保留两份数据并比较相同查询的耗时。
+"""另存 SQLite 为 Parquet 并比较相同查询。
 
-运行：uv run --with-editable . python examples/18_save_as_compare_engines.py
-只重置本示例的两个演示路径，运行后保留两份数据供继续查询。
+运行：在本文件所在目录执行 python 18_save_as_compare_engines.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出两份数据的行数和查询耗时。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 from pathlib import Path
 from statistics import median
 from time import perf_counter
-
-from _example_support import reset_database
+from uuid import uuid4
 
 from iosql import Database
 
-RUNTIME = Path(__file__).resolve().parent / 'runtime'
+RUNTIME = Path(__file__).resolve().parent / 'runtime' / f'18_compare_{uuid4().hex}'
 SOURCE_PATH = RUNTIME / '18_sqlite_source.iosql'
 TARGET_PATH = RUNTIME / '18_parquet_copy.iosql'
 BASE_TIME = 1735689600000
@@ -56,8 +57,7 @@ def compare_queries(source, target):
 
 
 def run():
-    for path in (SOURCE_PATH, TARGET_PATH):
-        reset_database(path)
+    RUNTIME.mkdir(parents=True, exist_ok=True)
     source_uri = f'sqlite://{SOURCE_PATH}'
     target_uri = f'parquet://{TARGET_PATH}'
     with Database(source_uri) as source:

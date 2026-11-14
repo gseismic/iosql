@@ -669,9 +669,12 @@ dry-run 不连接目标，不验证目标权限或已有表兼容性。
 已有 SQLite 目录库迁移到 PostgreSQL 时，优先使用高层迁移接口。它会复用源表契约，
 并按 `batch_size` 从 SQLite 物理文件逐批读取，适合海量 K 线：
 
+下面的 URI 不包含密码；先配置 `PGPASSWORD` 或 PostgreSQL 标准密码文件 `PGPASSFILE`。
+详细配置、优先级及安全边界见[示例运行说明](../examples/README.md#postgresql-示例)。
+
 ```python
 with Database("sqlite://db/market.iosql") as source:
-    target_uri = "postgresql://user:pass@localhost:5432/market"
+    target_uri = "postgresql://user@localhost:5432/market"
     options = {
         "tables": {"kline_1m": "pg_kline_1m"},
         "batch_size": 50_000,
@@ -689,7 +692,7 @@ with Database("sqlite://db/market.iosql") as source:
 source = Database("sqlite://db/market.iosql")
 ticks = source.table("ticks")
 result = ticks.migrate_to(
-    "postgresql://user:pass@localhost:5432/market",
+    "postgresql://user@localhost:5432/market",
     tables={"ticks": "pg_ticks"},
     batch_size=50_000,
 )
@@ -701,7 +704,7 @@ CLI：
 ```bash
 iosql migrate \
   -s sqlite://db/market.iosql \
-  --target postgresql://user:pass@localhost:5432/market \
+  --target postgresql://user@localhost:5432/market \
   --table kline_1m:pg_kline_1m \
   --batch-size 50000 \
   --verify row-count
@@ -724,7 +727,7 @@ PostgreSQL 也可以作为迁移源写回 SQLite。重新打开 PostgreSQL 逻�
 ```python
 spec = sqlite_source.table("ticks").spec()
 
-pg = Database("postgresql://user:pass@localhost:5432/market")
+pg = Database("postgresql://user@localhost:5432/market")
 pg.table("pg_ticks", spec=spec)
 result = pg.migrate_to(
     "sqlite://db/from-postgresql.iosql",
@@ -742,7 +745,7 @@ pg.close()
 iosql 支持 PostgreSQL 作为后端引擎：
 
 ```python
-db = Database("postgresql://user:pass@localhost:5432/mydb")
+db = Database("postgresql://user@localhost:5432/mydb")
 table = db.table(
     "ticks",
     pk=["symbol", "ts"],
@@ -835,7 +838,7 @@ def test_my_case():
 - `create_index(column=None, order='asc', exist_ok=True, *, columns=None)` 支持复合 B-tree；与主键等价时复用。`drop_index(column=None, *, columns=None)` 仅删除当前表带 iosql 标记且定义匹配的二级索引；不能按名称误删用户索引或约束索引。
 - 重开物理表验证声明列类型、主键顺序、分区形态和 RANGE 单列键；分区主键必须包含分区列。
 - upsert_all 按输入主键增量合并，缺字段保留旧值，显式 None 写 NULL，重复主键按输入顺序合并。count_rows 是精确计数，可能全表扫描。
-- 完整示例：`examples/15_postgresql_timeseries_query.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
+- PostgreSQL 基础读写：`examples/01_quickstart_postgresql.py`；查询计划与索引：`examples/15_postgresql_timeseries_query.py`；最新截面：`examples/finance/01_kline_bars.py`；字段级更新：`examples/03_partial_upsert.py`。百万/千万行基准：仓库 `benchmarks/benchmark_postgresql_query.py`。
 
 指定 symbols 的单 symbol 分组 latest 会在目录确认有效 symbol/time B-tree 前缀索引后使用 LATERAL LIMIT 1；无索引/多维分组/无 symbols 时使用 DISTINCT ON。
 

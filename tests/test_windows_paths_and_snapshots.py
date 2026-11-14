@@ -59,6 +59,8 @@ def test_database_access_does_not_redirect_to_lowercase_sibling(tmp_path, lowerc
     path = tmp_path / 'MyDB'
     sibling = tmp_path / 'mydb'
     sibling.mkdir()
+    if path.exists():
+        pytest.skip('当前文件系统无法同时创建仅大小写不同的目录')
     (sibling / 'keep.txt').write_bytes(b'unchanged')
     with Database(f'{backend}://{path}') as db:
         table = db.table('ticks', pk=['id'], columns={'id': 'integer'})

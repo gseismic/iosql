@@ -35,7 +35,7 @@ with Database("sqlite://db/market.iosql") as db:        # 新库显式选择 SQL
 默认依赖安装，无需额外 extra。建表、查询和迁移沿用主 API；Parquet 追加采用不可变数据片，
 修改和删除重写受影响集合，适合批量归档。先看 [Parquet 使用指南](references/parquet.md) 了解性能和接口边界，再运行
 [SQLite → Parquet 迁移示例](examples/16_sqlite_to_parquet.py) 或
-[Parquet 后端完整示例](examples/14_parquet_backend.py)。已有库可直接以路径自动识别；
+[Parquet 写入与查询示例](examples/14_parquet_backend.py)。已有库可直接以路径自动识别；
 CLI 常用查询、迁移和 Web 的数据浏览及图表支持 Parquet。
 
 ```
@@ -74,9 +74,8 @@ CLI 常用查询、迁移和 Web 的数据浏览及图表支持 Parquet。
    `published` 和 `verified`。dry-run 不连接目标，不能据此确认目标权限或已有表兼容。
    直接操作单 SQLite 文件时进入 mysqlite 示例。
 
-这条工作流对应主线示例的递进关系：01/02 解决建模入口，03 解决批量写入和计划确认，
-04～08 解决布局与运维，09/10 解决已有库，11/12 解决迁移，13 解决大结果集的有序流式读取，
-14 展示 Parquet 归档，15 展示 PostgreSQL 查询，16 聚焦 SQLite 到 Parquet 的迁移，17 展示迁移发布和路径安全。
+按实际问题选择示例：基本读写、重开、部分更新和大结果集读取先看下方常用入口；
+布局维护、跨后端迁移和查询诊断按需查阅[完整示例索引](examples/README.md)。文件编号保留历史路径，不代表使用频率。
 
 ## 参数怎么设：先估算数据量，再定分区
 
@@ -121,25 +120,29 @@ CLI 常用查询、迁移和 Web 的数据浏览及图表支持 Parquet。
 
 写入后跑 `table.layout_report()`，看 `report.recommendation`（行数倾斜、文件过多/过大会给建议）；调整分区用 `spec().with_partition(...)` + `repartition_to()` 迁新库。
 
-## 场景导航（频率按真实示例反推）
+## 场景导航
 
-### 常用（高频）
+顺序根据日常读写与维护场景估计，并非实际使用统计。优先选择只覆盖当前问题的示例。
+
+### 常用
 
 | 场景 | 最小做法 | 可运行示例 |
 |------|---------|-----------|
-| 建表 + 写 + 时间窗查 | 上面的 30 秒上手 | [examples/01_quickstart_timeseries.py](examples/01_quickstart_timeseries.py) |
-| 日期字符串数据（ISO/交易日） | `db.timeseries(..., partition=Partition.calendar("date", every="1day", timezone="Asia/Shanghai"))`，查询 `query(date="2026-01-06")` | [examples/02_calendar_events.py](examples/02_calendar_events.py) |
-| 大批量缓冲写入（万行级） | `with table.buffered_writer(max_rows=10_000) as buf: buf.append(batch)` | [examples/03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
-| 大表控制文件大小 | `segment=Segment.rows(max_rows=500_000, target_rows=200_000)` | [examples/finance/02_orderbook_snapshots.py](examples/finance/02_orderbook_snapshots.py) |
-| 大结果集全局排序 | `query(order_by="open_time").iter_rows(batch_size=...)`，先消费首行再继续迭代 | [examples/13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py) |
-| 金融最新截面 | `table.latest(symbols=[...], as_of=..., by=["symbol","timeframe"], columns=[...]).to_list()`；单条用 `.one()` | [examples/finance/01_kline_bars.py](examples/finance/01_kline_bars.py) |
-| 任意条件查询 | `table.select(where=..., order_by=..., limit=..., to_dict=True)`；where 用 dict/list/文本/`Case` | [examples/01_quickstart_table.py](examples/01_quickstart_table.py)、[references/usage-patterns.md](references/usage-patterns.md) #Where 条件构造 |
-| 表说明、字段解释与声明值域 | `table.describe()`；SQLite/Parquet 用 `update_metadata(...)` 增量更新，值域只描述、不校验写入 | [references/usage-patterns.md](references/usage-patterns.md#表说明与字段元数据)、[references/api-reference.md](references/api-reference.md#表说明与字段元数据) |
-| 查询裁剪诊断 | `table.explain_select(where=..., order_by=...)` 或 `query(...).explain()` | [examples/03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
-| 期货/夜盘交易日 session | 建表传 `session_column="trading_date"`，查询 `query(session="2026-01-06")` | [references/usage-patterns.md](references/usage-patterns.md) #交易日session |
-| 打开已有库继续写 | `db.table("name")` 不重新声明契约；`write(mode="ignore")` 跳过重复主键 | [examples/09_existing_database_append.py](examples/09_existing_database_append.py) |
-| Parquet 批量归档/分析 | `Database("parquet://...")` 配合分区、segment 和流式有序查询 | [references/parquet.md](references/parquet.md)、[examples/14_parquet_backend.py](examples/14_parquet_backend.py) |
-| 保留源库，另存并比较 engine | `db.save_as(target_uri, verify="row-count")`；单表用 `table.save_as(...)` | [examples/18_save_as_compare_engines.py](examples/18_save_as_compare_engines.py) |
+| SQLite 建表、写入和时间窗查询 | `db.timeseries(...)` + `write()` + `query()` | [01_quickstart_timeseries.py](examples/01_quickstart_timeseries.py) |
+| PostgreSQL 直接写入并查询 | `Database(POSTGRES_DSN)`；URI 可省略密码，由 `PGPASSWORD` 或 `PGPASSFILE` 提供；重开时绑定相同契约 | [01_quickstart_postgresql.py](examples/01_quickstart_postgresql.py) |
+| PostgreSQL 环境变量密码 | 不带密码的 `POSTGRES_DSN` + `PGPASSWORD`，普通表写入和查询 | [01_postgresql_env_password.py](examples/01_postgresql_env_password.py) |
+| Parquet 写入并重开查询 | `Database("parquet://...")`；重开用 `db.table(name)` | [14_parquet_backend.py](examples/14_parquet_backend.py) |
+| 已有本地库继续写 | `db.table(name)`；`write(mode="ignore")` 跳过重复主键 | [09_existing_database_append.py](examples/09_existing_database_append.py) |
+| 任意条件查询 | `table.select(where=..., order_by=..., limit=...)` | [01_quickstart_table.py](examples/01_quickstart_table.py)、[条件构造](references/usage-patterns.md) |
+| 日期字符串和日历分区 | `Partition.calendar(...)` + `query(date=...)` | [02_calendar_events.py](examples/02_calendar_events.py) |
+| 只更新部分字段 | `table.upsert_all(rows, pk=...)`；未提供字段保留，显式 `None` 写 NULL | [03_partial_upsert.py](examples/03_partial_upsert.py) |
+| 缓冲批量写入 | `with table.buffered_writer(max_rows=...) as buf: buf.append(batch)` | [03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
+| 大结果集全局排序 | `query(order_by=...).iter_rows(batch_size=...)` | [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py) |
+| K 线和最新截面 | `query()`；`latest(symbols=..., as_of=..., by=...)` | [finance/01_kline_bars.py](examples/finance/01_kline_bars.py) |
+| 大表控制文件大小 | `segment=Segment.rows(max_rows=...)` | [finance/02_orderbook_snapshots.py](examples/finance/02_orderbook_snapshots.py) |
+| 查询裁剪诊断 | `table.explain_select(...)` 或 `query(...).explain()` | [03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
+| 表与字段元数据 | `table.describe()`；SQLite/Parquet 用 `update_metadata(...)` 更新 | [元数据用法](references/usage-patterns.md#表说明与字段元数据) |
+| 期货夜盘交易日 | 建表传 `session_column="trading_date"`，查询 `query(session=...)` | [跨日交易日示例](examples/02_calendar_events_table.py)、[交易日 session](references/usage-patterns.md) |
 
 ### 进阶（偶尔需要）
 
@@ -149,8 +152,9 @@ CLI 常用查询、迁移和 Web 的数据浏览及图表支持 Parquet。
 | 晚到数据 + 纯 row segment | `db.table(..., segment=Segment.rows(max_rows=N), order_key=...)`，晚到数据进新 active segment | [examples/06_row_segment_late_data.py](examples/06_row_segment_late_data.py) |
 | 布局诊断 + 重分区 | `layout_report()` → `spec().with_partition(...)` → `repartition_to(新库URI, spec=)`（只写新库） | [examples/04_layout_report_and_repartition.py](examples/04_layout_report_and_repartition.py) |
 | CLI 重分区 | `iosql repartition -s ... -t ... --partition 'duration(ts,every=1hour)' --target 新库` | [examples/07_partition_string_repartition_cli.py](examples/07_partition_string_repartition_cli.py) |
+| SQLite 目录库备份 | `iosql backup --source 源库 --target 新目录` | [备份示例](examples/17_safe_migration_and_paths.py) |
 | 跨后端迁移与调整目标布局 | `migrate_to(uri, specs=..., verify="row-count")`；正式迁移前先 dry-run | [examples/11_sqlite_to_postgresql_migration.py](examples/11_sqlite_to_postgresql_migration.py)、[examples/16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py)、[references/api-reference.md](references/api-reference.md) |
-| PostgreSQL 在线时序查询、计划与复合索引 | `query/latest/asof`、`.explain(analyze=True)`、`create_index(columns=[...])` | [examples/15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) |
+| PostgreSQL 查询计划与复合索引 | `query()`、`.explain(analyze=True)`、`create_index(columns=[...])` | [examples/15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py) |
 | SQLite ⇄ PostgreSQL 双向 | PG 侧重开逻辑表需 `db.table(名字, spec=同一份契约)` | [examples/12_sqlite_postgresql_roundtrip.py](examples/12_sqlite_postgresql_roundtrip.py) |
 | SQLite ⇄ Parquet 迁移 | `db.migrate_to("parquet://...")` 或反向迁移；正式迁移可启用 `verify="row-count"` | [examples/16_sqlite_to_parquet.py](examples/16_sqlite_to_parquet.py)、[references/parquet.md](references/parquet.md) |
 | 逻辑分区 + 物理 segment 组合 | partition 与 segment 同时配置，explain 看两级裁剪 | [examples/05_partition_segments_smoke.py](examples/05_partition_segments_smoke.py) |
@@ -165,62 +169,35 @@ CLI 常用查询、迁移和 Web 的数据浏览及图表支持 Parquet。
 | 可视化管理台 `iosql web` 工作区/安全模型 | [references/ui.md](references/ui.md) |
 | compact / cleanup_obsolete / validate / segments 维护流 | [references/usage-patterns.md](references/usage-patterns.md) #布局和重分区；错误对照 [references/troubleshooting.md](references/troubleshooting.md) #分区维护 |
 | 流式查询 iter_select_batches / iter_batches / 大结果导出 | [references/usage-patterns.md](references/usage-patterns.md) #流式查询和导出 |
-| upsert_all 字段级合并、delete/truncate、create_index/drop_index、rename | [references/usage-patterns.md](references/usage-patterns.md) |
+| delete/truncate、create_index/drop_index、rename | [references/usage-patterns.md](references/usage-patterns.md) |
 | where 全部运算符、Case/CaseExpression 组合 | [references/api-reference.md](references/api-reference.md) #Where 条件支持的运算符 |
 | mysqlite 单文件（schema-on-write/事务/加删列/索引/备份） | [examples/mysqlite/](examples/mysqlite/)、[examples/mysqlite-scenarios/](examples/mysqlite-scenarios/) |
 | 写入性能调优（批次/PRAGMA/FD 预算/HDD） | [references/write-performance.md](references/write-performance.md) |
 | 全部 API 签名、结果类型、异常、mysqlite 契约 | [references/api-reference.md](references/api-reference.md) |
-| 迁移发布状态、锁超时、恢复及路径错误 | [references/troubleshooting.md](references/troubleshooting.md#统一迁移与协作锁)、[examples/17_safe_migration_and_paths.py](examples/17_safe_migration_and_paths.py) |
+| 迁移发布状态、锁超时、恢复及路径错误 | [references/troubleshooting.md](references/troubleshooting.md#统一迁移与协作锁) |
 | 本仓库开发守则（接口冻结/PG 引擎差异/测试要求/反模式全表） | [references/design-contract.md](references/design-contract.md) |
 
 ## 示例目录：按问题选择
 
-主线示例位于 `examples/`，每个文件解决一类可复用问题：
+[示例索引](examples/README.md) 按场景和预计频率列出主 API、金融和 mysqlite 的全部示例，
+注明每个示例的目的、依赖和数据保留或清理行为；每个 Python 示例均可单独复制运行，
+不依赖其他示例文件。`examples/mysqlite/` 是低层单文件
+SQLite 工具，普通目录库优先使用 `Database.table()` 或 `Database.timeseries()`。
 
-| 示例 | 解决的问题 |
-| --- | --- |
-| `01_quickstart_table.py` | 显式使用 `Table + Partition` 建立普通时间分区表，并用 `select` / `explain_select` 查询。 |
-| `01_quickstart_timeseries.py` | 用 `timeseries()` 快速完成同类时间戳建模，理解 helper 与底层 API 的关系。 |
-| `02_calendar_events_table.py` | 处理 ISO 日期字符串和时区边界，使用 `Partition.calendar`。 |
-| `02_calendar_events.py` | 用 `timeseries()` 快速创建日期字符串事件表。 |
-| `03_buffered_ingest_and_query_plan.py` | 对万行级写入使用 `buffered_writer`，同时检查分区/segment 裁剪。 |
-| `04_layout_report_and_repartition.py` | 发现布局不合适后，诊断并将数据写入新的分区布局。 |
-| `05_partition_segments_smoke.py` | 组合逻辑分区和物理 row segment，验证两级查询计划。 |
-| `06_row_segment_late_data.py` | 无逻辑分区时按行滚动文件，并观察晚到数据与 stats pruning。 |
-| `07_partition_string_repartition_cli.py` | 复用字符串 partition 表达，在 CLI 中执行安全重分区。 |
-| `08_doctor_time_first_suggestions.py` | 对历史表运行 doctor，获得时间优先建模建议。 |
-| `09_existing_database_append.py` | 重新打开已有库，沿用持久化契约继续增量写入。 |
-| `10_existing_database_repartition.py` | 不改动源库，将已有表离线重分区到新目标库。 |
-| `11_sqlite_to_postgresql_migration.py` | 先 dry-run，再迁移到 PostgreSQL 并做行数校验。 |
-| `12_sqlite_postgresql_roundtrip.py` | 演示 SQLite → PostgreSQL → SQLite 双向转换。 |
-| `13_streaming_ordered_query.py` | 对跨分区结果全局排序，并用 `query().iter_rows()` 惰性消费大结果集。 |
-| `14_parquet_backend.py` | 演示 Parquet 分区存储、segment、流式排序、重开与 SQLite 双向迁移。 |
-| `15_postgresql_timeseries_query.py` | 演示 PG14+ 时间窗流式查询、latest/asof、原生计划、复合索引与字段更新。 |
-| `16_sqlite_to_parquet.py` | 演示 SQLite 源库 dry-run、迁移到 Parquet、row-count 校验和目标查询。 |
-| `17_safe_migration_and_paths.py` | 演示大小写路径保留、迁移与备份，以及快照 junction/库锁符号链接拒绝。 |
-| `18_save_as_compare_engines.py` | 演示另存独立副本，校验相同查询结果后比较 SQLite/Parquet 首次与预热读取耗时。 |
+运行示例前执行 `python -m pip install -e .`。PostgreSQL 示例需额外安装
+`python -m pip install -e ".[postgresql]"`，并将 `POSTGRES_DSN` 指向测试数据库。
+可使用无密码 URI `postgresql://user@host:port/dbname`，将密码放在 `PGPASSWORD`，
+或使用 `PGPASSFILE` 指定 PostgreSQL 标准密码文件；Unix 上文件不能允许组和其他用户访问，通常设为 `0600`。
+环境变量和文件均非加密存储；URI 中的显式密码优先，`!password` 不是变量引用。service 配置也可能提供优先于 `PGPASSWORD` 的密码。
+[环境变量密码示例](examples/01_postgresql_env_password.py)要求 `PGPASSWORD`，拒绝 URI 内的密码及 service 配置，并应使用密码认证的测试库；保留普通示例表并可重复运行；
+[基础读写](examples/01_quickstart_postgresql.py)保留示例表并跳过重复主键；
+`rows_seen` 是提交数，不等于实际新增数。11 和 12 未设置 DSN 时只做 dry-run，
+设置后原子创建新的目标表并保留结果；失败时检查可能残留的表。15 使用随机表并在结束时清理。
+本地示例每次使用 `runtime/` 下的独立目录并保留数据；备份例使用自动清理的临时目录。
 
-金融示例位于 `examples/finance/`：`01_kline_bars.py` 解决 K 线 OHLCV，
-`02_orderbook_snapshots.py` 解决高频 orderbook 快照，`03_financial_reports.py` 解决财报
-日期和月度日历分区，`04_news_announcements.py` 解决新闻/公告的类型过滤与查询计划。
-
-低层 mysqlite 示例位于 `examples/mysqlite/` 和 `examples/mysqlite-scenarios/`：
-`mysqlite/01_schemaless_crud.py` 覆盖 schema-on-write CRUD，`02_bulk_query_and_conflict.py`
-覆盖批量查询和冲突策略，`03_connection_pool_cleanup.py` 覆盖连接池清理；
-`mysqlite-scenarios/01_crud.py`、`02_add_drop_column.py`、`03_query_variants.py`、
-`04_rename_and_table_info.py`、`05_index_operations.py`、`06_backup.py` 分别覆盖六类
-单文件运维问题。进入低层示例前，先确认需求不是普通 `Database.table()` /
-`Database.timeseries()` 能解决的主 API 场景。
-
-运行示例前先执行 `python -m pip install -e .`，此安装已包含 DuckDB 和 Parquet 后端。
-脚本默认把可重复生成的数据库放在各自
-`examples/runtime/` 下。未设置 `POSTGRES_DSN` 时，11 和 12 只执行 SQLite 准备与 dry-run。
-
-本机 PostgreSQL 查询示例 15 可先执行 `bash examples/start_postgresql_test.sh`，
-再直接运行 `python3 examples/15_postgresql_timeseries_query.py`。启动脚本复用已安装的
-PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用 POSTGRES_DSN，
-未设置时读取本地连接文件。其他 PG 示例/基准可先 source
-`examples/runtime/postgresql-test.env`；重启电脑后重新运行启动脚本。
+本机有 PostgreSQL 14+ 时，可运行 `bash examples/start_postgresql_test.sh`，
+然后 `source examples/runtime/postgresql-test.env` 并执行基础读写或查询计划示例。
+启动脚本保留本机测试库，重启后需重新运行；完整说明见示例索引。
 
 ## 常用 API 速查
 
@@ -282,7 +259,7 @@ PostgreSQL 14+，保留独立的本机测试库和连接文件；15 优先使用
 - [references/cli.md](references/cli.md) —— CLI 命令与安全规则
 - [references/ui.md](references/ui.md) —— 可视化管理台 iosql web（旧名 iosql ui）
 - [references/design-contract.md](references/design-contract.md) —— 接口契约、设计偏好与开发守则（本仓库开发必读）
-- [examples/README.md](examples/README.md) —— 主线 `01~18` 示例索引，每个示例对应一个常见问题；
+- [examples/README.md](examples/README.md) —— 按场景和预估频率组织的完整示例索引；
   `examples/13_streaming_ordered_query.py` 专门覆盖有序大结果集的惰性读取。
 - [examples/finance/README.md](examples/finance/README.md) —— K线、orderbook、财报、新闻四类金融场景。
 - [examples/mysqlite/README.md](examples/mysqlite/README.md) 和

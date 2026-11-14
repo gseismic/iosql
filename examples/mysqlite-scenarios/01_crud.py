@@ -1,25 +1,23 @@
-"""mysqlite 场景 01：增删改查与冲突处理。
+"""使用 mysqlite 增删改查、处理冲突和事务。
 
-运行: python examples/mysqlite-scenarios/01_crud.py
+运行：在本文件所在目录执行 python 01_crud.py。
+准备：已安装 iosql 及其默认依赖。
+预期：输出各操作结果及事务回滚、提交后的行数。
+数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
 from pathlib import Path
-import shutil
+from uuid import uuid4
 
 from iosql.utils.mysqlite import Database
 
 
-DB_DIR = Path(__file__).resolve().parents[1] / "runtime" / "mysqlite-scenarios" / "01_crud"
+DB_DIR = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "01_crud"
 DB_FILE = DB_DIR / "crud.sqlite3"
 
 
-def reset_database():
-    shutil.rmtree(DB_DIR, ignore_errors=True)
-    DB_DIR.mkdir(parents=True, exist_ok=True)
-
-
 def run():
-    reset_database()
+    DB_DIR.mkdir(parents=True, exist_ok=True)
     db = Database(str(DB_FILE), auto_commit=True, verbose=0)
     orders = db["orders"]
 

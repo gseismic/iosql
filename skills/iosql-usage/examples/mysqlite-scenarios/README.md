@@ -1,26 +1,26 @@
 # mysqlite 典型场景示例
 
 `iosql.utils.mysqlite` 是低层单文件 SQLite 工具层（主 API 见 `examples/` 根目录）。
-本目录按运维场景组织示例，每个脚本独立可运行、自动重建自己的数据库：
+本目录按运维场景组织示例，顺序依日常读写和维护场景估计，并非访问统计。每个脚本可单独复制运行，每次在脚本所在目录的 `runtime/` 下创建独立数据库并保留：
 
 | 文件 | 场景 |
 | --- | --- |
-| `01_crud.py` | 建表契约、单条/批量写入、replace/ignore 冲突、update、delete、事务提交回滚 |
-| `02_add_drop_column.py` | ensure_column 动态加列、显式加默认值列、原生 SQL 删列及"被索引列先删索引"限制 |
-| `03_query_variants.py` | select/select_one/select_all、query/query_all 聚合、fetchall/fetchone、参数化执行、limit=0 |
-| `04_rename_and_table_info.py` | 原生 SQL 重命名表及其 _meta 注意点、column_info/pk/default_values/table_exists/get_all_tables |
-| `05_index_operations.py` | create_index、Table/Database 两级索引查询、drop_column_index/drop_all_index |
+| `01_crud.py` | 单条/批量写入、冲突处理、删除与事务提交回滚 |
+| `03_query_variants.py` | 条件查询、聚合、参数化执行和 `limit=0` |
+| `05_index_operations.py` | 索引的创建、查询与删除 |
 | `06_backup.py` | 通过池化连接调用 sqlite3 backup API 在线备份并校验 |
+| `02_add_drop_column.py` | 动态加列、显式加默认值列及原生 SQL 删列限制 |
+| `04_rename_and_table_info.py` | 原生 SQL 重命名、表结构和 `_meta` 注意点 |
 
 ## 运行
 
 ```bash
 python examples/mysqlite-scenarios/01_crud.py
-python examples/mysqlite-scenarios/02_add_drop_column.py
 python examples/mysqlite-scenarios/03_query_variants.py
-python examples/mysqlite-scenarios/04_rename_and_table_info.py
 python examples/mysqlite-scenarios/05_index_operations.py
 python examples/mysqlite-scenarios/06_backup.py
+python examples/mysqlite-scenarios/02_add_drop_column.py
+python examples/mysqlite-scenarios/04_rename_and_table_info.py
 ```
 
 ## 与 examples/mysqlite/ 的分工
