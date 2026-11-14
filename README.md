@@ -4,6 +4,20 @@
 
 支持 Parquet 和可选的 PostgreSQL 后端；同一套表契约与读写接口可用于不同后端。
 
+## 使用指南与参考
+
+[`iosql-usage` 使用指南](skills/iosql-usage/SKILL.md)提供场景导航、分区建议和常用 API 速查，可供开发者和 AI 编程助手查阅。[skills 目录](skills/)包含指南及其配套资料。
+
+- [API 参考](skills/iosql-usage/references/api-reference.md)：接口、参数和结果类型。
+- [常用模式](skills/iosql-usage/references/usage-patterns.md)：查询、维护和迁移等用法。
+- [CLI 指南](skills/iosql-usage/references/cli.md)：命令行操作。
+- [Parquet 指南](skills/iosql-usage/references/parquet.md)：存储、查询和迁移。
+- [Web 管理台](skills/iosql-usage/references/ui.md)：界面功能与使用方式。
+- [写入性能](skills/iosql-usage/references/write-performance.md)：批量写入和性能调优。
+- [常见问题排查](skills/iosql-usage/references/troubleshooting.md)：错误与处理方法。
+- [接口契约与设计偏好](skills/iosql-usage/references/design-contract.md)：开发时的契约与约束。
+- [示例索引](skills/iosql-usage/examples/README.md)：按场景查找可运行示例。
+
 ## 特性
 
 - **普通 Table 主入口**：用 `Database.table(..., pk=..., partition=..., segment=..., time=...)` 声明主键、列类型、逻辑分区和物理分段；`time=` / `session_column=` 让契约感知查询直达普通分区表。
