@@ -9,7 +9,7 @@
 from pathlib import Path
 from uuid import uuid4
 
-from iosql import Database, Partition, Segment
+from iosql import Database, Partition
 
 
 DB_PATH = Path(__file__).resolve().parent / "runtime" / uuid4().hex / "03_buffered.iosql"
@@ -25,8 +25,6 @@ def run():
             pk=["symbol", "ts"],
             columns={"symbol": "text", "ts": "integer", "price": "float"},
             partition=Partition.duration("ts", every="1hour"),
-            segment=Segment.rows(max_rows=2000, target_rows=1000, min_rows=100),
-            order_key="ts",
         )
 
         base_ts = 1735689600000

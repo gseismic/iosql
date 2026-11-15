@@ -19,20 +19,19 @@ DB_FILE = DB_DIR / "demo.sqlite3"
 def run():
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    db = Database(str(DB_FILE), auto_commit=True, verbose=0)
-    events = db["events"]
+    with Database(str(DB_FILE), verbose=0) as db:
+        events = db["events"]
 
-    events.insert({"id": 1, "kind": "click", "page": "/home"}, pk="id", ensure_table=True)
-    events.insert({"id": 2, "kind": "scroll", "delta_y": 320}, ensure_column=True)
-    events.update({"page": "/pricing"}, where="id=1")
-    events.delete(where="id=2")
+        events.insert({"id": 1, "kind": "click", "page": "/home"}, pk="id", ensure_table=True)
+        events.insert({"id": 2, "kind": "scroll", "delta_y": 320}, ensure_column=True)
+        events.update({"page": "/pricing"}, where="id=1")
+        events.delete(where="id=2")
 
-    rows = events.select_all("*", order_by="id")
+        rows = events.select_all("*", order_by="id")
 
-    print("表已创建:", events.table_exists())
-    print("列:", list(events.column_info()["column_type"].keys()))
-    print("剩余行:", rows)
-    db.close()
+        print("表已创建:", events.table_exists())
+        print("列:", list(events.column_info()["column_type"].keys()))
+        print("剩余行:", rows)
 
 
 if __name__ == "__main__":

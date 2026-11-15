@@ -18,45 +18,29 @@ DB_FILE = DB_DIR / "info.sqlite3"
 
 def run():
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    db = Database(str(DB_FILE), auto_commit=True, verbose=0)
+    with Database(str(DB_FILE), verbose=0) as db:
+        bars = db["bars"]
+        bars.create_table(
+            [
+                {"name": "symbol", "type": "text"},
+                {"name": "ts", "type": "integer", "not_null": True},
+                {"name": "close", "type": "float", "default": 0.0},
+            ],
+            pk=["symbol", "ts"],
+            table_comment="示例行情表",
+        )
+        bars.insert({"symbol": "AAPL", "ts": 1, "close": 101.5})
+        print("重命名前字段:", dict(bars.column_info()["column_type"]))
 
-    print("== create_table：声明式建表并登记元数据")
-    bars = db["bars"]
-    bars.create_table(
-        [
-            {"name": "symbol", "type": "text"},
-            {"name": "ts", "type": "integer", "not_null": True},
-            {"name": "close", "type": "float", "default": 0.0},
-        ],
-        pk=["symbol", "ts"],
-        table_comment="示例行情表",
-        author="iosql",
-    )
-    bars.insert({"symbol": "AAPL", "ts": 1, "close": 101.5})
+        # 低层工具没有 rename 方法，使用原生 SQL，之后用新名字取得 Table。
+        bars.execute('ALTER TABLE "bars" RENAME TO "bars_2026"')
+        renamed = db["bars_2026"]
+        print("重命名后表清单:", db.get_all_tables())
+        print("新表记录:", renamed.select_all("*"))
 
-    print("== 表信息 API")
-    print("get_all_tables:", db.get_all_tables())
-    print("table_exists:", bars.table_exists())
-    info = bars.column_info()
-    print("column_type:", dict(info["column_type"]))
-    print("not_null:", info["not_null"])
-    print("default:", info["default"])
-    print("pk:", bars.pk())
-
-    print("== 重命名走原生 SQL（API 无 rename 方法）")
-    bars.execute('ALTER TABLE "bars" RENAME TO "bars_2026"')
-    renamed = db["bars_2026"]
-    print("重命名后 tables:", db.get_all_tables())
-    print("旧名 table_exists:", db["bars"].table_exists(),
-          "| 新名:", renamed.table_exists(), "| 行数:", renamed.count())
-
-    print("== 注意: 原生 RENAME 不会同步 _meta，需要自行维护")
-    meta = db["_meta"]
-    for row in meta.query_all("SELECT table_name, pk, table_comment FROM _meta"):
-        print("_meta 行:", dict(row))
-
-    db.close()
-    print("done ->", DB_FILE)
+        # 原生 RENAME 不同步 _meta；这里展示该限制，依赖业务元数据时需另行维护。
+        print("原元数据:", db["_meta"].query_all("SELECT table_name, table_comment FROM _meta"))
+    print("数据位置:", DB_FILE)
 
 
 if __name__ == "__main__":

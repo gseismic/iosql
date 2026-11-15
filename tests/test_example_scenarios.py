@@ -6,6 +6,7 @@ import io
 import os
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -55,6 +56,28 @@ def run_example(example_dir, script, extra_env=None):
     )
 
 
+def postgresql_example_env(uri, script):
+    env = {"POSTGRES_DSN": uri}
+    if script != "01_postgresql_env_password.py":
+        return env
+    parts = urlsplit(uri)
+    params = parse_qsl(parts.query, keep_blank_values=True)
+    password = next((value for key, value in params if key.lower() == "password"), None)
+    password = password or (unquote(parts.password) if parts.password else None)
+    password = password or os.environ.get("PGPASSWORD")
+    if not password:
+        pytest.skip("此示例需要测试 URI 中的密码或 PGPASSWORD")
+    netloc = parts.netloc
+    if parts.password is not None:
+        netloc = netloc.split("@", 1)[0].split(":", 1)[0] + "@" + netloc.rsplit("@", 1)[1]
+    query = urlencode(
+        [(key, value) for key, value in params if key.lower() != "password"], quote_via=quote,
+    )
+    env["POSTGRES_DSN"] = urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
+    env["PGPASSWORD"] = password
+    return env
+
+
 @pytest.fixture
 def example_dir(tmp_path):
     path = tmp_path / "examples"
@@ -85,6 +108,37 @@ def pg_uri():
                 cursor.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
 
 
+@pytest.fixture
+def restricted_pg_uri(pg_uri):
+    """仅在显式测试库创建临时角色，验证例子在主要逻辑前拒绝缺失权限。"""
+    import psycopg2
+    from psycopg2 import sql
+
+    role = "iosql_example_role_" + uuid.uuid4().hex
+    with closing(psycopg2.connect(pg_uri)) as conn, conn, conn.cursor() as cursor:
+        cursor.execute("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+        if not cursor.fetchone()[0]:
+            pytest.skip("临时角色前置检查测试需要显式测试库的管理员账号")
+        cursor.execute("SELECT current_schema()")
+        schema = cursor.fetchone()[0]
+        cursor.execute(sql.SQL("CREATE ROLE {} NOLOGIN").format(sql.Identifier(role)))
+        cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(
+            sql.Identifier(schema), sql.Identifier(role)))
+
+    parts = urlsplit(pg_uri)
+    params = parse_qsl(parts.query, keep_blank_values=True)
+    options = next((value for key, value in params if key == "options"), "")
+    params = [(key, value) for key, value in params if key != "options"]
+    params.append(("options", options + " -crole=" + role))
+    uri = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(params, quote_via=quote), parts.fragment))
+    try:
+        yield uri, role, schema
+    finally:
+        with closing(psycopg2.connect(pg_uri)) as conn, conn, conn.cursor() as cursor:
+            cursor.execute(sql.SQL("DROP OWNED BY {}").format(sql.Identifier(role)))
+            cursor.execute(sql.SQL("DROP ROLE {}").format(sql.Identifier(role)))
+
+
 def test_example_mirrors_are_identical():
     def files(root):
         return {
@@ -106,25 +160,7 @@ def test_single_copied_script_runs_without_other_examples(example_dir, request, 
     assert "预期：" in header
     env = {}
     if script in ("01_postgresql_env_password.py", "01_quickstart_postgresql.py", "15_postgresql_timeseries_query.py"):
-        env["POSTGRES_DSN"] = request.getfixturevalue("pg_uri")
-    if script == "01_postgresql_env_password.py":
-        # 该示例要求无密码 URI；测试库的凭据可能原本包含在 URI 中。
-        parts = urlsplit(env["POSTGRES_DSN"])
-        params = parse_qsl(parts.query, keep_blank_values=True)
-        password = next((value for key, value in params if key.lower() == "password"), None)
-        password = password or (unquote(parts.password) if parts.password else None)
-        password = password or os.environ.get("PGPASSWORD")
-        if not password:
-            pytest.skip("此示例需要测试 URI 中的密码或 PGPASSWORD")
-        netloc = parts.netloc
-        if parts.password is not None:
-            netloc = netloc.split("@", 1)[0].split(":", 1)[0] + "@" + netloc.rsplit("@", 1)[1]
-        query = urlencode(
-            [(key, value) for key, value in params if key.lower() != "password"],
-            quote_via=quote,
-        )
-        env["POSTGRES_DSN"] = urlunsplit((parts.scheme, netloc, parts.path, query, parts.fragment))
-        env["PGPASSWORD"] = password
+        env = postgresql_example_env(request.getfixturevalue("pg_uri"), script)
     result = run_example(example_dir, script, env)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip()
@@ -196,6 +232,65 @@ def test_repartition_external_source_and_existing_target(example_dir, tmp_path):
     assert "目标库必须为空" in result.stderr
     with Database(target_uri) as db:
         assert db.table("protected").select() == [{"id": 42}]
+
+
+def test_existing_repartition_counts_without_materializing_rows(example_dir, monkeypatch, capsys):
+    from iosql.engines.sqlite.table import Table
+
+    example = load_example(example_dir, "10_existing_database_repartition.py")
+
+    def reject_select(*args, **kwargs):
+        pytest.fail("重分区计数不应通过 select() 全量读取已有数据")
+
+    monkeypatch.setattr(Table, "select", reject_select)
+    example.run()
+    assert "源/目标行数: 4 4" in capsys.readouterr().out
+
+
+def test_existing_repartition_rejects_incompatible_time_before_work(example_dir, tmp_path):
+    uri = f"sqlite://{tmp_path / 'non_timeseries.iosql'}"
+    with Database(uri) as db:
+        db.table("ticks", pk=["id"], columns={"id": "integer"}).write({"id": 1})
+    result = run_example(example_dir, "10_existing_database_repartition.py", {"IOSQL_SOURCE_URI": uri})
+    assert result.returncode != 0
+    assert "time=ts、unit=ms" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (example_dir / "runtime").exists()
+
+
+def test_mysqlite_transaction_example_commits_both_writes(example_dir):
+    result = run_example(example_dir, "mysqlite-scenarios/01_crud.py")
+    assert result.returncode == 0, result.stderr
+    assert "回滚后库存: 5" in result.stdout
+    assert "提交后库存: 3" in result.stdout
+    path, = (example_dir / "runtime").glob("*/01_crud/crud.sqlite3")
+    with closing(sqlite3.connect(path)) as conn:
+        assert conn.execute("SELECT sku, qty FROM stock").fetchall() == [("A", 3)]
+        assert conn.execute("SELECT id, qty FROM reservations").fetchall() == [(1, 2)]
+
+
+def test_mysqlite_drop_column_example_refreshes_schema_cache(example_dir):
+    result = run_example(example_dir, "mysqlite-scenarios/02_add_drop_column.py")
+    assert result.returncode == 0, result.stderr
+    line = next(line for line in result.stdout.splitlines() if line.startswith("最终字段:"))
+    fields = ast.literal_eval(line.split(":", 1)[1].strip())
+    assert set(fields) == {"id", "kind", "source"}
+    path, = (example_dir / "runtime").glob("*/02_add_drop_column/schema.sqlite3")
+    with closing(sqlite3.connect(path)) as conn:
+        assert [item[1] for item in conn.execute("PRAGMA table_info(events)")] == fields
+        assert conn.execute("SELECT source FROM events ORDER BY id").fetchall() == [("web",), ("web",)]
+
+
+def test_mysqlite_index_example_preserves_primary_key(example_dir):
+    result = run_example(example_dir, "mysqlite-scenarios/05_index_operations.py")
+    assert result.returncode == 0, result.stderr
+    assert "按列删除数量: 1" in result.stdout
+    path, = (example_dir / "runtime").glob("*/05_index_ops/index.sqlite3")
+    with closing(sqlite3.connect(path)) as conn:
+        indexes = conn.execute("PRAGMA index_list(ticks)").fetchall()
+        assert len(indexes) == 1 and indexes[0][3] == "pk"
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute("INSERT INTO ticks VALUES ('AAPL', 0, 99)")
 
 
 @pytest.mark.parametrize(("script", "setting"), [
@@ -426,6 +521,67 @@ def test_postgresql_examples_check_service_before_work(example_dir, script):
     assert "无法连接 PostgreSQL" in result.stderr
     assert "example-secret" not in result.stdout + result.stderr
     assert not (example_dir / "runtime").exists()
+
+
+@pytest.mark.parametrize("script", [
+    "01_postgresql_env_password.py", "01_quickstart_postgresql.py",
+    "11_sqlite_to_postgresql_migration.py", "12_sqlite_postgresql_roundtrip.py",
+    "15_postgresql_timeseries_query.py",
+])
+def test_postgresql_examples_reject_missing_schema_create_before_work(
+    example_dir, pg_uri, restricted_pg_uri, script,
+):
+    import psycopg2
+    from psycopg2 import sql
+
+    uri, role, _ = restricted_pg_uri
+    # 让迁移例通过数据库权限检查，再验证缺失目标 schema CREATE 的情况。
+    with closing(psycopg2.connect(pg_uri)) as conn, conn, conn.cursor() as cursor:
+        cursor.execute("SELECT current_database()")
+        database = cursor.fetchone()[0]
+        cursor.execute(sql.SQL("GRANT CREATE ON DATABASE {} TO {}").format(
+            sql.Identifier(database), sql.Identifier(role)))
+    result = run_example(example_dir, script, postgresql_example_env(uri, script))
+    assert result.returncode != 0
+    assert "当前 schema 不可建表" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (example_dir / "runtime").exists()
+
+
+@pytest.mark.parametrize("script", [
+    "11_sqlite_to_postgresql_migration.py", "12_sqlite_postgresql_roundtrip.py",
+])
+def test_migration_examples_reject_missing_database_create_before_work(example_dir, restricted_pg_uri, script):
+    uri, _, _ = restricted_pg_uri
+    result = run_example(example_dir, script, {"POSTGRES_DSN": uri})
+    assert result.returncode != 0
+    assert "迁移需要数据库 CREATE 权限" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (example_dir / "runtime").exists()
+
+
+@pytest.mark.parametrize(("script", "table"), [
+    ("01_quickstart_postgresql.py", "iosql_example_ticks"),
+    ("01_postgresql_env_password.py", "iosql_example_env_quotes"),
+])
+def test_postgresql_quickstarts_explain_foreign_table_owner_before_work(
+    example_dir, pg_uri, restricted_pg_uri, script, table,
+):
+    import psycopg2
+    from psycopg2 import sql
+
+    uri, role, schema = restricted_pg_uri
+    with closing(psycopg2.connect(pg_uri)) as conn, conn, conn.cursor() as cursor:
+        cursor.execute(sql.SQL("GRANT CREATE ON SCHEMA {} TO {}").format(
+            sql.Identifier(schema), sql.Identifier(role)))
+        cursor.execute(sql.SQL("CREATE TABLE {} (id integer)").format(sql.Identifier(table)))
+    result = run_example(example_dir, script, postgresql_example_env(uri, script))
+    assert result.returncode != 0
+    assert "所有者权限" in result.stderr
+    assert "Traceback" not in result.stderr
+    with closing(psycopg2.connect(pg_uri)) as conn, conn.cursor() as cursor:
+        cursor.execute(sql.SQL("SELECT count(*) FROM {}").format(sql.Identifier(table)))
+        assert cursor.fetchone()[0] == 0
 
 
 @pytest.mark.parametrize("script", [

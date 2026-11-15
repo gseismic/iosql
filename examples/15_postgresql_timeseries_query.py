@@ -1,7 +1,8 @@
 """查看 PostgreSQL 时序查询和执行计划。
 
 运行：在本文件所在目录执行 python 15_postgresql_timeseries_query.py。
-准备：已安装 iosql 的 PostgreSQL 依赖；使用 PostgreSQL 14+ 测试库并授予建表权限。
+准备：已安装 iosql 的 PostgreSQL 依赖；使用 PostgreSQL 14+ 测试库，当前 schema 可建表。
+本例自行创建随机表，当前账号须能管理该表的分区、索引和删除操作。
 驱动安装：python -m pip install "psycopg2-binary>=2.9"。
 设置：POSTGRES_DSN=postgresql://user@localhost:5432/testdb；密码放在 PGPASSWORD 或 PGPASSFILE。
 预期：输出行情、执行计划及耗时，并清理本例随机表。
@@ -30,6 +31,10 @@ def check_prerequisites():
         with closing(psycopg2.connect(dsn)) as connection:
             if connection.server_version < 140000:
                 raise SystemExit("需要 PostgreSQL 14 或更高版本的测试库。")
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT has_schema_privilege(current_schema(), 'CREATE')")
+                if not cursor.fetchone()[0]:
+                    raise SystemExit("当前 schema 不可建表，请使用有 CREATE 权限的测试 schema。")
     except psycopg2.Error:
         raise SystemExit('无法连接 PostgreSQL，请检查测试库、连接参数和凭据。') from None
     return dsn
@@ -72,7 +77,7 @@ def run():
             bars.drop_index(columns=['venue', 'ts'])
     finally:
         # 只清理由此示例生成的随机表，避免重建用户已有表。
-        with psycopg2.connect(dsn) as conn, conn.cursor() as cursor:
+        with closing(psycopg2.connect(dsn)) as conn, conn, conn.cursor() as cursor:
             cursor.execute(sql.SQL('DROP TABLE IF EXISTS {} CASCADE').format(sql.Identifier(name)))
     print('PostgreSQL 查询示例校验通过')
 

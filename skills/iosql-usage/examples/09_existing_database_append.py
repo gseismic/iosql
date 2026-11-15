@@ -2,7 +2,8 @@
 
 运行：在本文件所在目录执行 python 09_existing_database_append.py。
 准备：已安装 iosql 及其默认依赖。
-可选 IOSQL_EXISTING_URI 和 IOSQL_EXISTING_TABLE；设置后会向指定测试表写入示例记录。
+可选 IOSQL_EXISTING_URI 和 IOSQL_EXISTING_TABLE；仅用于已有 SQLite/Parquet 测试库，
+表须含 symbol、ts、price 字段；设置后会写入示例记录。
 预期：输出已有契约、写入结果及最新记录。
 数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
@@ -24,8 +25,13 @@ TABLE_NAME = os.environ.get("IOSQL_EXISTING_TABLE", "ticks")
 def check_prerequisites():
     if EXTERNAL_DB_URI:
         with Database(EXTERNAL_DB_URI) as db:
+            if db.engine not in ("sqlite", "parquet"):
+                raise SystemExit("本例重开已有 SQLite/Parquet 库；PostgreSQL 重开契约请参考往返迁移示例。")
             if TABLE_NAME not in db.table_names():
                 raise SystemExit("IOSQL_EXISTING_URI 中未找到指定表，请设置已有测试库及表名。")
+            spec = db.table(TABLE_NAME).spec()
+            if spec is None or not {"symbol", "ts", "price"}.issubset(spec.columns):
+                raise SystemExit("已有测试表须保存含 symbol、ts、price 字段的契约。")
 
 
 def prepare_demo_database():
@@ -52,14 +58,7 @@ def run():
     check_prerequisites()
     prepare_demo_database()
 
-    # 直接信任 API 的错误路径：无契约时 write() 会给出修复指引，
-    # 不需要手动检查 spec is None。
-    with Database(
-        DB_URI,
-        max_open_partitions=5,
-        max_connections_per_file=1,
-        max_process_connections=32,
-    ) as db:
+    with Database(DB_URI) as db:
         ticks = db.table(TABLE_NAME)
         spec = ticks.spec()
 
@@ -82,7 +81,6 @@ def run():
         print("已有分区:", spec.partition.to_string() if spec.partition else None)
         print("本次看到/写入:", result.rows_seen, result.rows_written)
         print("AAPL 最新记录:", latest)
-        print("进程连接预算:", db.get_process_connection_budget_status())
 
 
 if __name__ == "__main__":

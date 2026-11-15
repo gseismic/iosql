@@ -8,7 +8,7 @@
 
 from pathlib import Path
 from uuid import uuid4
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from iosql.utils.mysqlite import Database
 
@@ -38,24 +38,19 @@ def count_rows(db):
 def run():
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    db = Database(str(DB_FILE), verbose=0, max_connections=4)
-    seed(db)
+    with Database(str(DB_FILE), verbose=0, max_connections=4) as db:
+        seed(db)
 
-    def worker(worker_id):
-        print(f"线程 {worker_id} 行数:", count_rows(db))
+        # 消费 Future 的结果，读取失败会传回主线程，不会被误报为成功。
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            counts = list(pool.map(count_rows, [db] * 3))
+        print("各线程行数:", counts)
 
-    threads = [threading.Thread(target=worker, args=(index,)) for index in range(3)]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join()
-
-    db.force_close_all_connections()
+        db.force_close_all_connections()
     print("已关闭:", db.is_closed())
 
-    reopened = Database(str(DB_FILE), verbose=0, max_connections=4)
-    print("重新打开后行数:", count_rows(reopened))
-    reopened.close()
+    with Database(str(DB_FILE), verbose=0, max_connections=4) as reopened:
+        print("重新打开后行数:", count_rows(reopened))
 
 
 if __name__ == "__main__":

@@ -43,3 +43,5 @@
 | 2026-11-15 15:53 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) | 实施中 | 修复五项已复现问题，覆盖事务失败、重复主键、文本精度及并发布局变更，并循环复审。 |
 | 2026-11-15 16:51 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) / [结果](PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md) | 已完成（WORKTREE） | 修复五项及事务、标识符等复审问题；最终全量 1599 通过、99 跳过，PG 专项 235 通过；权限变化和 CLI 兼容性待评估项已记录。 |
 | 2026-11-15 17:11 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) / [结果](PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md) | 已提交（3cb4c8b） | 修复及验证记录提交为 3cb4c8baf226bb53715f2cf8f4bc22aed77f00ad；示例规范检查尚未开始，接续见 docs/HANDOFF.md；未推送。 |
+| 2026-11-15 17:20 | [示例规范检查与修正](PLAN-20261115-006-model-unknown-example-standards.md) | 实施中 | 接续示例检查授权，修正前置条件、资源释放和过时说明，逐例独立运行并同步镜像。 |
+| 2026-11-15 17:52 | [示例规范检查与修正](PLAN-20261115-006-model-unknown-example-standards.md) / [结果](PLAN-20261115-006-model-unknown-example-standards-OUTCOME.md) | 已完成（WORKTREE） | 36 个示例双依赖环境独立运行通过，镜像同步；修复 DuckDB 计数兼容问题，扩大回归 593 通过、4 跳过，1.5.4 回归 55 通过，既有示例专项 8 通过。 |

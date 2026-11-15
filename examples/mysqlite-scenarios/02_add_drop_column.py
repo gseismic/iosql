@@ -3,7 +3,7 @@
 运行：在本文件所在目录执行 python 02_add_drop_column.py。
 准备：已安装 iosql 及其默认依赖。
 需要 SQLite 3.35 或更高版本以支持 DROP COLUMN。
-预期：输出列缓存、预期限制和实际表结构。
+预期：输出默认值、删除列并刷新缓存后的表结构。
 数据：本地演示数据保留在文件旁 runtime/ 的独立目录中。
 """
 
@@ -26,46 +26,27 @@ def check_prerequisites():
 def run():
     check_prerequisites()
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    db = Database(str(DB_FILE), auto_commit=True, verbose=0)
-    events = db["events"]
+    with Database(str(DB_FILE), verbose=0) as db:
+        events = db["events"]
+        events.insert({"id": 1, "kind": "click"}, pk="id", ensure_table=True)
+        events.insert({"id": 2, "kind": "scroll", "delta_y": 320}, ensure_column=True)
+        events.ensure_column("source", "text", default="web")
+        events.add_column("score", "integer DEFAULT 0")
+        print("新增列默认值:", events.select_one(["id", "source", "score"], where="id=2"))
 
-    print("== ensure_table + ensure_column: 写入时自动演进 schema")
-    events.insert({"id": 1, "kind": "click"}, pk="id", ensure_table=True)
-    events.insert({"id": 2, "kind": "scroll", "delta_y": 320}, ensure_column=True)
-    print("column_type:", dict(events.column_info()["column_type"]))
+        # 原生 DDL 不会刷新 Table 缓存；再次查看字段前显式失效缓存。
+        print("删除前字段:", list(events.column_info()["column_type"]))
+        events.execute('ALTER TABLE "events" DROP COLUMN "score"')
+        events.invalidate_cache()
+        print("删除 score 后字段:", list(events.column_info()["column_type"]))
 
-    print("== add_column / ensure_column 显式加列")
-    events.ensure_column("source", "text", default="web")
-    added = events.ensure_column("source", "text")
-    print("第二次加同名列返回:", added, "(False 表示已存在)")
-    events.add_column("score", "integer DEFAULT 0")
-
-    print("== 带默认值回填验证")
-    print(events.select_one(["id", "delta_y", "source", "score"], where="id=2"))
-
-    print("== 删除列走原生 SQL（API 无 drop_column；execute 不失效 schema 缓存）")
-    cached_before = list(dict(events.column_info()["column_type"]).keys())
-    print("删除前缓存字段:", cached_before)
-    events.execute('ALTER TABLE "events" DROP COLUMN "score"')
-    cached_after = list(dict(events.column_info()["column_type"]).keys())
-    print(f"缓存视图: {cached_after}  <- 仍含已删的 score，Table 缓存不感知原生 DDL")
-
-    print("== 被索引的列不能直接删，需先删索引")
-    events.create_index("delta_y", exist_ok=True)
-    try:
+        # 删除有用户索引的列，先移除该列索引；主键等其他依赖仍需自行处理。
+        events.create_index("delta_y")
+        events.drop_column_index("delta_y")
         events.execute('ALTER TABLE "events" DROP COLUMN "delta_y"')
-    except Exception as e:
-        print(f"预期失败: {type(e).__name__}")
-        events.drop_all_index()
-        events.execute('ALTER TABLE "events" DROP COLUMN "delta_y"')
-        print("先删索引后删除成功")
-
-    print("== 用 PRAGMA 直查验证实际 schema（绕开 Table 缓存）")
-    cols = [row[1] for row in events.fetchall("PRAGMA table_info(events)")]
-    print("实际 columns:", cols)
-
-    db.close()
-    print("done ->", DB_FILE)
+        events.invalidate_cache()
+        print("最终字段:", list(events.column_info()["column_type"]))
+    print("数据位置:", DB_FILE)
 
 
 if __name__ == "__main__":

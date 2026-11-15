@@ -11,7 +11,7 @@
 | PostgreSQL 环境变量密码 | [01_postgresql_env_password.py](01_postgresql_env_password.py) | 从 `PGPASSWORD` 提供密码，写入和查询普通表。 |
 | Parquet 入门 | [14_parquet_backend.py](14_parquet_backend.py) | 写入 Parquet，重新打开库后查询。 |
 | 已有库增量写入 | [09_existing_database_append.py](09_existing_database_append.py) | 重开本地库并复用持久化契约，跳过重复主键。 |
-| 条件查询 | [01_quickstart_table.py](01_quickstart_table.py) | 显式使用 `table()` 和分区，按条件查询并查看裁剪计划。 |
+| 普通表条件查询 | [01_quickstart_table.py](01_quickstart_table.py) | 保存商品库存，按类别和库存筛选，再按价格排序。 |
 | 日期事件 | [02_calendar_events.py](02_calendar_events.py) | 用自然日期和日历分区保存、查询事件。 |
 | 只更新部分字段 | [03_partial_upsert.py](03_partial_upsert.py) | 用 `upsert_all()` 更新指定字段，保留未提供的字段。 |
 | 缓冲批量写入 | [03_buffered_ingest_and_query_plan.py](03_buffered_ingest_and_query_plan.py) | 缓冲多次写入，并查看窗口查询的分区裁剪。 |
@@ -55,11 +55,11 @@ python examples/03_partial_upsert.py
 python examples/14_parquet_backend.py
 ```
 
-Parquet 是默认依赖。产生本地持久数据的脚本，每次在脚本所在目录的 `runtime/` 下创建独立目录并保留结果；可在确认后自行清理。`17` 使用自动清理的临时目录。`09` 如果设置了 `IOSQL_EXISTING_URI`，会向指定的已有表写入示例记录；请只在允许写入的测试库上运行。`10` 的目标必须是独立的新库。
+Parquet 是默认依赖。产生本地持久数据的脚本，每次在脚本所在目录的 `runtime/` 下创建独立目录并保留结果；可在确认后自行清理。`17` 使用自动清理的临时目录。`09` 如果设置了 `IOSQL_EXISTING_URI`，会向指定的已有表写入示例记录；请只在允许写入的测试库上运行，其表须保存含 symbol、ts、price 字段的 SQLite/Parquet 契约。`10` 的源须保存以毫秒时间戳 ts 为时间列的契约，目标必须是独立的新 SQLite/Parquet 库；行数通过计数接口读取，不将已有数据全量载入内存。
 
 ### PostgreSQL 示例
 
-需要 PostgreSQL 14+、已存在的测试数据库及建表权限：
+需要 PostgreSQL 14+、已存在的测试数据库和当前 schema 的 CREATE 权限；入门示例创建或重用当前账号拥有的示例表：
 
 ```bash
 python -m pip install -e ".[postgresql]"
@@ -89,6 +89,8 @@ python examples/01_quickstart_postgresql.py
 URI 中显式提供的密码优先于上述默认来源。`postgresql://user:!password@...` 会把 `!password` 当作字面密码，不会读取同名环境变量。
 
 时序入门示例创建或打开 `iosql_example_ticks`；环境变量示例创建或打开普通表 `iosql_example_env_quotes`。两者都保留数据，`mode="ignore"` 会跳过重复主键。环境变量示例要求设置 `PGPASSWORD`，并拒绝含密码或 `service` 参数的 URI 以及 `PGSERVICE`，避免 service 配置中的密码覆盖演示的密码来源。验证密码时应使用需要密码认证的测试库；无密码认证的库无法证明密码被使用。使用 `PGPASSFILE` 时可运行时序入门示例。时序示例输出的 `rows_seen` 是提交的记录数，包含跳过的行；`ts` 使用毫秒，时间窗口包含起止边界。重开 PostgreSQL 表时应再次声明相同契约；完整示例见 `12`。
+
+分区写入除 SELECT/INSERT 外，还需表级 UPDATE、DELETE 或 TRUNCATE 之一以锁定布局；首次固定契约及创建分区需要所有者权限。时序入门用当前账号拥有的测试表满足这些条件，不会自动为业务角色授权。迁移示例 `11`、`12` 还需数据库 CREATE 权限以建立暂存 schema，并能管理 `__iosql_control` 控制 schema；前置检查会核对数据库和目标 schema 的 CREATE，既有控制 schema 的对象权限仍由实际迁移校验。
 
 `11` 和 `12` 在未设置 `POSTGRES_DSN` 时只准备本地源库并 dry-run；设置后会原子创建带随机后缀的 PostgreSQL 目标表并保留结果。可分别用 `IOSQL_POSTGRES_TARGET_TABLE` 和 `IOSQL_POSTGRES_ROUNDTRIP_TABLE` 指定新的目标表名；已有或并发创建的同名关系会被拒绝。发生错误时已预留的表可能保留，应检查后再处理。`15` 使用随机表并在结束时清理，演示查询计划时，小数据集可能选择顺序扫描。
 

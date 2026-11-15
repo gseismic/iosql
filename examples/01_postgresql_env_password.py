@@ -1,7 +1,8 @@
 """使用 PGPASSWORD 连接 PostgreSQL 并读写普通表。
 
 运行：在本文件所在目录执行 python 01_postgresql_env_password.py。
-准备：已安装 iosql 的 PostgreSQL 依赖；使用 PostgreSQL 14+ 测试库并授予建表权限。
+准备：已安装 iosql 的 PostgreSQL 依赖；使用 PostgreSQL 14+ 测试库，当前 schema 可建表。
+本例创建或重用自己拥有的 iosql_example_env_quotes 普通表，保留数据。
 驱动安装：python -m pip install "psycopg2-binary>=2.9"。
 设置：POSTGRES_DSN=postgresql://user@localhost:5432/testdb；密码放在 PGPASSWORD。
 本例要求密码认证和 PGPASSWORD；取消 PGSERVICE，URI 不包含密码或 service 参数。
@@ -37,6 +38,17 @@ def check_prerequisites():
         with closing(psycopg2.connect(dsn)) as connection:
             if connection.server_version < 140000:
                 raise SystemExit("需要 PostgreSQL 14 或更高版本的测试库。")
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT has_schema_privilege(current_schema(), 'CREATE')")
+                if not cursor.fetchone()[0]:
+                    raise SystemExit("当前 schema 不可建表，请使用有 CREATE 权限的测试 schema。")
+                cursor.execute(
+                    "SELECT pg_has_role(relowner, 'USAGE') FROM pg_class WHERE oid = to_regclass(%s)",
+                    ("iosql_example_env_quotes",),
+                )
+                owner = cursor.fetchone()
+                if owner and not owner[0]:
+                    raise SystemExit("本例需要 iosql_example_env_quotes 的所有者权限，请使用自己的测试 schema。")
     except psycopg2.Error:
         raise SystemExit("无法连接 PostgreSQL，请检查测试库、连接参数和 PGPASSWORD。") from None
     return dsn

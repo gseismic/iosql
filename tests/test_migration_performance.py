@@ -296,3 +296,15 @@ def test_deep_parquet_validation_reuses_connection_and_rejects_damage(tmp_path, 
         assert not is_iosql_table(table_path, backend='parquet', deep=True)
         with pytest.raises(UnsafeOperation):
             table._count_migration_rows()
+
+
+@pytest.mark.parametrize('row_count', [0, 2])
+def test_parquet_data_file_validation_counts_without_shared_connection(tmp_path, row_count):
+    duckdb = pytest.importorskip('duckdb')
+    from iosql.utils.storage_identity import _valid_data_file
+
+    path = tmp_path / 'records.parquet'
+    with closing(duckdb.connect()) as conn:
+        conn.sql(f'SELECT range AS id FROM range({row_count})').write_parquet(str(path))
+    assert _valid_data_file(path, backend='parquet', expected_rows=row_count)
+    assert not _valid_data_file(path, backend='parquet', expected_rows=row_count + 1)

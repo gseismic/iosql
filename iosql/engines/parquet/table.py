@@ -555,7 +555,7 @@ class Table(DirectoryTable):
                     try:
                         total += conn.read_parquet(
                             self._parquet_files(path), union_by_name=True,
-                        ).count('*').fetchone()[0]
+                        ).count('*').fetchall()[0][0]
                     except _duckdb().Error as exc:
                         raise UnsafeOperation(f'Parquet 查询失败 {path}: {exc}') from exc
                 if report is not None:

@@ -339,10 +339,10 @@ def _valid_data_file(path, *, expected_rows=None, backend='sqlite', parquet_conn
         try:
             import duckdb
             if parquet_conn is not None:
-                actual = parquet_conn.read_parquet(str(path)).count('*').fetchone()[0]
+                actual = parquet_conn.read_parquet(str(path)).count('*').fetchall()[0][0]
             else:
                 with closing(duckdb.connect(config={'threads': 1})) as conn:
-                    actual = conn.read_parquet(str(path)).count('*').fetchone()[0]
+                    actual = conn.read_parquet(str(path)).count('*').fetchall()[0][0]
             return expected_rows is None or actual == int(expected_rows)
         except (ImportError, OSError, ValueError):
             return False

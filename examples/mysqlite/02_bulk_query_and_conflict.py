@@ -19,31 +19,30 @@ DB_FILE = DB_DIR / "demo.sqlite3"
 def run():
     DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    db = Database(str(DB_FILE), auto_commit=True, verbose=0)
-    orders = db["orders"]
+    with Database(str(DB_FILE), verbose=0) as db:
+        orders = db["orders"]
 
-    orders.insert_all([
-        {"order_id": 1, "line_id": 1, "sku": "A", "qty": 2},
-        {"order_id": 1, "line_id": 2, "sku": "B", "qty": 1},
-        {"order_id": 2, "line_id": 1, "sku": "A", "qty": 5},
-    ], ensure_table=True, pk=["order_id", "line_id"])
+        orders.insert_all([
+            {"order_id": 1, "line_id": 1, "sku": "A", "qty": 2},
+            {"order_id": 1, "line_id": 2, "sku": "B", "qty": 1},
+            {"order_id": 2, "line_id": 1, "sku": "A", "qty": 5},
+        ], ensure_table=True, pk=["order_id", "line_id"])
 
-    orders.insert_all([
-        {"order_id": 1, "line_id": 1, "sku": "A", "qty": 9},
-    ], replace=True)
-    orders.insert_all([
-        {"order_id": 1, "line_id": 1, "sku": "A", "qty": 99},
-    ], ignore=True)
+        orders.insert_all([
+            {"order_id": 1, "line_id": 1, "sku": "A", "qty": 9},
+        ], replace=True)
+        orders.insert_all([
+            {"order_id": 1, "line_id": 1, "sku": "A", "qty": 99},
+        ], ignore=True)
 
-    summary = orders.query_all(
-        "SELECT sku, SUM(qty) AS total_qty FROM orders GROUP BY sku ORDER BY sku"
-    )
-    rows = orders.select_all("*", order_by="order_id,line_id")
+        summary = orders.query_all(
+            "SELECT sku, SUM(qty) AS total_qty FROM orders GROUP BY sku ORDER BY sku"
+        )
+        rows = orders.select_all("*", order_by="order_id,line_id")
 
-    print("主键:", orders.pk())
-    print("明细:", rows)
-    print("汇总:", summary)
-    db.close()
+        print("主键:", orders.pk())
+        print("明细:", rows)
+        print("汇总:", summary)
 
 
 if __name__ == "__main__":

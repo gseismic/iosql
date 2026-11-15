@@ -7,6 +7,7 @@
 """
 
 import sqlite3
+from contextlib import closing
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,37 +21,23 @@ BACKUP_FILE = DB_DIR / "backup.sqlite3"
 
 def run():
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    db = Database(str(DB_FILE), auto_commit=True, verbose=0)
-    events = db["events"]
-    events.insert_all(
-        [{"id": i, "kind": f"k{i}"} for i in range(100)],
-        pk="id",
-        ensure_table=True,
-    )
+    with Database(str(DB_FILE), verbose=0) as db:
+        events = db["events"]
+        events.insert_all(
+            [{"id": i, "kind": f"k{i}"} for i in range(3)],
+            pk="id", ensure_table=True,
+        )
 
-    print("== 通过池化连接调用 sqlite3 backup API（在线快照，不阻塞写入语义）")
-    with db.get_connection() as src_conn:
-        dst_conn = sqlite3.connect(str(BACKUP_FILE))
-        try:
+        # 仅演示低层单文件库；iosql 目录库使用主示例中的 iosql backup。
+        with db.get_connection() as src_conn, closing(sqlite3.connect(str(BACKUP_FILE))) as dst_conn:
             src_conn.backup(dst_conn)
-            dst_conn.commit()
-        finally:
-            dst_conn.close()
 
-    print("== 打开备份库校验一致性")
-    backup_db = Database(str(BACKUP_FILE), auto_commit=True, verbose=0)
-    backup_rows = backup_db["events"].count()
-    print(f"源库 {events.count()} 行 / 备份 {backup_rows} 行 -> "
-          f"{'一致' if backup_rows == events.count() else '不一致'}")
-    print("备份库表清单:", sorted(backup_db.get_all_tables()))
-
-    print("== 备份是独立文件：继续写源库不影响备份")
-    events.insert({"id": 1000, "kind": "new"}, ensure_column=False)
-    print(f"源库 {events.count()} 行 / 备份仍 {backup_db['events'].count()} 行")
-
-    backup_db.close()
-    db.close()
-    print("done ->", BACKUP_FILE)
+        with Database(str(BACKUP_FILE), verbose=0) as backup_db:
+            backup_rows = backup_db["events"].count()
+            print(f"源库 {events.count()} 行 / 备份 {backup_rows} 行")
+            events.insert({"id": 1000, "kind": "new"})
+            print(f"继续写入后源库 {events.count()} 行 / 备份仍 {backup_db['events'].count()} 行")
+    print("备份位置:", BACKUP_FILE)
 
 
 if __name__ == "__main__":

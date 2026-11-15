@@ -1,7 +1,10 @@
 """在 PostgreSQL 写入时序数据并按时间窗口查询。
 
 运行：在本文件所在目录执行 python 01_quickstart_postgresql.py。
-准备：已安装 iosql 的 PostgreSQL 依赖；使用 PostgreSQL 14+ 测试库并授予建表权限。
+准备：已安装 iosql 的 PostgreSQL 依赖；使用 PostgreSQL 14+ 测试库，当前 schema 可建表。
+本例使用自己拥有的 iosql_example_ticks 表，以便固定分区契约、创建新分区。
+写入他人已有分区表还需 SELECT/INSERT 及表级 UPDATE、DELETE 或 TRUNCATE 之一，
+首次固定契约及创建分区需要所有者权限；本例不自动授权。
 驱动安装：python -m pip install "psycopg2-binary>=2.9"。
 设置：POSTGRES_DSN=postgresql://user@localhost:5432/testdb；密码放在 PGPASSWORD 或 PGPASSFILE。
 预期：输出提交的记录数和 AAPL 行情，保留 iosql_example_ticks 示例表。
@@ -25,6 +28,17 @@ def check_prerequisites():
         with closing(psycopg2.connect(dsn)) as connection:
             if connection.server_version < 140000:
                 raise SystemExit("需要 PostgreSQL 14 或更高版本的测试库。")
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT has_schema_privilege(current_schema(), 'CREATE')")
+                if not cursor.fetchone()[0]:
+                    raise SystemExit("当前 schema 不可建表，请使用有 CREATE 权限的测试 schema。")
+                cursor.execute(
+                    "SELECT pg_has_role(relowner, 'USAGE') FROM pg_class WHERE oid = to_regclass(%s)",
+                    ("iosql_example_ticks",),
+                )
+                owner = cursor.fetchone()
+                if owner and not owner[0]:
+                    raise SystemExit("本例需要 iosql_example_ticks 的所有者权限，请使用自己的测试 schema。")
     except psycopg2.Error:
         raise SystemExit("无法连接 PostgreSQL，请检查测试库、连接参数和凭据。") from None
     return dsn

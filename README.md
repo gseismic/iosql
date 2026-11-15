@@ -961,7 +961,7 @@ iosql repartition -s sqlite://database/market.iosql -t ticks \
 | PostgreSQL 环境变量密码 | [01_postgresql_env_password.py](examples/01_postgresql_env_password.py) |
 | Parquet 写入、重开并查询 | [14_parquet_backend.py](examples/14_parquet_backend.py) |
 | 已有库增量写入 | [09_existing_database_append.py](examples/09_existing_database_append.py) |
-| 条件查询和分区裁剪 | [01_quickstart_table.py](examples/01_quickstart_table.py) |
+| 普通表按业务条件查询 | [01_quickstart_table.py](examples/01_quickstart_table.py) |
 | 更新部分字段 | [03_partial_upsert.py](examples/03_partial_upsert.py) |
 | 缓冲写入 | [03_buffered_ingest_and_query_plan.py](examples/03_buffered_ingest_and_query_plan.py) |
 | 大结果集逐行读取 | [13_streaming_ordered_query.py](examples/13_streaming_ordered_query.py) |
@@ -974,7 +974,7 @@ python -m pip install -e .
 python examples/01_quickstart_timeseries.py
 ```
 
-PostgreSQL 示例需要可选依赖和测试数据库：
+PostgreSQL 示例需要可选依赖和测试数据库；当前 schema 可建表，使用当前账号拥有的示例表。迁移示例还需数据库 CREATE 及控制 schema 管理权限，详见[示例说明](examples/README.md#postgresql-示例)：
 
 ```bash
 python -m pip install -e ".[postgresql]"

@@ -1,7 +1,9 @@
 """将 SQLite 目录库迁移到 PostgreSQL 并校验行数。
 
 运行：在本文件所在目录执行 python 11_sqlite_to_postgresql_migration.py。
-准备：已安装 iosql；实际迁移还需 PostgreSQL 依赖、14+ 测试库和建表权限。
+准备：已安装 iosql；实际迁移还需 PostgreSQL 依赖和 14+ 测试库。
+测试账号须有数据库 CREATE（创建迁移 schema）、目标 schema CREATE 及
+__iosql_control 控制 schema 的管理权限；新建目标表及分区归该账号所有。
 驱动安装：python -m pip install "psycopg2-binary>=2.9"。
 设置：POSTGRES_DSN 可不设（仅 dry-run）；设置后通过 PGPASSWORD 或 PGPASSFILE 提供密码。
 目标表原子创建；发生错误时已创建的表可能保留，检查后再处理。
@@ -42,6 +44,13 @@ def check_prerequisites():
         with closing(psycopg2.connect(POSTGRES_DSN)) as connection:
             if connection.server_version < 140000:
                 raise SystemExit("需要 PostgreSQL 14 或更高版本的测试库。")
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT has_database_privilege(current_database(), 'CREATE')")
+                if not cursor.fetchone()[0]:
+                    raise SystemExit("迁移需要数据库 CREATE 权限以创建临时 schema，请使用可管理的测试库。")
+                cursor.execute("SELECT has_schema_privilege(current_schema(), 'CREATE')")
+                if not cursor.fetchone()[0]:
+                    raise SystemExit("当前 schema 不可建表，请使用有 CREATE 权限的测试 schema。")
     except psycopg2.Error:
         raise SystemExit("无法连接 PostgreSQL，请检查测试库、连接参数和凭据。") from None
 
