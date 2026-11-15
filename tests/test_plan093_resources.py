@@ -141,7 +141,7 @@ def test_parquet_append_writes_only_new_rows_and_recovers_failed_publish(tmp_pat
         written = []
 
         def observed(conn, path, **kwargs):
-            written.append(conn.execute('SELECT COUNT(*) FROM data').fetchone()[0])
+            written.append(conn.execute('SELECT COUNT(*) FROM data').fetchall()[0][0])
             return publish(conn, path, **kwargs)
 
         with patch.object(table, '_publish', observed):

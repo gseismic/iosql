@@ -510,9 +510,9 @@ class Table(DirectoryTable):
                 for batch in batches:
                     yield from batch
 
-    def _compact_primary_key(self, row, primary_key):
+    def _compact_primary_key(self, row, primary_key, table_spec=None):
         return tuple(_NAN_PRIMARY_KEY if isinstance(value, float) and math.isnan(value) else value
-                     for value in super()._compact_primary_key(row, primary_key))
+                     for value in super()._compact_primary_key(row, primary_key, table_spec))
 
     def _compact_sorted_batches(self, refs, spec):
         """DuckDB 磁盘暂存保留 NaN，排序可落盘，不经 SQLite 值绑定。"""

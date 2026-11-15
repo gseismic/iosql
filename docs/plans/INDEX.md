@@ -47,3 +47,5 @@
 | 2026-11-15 17:52 | [示例规范检查与修正](PLAN-20261115-006-model-unknown-example-standards.md) / [结果](PLAN-20261115-006-model-unknown-example-standards-OUTCOME.md) | 已完成（WORKTREE） | 36 个示例双依赖环境独立运行通过，镜像同步；修复 DuckDB 计数兼容问题，扩大回归 593 通过、4 跳过，1.5.4 回归 55 通过，既有示例专项 8 通过。 |
 | 2026-11-15 19:07 | [Parquet 六项 Review 问题循环修复](PLAN-20261115-007-model-unknown-parquet-review-fixes.md) | 实施中 | 复核并修复路径、数据片校验、发布持久性、NaN 和 ignore 空数据片六项问题。 |
 | 2026-11-15 19:39 | [Parquet 六项 Review 问题循环修复](PLAN-20261115-007-model-unknown-parquet-review-fixes.md) / [结果](PLAN-20261115-007-model-unknown-parquet-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 六项及 NaN 主键、单连接 compact 边界修复；组合回归 657 通过、16 跳过，DuckDB 1.1.0 核心 115 通过、1 跳过，最终复审无待修复发现；未提交。 |
+| 2026-11-15 20:55 | [SQLite 与 mysqlite 十一项 Review 循环修复](PLAN-20261115-008-model-unknown-sqlite-review-fixes.md) | 实施中 | 核实事务、绑定、逻辑登记、比较、类型、路由和缓存十一项缺陷并循环修复验证。 |
+| 2026-11-15 21:28 | [SQLite 与 mysqlite 十一项 Review 循环修复](PLAN-20261115-008-model-unknown-sqlite-review-fixes.md) / [结果](PLAN-20261115-008-model-unknown-sqlite-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 十一项及精度、快照并发和 fork 边界修复；扩大回归 1535 通过、126 跳过，最终专项组合 63 通过，DuckDB 最低版 73 通过；未提交。 |

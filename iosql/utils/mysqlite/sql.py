@@ -1,5 +1,6 @@
 import numbers
 from collections import OrderedDict
+from collections.abc import Mapping
 from operator import itemgetter
 from typing import Dict, List, Tuple, Union, Optional, Any
 
@@ -27,7 +28,28 @@ def quoted_sql_text(s: str) -> str:
     return f'"{s.replace(chr(34), chr(34) + chr(34))}"'
 
 
+def normalize_sqlite_value(value: Any) -> Any:
+    """绑定前转换 NumPy 标量，避免 sqlite3 把其 buffer 当成 BLOB。"""
+    if _has_np and isinstance(value, np.generic):
+        if isinstance(value, np.integer):
+            return int(value)
+        if isinstance(value, np.floating):
+            return float(value)
+        return value.item()
+    return value
+
+
+def normalize_sqlite_parameters(params):
+    """位置参数与命名参数共用原生标量转换，不改写调用者对象。"""
+    if params is None:
+        return ()
+    if isinstance(params, Mapping):
+        return {key: normalize_sqlite_value(value) for key, value in params.items()}
+    return tuple(normalize_sqlite_value(value) for value in params)
+
+
 def sql_literal(value: Any) -> str:
+    value = normalize_sqlite_value(value)
     if value is None:
         return 'NULL'
     # bytes 必须走 blob 字面量，直接 str(bytes) 会得到 b'...' 字面量

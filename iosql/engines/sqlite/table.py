@@ -67,6 +67,7 @@ from ...utils.storage_identity import iosql_table_names, is_iosql_table
 
 # from mysqlite import Database as MyDatabase
 from ...utils.mysqlite.exception import DuplicateColumn, NoSuchColumn, NoSuchTable
+from ...utils.mysqlite.sql import normalize_sqlite_parameters, normalize_sqlite_value
 from .const import (
     _DB_META_FILE,
     _DEFAULT_BATCH_SIZE,
@@ -187,6 +188,19 @@ _SQLITE_NOCASE_TRANSLATION = str.maketrans(
 )
 
 
+def _sqlite_collation_key(value, collation):
+    if isinstance(value, str):
+        if collation == 'NOCASE':
+            # SQLite 只折叠 ASCII，NUL 后忽略内容但仍比较完整 UTF-8 长度。
+            return (value.split('\0', 1)[0].translate(_SQLITE_NOCASE_TRANSLATION),
+                    len(value.encode('utf-8')))
+        if collation == 'RTRIM':
+            return value.rstrip(' ')
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    return value
+
+
 def _sqlite_sort_rank(value):
     """SQLite 值序的类别秩：NULL < 数值 < 文本 < blob < 其他（按 str 兜底）。"""
     if value is None:
@@ -210,9 +224,9 @@ class _SqliteSortKey:
     """
     __slots__ = ('rank', 'value', 'desc')
 
-    def __init__(self, value, reverse):
+    def __init__(self, value, reverse, collation='BINARY'):
         self.rank = _sqlite_sort_rank(value)
-        self.value = value
+        self.value = _sqlite_collation_key(value, collation)
         self.desc = reverse
 
     def _value_lt(self, other_value):
@@ -559,6 +573,10 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 if db and not db.is_closed():
                     db.close()
         finally:
+            with self._column_stats_cache_lock:
+                for key in list(self._column_stats_cache):
+                    if os.path.dirname(key[0]) == self.table_part_path:
+                        self._column_stats_cache.pop(key, None)
             with self._db_parts_condition:
                 self._db_parts_closing = False
                 self._db_parts_closed = True
@@ -1209,17 +1227,15 @@ class Table(TimeseriesQueryMixin, BaseTable):
         }
         if not declared:
             return
-        inferred = {}
+        inferred = set()
         for row in rows[:_TYPE_CHECK_SAMPLE_ROWS]:
             for column, value in row.items():
                 if value is None:
                     continue
                 type_ = sqlite_type_of_value(value)
                 key = str(column).lower()
-                existing = inferred.get(key)
-                if existing is None or (existing == 'integer' and type_ == 'float'):
-                    inferred[key] = type_
-        for column, type_ in inferred.items():
+                inferred.add((key, type_))
+        for column, type_ in sorted(inferred):
             if column not in declared:
                 continue
             declared_type = _canon_sqlite_type(declared[column])
@@ -1887,7 +1903,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 conn.execute('PRAGMA temp_store=FILE')
                 conn.execute('PRAGMA cache_size=-4096')
                 conn.execute('CREATE TABLE rows (' + ','.join(
-                    self._quote_identifier(column) + ' BLOB' for column in columns) + ')')
+                    self._quote_identifier(column) + ' BLOB COLLATE ' +
+                    _sqlite_declared_collation(spec.columns.get(column), column)
+                    for column in columns) + ')')
                 insert = f'INSERT INTO rows ({quoted}) VALUES (' + ','.join('?' for _ in columns) + ')'
                 for ref in refs:
                     self._ensure_ref_file_present(ref)
@@ -1907,17 +1925,18 @@ class Table(TimeseriesQueryMixin, BaseTable):
                         for row in batch:
                             yield dict(row)
 
-    def _compact_primary_key(self, row, primary_key):
-        return tuple(row[field] for field in primary_key)
+    def _compact_primary_key(self, row, primary_key, table_spec=None):
+        return self._stored_pk_key(row, primary_key, table_spec or self.spec())
 
     def _compact_row_chunks(self, rows, primary_key, target_rows):
         current = []
         current_keys = set()
+        comparison_spec = self._pk_normalization_spec([], primary_key, self.spec(), {})
         for row in rows:
             pk_value = None
             if primary_key:
                 try:
-                    pk_value = self._compact_primary_key(row, primary_key)
+                    pk_value = self._compact_primary_key(row, primary_key, comparison_spec)
                 except KeyError as e:
                     raise MissingPrimaryKey(
                         f'compact row missing primary key column `{e.args[0]}`'
@@ -2333,6 +2352,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         table_spec = self.spec()
         if not table_spec:
             raise BadArgument('latest requires a TableSpec')
+        table_spec = self._pk_normalization_spec([], [], table_spec, {})
         symbol_column = table_spec.symbol_column
         if symbol_column is None and by is None:
             raise BadArgument(
@@ -2353,6 +2373,12 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if field not in table_spec.columns:
                 raise BadArgument(f'latest grouping field missing: {field}')
         requested_symbols = self._normalize_symbols(query_spec.symbols)
+        requested_symbol_keys = None
+        if requested_symbols is not None:
+            requested_symbol_keys = list(dict.fromkeys(self._normalize_comparison_keys(
+                [{symbol_column: value} for value in requested_symbols],
+                [symbol_column], table_spec,
+            )))
         latest_by_key = OrderedDict()
         time_column = self._query_time_column(table_spec).name
         order = [(time_column, 'desc')] + [
@@ -2360,11 +2386,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
         ]
         sort_key = self._row_sort_key(self._parse_order_by(order))
         for row in self._iter_latest_candidates(query_spec, group_fields, order):
-            if requested_symbols is not None:
-                symbol = row.get(symbol_column)
-                if symbol not in requested_symbols:
-                    continue
-            key = tuple(row[field] for field in group_fields)
+            # SQL 已按列亲和性和 collation 过滤 symbols；跨文件分组使用相同等价键。
+            key = self._stored_pk_key(row, group_fields, table_spec)
             previous = latest_by_key.get(key)
             if previous is None or sort_key(row) < sort_key(previous):
                 latest_by_key[key] = row
@@ -2376,7 +2399,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         else:
             latest_rows = self._order_latest_rows_by_symbols(
                 latest_by_key,
-                requested_symbols,
+                requested_symbol_keys,
                 symbol_column,
                 group_fields,
             )
@@ -2429,7 +2452,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         rows = []
         for symbol in requested_symbols:
             for key, row in latest_by_key.items():
-                if key[symbol_index] == symbol:
+                if key[symbol_index] == symbol[0]:
                     rows.append(row)
         return rows
 
@@ -2822,7 +2845,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
         row = rows[0]
         return row.get('session_min'), row.get('session_max')
 
-    _column_stats_cache = {}
+    _column_stats_cache = OrderedDict()
+    _column_stats_cache_limit = 256
+    _column_stats_cache_lock = threading.Lock()
     _column_stats_cache_hits = 0
     _column_stats_cache_misses = 0
 
@@ -2854,13 +2879,14 @@ class Table(TimeseriesQueryMixin, BaseTable):
             except OSError:
                 return None
 
-        # 查询本身开/关连接可能触发 WAL checkpoint 改写文件 mtime，
-        # 因此存储键在查询后取：首次写入的是查询后状态，后续查询即可命中
+        # 查询前后版本必须一致，不能把并发写入前的快照缓存到新版本键下。
         cache_key = _stat_key()
-        if cache_key is not None and cache_key in self._column_stats_cache:
-            type(self)._column_stats_cache_hits += 1
-            return dict(self._column_stats_cache[cache_key])
-        type(self)._column_stats_cache_misses += 1
+        with self._column_stats_cache_lock:
+            if cache_key is not None and cache_key in self._column_stats_cache:
+                type(self)._column_stats_cache_hits += 1
+                self._column_stats_cache.move_to_end(cache_key)
+                return copy.deepcopy(self._column_stats_cache[cache_key])
+            type(self)._column_stats_cache_misses += 1
 
         projections = []
         for column in columns:
@@ -2887,9 +2913,15 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 'min': row.get(f'{column}__min'),
                 'max': row.get(f'{column}__max'),
             }
-        cache_key = _stat_key()
-        if cache_key is not None:
-            self._column_stats_cache[cache_key] = stats
+        final_key = _stat_key()
+        if cache_key is not None and final_key == cache_key:
+            with self._column_stats_cache_lock:
+                for key in list(self._column_stats_cache):
+                    if key[0] == cache_key[0]:
+                        self._column_stats_cache.pop(key, None)
+                self._column_stats_cache[cache_key] = copy.deepcopy(stats)
+                while len(self._column_stats_cache) > self._column_stats_cache_limit:
+                    self._column_stats_cache.popitem(last=False)
         return stats
 
     def _refresh_segment_info(self, logical_part, segment_id, part_key, layout):
@@ -4035,21 +4067,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         if not specs or not rows:
             return rows
 
-        ordered = list(rows)
-        for field, reverse in reversed(specs):
-            try:
-                ordered = sorted(
-                    ordered,
-                    key=lambda row: self._row_sort_value(row, field),
-                    reverse=reverse,
-                )
-            except TypeError:
-                ordered = sorted(
-                    ordered,
-                    key=lambda row: str(self._row_sort_value(row, field)),
-                    reverse=reverse,
-                )
-        return ordered
+        return sorted(rows, key=self._row_sort_key(specs))
 
     def _row_sort_value(self, row, field):
         try:
@@ -4483,7 +4501,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 conn.set_progress_handler(
                     lambda: int(time.monotonic() >= deadline), 1000,
                 )
-            cursor = conn.execute(query.sql, query.params)
+            cursor = conn.execute(query.sql, normalize_sqlite_parameters(query.params))
             try:
                 while True:
                     if deadline is not None and time.monotonic() >= deadline:
@@ -4645,10 +4663,17 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _row_sort_key(self, specs):
         """构造对齐 SQLite 排序语义的 heap key 函数。"""
+        spec = self.spec()
+        columns = dict(spec.columns) if spec else {}
+        meta = self.get_table_meta()
+        columns.update({field: info.get('type')
+                        for field, info in ((meta or {}).get('column_info') or {}).items()})
+        comparisons = [(field, reverse, _sqlite_declared_collation(columns.get(field), field))
+                       for field, reverse in specs]
         def key(row):
             return tuple(
-                _SqliteSortKey(self._row_sort_value(row, field)[1], reverse)
-                for field, reverse in specs
+                _SqliteSortKey(self._row_sort_value(row, field)[1], reverse, collation)
+                for field, reverse, collation in comparisons
             )
         return key
 
@@ -4955,7 +4980,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         else:
             # Partition data by key
             partitioned_data = {}
-            for row in data:
+            for row in self._partition_storage_rows(data, part_obj, segment_spec, kwargs):
                 key = part_obj.get_key(row)
                 if key not in partitioned_data:
                     partitioned_data[key] = []
@@ -5002,6 +5027,36 @@ class Table(TimeseriesQueryMixin, BaseTable):
         logger.debug(f"Insert Time: {_t2 - _t1}")
         keys = list(partitioned_data)
         return keys if len(keys) <= 1 else sorted(keys)
+
+    def _partition_storage_rows(self, rows, partition, table_spec, write_kwargs):
+        """按物理存储值路由，避免 REAL 舍入等亲和性转换跨越分区边界。"""
+        if self._storage_engine != 'sqlite':
+            return rows
+        field = partition.TS_COL
+        columns = dict(table_spec.columns if table_spec else {})
+        columns.update(write_kwargs.get('column_type') or {})
+        meta = self.get_table_meta()
+        columns.update({column: info.get('type')
+                        for column, info in ((meta or {}).get('column_info') or {}).items()})
+        if field not in columns:
+            columns = self.suggest_column_types(
+                rows, column_type=columns,
+                n_suggest_check=write_kwargs.get('n_suggest_check', _DEFAULT_N_SUGGEST_CHECK),
+            )
+        affinity = _sqlite_affinity(columns.get(field), field)
+        with closing(sqlite3.connect(':memory:')) as conn:
+            conn.execute(f'CREATE TABLE routing (value {affinity})')
+            conn.executemany('INSERT INTO routing VALUES (?)',
+                             [(normalize_sqlite_value(row[field]),) for row in rows])
+            values = [item[0] for item in conn.execute('SELECT value FROM routing ORDER BY rowid')]
+        normalized = []
+        for row, value in zip(rows, values):
+            original = normalize_sqlite_value(row[field])
+            # 分区 API 显式拒绝 bool，不能由亲和性转换绕过该校验。
+            if isinstance(original, bool):
+                value = original
+            normalized.append({**row, field: value})
+        return normalized
 
     def _ensure_write_partition_compatible(self, partition, declared_contract=None):
         """锁内检查持久布局及尚未落盘的声明，不能由低层写入覆盖。"""
@@ -5118,16 +5173,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
         values = []
         for field in pk:
             value = row[field]
-            if self._storage_engine == 'sqlite' and isinstance(value, str):
+            if self._storage_engine == 'sqlite':
                 collation = _sqlite_declared_collation(table_spec.columns.get(field), field)
-                if collation == 'NOCASE':
-                    # SQLite NOCASE 只折叠 ASCII，遇到 NUL 后仍比较原始字节长度。
-                    value = (
-                        value.split('\0', 1)[0].translate(_SQLITE_NOCASE_TRANSLATION),
-                        len(value.encode('utf-8')),
-                    )
-                elif collation == 'RTRIM':
-                    value = value.rstrip(' ')
+                value = _sqlite_collation_key(value, collation)
             values.append(value)
         return tuple(values)
 
@@ -5142,9 +5190,20 @@ class Table(TimeseriesQueryMixin, BaseTable):
             conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ', ordinal INTEGER)')
             conn.executemany('INSERT INTO keys VALUES (' +
                              ','.join('?' for _ in range(len(pk) + 1)) + ')',
-                             [tuple(row[field] for field in pk) + (i,) for i, row in enumerate(rows)])
+                             [tuple(normalize_sqlite_value(row[field]) for field in pk) + (i,)
+                              for i, row in enumerate(rows)])
             return [self._stored_pk_key(dict(zip(pk, item[:-1])), pk, table_spec)
                     for item in conn.execute('SELECT * FROM keys ORDER BY ordinal')]
+
+    def _normalize_comparison_keys(self, rows, fields, table_spec):
+        """比较亲和性不强制 REAL 舍入，避免把不匹配的整数请求合并。"""
+        if self._storage_engine == 'sqlite':
+            columns = dict(table_spec.columns)
+            for field in fields:
+                if _sqlite_affinity(columns.get(field), field) == 'REAL':
+                    columns[field] = 'NUMERIC COLLATE ' + _sqlite_declared_collation(columns[field], field)
+            table_spec = replace(table_spec, columns=columns)
+        return self._normalize_pk_keys(rows, fields, table_spec)
 
     def _do_insert_part(
         self,
@@ -5741,19 +5800,60 @@ class Table(TimeseriesQueryMixin, BaseTable):
         self._pragma_dict[key] = value
 
     def create_table(self, column_type, pk, partition=None, **kwargs):
-        """手动创建表结构（非 insert 路径）。
+        """手动建表并登记逻辑结构；分区/segment 文件在首次写入时创建。"""
+        with self._mutation_lock(), self._schema_lock:
+            current = self.spec()
+            declared = kwargs.get('table_contract') or kwargs.get('table_spec')
+            base = current or (TableContract.ensure(declared) if declared is not None else TableContract())
+            columns = dict(base.columns)
+            columns.update(self.suggest_column_types([], column_type=column_type))
+            runtime_partition = partition if partition is not None else base.to_partition()
+            contract = replace(base, primary_key=pk, columns=columns, partition=runtime_partition)
+            if set(contract.primary_key) - columns.keys():
+                raise BadArgument('create_table 的主键必须包含在 columns 中')
+            if current:
+                self._ensure_spec_compatible(current, contract)
+            self._ensure_write_partition_compatible(contract.to_partition(), contract)
+            meta = self.get_table_meta()
+            fresh = {field: type_ for field, type_ in columns.items()
+                     if meta and field not in meta['column_info']}
+            if fresh:
+                if not kwargs.get('alter', False):
+                    raise SchemaConflict('已有表新增列需要 create_table(..., alter=True)')
+                self._add_columns_for_all_partitions(fresh)
+            create_kwargs = dict(kwargs, table_contract=contract.to_dict())
+            createtable_meta = build_createtable_meta(
+                columns, pk=contract.primary_key, partition=contract.to_partition(), **create_kwargs,
+            )
+            if meta:
+                createtable_meta['column_info'] = {
+                    **createtable_meta['column_info'], **meta['column_info'],
+                }
+            if contract.partition is None and contract.segment is None:
+                self.do_create_table(
+                    self._get_part_dbfile(None), _PART_DATA_TABLE_NAME, createtable_meta,
+                    alter=kwargs.get('alter', False),
+                )
+                with self.table_meta_db.transaction():
+                    self._update_meta(None, None, None, createtable_meta)
+            else:
+                createtable_meta['partition'] = (
+                    contract.to_partition().to_meta() if contract.partition else None
+                )
+                with self.table_meta_db.transaction():
+                    self._persist_contract_metadata(contract)
+                    self._overwrite_table_meta(createtable_meta)
+            self._declared_spec = contract
+            self._partition = contract.to_partition()
 
-        通过推断列类型并调用 do_create_table 在主分区文件上建表。
-        """
-        self.suggest_column_types(
-            [], column_type=column_type, n_suggest_check=None
-        )
-        createtable_meta = build_createtable_meta(
-            column_type, pk=pk, partition=partition, **kwargs
-        )
-        part_key = DEFAULT_LOGICAL_PART if self.spec() and self.spec().segment else None
-        part_dbfile = self._get_part_dbfile(part_key)
-        self.do_create_table(
-            part_dbfile, _PART_DATA_TABLE_NAME, createtable_meta,
-            alter=kwargs.get('alter', False),
-        )
+
+def _reset_column_stats_cache_after_fork():
+    """子进程不能继承其他线程持有的缓存锁。"""
+    Table._column_stats_cache_lock = threading.Lock()
+    Table._column_stats_cache = OrderedDict()
+    Table._column_stats_cache_hits = 0
+    Table._column_stats_cache_misses = 0
+
+
+if hasattr(os, 'register_at_fork'):
+    os.register_at_fork(after_in_child=_reset_column_stats_cache_after_fork)

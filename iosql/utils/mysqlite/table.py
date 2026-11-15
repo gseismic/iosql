@@ -29,6 +29,7 @@ from .sql import (
     suggest_data_columns,
     getsql_query_table, quoted_sql_text, sql_literal,
     group_rows_by_keys,
+    normalize_sqlite_parameters,
     _union_fields_of_dictlist,
     suggest_columns
 )
@@ -38,7 +39,7 @@ from .logger import logger
 # Pre-compiled regex patterns for better performance
 _COLUMN_NAME_PATTERN = re.compile(r'no column named (\w+)')
 _TABLE_NAME_PATTERN = re.compile(r'no such table: (\w+)')
-_TABLE_EXISTS_PATTERN = re.compile(r'table (\w+) already exists')
+_TABLE_EXISTS_PATTERN = re.compile(r'table (.+) already exists')
 _DUPLICATE_COLUMN_PATTERN = re.compile(r'duplicate column name: (\w+)')
 
 """
@@ -191,6 +192,7 @@ class Table:
         try:
             self.execute(sql, commit=True)
             table_created = True
+            self._invalidate_cache()
         except DuplicateColumn as e:
             logger.error(f'DuplicateColumn: `{e}`')
             raise e
@@ -327,7 +329,7 @@ class Table:
             logger.info(f'SQL: {sql}; params={params}')
 
         try:
-            cursor.execute(sql, params or [])
+            cursor.execute(sql, normalize_sqlite_parameters(params))
             self._try_commit_on_connection(conn, commit)
         except sqlite3.Error as e:
             self._handle_error_on_connection(e, conn)
@@ -343,7 +345,7 @@ class Table:
             return
 
         try:
-            cursor.executemany(sql, list_values)
+            cursor.executemany(sql, map(normalize_sqlite_parameters, list_values))
             self._try_commit_on_connection(conn, commit)
         except sqlite3.Error as e:
             self._handle_error_on_connection(e, conn)
@@ -378,17 +380,13 @@ class Table:
         self._check_write_commit(commit)
 
         with self._get_cursor() as (cursor, conn):
-            try:
-                cursor.executemany(sql, list_values)
-                self._try_commit_on_connection(conn, commit)
-            except sqlite3.Error as e:
-                self._handle_error_on_connection(e, conn)
+            self._executemany_on_connection(cursor, conn, sql, list_values, commit)
 
     def fetchall(self, sql: str, params: Optional[List[Any]] = None) -> List[Tuple]:
         """执行查询并返回所有结果"""
         with self._get_cursor() as (cursor, conn):
             try:
-                cursor.execute(sql, params or [])
+                cursor.execute(sql, normalize_sqlite_parameters(params))
                 return cursor.fetchall()
             except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
@@ -397,7 +395,7 @@ class Table:
         """执行查询并返回单个结果"""
         with self._get_cursor() as (cursor, conn):
             try:
-                cursor.execute(sql, params or [])
+                cursor.execute(sql, normalize_sqlite_parameters(params))
                 return cursor.fetchone()
             except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
@@ -526,6 +524,23 @@ class Table:
         if not batch_data:
             return
 
+        if ensure_table or ensure_column:
+            # 在写任何行之前补齐本批结构，避免失败后回滚此前批次，
+            # 也避免共享事务内重放已经成功的异构语句组。
+            cursor.execute(f'PRAGMA table_info({quoted_sql_text(self._table_name)})')
+            existing = {item[1].lower() for item in cursor.fetchall()}
+            if not existing and ensure_table:
+                columns = suggest_columns(_union_fields_of_dictlist(batch_data))
+                self._create_table_on_connection(cursor, conn, columns, **kwargs)
+                existing = {item['name'].lower() for item in columns}
+            if existing and ensure_column:
+                missing_rows = [{field: value for field, value in row.items()
+                                 if field.lower() not in existing} for row in batch_data]
+                if any(missing_rows):
+                    self._ensure_columns_on_connection(
+                        cursor, conn, _union_fields_of_dictlist(missing_rows),
+                    )
+
         # 稳定结构只需按字段分组；类型推断延迟到真实建表/加列的冷路径。
         statements = [
             (
@@ -537,23 +552,7 @@ class Table:
             for fields, values in group_rows_by_keys(batch_data)
         ]
 
-        try:
-            self._executemany_statements_on_connection(cursor, conn, statements)
-        except NoSuchTable as e:
-            if ensure_table:
-                # Note 这里忽略了not_null等参数, 用了默认数值
-                # 用户能传的只有 columns(包含了not_null等信息), pk
-                columns = suggest_columns(_union_fields_of_dictlist(batch_data))
-                self._create_table_on_connection(cursor, conn, columns, **kwargs)
-                self._executemany_statements_on_connection(cursor, conn, statements)
-            else:
-                raise e
-        except NoSuchColumn as e:
-            if ensure_column:
-                self._ensure_columns_on_connection(cursor, conn, _union_fields_of_dictlist(batch_data))
-                self._executemany_statements_on_connection(cursor, conn, statements)
-            else:
-                 raise e
+        self._executemany_statements_on_connection(cursor, conn, statements)
 
     def _executemany_statements_on_connection(self, cursor: sqlite3.Cursor,
                                               conn: sqlite3.Connection,
@@ -574,6 +573,7 @@ class Table:
         try:
             cursor.execute(sql)
             table_created = True
+            self._invalidate_cache()
         except DuplicateColumn as e:
             logger.error(f'DuplicateColumn: `{e}`')
             raise e
@@ -709,7 +709,7 @@ class Table:
         sql = f'UPDATE {quoted_sql_text(self._table_name)} SET {kv_string} WHERE {where}'
         with self._get_cursor() as (cursor, conn):
             try:
-                cursor.execute(sql, values)
+                cursor.execute(sql, normalize_sqlite_parameters(values))
                 self._try_commit_on_connection(conn, True)
             except sqlite3.Error as e:
                 self._handle_error_on_connection(e, conn)
