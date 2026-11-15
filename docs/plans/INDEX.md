@@ -42,3 +42,4 @@
 | 2026-11-15 02:57 | [修复全部示例检查问题](PLAN-20261115-004-model-unknown-example-review-fixes.md) / [结果](PLAN-20261115-004-model-unknown-example-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 八项检查问题修复并同步 skill；隔离 PostgreSQL 和相关回归 154 通过、6 项 Windows 原机测试跳过。 |
 | 2026-11-15 15:53 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) | 实施中 | 修复五项已复现问题，覆盖事务失败、重复主键、文本精度及并发布局变更，并循环复审。 |
 | 2026-11-15 16:51 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) / [结果](PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md) | 已完成（WORKTREE） | 修复五项及事务、标识符等复审问题；最终全量 1599 通过、99 跳过，PG 专项 235 通过；权限变化和 CLI 兼容性待评估项已记录。 |
+| 2026-11-15 17:11 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) / [结果](PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md) | 已提交（3cb4c8b） | 修复及验证记录提交为 3cb4c8baf226bb53715f2cf8f4bc22aed77f00ad；示例规范检查尚未开始，接续见 docs/HANDOFF.md；未推送。 |

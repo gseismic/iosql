@@ -47,3 +47,7 @@
 本轮在 `iosql/engines/postgresql/table.py:859` 改用 SHARE UPDATE EXCLUSIVE，将布局检查到写入覆盖在能排斥 ATTACH/DETACH 的父表锁内。非所有者角色需有表级 UPDATE、DELETE 或 TRUNCATE 之一，库不自动授权；已有摘要的正常写入仍不要求所有者身份，首次固定摘要的所有者要求不变。
 
 验证：隔离 PostgreSQL 14 中确认并发 ATTACH 在写入期间超时、提交后能完成；既有分区契约、历史边界、权限和迁移测试及本轮其他 PostgreSQL 专项合计 235 passed。最终完整回归与复审结果见 `docs/plans/PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md`；本事件对应结果仍未提交。
+
+## 2026-11-15 17:11 补充修复提交依据
+
+模型：Codex（基于 GPT-6，实际模型 ID 未提供）；状态保持“已解决”。上次事件中的 WORKTREE 补充修复现对应实际提交 `3cb4c8baf226bb53715f2cf8f4bc22aed77f00ad`，已验证代码与提交内容一致；全量 1599 passed、99 skipped，PostgreSQL 专项 235 passed，验证边界仍以关联 OUTCOME 为准。本事件为提交后的来源追加，不改变问题状态，未推送。
