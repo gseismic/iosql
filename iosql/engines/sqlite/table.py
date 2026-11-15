@@ -1907,6 +1907,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
                         for row in batch:
                             yield dict(row)
 
+    def _compact_primary_key(self, row, primary_key):
+        return tuple(row[field] for field in primary_key)
+
     def _compact_row_chunks(self, rows, primary_key, target_rows):
         current = []
         current_keys = set()
@@ -1914,7 +1917,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             pk_value = None
             if primary_key:
                 try:
-                    pk_value = tuple(row[field] for field in primary_key)
+                    pk_value = self._compact_primary_key(row, primary_key)
                 except KeyError as e:
                     raise MissingPrimaryKey(
                         f'compact row missing primary key column `{e.args[0]}`'

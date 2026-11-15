@@ -9,6 +9,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from ..exception import DatabaseBusy, UnsafeOperation
+from .parquet_files import read_parquet
 
 
 # __ 前缀已保留给内部对象，避免与历史合法表名冲突。
@@ -339,12 +340,12 @@ def _valid_data_file(path, *, expected_rows=None, backend='sqlite', parquet_conn
         try:
             import duckdb
             if parquet_conn is not None:
-                actual = parquet_conn.read_parquet(str(path)).count('*').fetchall()[0][0]
+                actual = read_parquet(parquet_conn, path).count('*').fetchall()[0][0]
             else:
                 with closing(duckdb.connect(config={'threads': 1})) as conn:
-                    actual = conn.read_parquet(str(path)).count('*').fetchall()[0][0]
+                    actual = read_parquet(conn, path).count('*').fetchall()[0][0]
             return expected_rows is None or actual == int(expected_rows)
-        except (ImportError, OSError, ValueError):
+        except (ImportError, OSError, ValueError, UnsafeOperation):
             return False
         except duckdb.Error:
             return False

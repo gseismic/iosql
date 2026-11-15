@@ -169,7 +169,10 @@ class TestConnectionPool:
         assert len(errors) == 1
         assert isinstance(errors[0], RuntimeError)
 
-    def test_process_budget_reclaims_idle_connections_across_pools(self, tmp_path):
+    @pytest.mark.parametrize('idle_limit', [None, 32])
+    def test_process_budget_reclaims_idle_connections_across_pools(self, tmp_path, idle_limit):
+        idle = (DatabaseConnectionPool(str(tmp_path / 'idle.sqlite3'), max_process_connections=idle_limit)
+                if idle_limit is not None else None)
         pools = [
             DatabaseConnectionPool(
                 str(tmp_path / f'pool-{index}.sqlite3'),
@@ -179,22 +182,28 @@ class TestConnectionPool:
             for index in range(10)
         ]
         try:
+            if idle is not None:
+                with idle.get_connection() as conn:
+                    conn.execute('select 1')
             for item in pools:
                 with item.get_connection() as conn:
                     conn.execute('select 1')
 
-            status = get_process_connection_budget_status()
-            created = sum(
-                item.get_pool_status()['created_connections']
-                for item in pools
-            )
-
-            assert status['max_process_connections'] == 3
-            assert status['open_process_connections'] <= 3
-            assert created <= 3
+            # 全部空闲时预算可恢复为其他池的较大值；在受限池活跃时核验回收。
+            with pools[-1].get_connection():
+                status = get_process_connection_budget_status()
+                created = sum(
+                    item.get_pool_status()['created_connections']
+                    for item in pools
+                )
+                assert status['max_process_connections'] == 3
+                assert status['open_process_connections'] <= 3
+                assert created <= 3
         finally:
             for item in pools:
                 item.force_close_all_connections()
+            if idle is not None:
+                idle.force_close_all_connections()
 
     def test_abandoned_pool_returns_process_budget(self, tmp_path):
         gc.collect()

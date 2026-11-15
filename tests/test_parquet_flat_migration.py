@@ -41,6 +41,81 @@ def test_new_parquet_migration_has_the_normal_root_layout(tmp_path):
         assert db.table('bars').select() == [{'id': 1, 'value': 'first'}]
 
 
+@pytest.mark.skipif(os.name != 'posix', reason='验证 POSIX 目录同步顺序')
+def test_new_target_parent_is_synced_before_commit_decision(tmp_path, monkeypatch):
+    import iosql.coordination as coordination
+    import iosql._parquet_flat_publish as flat
+
+    target = (tmp_path / 'new-parent' / 'target').resolve()
+    sync = coordination.sync_directory
+    write = coordination.LocalCoordinator.write_state
+    events = []
+
+    def tracked_sync(path):
+        sync(path)
+        if Path(path) == target.parent and target.is_dir():
+            events.append('parent-synced')
+
+    def tracked_write(self, generation, transaction=None, **kwargs):
+        if self.resource.path == target and (transaction or {}).get('state') == 'FLAT_COMMIT_DECIDED':
+            assert 'parent-synced' in events
+            events.append('commit-decided')
+        return write(self, generation, transaction, **kwargs)
+
+    monkeypatch.setattr(coordination, 'sync_directory', tracked_sync)
+    monkeypatch.setattr(flat, 'sync_directory', tracked_sync)
+    monkeypatch.setattr(coordination.LocalCoordinator, 'write_state', tracked_write)
+    with Database(_uri(tmp_path / 'source', 'sqlite')) as source:
+        _table(source, 'bars', {'id': 1, 'value': 'first'})
+        result = source.migrate_to(_uri(target), verify='row-count')
+        assert result.published and result.verified
+    assert events.index('parent-synced') < events.index('commit-decided')
+
+
+@pytest.mark.skipif(os.name != 'posix', reason='验证 POSIX 目录同步失败')
+def test_target_parent_sync_failure_cannot_commit(tmp_path, monkeypatch):
+    import iosql.coordination as coordination
+    import iosql._parquet_flat_publish as flat
+
+    target = (tmp_path / 'target').resolve()
+    sync = coordination.sync_directory
+    original_publish = flat.publish
+    publishing = False
+    reject_sync = True
+    events = []
+
+    def publishing_now(*args):
+        nonlocal publishing
+        events.append(('root-exists', target.exists()))
+        publishing = True
+        return original_publish(*args)
+
+    def fail_parent_sync(path):
+        if publishing and Path(path) == target.parent and target.is_dir():
+            if reject_sync:
+                raise OSError('模拟新目标父目录同步失败')
+            events.append(('parent-synced', True))
+        return sync(path)
+
+    monkeypatch.setattr(flat, 'publish', publishing_now)
+    monkeypatch.setattr(coordination, 'sync_directory', fail_parent_sync)
+    monkeypatch.setattr(flat, 'sync_directory', fail_parent_sync)
+    with Database(_uri(tmp_path / 'source', 'sqlite')) as source:
+        table = _table(source, 'bars', {'id': 1, 'value': 'first'})
+        with pytest.raises(MigrationError) as failure:
+            source.migrate_to(_uri(target))
+        assert not failure.value.partial_result.published
+        state = coordination.LocalCoordinator(resource(_uri(target))).state()
+        assert not coordination.needs_recovery(state)
+        assert not (target / 'bars').exists()
+        assert table.select() == [{'id': 1, 'value': 'first'}]
+        reject_sync = False
+        result = source.migrate_to(_uri(target), verify='row-count')
+        assert result.published and result.verified
+        assert events[:2] == [('root-exists', False), ('root-exists', True)]
+        assert ('parent-synced', True) in events[2:]
+
+
 def test_existing_target_preserves_idle_metadata_connection_and_unselected_table(tmp_path):
     target = tmp_path / 'target'
     with Database(_uri(tmp_path / 'source', 'sqlite')) as source, Database(_uri(target)) as db:

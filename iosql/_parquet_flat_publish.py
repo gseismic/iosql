@@ -114,7 +114,7 @@ def publish(publisher, operation_id):
     root = item.path
     if publisher.previous != root:
         raise UnsafeOperation('旧代目录需要先整理为普通 Parquet 目录后才能迁移到该库')
-    root.mkdir(parents=True, exist_ok=True)
+    ensure_directory(root)
     _identity(root, stat.S_ISDIR)
     parent = _default_workspace_root(None, item)
     ensure_directory(parent)
@@ -137,6 +137,8 @@ def publish(publisher, operation_id):
     _sync_tree(candidate)
     sync_directory(parent)
     entries = [_entry(root, payload, name) for name in publisher.flat_table_names]
+    # 同步失败可能留下已创建的根目录；再次迁移仍须持久化该目录项。
+    sync_directory(root.parent)
     state = publisher.coordinator.state()
     record = {'state': 'FLAT_COMMIT_DECIDED', 'operation_id': operation_id,
               'location': location, 'candidate_identity': _identity(candidate, stat.S_ISDIR),

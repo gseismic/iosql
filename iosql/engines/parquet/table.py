@@ -5,13 +5,13 @@ from __future__ import annotations
 import os
 import numbers
 import math
+import pickle
 import tempfile
 import threading
 import time
-import json
 import uuid
 import warnings
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 
 from ..._migration_progress import count_reporter
 from ...migration import OMITTED
@@ -21,10 +21,14 @@ from ...spec import PhysicalLayout, SegmentInfo, TableContract
 from ...utils.createtable import build_createtable_meta
 from ...utils.mysqlite.connection_pool import reserve_process_connections, release_process_connections
 from ...utils.mysqlite.exception import NoSuchTable
-from ..sqlite.table import Table as DirectoryTable, _canon_sqlite_type
+from ...utils.parquet_files import fragment_directory, parquet_files, read_parquet
+from ..sqlite.table import Table as DirectoryTable, _canon_sqlite_type, _SqliteSortKey
 from ..sqlite.const import _TABLE_PART_TABLE_NAME
 from ..sqlite.query_util import build_delete_query, build_select_count_query
 from ._bulk import try_insert as _try_bulk_insert
+
+
+_NAN_PRIMARY_KEY = object()
 
 
 def _duckdb():
@@ -91,6 +95,17 @@ class _Scan:
         if fields != '*' or where is not None:
             raise BadArgument('内部 Parquet 全表读取仅支持 select("*")')
         return self.query('SELECT * FROM data', to_dict=to_dict)
+
+
+class _ParquetSortKey(_SqliteSortKey):
+    """与 DuckDB 一致：NaN 等于 NaN，并大于其他数值（包括正无穷）。"""
+
+    def _value_lt(self, other_value):
+        if isinstance(self.value, float) and math.isnan(self.value):
+            return False
+        if isinstance(other_value, float) and math.isnan(other_value):
+            return True
+        return super()._value_lt(other_value)
 
 
 class Table(DirectoryTable):
@@ -205,11 +220,11 @@ class Table(DirectoryTable):
                 self._db_parts_condition.notify_all()
 
     @contextmanager
-    def _connection(self, deadline=None, reserved=False):
+    def _connection(self, deadline=None, reserved=False, database=':memory:'):
         reservation = None if reserved else reserve_process_connections(1, self._max_process_connections)
         try:
             with tempfile.TemporaryDirectory(prefix='iosql-parquet-') as temp_dir:
-                conn = _duckdb().connect(config={
+                conn = _duckdb().connect(database=database, config={
                     'threads': 1, 'memory_limit': '256MB', 'temp_directory': temp_dir,
                 })
                 timer = None
@@ -236,7 +251,7 @@ class Table(DirectoryTable):
         if not os.path.isfile(path) or os.path.islink(path):
             raise UnsafeOperation(f'Parquet 数据文件缺失或为符号链接: {path}')
         try:
-            relation = conn.read_parquet(self._parquet_files(path), union_by_name=True)
+            relation = read_parquet(conn, path)
             physical = set(relation.columns)
             if columns is None:
                 columns = (self.get_table_meta() or {}).get('column_info') or {}
@@ -278,7 +293,7 @@ class Table(DirectoryTable):
         if path is not None and os.path.exists(path):
             if os.path.islink(path):
                 raise UnsafeOperation(f'Parquet 数据文件不能是符号链接: {path}')
-            relation = conn.read_parquet(self._parquet_files(path), union_by_name=True)
+            relation = read_parquet(conn, path)
             physical = set(relation.columns)
             relation.create_view('source_data')
             fields = [self._quote_identifier(column) for column in columns]
@@ -287,42 +302,11 @@ class Table(DirectoryTable):
             conn.execute('INSERT INTO data SELECT ' + ', '.join(expressions) + ' FROM source_data')
 
     def _parquet_files(self, path):
-        """清单是物理集合的唯一发布点；缺文件或越界引用不能退化为空数据。"""
-        manifest = path + '.manifest.json'
-        if not os.path.exists(manifest):
-            return [path]
-        if os.path.islink(manifest):
-            raise UnsafeOperation(f'Parquet 清单不能是符号链接: {manifest}')
-        try:
-            with open(manifest, encoding='utf-8') as handle:
-                payload = json.load(handle)
-            files = payload['files']
-            if payload.get('format') != 'iosql-parquet-parts-v1' or not isinstance(files, list) or not files:
-                raise ValueError('invalid manifest')
-            directory = self._fragment_directory(path)
-            if os.path.islink(directory):
-                raise ValueError('symlink directory')
-            resolved = []
-            for name in files:
-                if name == '@base':
-                    candidate = path
-                elif (isinstance(name, str) and len(name) == 40 and name.endswith('.parquet')
-                      and all(char in '0123456789abcdef' for char in name[:-8])):
-                    candidate = os.path.join(directory, name)
-                else:
-                    raise ValueError('invalid fragment name')
-                if not os.path.isfile(candidate) or os.path.islink(candidate):
-                    raise ValueError('missing or unsafe fragment')
-                resolved.append(candidate)
-            if len(resolved) != len(set(resolved)):
-                raise ValueError('duplicate fragment')
-            return resolved
-        except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise UnsafeOperation(f'Parquet 数据清单损坏: {manifest}') from exc
+        return parquet_files(path)
 
     @staticmethod
     def _fragment_directory(path):
-        return os.path.join(os.path.dirname(path), '.' + os.path.basename(path) + '.parts')
+        return fragment_directory(path)
 
     def _part_is_registered(self, part):
         """检查单个逻辑分区，避免每次写入都物化并排序全部分区。"""
@@ -441,7 +425,7 @@ class Table(DirectoryTable):
                         [[row.get(column) for column in column_types] for row in part_data],
                     )
                 if not replace and os.path.exists(path) and pk:
-                    conn.read_parquet(self._parquet_files(path), union_by_name=True).create_view('existing_data')
+                    read_parquet(conn, path).create_view('existing_data')
                     predicate = ' AND '.join(
                         f'data.{self._quote_identifier(column)} = existing_data.{self._quote_identifier(column)}'
                         for column in pk
@@ -451,7 +435,9 @@ class Table(DirectoryTable):
                     elif conn.execute(f'SELECT 1 FROM data JOIN existing_data ON {predicate} LIMIT 1').fetchone():
                         raise BadArgument('Parquet 主键冲突；append 不允许覆盖已有行')
                 conn.execute('COMMIT')
-                self._publish(conn, path, append=not replace)
+                if not (ignore and os.path.exists(path) and not conn.execute(
+                        'SELECT 1 FROM data LIMIT 1').fetchall()):
+                    self._publish(conn, path, append=not replace)
         except _duckdb().ConstraintException as exc:
             raise BadArgument(f'Parquet 主键冲突或约束失败: {exc}') from exc
         except _duckdb().ConversionException as exc:
@@ -495,6 +481,66 @@ class Table(DirectoryTable):
             f'{self._quote_identifier(column)} ' + ('DESC NULLS LAST' if reverse else 'ASC NULLS FIRST')
             for column, reverse in self._parse_order_by(order_by)
         )
+
+    def _row_sort_key(self, specs):
+        def key(row):
+            return tuple(_ParquetSortKey(self._row_sort_value(row, field)[1], reverse)
+                         for field, reverse in specs)
+        return key
+
+    def _apply_order_by(self, rows, order_by):
+        specs = self._parse_order_by(order_by)
+        return sorted(rows, key=self._row_sort_key(specs)) if specs and rows else rows
+
+    def _compact_sorted_rows(self, refs, spec):
+        with closing(self._compact_sorted_batches(refs, spec)) as batches:
+            if self._max_process_connections == 1:
+                # 单连接预算下先释放排序连接，再交给后续的 segment 写入。
+                with tempfile.TemporaryFile() as spool:
+                    for batch in batches:
+                        pickle.dump(batch, spool, protocol=pickle.HIGHEST_PROTOCOL)
+                    spool.seek(0)
+                    while True:
+                        try:
+                            batch = pickle.load(spool)
+                        except EOFError:
+                            break
+                        yield from batch
+            else:
+                for batch in batches:
+                    yield from batch
+
+    def _compact_primary_key(self, row, primary_key):
+        return tuple(_NAN_PRIMARY_KEY if isinstance(value, float) and math.isnan(value) else value
+                     for value in super()._compact_primary_key(row, primary_key))
+
+    def _compact_sorted_batches(self, refs, spec):
+        """DuckDB 磁盘暂存保留 NaN，排序可落盘，不经 SQLite 值绑定。"""
+        order = list(dict.fromkeys(field for field in [
+            spec.order_key, spec.time.name if spec.time else None,
+            spec.partition.column if spec.partition else None, *spec.primary_key,
+        ] if field))
+        columns = {column: {'type': type_} for column, type_ in spec.columns.items()}
+        with tempfile.TemporaryDirectory(prefix='iosql-compact-parquet-') as directory:
+            with self._connection(database=os.path.join(directory, 'sort.duckdb')) as conn:
+                conn.execute('CREATE TABLE rows (' + ','.join(
+                    self._quote_identifier(column) + ' ' + _sql_type(type_)
+                    for column, type_ in spec.columns.items()) + ')')
+                for ref in refs:
+                    self._ensure_ref_file_present(ref)
+                    with self._read_lease(ref.path):
+                        self._create_view(conn, ref.path, columns)
+                        conn.execute('INSERT INTO rows SELECT * FROM data')
+                sql = 'SELECT * FROM rows'
+                if order:
+                    sql += ' ORDER BY ' + self._order_by_sql(order, '*', spec.columns)
+                cursor = conn.execute(sql)
+                names = [description[0] for description in cursor.description]
+                while True:
+                    batch = cursor.fetchmany(1000)
+                    if not batch:
+                        break
+                    yield [dict(zip(names, row)) for row in batch]
 
     def _normalize_pk_keys(self, rows, pk, table_spec):
         with self._connection() as conn:
@@ -553,9 +599,7 @@ class Table(DirectoryTable):
                     if not os.path.isfile(path) or os.path.islink(path):
                         raise UnsafeOperation(f'Parquet 数据文件缺失或为符号链接: {path}')
                     try:
-                        total += conn.read_parquet(
-                            self._parquet_files(path), union_by_name=True,
-                        ).count('*').fetchall()[0][0]
+                        total += read_parquet(conn, path).count('*').fetchall()[0][0]
                     except _duckdb().Error as exc:
                         raise UnsafeOperation(f'Parquet 查询失败 {path}: {exc}') from exc
                 if report is not None:
