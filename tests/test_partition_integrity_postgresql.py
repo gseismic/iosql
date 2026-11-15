@@ -395,7 +395,7 @@ def test_pg_legacy_first_write_requires_owner_but_existing_marker_does_not(pg_ur
                 cursor.execute("SELECT current_schema()")
                 schema = cursor.fetchone()[0]
                 cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
-                cursor.execute(sql.SQL("GRANT SELECT, INSERT ON events TO {}").format(sql.Identifier(role)))
+                cursor.execute(sql.SQL("GRANT SELECT, INSERT, UPDATE ON events TO {}").format(sql.Identifier(role)))
                 cursor.execute("SELECT 1 FROM pg_namespace WHERE nspname='__iosql_control'")
                 if cursor.fetchone():
                     cursor.execute(sql.SQL("GRANT USAGE ON SCHEMA __iosql_control TO {}").format(sql.Identifier(role)))
@@ -412,6 +412,15 @@ def test_pg_legacy_first_write_requires_owner_but_existing_marker_does_not(pg_ur
         with Database(role_uri) as db:
             table = db.table("events", **args)
             table.write({"ts": 2})
+            assert table.select(order_by="ts") == [{"ts": 1}, {"ts": 2}]
+        with closing(psycopg2.connect(pg_uri)) as conn:
+            conn.autocommit = True
+            with conn.cursor() as cursor:
+                cursor.execute(sql.SQL("REVOKE UPDATE ON events FROM {}").format(sql.Identifier(role)))
+        with Database(role_uri) as db:
+            table = db.table("events", **args)
+            with pytest.raises(TableSpecConflict, match="UPDATE.*DELETE.*TRUNCATE"):
+                table.write({"ts": 3})
             assert table.select(order_by="ts") == [{"ts": 1}, {"ts": 2}]
     finally:
         with closing(psycopg2.connect(pg_uri)) as conn:

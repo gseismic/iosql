@@ -1127,7 +1127,9 @@ bars.create_index(columns=['symbol', 'ts'])  # 等价主键索引会被复用
 
 `create_index(column=...)` 或 `create_index(columns=[...])` 显式创建父表 B-tree；子分区自动继承。`drop_index(columns=[...])` 只删除有 iosql 标记、定义与归属仍匹配的二级索引；约束和外部用户索引受保护。`upsert_all()` 只合并输入主键的字段，缺字段保留，显式 None 写 NULL，重复主键按输入顺序合并；不读取全表。`count_rows()` 保持精确计数，可能扫描整个表。
 
-重开表会验证声明列的真实类型、主键顺序、分区形态与单列 RANGE 键。分区主键必须包含分区列。原生 date/timestamp/timestamptz 查询按契约时区绑定边界；calendar text 使用统一定长 compact 或无偏移 ISO 格式，查询精度独立于分区周期；带偏移时间使用 timestamptz。
+`write(mode='upsert'/'replace')` 的同主键记录按输入顺序取最后一行，SQL 分页不改变最终结果；同批列并集内缺失的字段写 NULL，`rows_written` 记录实际 INSERT/UPDATE 行数。`upsert_all()` 按连续的相同字段集合批量执行，交替字段集合可能产生更多 SQL，但始终保持字段覆盖顺序。`commit=False` 保持事务，后续非空的 `commit=True` 写入或 `delete()` / `delete_all()` 提交，关闭连接时未提交数据回滚；SQL 或提交失败会清理事务状态。连接断开导致事务丢失后，首次尝试重连抛 `UnsafeOperation`，本次操作不执行；调用方应确认先前工作丢失后重新开始事务，库不自动重放。若连接在 COMMIT 时中断，提交结果可能不确定，必须先按主键查询确认，再决定是否重试。
+
+重开表会验证声明列的真实类型、主键顺序、分区形态与单列 RANGE 键。表名、列名最多 63 个 UTF-8 字节，超长抛 `BadArgument`，防止 PostgreSQL 静默截断而串表。分区主键必须包含分区列。分区写入期间使用父表 `SHARE UPDATE EXCLUSIVE` 锁阻止并发 ATTACH/DETACH 穿过布局校验；普通 SELECT 仍可执行。非所有者写入角色需要表级 `UPDATE`、`DELETE` 或 `TRUNCATE` 权限之一以取得锁（仅 `INSERT` 不够），库不会自动授权；首次固定分区摘要仍需要表所有者权限。原生 date/timestamp/timestamptz 查询按契约时区绑定边界；calendar text 使用统一定长 compact 或无偏移 ISO 格式，查询精度独立于分区周期；精度更细的文本时间查询下界向上对齐、上界向下对齐，避免误取边界之外的记录。带偏移时间使用 timestamptz。
 
 基本读写示例：[01_quickstart_postgresql.py](examples/01_quickstart_postgresql.py)；查询计划与索引示例：[15_postgresql_timeseries_query.py](examples/15_postgresql_timeseries_query.py)。查询基准：`POSTGRES_DSN=... uv run --extra postgresql benchmarks/benchmark_postgresql_query.py`，默认覆盖百万/千万行。结果和环境见 [基准报告](benchmarks/results/postgresql-query-20261002.md)。
 

@@ -1,6 +1,7 @@
 """PostgreSQL 时序查询和原生计划，保证大结果在数据库端执行并流式返回。"""
 
 from dataclasses import replace
+from datetime import timedelta
 import re
 
 import arrow
@@ -32,7 +33,7 @@ class _TimeColumn:
             with table.connect().cursor() as cursor:
                 cursor.execute(
                     f'SELECT {_quote(self.name)} FROM {_quote(table.table_name)} '
-                    f'WHERE {_quote(self.name)} IS NOT NULL LIMIT 1'
+                    f'WHERE {_quote(self.name)} IS NOT NULL LIMIT 1', ()
                 )
                 sample = cursor.fetchone()
             self._text_format, has_time = _text_time_format(str(sample[0]) if sample else '2000-01-01')
@@ -63,6 +64,26 @@ class _TimeColumn:
         if self._physical == 'TIMESTAMPTZ':
             return value.format('YYYY-MM-DD HH:mm:ss.SSSSSSZZ')
         return value.format(self._text_format)
+
+    def normalize_bound(self, value, *, lower):
+        normalized = self.normalize_value(value)
+        if self._physical != 'TEXT' or self.unit == 'date' or not lower:
+            return normalized
+        local = self._value(value)
+        rounded = arrow.get(normalized, self._text_format)
+        if rounded.naive < local.naive:
+            # 文本表示的是墙上时间，在无时区的日历上对齐，避免 DST 的 shift 改写边界。
+            fraction = re.search(r'\.(S+)$', self._text_format)
+            if fraction:
+                step = timedelta(microseconds=10 ** (6 - len(fraction[1])))
+            elif self._text_format.endswith('ss'):
+                step = timedelta(seconds=1)
+            elif self._text_format.endswith('mm'):
+                step = timedelta(minutes=1)
+            else:
+                step = timedelta(hours=1)
+            return arrow.get(rounded.naive + step).format(self._text_format)
+        return normalized
 
     def normalize_date_range(self, value):
         start, next_day = _natural_day_bounds(self._value(value))
@@ -174,6 +195,11 @@ class PostgreSQLQueryMixin(TimeseriesQueryMixin):
         ):
             return _TimeColumn(self, logical, physical)
         return logical
+
+    def _normalize_query_time_bound(self, time_column, value, *, lower):
+        if isinstance(time_column, _TimeColumn):
+            return time_column.normalize_bound(value, lower=lower)
+        return super()._normalize_query_time_bound(time_column, value, lower=lower)
 
     def _latest_query(self, spec, by):
         contract = self.spec()

@@ -111,16 +111,20 @@ class TimeseriesQueryMixin:
                 generated.append({
                     'field': time_column.name,
                     'op': '>=',
-                    'value': time_column.normalize_value(query_spec.start),
+                    'value': self._normalize_query_time_bound(time_column, query_spec.start, lower=True),
                 })
             if query_spec.end is not None:
                 generated.append({
                     'field': time_column.name,
                     'op': '<=',
-                    'value': time_column.normalize_value(query_spec.end),
+                    'value': self._normalize_query_time_bound(time_column, query_spec.end, lower=False),
                 })
 
         return self._combine_query_where(query_spec.where, generated)
+
+    def _normalize_query_time_bound(self, time_column, value, *, lower):
+        """默认沿用逻辑时钟；物理存储精度不同的后端可分别对齐上下界。"""
+        return time_column.normalize_value(value)
 
     def _query_time_column(self, table_spec):
         if not table_spec or not table_spec.time:

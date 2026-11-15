@@ -99,7 +99,12 @@ DeprecationWarning 永久保留，不要计划移除，也不要在新代码里�
 - 字符串 `fields` 只接受 `*` 或标识符列表；含 SQL 语法直接抛 `BadArgument`；
   `select()` / `iter_select*()` 拒绝未知 kwargs。
 - `insert_all` 按整批行列并集取值、缺列补 `NULL`；`upsert_all` 仅更新输入字段、缺字段保留旧值，并按参数上限拆页；
-  `commit=False` 会保持事务，后续 `commit=True` 的写入或 delete 提交，关闭连接时未提交事务回滚，失败整体回滚。
+  `commit=False` 会保持事务，后续非空 `commit=True` 写入或 delete 提交，关闭连接时未提交事务回滚，SQL 失败整体回滚；COMMIT 时断连需先查询确认持久结果，不自动重试。
+- `write(upsert/replace)` 在 SQL 类型归一后同键取最后输入行，分页不改变最终结果；字段级 `upsert_all` 按连续相同字段集合执行，保持输入覆盖顺序，不按 Python 原始键全局重排。
+- SQL 或提交失败清理事务及租约，rollback 失败不能覆盖原错误。事务丢失后的首次重连抛 `UnsafeOperation`，不自动重放；迁移专用连接禁止自行重连。
+- 分区布局校验到写入持有父表 SHARE UPDATE EXCLUSIVE 锁，排斥并发 ATTACH/DETACH，允许普通 SELECT。角色需要表级 UPDATE、DELETE 或 TRUNCATE 之一；仅 INSERT 时明确拒绝并提示授权，不降级为弱锁。首次写入固定摘要仍需所有者权限。
+- 统一格式的文本时间查询按方向对齐精度：下界向上、上界向下；原生日期与时间类型保留既有转换规则，谓词仍直接作用于列。
+- 表名和列名在 DDL 前校验 63 字节 UTF-8 上限；生成的分区/索引名称继续使用截断加摘要。带参数语句的标识符引用须转义百分号，无参数语句不重复转义。
 - `order_by` 的 NULL 排序与 SQLite 一致：ASC → `NULLS FIRST`，DESC → `NULLS LAST`。
 - `upsert_all(..., where=...)` 已废弃（忽略并告警）；`calendar(...)` 的 `timestamptz` 边界带 UTC 偏移；
   `table_parts()` 返回排序后的子分区关系名。

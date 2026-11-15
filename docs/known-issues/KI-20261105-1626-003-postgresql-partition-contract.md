@@ -39,3 +39,11 @@
 ## 2026-11-05 18:50 修复提交
 
 模型：Codex，基于 GPT-6；实际模型 ID 未提供。已验证的修复版本为提交 `0bf5c9af250cde1a0a281e42eb3a3b78bd4c895e`；提交快照的隔离 PostgreSQL 18 全量测试为 1345 passed、19 skipped。状态保持“已解决”。本条为提交后的追加记录，尚未另行提交。
+
+## 2026-11-15 16:43 分区布局锁补充复核
+
+模型：Codex（基于 GPT-6，实际模型 ID 未提供）；状态保持“已解决”。本次用户要求 PostgreSQL 逻辑循环审查与修复，范围为 WORKTREE，基准提交 `620ee5e040159cb458c2fb60068e6352ee07b355`，涉及 `iosql/engines/postgresql/table.py` 和 PostgreSQL 回归测试。原先 API 分区契约绑定冲突的结论不变；补充发现原生 ROW EXCLUSIVE 锁不能排斥外部 ATTACH，布局读取之后仍可能附加不同边界的子表。
+
+本轮在 `iosql/engines/postgresql/table.py:859` 改用 SHARE UPDATE EXCLUSIVE，将布局检查到写入覆盖在能排斥 ATTACH/DETACH 的父表锁内。非所有者角色需有表级 UPDATE、DELETE 或 TRUNCATE 之一，库不自动授权；已有摘要的正常写入仍不要求所有者身份，首次固定摘要的所有者要求不变。
+
+验证：隔离 PostgreSQL 14 中确认并发 ATTACH 在写入期间超时、提交后能完成；既有分区契约、历史边界、权限和迁移测试及本轮其他 PostgreSQL 专项合计 235 passed。最终完整回归与复审结果见 `docs/plans/PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md`；本事件对应结果仍未提交。

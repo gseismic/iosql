@@ -43,17 +43,20 @@ def test_unordered_batches_use_one_linear_cursor(tmp_path):
 
 
 @pytest.mark.parametrize('backend', ['sqlite', 'parquet'])
-def test_unordered_stream_close_and_timeout_release_budget(tmp_path, backend):
+def test_unordered_stream_close_and_timeout_release_budget(tmp_path, backend, monkeypatch):
     """R06/R10：异常或提前关闭必须释放外部预留，后续写读仍可用。"""
     from iosql.utils.mysqlite.connection_pool import _PROCESS_CONNECTION_BUDGET as budget
     with Database(f'{backend}://{tmp_path / "db"}', max_process_connections=2) as db:
         table = db.table('t', pk=['id'], columns={'id': 'integer'})
         table.write([{'id': i} for i in range(20)])
-        stream = table.iter_select_batches(batch_size=1, timeout_ms=20)
+        stream = table.iter_select_batches(batch_size=1, timeout_ms=10_000)
         assert next(stream)[0]['id'] == 0
-        time.sleep(0.03)
-        with pytest.raises(TimeoutError):
-            next(stream)
+        # 首批启动成本不属于此反例；取得首批后再确定性地越过迭代截止时间。
+        monotonic = time.monotonic
+        with monkeypatch.context() as clock:
+            clock.setattr(time, 'monotonic', lambda: monotonic() + 11)
+            with pytest.raises(TimeoutError):
+                next(stream)
         assert not budget._external_reservations
         stream = table.iter_batches(batch_size=1)
         assert next(stream)[0]['id'] == 0

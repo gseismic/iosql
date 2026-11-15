@@ -21,7 +21,7 @@ from ...table import BaseTable, resolve_select_fields
 from ...partition import Partition, CalendarPartition
 from ...core.query import Where
 from ...migration import OMITTED
-from ...exception import BadArgument, SchemaConflict, TableSpecConflict
+from ...exception import BadArgument, SchemaConflict, TableSpecConflict, UnsafeOperation
 from ...utils.schema import parse_db_schema
 from ...logger import default_logger as logger
 from ...spec import TableContract, WriteResult
@@ -78,6 +78,17 @@ _CALENDAR_TRANSITION_PREFIX = 'iosql_tzday_'
 def _pg_identifier(name):
     """带参数执行时的标识符引用：转义 % 避免 psycopg2 占位符插值误判。"""
     return _quote_sql_identifier(name).replace('%', '%%')
+
+
+def _pg_identifier_sql(*names):
+    """仅用于传入 params 的 execute；限定标识符各段都需要转义百分号。"""
+    return sql.SQL('.'.join(_pg_identifier(name) for name in names))
+
+
+def _check_identifier_length(name):
+    """PostgreSQL 会静默截断超长名称，必须在创建或重命名前拒绝。"""
+    if len(str(name).encode('utf-8')) > _IDENTIFIER_MAX_BYTES:
+        raise BadArgument('PostgreSQL 表名和列名不能超过 63 个 UTF-8 字节，请使用较短名称')
 
 
 def _rewrite_placeholders(sql_text):
@@ -137,6 +148,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             partition_mode: 'native' for native PostgreSQL partitioning, 'file' for file-per-partition
             partition: Partition object for data partitioning
         """
+        _check_identifier_length(table_name)
         self._uri = uri
         self._table_name = table_name
         self._uri_schema, self._uri_options = parse_db_schema(uri)
@@ -170,8 +182,18 @@ class Table(PostgreSQLQueryMixin, BaseTable):
     def connect(self):
         """Establish database connection."""
         if self._conn is None or self._conn.closed:
+            if getattr(self, '_iosql_migration_owned', False):
+                raise UnsafeOperation('迁移专用连接已断开，不能重连并绕过发布事务')
+            if self._in_explicit_tx:
+                self._finish_transaction(self._conn)
+                self._table_created = False
+                raise UnsafeOperation(
+                    'PostgreSQL 连接已断开，未提交事务已丢失；'
+                    '本次操作未执行，请明确重新开始事务'
+                )
             self._conn = psycopg2.connect(self._uri)
             self._conn.autocommit = True
+            self._schema = None
         return self._conn
 
     def _preflight_public_call(self, name, args, kwargs):
@@ -183,6 +205,8 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         partition = args[2] if len(args) > 2 else kwargs.get('partition')
         partition = partition if partition is not None else self._partition
         columns = dict(columns or {})
+        for name in columns:
+            _check_identifier_length(name)
         for type_ in columns.values():
             self._pg_column_type(type_)
         if any(column not in columns for column in pk or []):
@@ -219,21 +243,60 @@ class Table(PostgreSQLQueryMixin, BaseTable):
     
     def close(self):
         """Close database connection."""
-        if self._conn and not self._conn.closed:
-            if self._in_explicit_tx:
+        try:
+            if self._conn and not self._conn.closed:
                 try:
-                    self._conn.rollback()
-                except Exception:
-                    pass
-                self._in_explicit_tx = False
-            self._conn.close()
-        self._release_transaction_lease()
+                    if self._in_explicit_tx:
+                        try:
+                            self._conn.rollback()
+                        except Exception:
+                            pass
+                finally:
+                    self._conn.close()
+        finally:
+            if self._in_explicit_tx:
+                self._table_created = False
+            self._finish_transaction(self._conn)
 
     def _release_transaction_lease(self):
         held = getattr(self, '_iosql_transaction_lease', None)
         self._iosql_transaction_lease = None
         if held is not None:
             held.__exit__(None, None, None)
+
+    def _finish_transaction(self, conn):
+        """清除事务状态；恢复失败的连接不能继续用于后续自动提交操作。"""
+        self._in_explicit_tx = False
+        try:
+            if conn is not None and not conn.closed:
+                try:
+                    conn.autocommit = self._tx_previous_autocommit
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+        finally:
+            self._release_transaction_lease()
+
+    @staticmethod
+    def _rollback_connection(conn):
+        """连接失效后的 rollback/close 错误不能覆盖正在传播的主错误。"""
+        try:
+            conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _abort_transaction(self, conn):
+        """失败清理不得覆盖原错误，断开的连接也必须释放事务租约。"""
+        try:
+            self._rollback_connection(conn)
+        finally:
+            self._table_created = False
+            self._finish_transaction(conn)
 
     @contextmanager
     def _transaction(self, commit=True):
@@ -248,43 +311,26 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 raise BadArgument('迁移正式连接只能由发布器统一提交')
             yield conn
             return
-        if self._in_explicit_tx:
-            try:
-                yield conn
-            except BaseException:
-                conn.rollback()
-                self._in_explicit_tx = False
-                self._set_autocommit(conn, self._tx_previous_autocommit)
-                self._release_transaction_lease()
-                raise
+        try:
+            if not self._in_explicit_tx:
+                self._tx_previous_autocommit = conn.autocommit
+                # 开始事务不能吞掉属性设置错误，否则会把 commit=False 当成自动提交。
+                conn.autocommit = False
+                self._in_explicit_tx = True
+                if not commit:
+                    from ...coordination import lease
+                    pending = lease(self._uri)
+                    pending.__enter__()
+                    self._iosql_transaction_lease = pending
+            yield conn
             if commit:
                 conn.commit()
-                self._in_explicit_tx = False
-                self._set_autocommit(conn, self._tx_previous_autocommit)
-                self._release_transaction_lease()
-            return
-
-        previous_autocommit = conn.autocommit
-        self._set_autocommit(conn, False)
-        self._in_explicit_tx = True
-        self._tx_previous_autocommit = previous_autocommit
-        if not commit:
-            from ...coordination import lease
-            pending = lease(self._uri)
-            pending.__enter__()
-            self._iosql_transaction_lease = pending
-        try:
-            yield conn
         except BaseException:
-            conn.rollback()
-            self._in_explicit_tx = False
-            self._set_autocommit(conn, previous_autocommit)
-            self._release_transaction_lease()
+            self._abort_transaction(conn)
             raise
-        if commit:
-            conn.commit()
-            self._in_explicit_tx = False
-            self._set_autocommit(conn, previous_autocommit)
+        else:
+            if commit:
+                self._finish_transaction(conn)
 
     @staticmethod
     def _set_autocommit(conn, value):
@@ -390,6 +436,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             raise BadArgument('table name must not be empty')
         if '\x00' in value or '.' in value:
             raise BadArgument(f'invalid table name: {name}')
+        _check_identifier_length(value)
         return value
 
     def _relation_exists(self, name):
@@ -801,21 +848,28 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             self.create_table(column_types, pk=pk, partition=partition)
 
         partitioned_data = None
+        rows_written = 0
         # 整批写入放在一个显式事务中：失败不留半批脏数据
         with self._transaction(commit):
             if partition is not None:
                 self._lock_partition_layout()
                 # 持有父表原生锁，使绕过 iosql 的并发 DDL 不能穿过布局检查。
                 with self.connect().cursor() as cursor:
-                    cursor.execute(sql.SQL('LOCK TABLE ONLY {} IN ROW EXCLUSIVE MODE').format(
-                        sql.Identifier(self._schema_name(), self._table_name)))
+                    try:
+                        cursor.execute(sql.SQL('LOCK TABLE ONLY {} IN SHARE UPDATE EXCLUSIVE MODE').format(
+                            sql.Identifier(self._schema_name(), self._table_name)))
+                    except psycopg2.errors.InsufficientPrivilege as exc:
+                        raise TableSpecConflict(
+                            '分区写入需要表级 UPDATE、DELETE 或 TRUNCATE 权限之一以锁定布局；'
+                            '请联系表所有者授权，避免并发 ATTACH/DETACH 穿过校验'
+                        ) from exc
                 children = self._inspect_native_layout(partition)
                 self._check_partition_marker(partition, children)
                 self._check_control_partition(partition, children, update=True)
                 self._ensure_partition_marker(partition, children)
             if partition is None:
                 # No partitioning - insert all into single table
-                self._insert_into_table(
+                rows_written = self._insert_into_table(
                     data,
                     self._table_name,
                     pk=pk,
@@ -834,7 +888,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 for part_key, part_rows in partitioned_data.items():
                     self._check_legacy_transition_overlap(partition, part_key, part_rows, children)
                     self._repair_legacy_calendar_boundaries(partition, part_key, part_rows, children)
-                    self._insert_partition(
+                    rows_written += self._insert_partition(
                         part_key,
                         part_rows,
                         partition,
@@ -845,7 +899,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                     )
         return WriteResult(
             rows_seen=len(data),
-            rows_written=None if ignore else len(data),
+            rows_written=None if ignore else rows_written,
             partitions_touched=(
                 list(partitioned_data)
                 if partitioned_data is not None
@@ -938,7 +992,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                            replace=False, ignore=False):
         """Insert data into a specific table (multi-row VALUES 分页批量)。"""
         if not data:
-            return
+            return 0
 
         if replace and not pk:
             raise BadArgument('PostgreSQL replace/upsert requires primary key')
@@ -948,29 +1002,49 @@ class Table(PostgreSQLQueryMixin, BaseTable):
 
         columns = self._union_columns(data)
         col_identifiers = ', '.join(_pg_identifier(col) for col in columns)
+        casts = None
+        ordinal = '__iosql_ordinal'
+        if replace:
+            types = self._column_types()
+            casts = [_PG_TYPE_MAP.get(str(types.get(col, '')).strip().lower()) for col in columns]
+            if any(col in types and cast is None for col, cast in zip(columns, casts)):
+                # 低层接口可写已有原生表；目录返回的类型名已按 SQL 标识符规则引用。
+                cursor.execute('''SELECT attname, format_type(atttypid, atttypmod)
+                                  FROM pg_attribute WHERE attrelid=to_regclass(%s)
+                                    AND attnum>0 AND NOT attisdropped''',
+                               (self._qualified_relation(),))
+                physical_types = dict(cursor.fetchall())
+                casts = [physical_types.get(col) for col in columns]
+            while ordinal in columns:
+                ordinal += '_'
         param_rows = [
             [row.get(col) for col in columns]
             for row in data
         ]
         page_size = max(1, _INSERT_MAX_PARAMS // max(1, len(columns)))
+        rows_written = 0
 
         for start in range(0, len(param_rows), page_size):
             page = param_rows[start:start + page_size]
-            values_sql = ', '.join(
-                '(' + ', '.join(['%s'] * len(columns)) + ')'
-                for _ in page
-            )
-            insert_sql = (
-                f'INSERT INTO {_pg_identifier(table_name)} '
-                f'({col_identifiers}) VALUES {values_sql}'
-            )
+            insert_sql = f'INSERT INTO {_pg_identifier(table_name)} ({col_identifiers}) '
             if replace:
+                # SQL 类型归一后去重；同页按最后输入行覆盖，跨页按顺序覆盖。
+                # 不能仅比较 Python 主键，例如 1 与 '1' 在 BIGINT 列中属于同一行。
+                placeholders = ', '.join(
+                    '%s::' + cast.replace('%', '%%') if cast else '%s' for cast in casts)
+                values_sql = ', '.join(f'({placeholders}, {index})' for index in range(len(page)))
+                conflict_cols = ', '.join(_pg_identifier(col) for col in pk)
+                insert_sql += (
+                    f'SELECT DISTINCT ON ({conflict_cols}) {col_identifiers} '
+                    f'FROM (VALUES {values_sql}) AS incoming '
+                    f'({col_identifiers}, {_pg_identifier(ordinal)}) '
+                    f'ORDER BY {conflict_cols}, {_pg_identifier(ordinal)} DESC'
+                )
                 update_parts = [
                     f'{_pg_identifier(col)} = EXCLUDED.{_pg_identifier(col)}'
                     for col in columns
                     if col not in pk
                 ]
-                conflict_cols = ', '.join(_pg_identifier(col) for col in pk)
                 if update_parts:
                     insert_sql += (
                         f' ON CONFLICT ({conflict_cols}) DO UPDATE SET '
@@ -978,17 +1052,23 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                     )
                 else:
                     insert_sql += f' ON CONFLICT ({conflict_cols}) DO NOTHING'
-            elif ignore:
-                insert_sql += ' ON CONFLICT DO NOTHING'
+            else:
+                values_sql = ', '.join(
+                    '(' + ', '.join(['%s'] * len(columns)) + ')' for _ in page)
+                insert_sql += f'VALUES {values_sql}'
+                if ignore:
+                    insert_sql += ' ON CONFLICT DO NOTHING'
 
             flat_params = [value for row in page for value in row]
             cursor.execute(insert_sql, flat_params)
+            rows_written += cursor.rowcount
+        return rows_written
     
     def _insert_partition(self, part_key, data: List[Dict], partition: Partition,
                          pk=None,
                          replace=False, ignore=False, children=None):
         """Insert data into a specific native partition."""
-        self._insert_into_native_partition(
+        return self._insert_into_native_partition(
             part_key,
             data,
             partition,
@@ -1018,8 +1098,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
         # 旧版或外部创建的子表可能使用不同名称；边界一致时交给父表路由。
         if any(child['bounds'] == (start_bound, end_bound) and child['legacy_bounds'] is None
                for child in children or []):
-            self._insert_into_table(data, self._table_name, pk=pk, replace=replace, ignore=ignore)
-            return
+            return self._insert_into_table(data, self._table_name, pk=pk, replace=replace, ignore=ignore)
         existing_bound = self._existing_partition_bounds(partition_name)
         if (existing_bound is not None and
                 not self._partition_bounds_equal(existing_bound, start_bound, end_bound, partition=partition) and
@@ -1043,8 +1122,8 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 'CREATE TABLE {} PARTITION OF {} '
                 'FOR VALUES FROM ({}) TO ({})'
             ).format(
-                sql.Identifier(partition_name),
-                sql.Identifier(self._table_name),
+                _pg_identifier_sql(partition_name),
+                _pg_identifier_sql(self._table_name),
                 sql.Placeholder(),
                 sql.Placeholder()
             )
@@ -1066,7 +1145,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 ) from exc
         
         # Insert through the parent so PostgreSQL routes and enforces parent constraints.
-        self._insert_into_table(
+        return self._insert_into_table(
             data,
             self._table_name,
             pk=pk,
@@ -1280,13 +1359,15 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 if latest is None or latest['legacy_bounds'] != child['legacy_bounds']:
                     raise TableSpecConflict('历史分区布局在检查时发生变化，请重试或迁移到新表')
                 cursor.execute(sql.SQL('SELECT EXISTS (SELECT 1 FROM ONLY {} WHERE {} >= %s)').format(
-                    child_name, sql.Identifier(partition.TS_COL)), (clipped_end,))
+                    _pg_identifier_sql(child['schema'], child['name']),
+                    _pg_identifier_sql(partition.TS_COL)), (clipped_end,))
                 if cursor.fetchone()[0]:
                     raise TableSpecConflict('历史跨年分区包含越界数据，无法自动调整；请使用 migrate_to 迁移')
                 try:
                     cursor.execute(sql.SQL('ALTER TABLE {} DETACH PARTITION {}').format(parent, child_name))
                     cursor.execute(sql.SQL('ALTER TABLE {} ATTACH PARTITION {} FOR VALUES FROM (%s) TO (%s)').format(
-                        parent, child_name), (start, clipped_end))
+                        _pg_identifier_sql(self._schema_name(), self._table_name),
+                        _pg_identifier_sql(child['schema'], child['name'])), (start, clipped_end))
                 except psycopg2.Error as exc:
                     raise TableSpecConflict(
                         '无法安全调整历史跨年分区；事务将回滚，请检查表权限或使用 migrate_to 迁移'
@@ -1559,11 +1640,11 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             return
 
         previous_autocommit = conn.autocommit
-        self._set_autocommit(conn, False)
+        conn.autocommit = False
         try:
             yield from _iterate()
         except BaseException as exc:
-            conn.rollback()
+            self._rollback_connection(conn)
             if timeout_ms is not None and getattr(exc, 'pgcode', None) == '57014':
                 raise TimeoutError(
                     'PostgreSQL query exceeded timeout_ms budget'
@@ -1988,20 +2069,15 @@ class Table(PostgreSQLQueryMixin, BaseTable):
             raise BadArgument('upsert_all requires primary key')
         data = list(kv_list)
         self._union_columns(data)
-        merged = {}
         for row in data:
             missing = [column for column in pk if column not in row or row[column] is None]
             if missing:
                 raise BadArgument(f'upsert_all 缺少非空主键字段: {missing}')
-            key = tuple(row[column] for column in pk)
-            merged[key] = {**merged.get(key, {}), **row}
-        # 仅在输入规模内合并重复主键；不同字段集合分开 SQL，缺字段保留旧值。
-        groups = {}
-        for row in merged.values():
-            groups.setdefault(tuple(sorted(row)), []).append(row)
+        # 仅合并连续的相同字段集合，不能按 Python 原始键全局重排：
+        # 不同表示可能在 PostgreSQL 中属于同一主键，仍须按输入顺序覆盖字段。
         with self._transaction(commit):
-            for rows in groups.values():
-                self.insert_all(rows, pk=pk, replace=True, partition=partition,
+            for _, rows in itertools.groupby(data, key=lambda row: tuple(sorted(row))):
+                self.insert_all(list(rows), pk=pk, replace=True, partition=partition,
                                 commit=False, **kwargs)
 
     def delete(self, where):
@@ -2028,23 +2104,21 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                 '删除全表请显式调用 delete_all()'
             )
 
-        conn = self.connect()
-        cursor = conn.cursor()
         query = sql.SQL('DELETE FROM {} WHERE {}').format(
-            sql.Identifier(self._table_name),
+            _pg_identifier_sql(self._table_name),
             sql.SQL(where_sql),
         )
-        cursor.execute(query, params)
-        return cursor.rowcount
+        with self._transaction(not getattr(self, '_iosql_migration_owned', False)) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(query, params)
+                return cursor.rowcount
     
     def delete_all(self):
         """Delete all rows (explicit full-table delete)."""
-        conn = self.connect()
-        cursor = conn.cursor()
-        cursor.execute(
-            sql.SQL('DELETE FROM {}').format(sql.Identifier(self._table_name))
-        )
-        return cursor.rowcount
+        with self._transaction(not getattr(self, '_iosql_migration_owned', False)) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql.SQL('DELETE FROM {}').format(sql.Identifier(self._table_name)))
+                return cursor.rowcount
     
     def _index_columns(self, column, columns):
         """统一单列/复合列声明；列顺序就是索引定义。"""
@@ -2116,7 +2190,7 @@ class Table(PostgreSQLQueryMixin, BaseTable):
                                       for name in names),
                 ))
                 cursor.execute(sql.SQL('COMMENT ON INDEX {} IS %s').format(
-                    sql.Identifier(index_name)), (self._index_marker(names),))
+                    _pg_identifier_sql(index_name)), (self._index_marker(names),))
 
     def _index_name(self, column):
         names = [column] if isinstance(column, str) else list(column)

@@ -40,3 +40,5 @@
 | 2026-11-15 02:01 | [PostgreSQL 环境变量密码独立示例](PLAN-20261115-003-model-unknown-postgresql-env-example.md) / [结果](PLAN-20261115-003-model-unknown-postgresql-env-example-OUTCOME.md) | 已完成（WORKTREE） | 独立环境变量示例和技能同步，SCRAM 认证及示例回归通过。 |
 | 2026-11-15 02:33 | [修复全部示例检查问题](PLAN-20261115-004-model-unknown-example-review-fixes.md) | 实施中 | 修复数据清理、并发、流式读取、诊断、凭据、跨平台和单文件说明，并同步 skill。 |
 | 2026-11-15 02:57 | [修复全部示例检查问题](PLAN-20261115-004-model-unknown-example-review-fixes.md) / [结果](PLAN-20261115-004-model-unknown-example-review-fixes-OUTCOME.md) | 已完成（WORKTREE） | 八项检查问题修复并同步 skill；隔离 PostgreSQL 和相关回归 154 通过、6 项 Windows 原机测试跳过。 |
+| 2026-11-15 15:53 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) | 实施中 | 修复五项已复现问题，覆盖事务失败、重复主键、文本精度及并发布局变更，并循环复审。 |
+| 2026-11-15 16:51 | [PostgreSQL 逻辑正确性循环审查与修复](PLAN-20261115-005-model-unknown-postgresql-correctness.md) / [结果](PLAN-20261115-005-model-unknown-postgresql-correctness-OUTCOME.md) | 已完成（WORKTREE） | 修复五项及事务、标识符等复审问题；最终全量 1599 通过、99 跳过，PG 专项 235 通过；权限变化和 CLI 兼容性待评估项已记录。 |

@@ -194,6 +194,8 @@ class FakeCursor:
         self.results = []
         self.fetchone_result = None
         self.itersize = None
+        # SQL 生成桩不模拟受影响行数；真实计数由 PostgreSQL 集成回归验证。
+        self.rowcount = 0
 
     def execute(self, query, params=None):
         self.executed.append((query, params))

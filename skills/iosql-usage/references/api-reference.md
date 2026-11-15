@@ -290,7 +290,12 @@ PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻�
 - `delete(where)` 参数化执行并返回删除行数；`where=None` 触发 `DeprecationWarning` 并转发 `delete_all()`，`[]`/`{}`/`""`/`0`/`False` 等 falsy 非 None 值抛 `BadArgument`（不再退化为全表删除）。
 - 列类型走封闭白名单（`blob→BYTEA`、`datetime→TIMESTAMP` 等）；未知类型抛 `BadArgument`，不会把用户字符串拼进 DDL。已有物理表缺契约列、或声明分区但表未分区时抛 `SchemaConflict`。
 - 字符串 `fields` 只接受 `*` 或标识符列表；含 SQL 语法直接抛 `BadArgument`。`select()` / `iter_select()` / `iter_select_batches()` 拒绝未知 kwargs。
-- `insert_all` 按整批行列并集取值、缺列补 `NULL`；`upsert_all` 仅更新输入字段、缺字段保留旧值，并按参数上限拆页；`commit=False` 会保持事务，后续 `commit=True` 的写入或 delete 提交，连接关闭时未提交事务回滚，失败整体回滚。
+- `insert_all` 按整批行列并集取值、缺列补 `NULL`；`upsert_all` 仅更新输入字段、缺字段保留旧值，并按参数上限拆页；`commit=False` 会保持事务，后续非空 `commit=True` 写入或 delete 提交，连接关闭时未提交事务回滚，SQL 失败整体回滚。COMMIT 时连接中断的结果可能不确定，先按主键查询确认，再决定是否重试。
+- `write(mode='upsert'/'replace')` 同主键取最后输入行，SQL 分页不改变最终结果；`upsert_all` 按连续相同字段集合执行，以保持 SQL 等价主键的字段覆盖顺序。交替字段集合可能产生更多 SQL。
+- SQL/提交失败会清理事务和共享租约；未提交事务因断线丢失时，首次重连抛 `UnsafeOperation` 且当前操作不执行，调用方确认后重新开始事务，库不自动重放。
+- 分区写入用父表 `SHARE UPDATE EXCLUSIVE` 锁保护布局；角色需具备表级 `UPDATE`、`DELETE` 或 `TRUNCATE` 权限之一（仅 `INSERT` 不足），不自动授权；首次固定分区摘要仍需所有者权限。普通 SELECT 不被该锁阻止。
+- calendar 文本时间使用统一格式；时间查询精度更细时，下界向上、上界向下对齐存储精度，保留直接作用于列的谓词及分区裁剪。
+- 表名、列名最长 63 个 UTF-8 字节；创建或重命名前拒绝超长名称，避免 PostgreSQL 静默截断导致不同逻辑表共用物理关系。
 - `order_by` 的 NULL 排序与 SQLite 一致：ASC → `NULLS FIRST`，DESC → `NULLS LAST`。
 - `upsert_all(..., where=...)` 的 `where` 为仅关键字参数且已废弃（忽略并告警）：upsert 以 pk 为身份通过 ON CONFLICT 增量合并输入字段。
 - `calendar(...)` 的 `timestamptz` 边界带 UTC 偏移；`table_parts()` 返回排序后的子分区关系名。

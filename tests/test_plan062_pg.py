@@ -368,6 +368,68 @@ class TestBatchKeysP1_2:
 
 
 class TestTransactionsP1_3:
+    def test_commit_failure_cleans_state_and_pending_lease(self, fake_pg, monkeypatch):
+        table = _make_table(fake_pg)
+        table.write({'symbol': 'A', 'ts': 1}, commit=False)
+
+        def fail_commit():
+            raise psycopg2.OperationalError('commit failed')
+
+        monkeypatch.setattr(fake_pg, 'commit', fail_commit)
+        with pytest.raises(psycopg2.OperationalError, match='commit failed'):
+            table.write({'symbol': 'B', 'ts': 2})
+        assert not table._in_explicit_tx
+        assert table._iosql_transaction_lease is None
+        assert fake_pg.autocommit is True
+
+    def test_rollback_failure_cannot_replace_write_error(self, fake_pg, monkeypatch):
+        table = _make_table(fake_pg)
+        original = fake_pg.cursor_obj.execute
+
+        def fail_insert(query, params=None):
+            if render_sql(query).lstrip().upper().startswith('INSERT'):
+                raise psycopg2.OperationalError('write disconnected')
+            return original(query, params)
+
+        def fail_rollback():
+            raise psycopg2.InterfaceError('connection already closed')
+
+        monkeypatch.setattr(fake_pg.cursor_obj, 'execute', fail_insert)
+        monkeypatch.setattr(fake_pg, 'rollback', fail_rollback)
+        with pytest.raises(psycopg2.OperationalError, match='write disconnected'):
+            table.write({'symbol': 'A', 'ts': 1}, commit=False)
+        assert fake_pg.closed
+        assert not table._in_explicit_tx
+        assert table._iosql_transaction_lease is None
+
+    def test_autocommit_switch_failure_prevents_insert(self, fake_pg, monkeypatch):
+        table = _make_table(fake_pg)
+        fake_pg.cursor_obj.executed.clear()
+        original = FakeConnection.__setattr__
+
+        def reject_manual_commit(self, name, value):
+            if name == 'autocommit' and value is False:
+                raise psycopg2.ProgrammingError('cannot start transaction')
+            return original(self, name, value)
+
+        monkeypatch.setattr(FakeConnection, '__setattr__', reject_manual_commit)
+        with pytest.raises(psycopg2.ProgrammingError, match='cannot start transaction'):
+            table.write({'symbol': 'A', 'ts': 1}, commit=False)
+        assert not _insert_statements(fake_pg.cursor_obj)
+        assert not table._in_explicit_tx
+        assert table._iosql_transaction_lease is None
+
+    def test_migration_connection_never_reconnects(self, fake_pg, monkeypatch):
+        from iosql.exception import UnsafeOperation
+
+        table = _make_table(fake_pg)
+        table._iosql_migration_owned = True
+        table._in_explicit_tx = True
+        fake_pg.close()
+        monkeypatch.setattr(pg_module.psycopg2, 'connect', lambda *a, **k: pytest.fail('不能重连'))
+        with pytest.raises(UnsafeOperation, match='迁移专用连接'):
+            table.connect()
+
     def test_write_commits_and_restores_autocommit(self, fake_pg):
         table = _make_table(fake_pg)
         fake_pg.cursor_obj.executed.clear()
