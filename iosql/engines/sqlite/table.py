@@ -17,7 +17,7 @@ from dataclasses import replace
 # from itertools import chain
 from collections import OrderedDict
 from contextlib import closing, contextmanager, nullcontext
-from functools import lru_cache
+from functools import lru_cache, partial
 
 import arrow
 from dateutil.tz import resolve_imaginary
@@ -66,8 +66,18 @@ from ...utils.mysqlite.connection_pool import (
 from ...utils.storage_identity import iosql_table_names, is_iosql_table
 
 # from mysqlite import Database as MyDatabase
-from ...utils.mysqlite.exception import DuplicateColumn, NoSuchColumn, NoSuchTable
-from ...utils.mysqlite.sql import normalize_sqlite_parameters, normalize_sqlite_value
+from ...utils.mysqlite.exception import NoSuchColumn, NoSuchTable
+from ...utils.mysqlite.sql import (
+    normalize_sqlite_parameters,
+    normalize_sqlite_value,
+    sqlite_column_definition,
+)
+from ...utils.sqlite_partition import (
+    sqlite_partition_column,
+    sqlite_partition_keys,
+    sqlite_partition_values,
+)
+from ...utils.sqlite_schema import sqlite_column_rules, sqlite_schema_rules
 from .const import (
     _DB_META_FILE,
     _DEFAULT_BATCH_SIZE,
@@ -126,6 +136,7 @@ _SQLITE_TYPE_ALIASES = {
 _TYPE_CHECK_SAMPLE_ROWS = 1000
 _IOSQL_METADATA_TABLE_NAME = "_iosql_metadata"
 _METADATA_UNSET = object()
+_SQLITE_PARTITION_ROUTING = "sqlite_partition_routing"
 
 
 def _canon_sqlite_type(type_):
@@ -135,52 +146,10 @@ def _canon_sqlite_type(type_):
 
 
 @lru_cache(maxsize=512)
-def _sqlite_parse_column_declaration(declaration, column):
-    """由 SQLite 区分类型与列约束，并读取该列的内置排序规则。"""
-    quoted = '"' + column.replace('"', '""') + '"'
-    try:
-        with closing(sqlite3.connect(':memory:')) as conn:
-            conn.execute('CREATE TABLE keys (' + quoted + ' ' + declaration + ')')
-            columns = conn.execute('PRAGMA table_info(keys)').fetchall()
-            if len(columns) != 1 or columns[0][1] != column:
-                raise BadArgument('SQLite 列声明包含额外的列')
-            type_name = columns[0][2]
-            conn.execute('CREATE INDEX key_index ON keys(' + quoted + ')')
-            collation = conn.execute('PRAGMA index_xinfo(key_index)').fetchone()[4].upper()
-    except (sqlite3.Error, TypeError, IndexError) as exc:
-        raise BadArgument(f'无法确认 SQLite 列声明: {declaration}') from exc
-    if collation not in ('BINARY', 'NOCASE', 'RTRIM'):
-        raise BadArgument(f'不支持 SQLite 列排序规则: {collation}')
-    return type_name, collation
-
-
-def _sqlite_column_declaration(type_, column=None):
-    # mysqlite 建表时未给出类型会使用 TEXT，而非 SQLite 的无类型列。
-    declaration = str(type_ or 'TEXT')
-    try:
-        return _sqlite_parse_column_declaration(declaration, '__iosql_value')
-    except BadArgument:
-        if column is None:
-            raise
-        return _sqlite_parse_column_declaration(declaration, str(column))
-
-
-def _sqlite_affinity(type_, column=None):
-    """按 SQLite 实际声明类型求亲和性，约束中的文本不参与判断。"""
-    value = _sqlite_column_declaration(type_, column)[0].upper()
-    if 'INT' in value:
-        return 'INTEGER'
-    if any(token in value for token in ('CHAR', 'CLOB', 'TEXT')):
-        return 'TEXT'
-    if not value or 'BLOB' in value:
-        return 'BLOB'
-    if any(token in value for token in ('REAL', 'FLOA', 'DOUB')):
-        return 'REAL'
-    return 'NUMERIC'
-
-
-def _sqlite_declared_collation(type_, column=None):
-    return _sqlite_column_declaration(type_, column)[1]
+def _sqlite_stats_column_rules(type_, column):
+    # 单列试建仅用于保守裁剪：依赖其他列的声明无法证明统计有效时扫描。
+    info = {column: {'name': column, 'type': type_}}
+    return sqlite_column_rules(info, (), (column,))[column]
 
 
 _SQLITE_NOCASE_TRANSLATION = str.maketrans(
@@ -303,7 +272,10 @@ class _LatestQuery:
         self._by = by
 
     def explain(self):
-        return self._table._build_query_plan(self._query_spec)
+        spec = self._query_spec
+        if self._table._normalize_symbols(spec.symbols) == []:
+            return QueryPlan(table=spec.table, columns=self._columns, order_by=spec.order_by)
+        return self._table._build_query_plan(spec)
 
     def to_list(self):
         return self._table._latest_rows(
@@ -856,7 +828,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         else:
             column_descriptions.update(contract.column_descriptions or {})
         column_descriptions.update(extended["column_descriptions"])
-        return replace(
+        contract = replace(
             contract,
             description=(
                 extended["description"]
@@ -873,6 +845,15 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 }
             ),
         )
+
+        if self._storage_engine == 'sqlite' and contract.partition:
+            # 仅绑定快照携带物理结构，序列化或重新声明时仍使用逻辑契约。
+            contract._partition_keys = partial(
+                sqlite_partition_keys,
+                column_info=self._schema_column_info(contract.columns, table_meta),
+                pk=tuple(contract.primary_key),
+            )
+        return contract
 
     def _read_extended_metadata(self):
         """读取 sidecar；旧库没有扩展表时视为没有新元信息。"""
@@ -1606,9 +1587,10 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 expected=expected, actual=actual,
             )
 
-    def _validate_partition_rows(self, ref, result):
-        contract = self.spec()
-        partition = contract.to_partition() if contract else None
+    def _validate_partition_rows(self, ref, result, *, partition=None):
+        if partition is None:
+            contract = self.spec()
+            partition = contract.to_partition() if contract else None
         if partition is None or not os.path.isfile(ref.path) or not self._is_safe_part_path(ref.path):
             return
         field = self._quote_identifier(partition.TS_COL)
@@ -1617,7 +1599,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             with self._part_db(ref.path, auto_commit=False) as db:
                 scope = db.get_connection() if hasattr(db, 'get_connection') else nullcontext(db.conn)
                 with scope as conn:
-                    cursor = conn.execute(f'SELECT {field} FROM {table_name}')
+                    cursor = conn.execute(f'SELECT {table_name}.{field} FROM {table_name}')
                     try:
                         while True:
                             rows = cursor.fetchmany(10_000)
@@ -1635,7 +1617,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
                     finally:
                         if cursor is not conn:
                             cursor.close()
-        except (BadArgument, UnsafeOperation, TypeError, ValueError, OSError, sqlite3.Error) as exc:
+        except (BadArgument, UnsafeOperation, TypeError, ValueError, OverflowError, OSError, sqlite3.Error) as exc:
             self._add_segment_issue(
                 result, ref, 'partition_validation_failed',
                 f'无法验证数据行的分区归属: {exc}',
@@ -1896,6 +1878,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
             spec.order_key, spec.time.name if spec.time else None,
             spec.partition.column if spec.partition else None, *spec.primary_key,
         ] if field))
+        rules = self._key_rules(order, spec)
         query = build_select_cases_query('data', '*', None, spec.columns)
         with tempfile.TemporaryDirectory(prefix='iosql-compact-') as directory:
             with closing(sqlite3.connect(os.path.join(directory, 'sort.sqlite3'))) as conn:
@@ -1904,7 +1887,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 conn.execute('PRAGMA cache_size=-4096')
                 conn.execute('CREATE TABLE rows (' + ','.join(
                     self._quote_identifier(column) + ' BLOB COLLATE ' +
-                    _sqlite_declared_collation(spec.columns.get(column), column)
+                    rules[column][1]
                     for column in columns) + ')')
                 insert = f'INSERT INTO rows ({quoted}) VALUES (' + ','.join('?' for _ in columns) + ')'
                 for ref in refs:
@@ -1925,18 +1908,18 @@ class Table(TimeseriesQueryMixin, BaseTable):
                         for row in batch:
                             yield dict(row)
 
-    def _compact_primary_key(self, row, primary_key, table_spec=None):
-        return self._stored_pk_key(row, primary_key, table_spec or self.spec())
+    def _compact_primary_key(self, row, primary_key, rules):
+        return self._stored_pk_key(row, primary_key, rules)
 
     def _compact_row_chunks(self, rows, primary_key, target_rows):
         current = []
         current_keys = set()
-        comparison_spec = self._pk_normalization_spec([], primary_key, self.spec(), {})
+        rules = self._key_rules(primary_key, self.spec())
         for row in rows:
             pk_value = None
             if primary_key:
                 try:
-                    pk_value = self._compact_primary_key(row, primary_key, comparison_spec)
+                    pk_value = self._compact_primary_key(row, primary_key, rules)
                 except KeyError as e:
                     raise MissingPrimaryKey(
                         f'compact row missing primary key column `{e.args[0]}`'
@@ -2352,7 +2335,6 @@ class Table(TimeseriesQueryMixin, BaseTable):
         table_spec = self.spec()
         if not table_spec:
             raise BadArgument('latest requires a TableSpec')
-        table_spec = self._pk_normalization_spec([], [], table_spec, {})
         symbol_column = table_spec.symbol_column
         if symbol_column is None and by is None:
             raise BadArgument(
@@ -2373,12 +2355,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if field not in table_spec.columns:
                 raise BadArgument(f'latest grouping field missing: {field}')
         requested_symbols = self._normalize_symbols(query_spec.symbols)
-        requested_symbol_keys = None
-        if requested_symbols is not None:
-            requested_symbol_keys = list(dict.fromkeys(self._normalize_comparison_keys(
-                [{symbol_column: value} for value in requested_symbols],
-                [symbol_column], table_spec,
-            )))
+        if requested_symbols == []:
+            return
+        group_rules = self._key_rules(group_fields, table_spec)
         latest_by_key = OrderedDict()
         time_column = self._query_time_column(table_spec).name
         order = [(time_column, 'desc')] + [
@@ -2387,22 +2366,26 @@ class Table(TimeseriesQueryMixin, BaseTable):
         sort_key = self._row_sort_key(self._parse_order_by(order))
         for row in self._iter_latest_candidates(query_spec, group_fields, order):
             # SQL 已按列亲和性和 collation 过滤 symbols；跨文件分组使用相同等价键。
-            key = self._stored_pk_key(row, group_fields, table_spec)
+            key = self._stored_pk_key(row, group_fields, group_rules)
             previous = latest_by_key.get(key)
             if previous is None or sort_key(row) < sort_key(previous):
                 latest_by_key[key] = row
 
         latest_by_key = OrderedDict(sorted(latest_by_key.items(), key=lambda item: sort_key(item[1])))
 
-        if requested_symbols is None:
-            latest_rows = list(latest_by_key.values())
-        else:
-            latest_rows = self._order_latest_rows_by_symbols(
-                latest_by_key,
-                requested_symbol_keys,
-                symbol_column,
-                group_fields,
+        latest_rows = list(latest_by_key.values())
+        if requested_symbols and len(requested_symbols) > 1 and symbol_column in group_fields:
+            symbol_index = group_fields.index(symbol_column)
+            symbols = tuple(dict.fromkeys(key[symbol_index] for key in latest_by_key))
+            ranks = self._latest_symbol_ranks(
+                requested_symbols, symbols, symbol_column, table_spec, group_rules,
             )
+            latest_rows = [
+                row for key, row in sorted(
+                    latest_by_key.items(),
+                    key=lambda item: ranks.get(item[0][symbol_index], len(requested_symbols)),
+                )
+            ]
         yield from self._project_columns(latest_rows, columns)
 
     def _iter_latest_candidates(self, query_spec, group_fields, order):
@@ -2438,24 +2421,16 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 f'latest grouping field missing from row: {missing}'
             )
 
-    def _order_latest_rows_by_symbols(
-        self,
-        latest_by_key,
-        requested_symbols,
-        symbol_column,
-        group_fields,
-    ):
-        if symbol_column not in group_fields:
-            return list(latest_by_key.values())
-
-        symbol_index = group_fields.index(symbol_column)
-        rows = []
-        for symbol in requested_symbols:
-            for key, row in latest_by_key.items():
-                if key[symbol_index] == symbol[0]:
-                    rows.append(row)
-        return rows
-
+    def _latest_symbol_ranks(self, requested, symbols, column, table_spec, rules):
+        if not symbols:
+            return {}
+        values = self._sqlite_key_values(
+            [{column: value} for value in requested], (column,), rules, comparison=True,
+        )
+        ranks = {}
+        for index, (value,) in enumerate(values):
+            ranks.setdefault(_sqlite_collation_key(value, rules[column][1]), index)
+        return ranks
 
     def _project_columns(self, rows, columns):
         fields = self._projection_fields(columns)
@@ -3260,6 +3235,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             return set()
         excluded = set()
         physical_types = self._physical_column_types(self.spec())
+        if not self._case_can_use_bounds(case, physical_types.get(case.field)):
+            return excluded
         for info in refs:
             stats = (info.stats or {}).get(case.field)
             if stats and self._stats_excludes_case(stats, case, physical_types):
@@ -3277,13 +3254,16 @@ class Table(TimeseriesQueryMixin, BaseTable):
         })
         return columns
 
+    def _case_can_use_bounds(self, case, type_):
+        return True
+
     def _stats_values_match_storage(self, type_, values, column=None):
         """无法证明统计值与存储值一致时禁止裁剪，包括历史 manifest。"""
         if self._storage_engine == 'sqlite':
             try:
-                if _sqlite_declared_collation(type_, column) != 'BINARY':
+                affinity, collation = _sqlite_stats_column_rules(type_, column)
+                if collation != 'BINARY':
                     return False
-                affinity = _sqlite_affinity(type_, column)
             except BadArgument:
                 return False
             if affinity == 'TEXT':
@@ -3364,6 +3344,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
         excluded = set()
         physical_types = self._physical_column_types(table_spec)
+        if not self._case_can_use_bounds(case, physical_types.get(case.field)):
+            return excluded
         for info in refs:
             bounds = (info.session_min, info.session_max)
             if (all(value is not None for value in bounds)
@@ -4080,6 +4062,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return (value is not None, value)
 
     def _excluded_parts_by_case(self, infos, case):
+        if case.value['type'] == 'variable':
+            return set()
         op, case_min, case_max = self._case_partition_range(case)
         if (getattr(self._partition, 'PARTITION_TYPE', None) == 'calendar'
                 and getattr(self._partition, 'time_unit', None) == 's'
@@ -4221,55 +4205,73 @@ class Table(TimeseriesQueryMixin, BaseTable):
             excluded_parts = excluded_parts.union(excluded)
         return excluded_parts
 
-    def _candidate_part_tokens_by_partition_cases(self, cases):
-        partition = self._partition
-        if partition is None:
-            spec = self.spec()
-            partition = spec.to_partition() if spec else None
-        if partition is None or not cases:
-            return None
-
+    def _candidate_part_tokens_by_partition_cases(self, partition, cases, affinity):
         candidates = None
         for case in cases:
-            if case.field != partition.TS_COL:
+            if case.field != partition.TS_COL or case.value['type'] == 'variable':
                 continue
-            case_tokens = self._candidate_part_tokens_for_case(partition, case)
+            case_tokens = self._candidate_part_tokens_for_case(partition, case, affinity)
             if case_tokens is None:
                 continue
             candidates = case_tokens if candidates is None else candidates & case_tokens
         return candidates
 
-    def _candidate_part_tokens_for_case(self, partition, case):
-        op = case.op
+    def _candidate_part_tokens_for_case(self, partition, case, affinity):
+        field = partition.TS_COL
         value = case.value['value']
-        try:
-            if op in ['eq', '==', '=']:
-                return {self._part_token(partition.get_key({partition.TS_COL: value}))}
-            if op == 'in':
-                return {
-                    self._part_token(partition.get_key({partition.TS_COL: item}))
-                    for item in value
-                }
-        except (KeyError, TypeError, ValueError):
+        if case.op in ('eq', '==', '='):
+            values = [value]
+        elif case.op == 'in':
+            values = value
+        else:
             return None
-        return None
+        try:
+            rows = [{field: item} for item in values]
+            if affinity is not None:
+                with closing(sqlite_partition_values(rows, field, affinity)) as stored:
+                    return {self._part_token(partition.get_key({field: item})) for item in stored}
+            return {self._part_token(partition.get_key(row)) for row in rows}
+        except (BadArgument, TypeError, ValueError, OverflowError, sqlite3.Error):
+            # 不可转换的查询参数仍由 SQL 判断，无法证明的情况保守扫描。
+            return None
 
     def _get_select_parts(self, cases):
-        """case And[Case..]"""
-        infos = self.get_part_column_ranges()
-        candidate_tokens = self._candidate_part_tokens_by_partition_cases(cases)
-        if cases:
-            excluded_parts = self._excluded_parts_by_cases(infos, cases)
-        else:
-            excluded_parts = set()
+        """按可证明的物理分区范围裁剪，完整的 SQL 谓词值保持原样。"""
         all_parts = self.table_parts()
-        need_parts = sorted(set(all_parts) - set(excluded_parts))
-        if candidate_tokens is not None:
-            need_parts = [
-                part for part in need_parts
-                if self._part_token(part) in candidate_tokens
-            ]
-        return need_parts
+        if not cases or not all_parts:
+            return all_parts
+
+        partition = self._partition
+        if partition is None:
+            spec = self.spec()
+            partition = spec.to_partition() if spec else None
+
+        candidate_tokens = None
+        if partition is not None and any(case.field == partition.TS_COL for case in cases):
+            field = partition.TS_COL
+            meta = self.get_table_meta()
+            info = ((meta or {}).get('column_info') or {}).get(field)
+            affinity = None
+            legacy = False
+            if info is not None and self._storage_engine == 'sqlite':
+                _, affinity, _ = sqlite_partition_column(
+                    [], field, meta['column_info'], meta['pk'],
+                )
+                legacy = self._legacy_partition_routing(partition, affinity, meta)
+            # 历史落盘位置或 SQL 的类型转换可能超出由原值推导的边界。
+            declaration = info.get('type') if info is not None else None
+            cases = [case for case in cases if case.field != field
+                     or (not legacy and self._case_can_use_bounds(case, declaration))]
+            candidate_tokens = self._candidate_part_tokens_by_partition_cases(
+                partition, cases, affinity,
+            )
+
+        infos = self.get_part_column_ranges() if cases else []
+        excluded = self._excluded_parts_by_cases(infos, cases)
+        return [
+            part for part in all_parts if part not in excluded
+            and (candidate_tokens is None or self._part_token(part) in candidate_tokens)
+        ]
 
     def _select_and_cases(self, fields, cases, column_types,
                           order_by_sql=None, limit=None):
@@ -4663,13 +4665,11 @@ class Table(TimeseriesQueryMixin, BaseTable):
 
     def _row_sort_key(self, specs):
         """构造对齐 SQLite 排序语义的 heap key 函数。"""
-        spec = self.spec()
-        columns = dict(spec.columns) if spec else {}
-        meta = self.get_table_meta()
-        columns.update({field: info.get('type')
-                        for field, info in ((meta or {}).get('column_info') or {}).items()})
-        comparisons = [(field, reverse, _sqlite_declared_collation(columns.get(field), field))
-                       for field, reverse in specs]
+        rules = self._key_rules((field for field, _ in specs), self.spec())
+        for field, _ in specs:
+            if field not in rules:
+                raise BadArgument(f'Unknown order_by field `{field}`')
+        comparisons = [(field, reverse, rules[field][1]) for field, reverse in specs]
         def key(row):
             return tuple(
                 _SqliteSortKey(self._row_sort_value(row, field)[1], reverse, collation)
@@ -4787,15 +4787,23 @@ class Table(TimeseriesQueryMixin, BaseTable):
         pk = [pk] if isinstance(pk, str) else list(pk)
         spec = self.spec()
         self._ensure_segment_conflict_supported(spec, 'replace')
-        self._reject_cross_partition_replace(partition or self._partition, pk)
+        runtime_partition = (
+            self._resolve_date_key_partition(partition, spec) if partition is not None
+            else spec.to_partition() if spec else self._partition
+        )
+        self._reject_cross_partition_replace(runtime_partition, pk)
+        meta = self.get_table_meta()
+        self._ensure_write_partition_compatible(runtime_partition, spec, meta=meta)
         # 只读取输入主键对应的行，避免一个键的修改物化并重写整张表。
-        data = self._rows_for_primary_keys(kv_list, pk, spec, partition or self._partition)
-
+        groups = (
+            self._group_partition_rows(kv_list, runtime_partition, pk, spec, meta, kwargs)
+            if runtime_partition else {None: kv_list}
+        )
         normalization_spec = self._pk_normalization_spec(kv_list, pk, spec, kwargs)
-        # 查询返回的是物理存储值，还需应用主键列的排序规则。
+        rules = self._key_rules(pk, normalization_spec)
         data = {
-            self._stored_pk_key(item, pk, normalization_spec): item
-            for item in data
+            self._stored_pk_key(item, pk, rules): item
+            for item in self._rows_for_primary_keys(groups, pk, normalization_spec, rules)
         }
         keys = self._normalize_pk_keys(kv_list, pk, normalization_spec)
         for key, dic in zip(keys, kv_list):
@@ -4814,13 +4822,9 @@ class Table(TimeseriesQueryMixin, BaseTable):
             **kwargs,
         )
 
-    def _rows_for_primary_keys(self, rows, pk, spec, partition):
+    def _rows_for_primary_keys(self, groups, pk, spec, rules):
         """按主键中的分区列直达文件，避免对每个键重复枚举整库分区。"""
-        groups = OrderedDict()
         known_parts = {self._part_token(part) for part in self.table_parts()}
-        for row in rows:
-            logical_part = partition.get_key(row) if partition else None
-            groups.setdefault(logical_part, []).append(row)
         data = []
         for logical_part, group in groups.items():
             refs = []
@@ -4834,9 +4838,8 @@ class Table(TimeseriesQueryMixin, BaseTable):
             if not refs:
                 continue
             for start in range(0, len(group), 100):
-                query = build_select_primary_keys_query(
-                    'data', '*', group[start:start + 100], pk, spec.columns,
-                )
+                keys = self._storage_key_rows(group[start:start + 100], pk, rules)
+                query = build_select_primary_keys_query('data', '*', keys, pk, spec.columns)
                 for ref in refs:
                     with self._part_db(ref.path, auto_commit=False) as db:
                         data.extend(db['data'].query(query.sql, params=query.params, to_dict=True))
@@ -4954,113 +4957,110 @@ class Table(TimeseriesQueryMixin, BaseTable):
         commit=True,
         **kwargs,
     ):
-        # Use new partition system
-        _t0 = time.time()
-
-        # Determine which partition to use:
-        # 1. If partition is explicitly passed, use it
-        # 2. If _partition is already loaded from metadata, use it
-        # 3. If neither, no partitioning (single table)
-        part_obj = partition
-        if part_obj is None:
-            part_obj = self._partition
-        else:
-            part_obj = self._resolve_date_key_partition(part_obj, self.spec())
-
         table_spec = kwargs.get("table_contract") or kwargs.get("table_spec")
-        segment_spec = TableContract.ensure(table_spec) if table_spec is not None else None
-        use_segment = bool(segment_spec and segment_spec.segment)
+        contract = TableContract.ensure(table_spec) if table_spec is not None else None
+        use_segment = bool(contract and contract.segment)
         if use_segment and replace:
-            self._ensure_segment_conflict_supported(segment_spec, 'replace')
-
-        if part_obj is None:
-            # No partitioning - put all data in a single partition
-            logical_part = DEFAULT_LOGICAL_PART if use_segment else None
-            partitioned_data = {logical_part: data}
-        else:
-            # Partition data by key
-            partitioned_data = {}
-            for row in self._partition_storage_rows(data, part_obj, segment_spec, kwargs):
-                key = part_obj.get_key(row)
-                if key not in partitioned_data:
-                    partitioned_data[key] = []
-                partitioned_data[key].append(row)
-
-        _t1 = time.time()
-        logger.debug(f"Partition Time: {_t1 - _t0}")
-
-        # Get ts_col for range calculation (needed for metadata)
-        ts_col = part_obj.TS_COL if part_obj else None
-        segment_kwargs = dict(kwargs)
-        segment_kwargs.pop("table_contract", None)
-        segment_kwargs.pop("table_spec", None)
+            self._ensure_segment_conflict_supported(contract, 'replace')
 
         with self._mutation_lock():
-            self._ensure_write_partition_compatible(part_obj, segment_spec)
-            for part_key, part_data in partitioned_data.items():
-                if use_segment:
-                    self._do_insert_segmented(
-                        part_key,
-                        ts_col,
-                        part_data,
-                        pk,
-                        partition=part_obj,
-                        replace=replace,
-                        ignore=ignore,
-                        commit=commit,
-                        table_spec=segment_spec,
-                        **segment_kwargs,
-                    )
-                else:
-                    self._do_insert_part(
-                        part_key,
-                        ts_col,
-                        part_data,
-                        pk,
-                        partition=part_obj,
-                        replace=replace,
-                        ignore=ignore,
-                        commit=commit,
-                        **kwargs,
-                    )
-        _t2 = time.time()
-        logger.debug(f"Insert Time: {_t2 - _t1}")
-        keys = list(partitioned_data)
-        return keys if len(keys) <= 1 else sorted(keys)
+            meta = self.get_table_meta()
+            part_obj = partition if partition is not None else self._partition
+            if part_obj is None and meta and meta.get('partition'):
+                part_obj = Partition.from_meta(meta['partition'])
+            if part_obj is not None:
+                part_obj = self._resolve_date_key_partition(part_obj, self.spec())
+            self._ensure_write_partition_compatible(part_obj, contract, meta=meta)
+            if replace:
+                self._reject_cross_partition_replace(part_obj, pk)
 
-    def _partition_storage_rows(self, rows, partition, table_spec, write_kwargs):
-        """按物理存储值路由，避免 REAL 舍入等亲和性转换跨越分区边界。"""
-        if self._storage_engine != 'sqlite':
-            return rows
+            if part_obj is None:
+                logical_part = DEFAULT_LOGICAL_PART if use_segment else None
+                partitioned_data = {logical_part: data}
+            else:
+                partitioned_data = self._group_partition_rows(data, part_obj, pk, contract, meta, kwargs)
+
+            insert = self._do_insert_segmented if use_segment else self._do_insert_part
+            if use_segment:
+                kwargs.pop("table_contract", None)
+                kwargs["table_spec"] = contract
+            for part_key, rows in partitioned_data.items():
+                insert(
+                    part_key,
+                    part_obj.TS_COL if part_obj else None,
+                    rows,
+                    pk,
+                    partition=part_obj,
+                    replace=replace,
+                    ignore=ignore,
+                    commit=commit,
+                    **kwargs,
+                )
+        return sorted(partitioned_data) if len(partitioned_data) > 1 else list(partitioned_data)
+
+    @staticmethod
+    def _schema_column_info(columns, meta):
+        info = {name: {'name': name, 'type': declaration}
+                for name, declaration in columns.items()}
+        info.update((meta or {}).get('column_info') or {})
+        return info
+
+    def _group_partition_rows(self, rows, partition, pk, contract, meta, write_kwargs):
         field = partition.TS_COL
-        columns = dict(table_spec.columns if table_spec else {})
-        columns.update(write_kwargs.get('column_type') or {})
-        meta = self.get_table_meta()
-        columns.update({column: info.get('type')
-                        for column, info in ((meta or {}).get('column_info') or {}).items()})
-        if field not in columns:
-            columns = self.suggest_column_types(
-                rows, column_type=columns,
-                n_suggest_check=write_kwargs.get('n_suggest_check', _DEFAULT_N_SUGGEST_CHECK),
-            )
-        affinity = _sqlite_affinity(columns.get(field), field)
-        with closing(sqlite3.connect(':memory:')) as conn:
-            conn.execute(f'CREATE TABLE routing (value {affinity})')
-            conn.executemany('INSERT INTO routing VALUES (?)',
-                             [(normalize_sqlite_value(row[field]),) for row in rows])
-            values = [item[0] for item in conn.execute('SELECT value FROM routing ORDER BY rowid')]
-        normalized = []
-        for row, value in zip(rows, values):
-            original = normalize_sqlite_value(row[field])
-            # 分区 API 显式拒绝 bool，不能由亲和性转换绕过该校验。
-            if isinstance(original, bool):
-                value = original
-            normalized.append({**row, field: value})
-        return normalized
+        groups = {}
+        if self._storage_engine != 'sqlite':
+            for row in rows:
+                groups.setdefault(partition.get_key(row), []).append(row)
+            return groups
 
-    def _ensure_write_partition_compatible(self, partition, declared_contract=None):
+        columns = dict(contract.columns) if contract else {}
+        columns.update(write_kwargs.get('column_type') or {})
+        info = self._schema_column_info(columns, meta)
+        pk = [pk] if isinstance(pk, str) else pk or []
+        declaration, affinity, inferred = sqlite_partition_column(
+            rows, field, info, pk, write_kwargs.get('n_suggest_check', _DEFAULT_N_SUGGEST_CHECK),
+        )
+        if inferred:
+            # 让各分区采用选址时的同一类型，避免各文件独立推断。
+            columns[field] = declaration
+            write_kwargs['column_type'] = columns
+
+        values = sqlite_partition_values(rows, field, affinity, reject_inexact=inferred and field in pk)
+        with closing(values):
+            for row, value in zip(rows, values):
+                key = partition.get_key(row if value is row[field] else {field: value})
+                groups.setdefault(key, []).append(row)
+        self._confirm_partition_routing(partition, affinity, meta)
+        return groups
+
+    @staticmethod
+    def _legacy_partition_routing(partition, affinity, meta):
+        if not meta or meta.get(_SQLITE_PARTITION_ROUTING) == 1:
+            return False
+        if partition.PARTITION_TYPE in ('range', 'duration'):
+            return affinity in ('REAL', 'TEXT')
+        return affinity != 'BLOB' and not (
+            affinity == 'TEXT' and getattr(partition, 'time_unit', None) == 'date'
+        )
+
+    def _confirm_partition_routing(self, partition, affinity, meta):
+        if not self._legacy_partition_routing(partition, affinity, meta):
+            return
+        result = SegmentValidationResult(table=self._table_name, deep=True)
+        for ref in self._physical_part_refs(lightweight=True):
+            self._ensure_ref_file_present(ref)
+            self._validate_partition_rows(ref, result, partition=partition)
+            if not result.ok:
+                raise TableSpecConflict(
+                    f'历史分区 {ref.logical_part!r} 无法按物理键继续写入。'
+                    '请先运行 validate(deep=True) 检查，再用 repartition_to() 迁移到新表'
+                )
+        self._overwrite_table_meta({**meta, _SQLITE_PARTITION_ROUTING: 1})
+
+    def _ensure_write_partition_compatible(self, partition, declared_contract=None, *, meta=_METADATA_UNSET):
         """锁内检查持久布局及尚未落盘的声明，不能由低层写入覆盖。"""
-        meta = self.get_table_meta()
+        if meta is _METADATA_UNSET:
+            meta = self.get_table_meta()
         if meta is not None:
             previous = meta.get('partition')
         elif self._declared_spec is not None or declared_contract is not None:
@@ -5111,6 +5111,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
         # 批内先按持久类型去重，随后每文件、每组键一次查询；新增行统一 append。
         normalization_spec = self._pk_normalization_spec(rows, pk, table_spec, part_kwargs)
         normalized = self._unique_pk_rows(rows, pk, normalization_spec)
+        rules = self._key_rules(pk, normalization_spec)
         existing_keys = set()
         known_parts = {self._part_token(part) for part in self.table_parts()}
         refs = []
@@ -5123,13 +5124,12 @@ class Table(TimeseriesQueryMixin, BaseTable):
         for start in range(0, len(normalized), 100):
             chunk = normalized[start:start + 100]
             if refs:
-                query = build_select_primary_keys_query(
-                    'data', pk, [row for _, row in chunk], pk, normalization_spec.columns,
-                )
+                keys = self._storage_key_rows([row for _, row in chunk], pk, rules)
+                query = build_select_primary_keys_query('data', pk, keys, pk, normalization_spec.columns)
             for ref in refs:
                 with self._part_db(ref.path, auto_commit=False) as db:
                     for row in db['data'].query(query.sql, params=query.params):
-                        existing_keys.add(self._stored_pk_key(row, pk, normalization_spec))
+                        existing_keys.add(self._stored_pk_key(row, pk, rules))
         pending = [row for key, row in normalized if key not in existing_keys]
         if pending:
             self._append_segment_rows(
@@ -5168,42 +5168,49 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 unique.append((key, row))
         return unique
 
-    def _stored_pk_key(self, row, pk, table_spec):
-        """应用 SQLite 内置列排序规则，供输入键和物理存储键共用。"""
-        values = []
-        for field in pk:
-            value = row[field]
-            if self._storage_engine == 'sqlite':
-                collation = _sqlite_declared_collation(table_spec.columns.get(field), field)
-                value = _sqlite_collation_key(value, collation)
-            values.append(value)
-        return tuple(values)
+    def _key_rules(self, fields, table_spec):
+        fields = tuple(fields)
+        if self._storage_engine != 'sqlite' or not fields:
+            return {}
+        meta = self.get_table_meta()
+        if meta and all(field in meta['column_info'] for field in fields):
+            info = meta['column_info']
+        else:
+            info = self._schema_column_info(table_spec.columns if table_spec else {}, meta)
+        pk = meta['pk'] if meta else table_spec.primary_key if table_spec else ()
+        return sqlite_column_rules(info, pk, fields)
+
+    def _stored_pk_key(self, row, pk, rules):
+        return tuple(_sqlite_collation_key(row[field], rules.get(field, (None, 'BINARY'))[1])
+                     for field in pk)
+
+    def _storage_key_rows(self, rows, pk, rules):
+        # 以实际写入值查找冲突目标。例如 REAL 写入舍入后仍须保留目标行的其他字段。
+        if not rules or not any(rules[field][0] == 'REAL' for field in pk):
+            return rows
+        return [dict(zip(pk, item)) for item in self._sqlite_key_values(rows, pk, rules)]
 
     def _normalize_pk_keys(self, rows, pk, table_spec):
         """归一输入主键的持久类型，供批量 ignore 与局部 upsert 共用。"""
-        with closing(sqlite3.connect(':memory:')) as conn:
-            fields = [f'k{i}' for i in range(len(pk))]
-            definitions = [
-                f'{field} {_sqlite_affinity(table_spec.columns.get(column), column)}'
-                for field, column in zip(fields, pk)
-            ]
-            conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ', ordinal INTEGER)')
-            conn.executemany('INSERT INTO keys VALUES (' +
-                             ','.join('?' for _ in range(len(pk) + 1)) + ')',
-                             [tuple(normalize_sqlite_value(row[field]) for field in pk) + (i,)
-                              for i, row in enumerate(rows)])
-            return [self._stored_pk_key(dict(zip(pk, item[:-1])), pk, table_spec)
-                    for item in conn.execute('SELECT * FROM keys ORDER BY ordinal')]
+        rules = self._key_rules(pk, table_spec)
+        values = self._sqlite_key_values(rows, pk, rules)
+        return [self._stored_pk_key(dict(zip(pk, item)), pk, rules) for item in values]
 
-    def _normalize_comparison_keys(self, rows, fields, table_spec):
-        """比较亲和性不强制 REAL 舍入，避免把不匹配的整数请求合并。"""
-        if self._storage_engine == 'sqlite':
-            columns = dict(table_spec.columns)
-            for field in fields:
-                if _sqlite_affinity(columns.get(field), field) == 'REAL':
-                    columns[field] = 'NUMERIC COLLATE ' + _sqlite_declared_collation(columns[field], field)
-            table_spec = replace(table_spec, columns=columns)
-        return self._normalize_pk_keys(rows, fields, table_spec)
+    @staticmethod
+    def _sqlite_key_values(rows, fields, rules, *, comparison=False):
+        with closing(sqlite3.connect(':memory:')) as conn:
+            affinities = [rules[field][0] for field in fields]
+            # REAL 比较应用数值亲和性，整数请求不会被强制转为浮点。
+            if comparison:
+                affinities = ['NUMERIC' if affinity == 'REAL' else affinity for affinity in affinities]
+            definitions = [f'k{i} {affinity}' for i, affinity in enumerate(affinities)]
+            conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ')')
+            placeholders = ','.join('?' for _ in fields)
+            conn.executemany(
+                f'INSERT INTO keys VALUES ({placeholders})',
+                (tuple(normalize_sqlite_value(row[field]) for field in fields) for row in rows),
+            )
+            return conn.execute('SELECT * FROM keys ORDER BY rowid').fetchall()
 
     def _do_insert_part(
         self,
@@ -5278,18 +5285,7 @@ class Table(TimeseriesQueryMixin, BaseTable):
                     # evolve 语义一：新分区文件必须包含存量全部列，
                     # 相对存量的新列补齐到旧分区，保证旧分区缺失列读为 NULL
                     #（否则 SQLite 双引号字面量会把缺失列静默变成字符串）
-                    fresh_types = {
-                        col: type_
-                        for col, type_ in data_suggested_types.items()
-                        if col not in current_meta["column_info"]
-                    }
-                    new_column_info = current_meta["column_info"]
-                    for col, item in createtable_meta["column_info"].items():
-                        if col not in new_column_info:
-                            new_column_info[col] = item
-                    createtable_meta["column_info"] = new_column_info
-                    if fresh_types:
-                        self._add_columns_for_all_partitions(fresh_types)
+                    self._evolve_sqlite_columns(current_meta, createtable_meta)
                 self._sync_contract_columns(createtable_meta)
 
                 # 确保表格建好后，才写meta，确保不删列(不支持)情况下，meta中有的信息, 表中都有
@@ -5326,20 +5322,11 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 data_suggested_types = self.suggest_column_types(
                     part_data, column_type=column_type, n_suggest_check=n_suggest_check
                 )
-                self._add_columns_for_all_partitions(data_suggested_types)
-
                 createtable_meta = build_createtable_meta(
                     data_suggested_types, pk=pk, partition=partition, **kwargs
                 )
-
-                # 数据库中没有的列增加，但已经有的，且insert数据没有的字段，并不会删除
-                # 所以要更新 createtable_meta
                 if current_meta:
-                    new_column_info = current_meta["column_info"]
-                    for col, item in createtable_meta["column_info"].items():
-                        if col not in new_column_info:
-                            new_column_info[col] = item
-                    createtable_meta["column_info"] = new_column_info
+                    self._evolve_sqlite_columns(current_meta, createtable_meta)
                 self._sync_contract_columns(createtable_meta)
 
                 # update meta
@@ -5358,6 +5345,10 @@ class Table(TimeseriesQueryMixin, BaseTable):
                 )
 
     def _update_meta(self, part_key, ts_col, partition, createtable_meta):
+        if self._storage_engine == 'sqlite' and partition is not None:
+            current = self.get_table_meta()
+            if current is None or current.get(_SQLITE_PARTITION_ROUTING) == 1:
+                createtable_meta[_SQLITE_PARTITION_ROUTING] = 1
         # 更新table创建的meta信息，直接覆盖
         # Store partition info in createtable_meta if it exists
         if partition is not None:
@@ -5594,27 +5585,55 @@ class Table(TimeseriesQueryMixin, BaseTable):
         return repartition(self, target_uri, table_name=table_name, spec=spec,
                            mode=mode, batch_size=batch_size)
 
-    def _add_columns_for_all_partitions(self, data_suggested_types):
-        """
-        params:
-            n_suggest_check 使用多少条数据检查类型
-        """
-        # createtable_meta = build_createtable_meta(data_suggested_types,
-        #                                          pk=pk,
-        #                                          partition=partition, **kwargs)
+    @staticmethod
+    def _validate_create_request(candidate):
+        sqlite_schema_rules(candidate['column_info'], candidate['pk'])
+        partition = candidate['partition']
+        if partition is not None:
+            partition = partition.to_meta()
+        try:
+            json.dumps({**candidate, 'partition': partition})
+        except (TypeError, ValueError) as exc:
+            raise BadArgument(f'无法保存 SQLite 建表元数据: {exc}') from exc
 
-        # 每个part都手动增加字段
-        for ref in self._physical_part_refs():
+    def _evolve_sqlite_columns(self, current_meta, candidate, *, manual=False, column_order=None):
+        existing = current_meta['column_info']
+        requested = candidate['column_info']
+        fresh = {name: item for name, item in requested.items()
+                 if name not in existing}
+        candidate['column_info'] = {**existing, **fresh}
+        if column_order and list(requested) != list(candidate['column_info']):
+            if self.table_parts():
+                raise SchemaConflict('SQLite 已有分区的列顺序只能在末尾追加，请迁移到新表以调整列顺序')
+            candidate['column_info'] = {name: existing.get(name, item) for name, item in requested.items()}
+        if fresh or manual:
+            self._validate_create_request(candidate)
+        if fresh:
+            self._add_columns_for_all_partitions(fresh)
+
+    def _add_columns_for_all_partitions(self, column_info):
+        refs = self._physical_part_refs(lightweight=True)
+        for ref in refs:
             self._ensure_ref_file_present(ref)
-            logger.info(f"Altering Table Schema: {ref.part_key} ..")
-            part_dbfile = self._get_part_dbfile(ref.part_key)
-            with self._part_db(part_dbfile, auto_commit=True) as part_db:
-                for column, type_ in data_suggested_types.items():
-                    try:
-                        part_db[_PART_DATA_TABLE_NAME].add_column(column, type_)
-                        logger.info(f"Added {column} {type_}")
-                    except DuplicateColumn:
-                        pass
+            self._alter_partition_columns(ref, column_info, preflight=True)
+        for ref in refs:
+            self._alter_partition_columns(ref, column_info, preflight=False)
+
+    def _alter_partition_columns(self, ref, column_info, *, preflight):
+        # 先在各文件的事务内试加列并回滚，覆盖实际存量数据和 SQLite ALTER 限制。
+        # 每次只借用一个连接，兼容连接预算为 1 的库。
+        try:
+            with self._part_db(ref.path, auto_commit=True) as db, db.transaction() as conn:
+                part_table = db[_PART_DATA_TABLE_NAME]
+                for name, info in column_info.items():
+                    part_table.add_column(name, sqlite_column_definition(info))
+                if preflight:
+                    conn.rollback()
+        except sqlite3.Error as exc:
+            raise SchemaConflict(
+                f'无法在已有分区 {ref.part_key!r} 新增列: {exc}。'
+                '请使用 SQLite 支持的 ADD COLUMN 定义，或迁移到新表'
+            ) from exc
 
     def suggest_column_types(self, data, column_type, n_suggest_check=None):
         return suggest_sqlite_column_types(
@@ -5807,28 +5826,35 @@ class Table(TimeseriesQueryMixin, BaseTable):
             base = current or (TableContract.ensure(declared) if declared is not None else TableContract())
             columns = dict(base.columns)
             columns.update(self.suggest_column_types([], column_type=column_type))
-            runtime_partition = partition if partition is not None else base.to_partition()
-            contract = replace(base, primary_key=pk, columns=columns, partition=runtime_partition)
+            runtime_partition = (
+                self._resolve_date_key_partition(partition, base) if partition is not None
+                else base.to_partition()
+            )
+            contract = self._date_key_contract(
+                replace(base, primary_key=pk, columns=columns, partition=runtime_partition)
+            )
             if set(contract.primary_key) - columns.keys():
                 raise BadArgument('create_table 的主键必须包含在 columns 中')
             if current:
                 self._ensure_spec_compatible(current, contract)
             self._ensure_write_partition_compatible(contract.to_partition(), contract)
             meta = self.get_table_meta()
-            fresh = {field: type_ for field, type_ in columns.items()
-                     if meta and field not in meta['column_info']}
-            if fresh:
-                if not kwargs.get('alter', False):
-                    raise SchemaConflict('已有表新增列需要 create_table(..., alter=True)')
-                self._add_columns_for_all_partitions(fresh)
             create_kwargs = dict(kwargs, table_contract=contract.to_dict())
             createtable_meta = build_createtable_meta(
                 columns, pk=contract.primary_key, partition=contract.to_partition(), **create_kwargs,
             )
-            if meta:
-                createtable_meta['column_info'] = {
-                    **createtable_meta['column_info'], **meta['column_info'],
-                }
+            if not meta:
+                self._validate_create_request(createtable_meta)
+                if contract.partition:
+                    createtable_meta[_SQLITE_PARTITION_ROUTING] = 1
+            else:
+                if not kwargs.get('alter', False) and columns.keys() - meta['column_info'].keys():
+                    raise SchemaConflict('已有表新增列需要 create_table(..., alter=True)')
+                if meta.get(_SQLITE_PARTITION_ROUTING) == 1:
+                    createtable_meta[_SQLITE_PARTITION_ROUTING] = 1
+                self._evolve_sqlite_columns(
+                    meta, createtable_meta, manual=True, column_order=kwargs.get('column_order'),
+                )
             if contract.partition is None and contract.segment is None:
                 self.do_create_table(
                     self._get_part_dbfile(None), _PART_DATA_TABLE_NAME, createtable_meta,

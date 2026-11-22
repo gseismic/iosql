@@ -28,6 +28,34 @@ def quoted_sql_text(s: str) -> str:
     return f'"{s.replace(chr(34), chr(34) + chr(34))}"'
 
 
+_SQLITE_IDENTIFIER_FOLD = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
+
+
+def sqlite_identifier_key(name: str) -> str:
+    return name.translate(_SQLITE_IDENTIFIER_FOLD)
+
+
+def sqlite_affinity(type_name):
+    value = type_name.upper()
+    if 'INT' in value:
+        return 'INTEGER'
+    if any(token in value for token in ('CHAR', 'CLOB', 'TEXT')):
+        return 'TEXT'
+    if not value or 'BLOB' in value:
+        return 'BLOB'
+    if any(token in value for token in ('REAL', 'FLOA', 'DOUB')):
+        return 'REAL'
+    return 'NUMERIC'
+
+
+def legacy_numpy_key_blob(value):
+    """旧驱动会用 buffer 绑定的 NumPy 数值标量的精确字节。"""
+    if (_has_np and isinstance(value, np.generic)
+            and value.dtype.kind in 'biuf' and not isinstance(value, (int, float))):
+        return memoryview(value).tobytes()
+    return None
+
+
 def normalize_sqlite_value(value: Any) -> Any:
     """绑定前转换 NumPy 标量，避免 sqlite3 把其 buffer 当成 BLOB。"""
     if _has_np and isinstance(value, np.generic):
@@ -43,9 +71,19 @@ def normalize_sqlite_parameters(params):
     """位置参数与命名参数共用原生标量转换，不改写调用者对象。"""
     if params is None:
         return ()
+    if not _has_np and type(params) in (list, tuple, dict):
+        return params
     if isinstance(params, Mapping):
         return {key: normalize_sqlite_value(value) for key, value in params.items()}
     return tuple(normalize_sqlite_value(value) for value in params)
+
+
+def normalize_sqlite_parameter_rows(rows):
+    if not _has_np and isinstance(rows, (list, tuple)) and all(
+        type(row) in (list, tuple, dict) for row in rows
+    ):
+        return rows
+    return map(normalize_sqlite_parameters, rows)
 
 
 def sql_literal(value: Any) -> str:
@@ -233,6 +271,17 @@ def getsql_query_table(table_name: str, name_only: bool = False) -> str:
     )
 
 
+def sqlite_column_definition(item, *, primary_key=False):
+    parts = [str(item['type'] or 'text')]
+    if primary_key or item.get('not_null'):
+        parts.append('NOT NULL')
+    if item.get('unique'):
+        parts.append('UNIQUE')
+    if item.get('default') is not None:
+        parts.append(f'DEFAULT {sql_literal(item["default"])}')
+    return ' '.join(parts)
+
+
 def getsql_create_table(table_name: str, columns: List[Dict[str, Any]], pk: Union[List[str], str, None], if_not_exists: bool = True) -> Tuple[str, Dict[str, Any]]:
     '''
     [{
@@ -254,9 +303,12 @@ def getsql_create_table(table_name: str, columns: List[Dict[str, Any]], pk: Unio
     sql_parts = [f'{create_keyword} {quoted_sql_text(table_name)} (']
 
     fields = [item['name'] for item in columns]
-    duplicates = sorted({f for f in fields if fields.count(f) > 1})
-    if duplicates:
-        raise DuplicateColumn(f'columns 定义存在重复列: {duplicates}')
+    seen = set()
+    for field in fields:
+        key = sqlite_identifier_key(field)
+        if key in seen:
+            raise DuplicateColumn(f'columns 定义存在重复列: {field}')
+        seen.add(key)
 
     if pk and not set(pk).issubset(set(fields)):
         extra_pk = set(pk) - set(fields)
@@ -264,16 +316,9 @@ def getsql_create_table(table_name: str, columns: List[Dict[str, Any]], pk: Unio
 
     pk_set = set(pk)
     for item in columns:
-        column_parts = [f"\t{quoted_sql_text(item['name'])} {item['type'] or 'text'}"]
-        
-        if item.get('not_null', False) or item['name'] in pk_set:
-            column_parts.append('NOT NULL')
-        if item.get('unique', False):
-            column_parts.append('UNIQUE')
-        if item.get('default') is not None:
-            column_parts.append(f'DEFAULT {sql_literal(item["default"])}')
-            
-        sql_parts.append(' '.join(column_parts) + ',')
+        name = item['name']
+        definition = sqlite_column_definition(item, primary_key=name in pk_set)
+        sql_parts.append(f'\t{quoted_sql_text(name)} {definition},')
 
     if pk:
         sql_parts.append(f'\tPRIMARY KEY ({",".join(_quote_columns(pk))})')

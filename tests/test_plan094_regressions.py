@@ -306,6 +306,7 @@ def test_single_connection_stream_and_save_as_do_not_deadlock(tmp_path, backend,
     """子进程设置硬超时，验证流消费期间可读写、关闭后可复制及校验。"""
     script = '''
 import sys, time
+from unittest.mock import patch
 from iosql import Database
 from iosql.utils.mysqlite.connection_pool import _PROCESS_CONNECTION_BUDGET as budget
 backend, target_backend, base = sys.argv[1:]
@@ -318,14 +319,15 @@ with Database(f'{backend}://{base}/source', max_process_connections=1) as db:
     table.write({'id': 10, 'v': 'new'})
     assert [row for batch in stream for row in batch] == [
         {'id': 1, 'v': '1'}, {'id': 2, 'v': '2'}]
-    stream = table.iter_select_batches(batch_size=1, timeout_ms=100)
+    # 首批返回后推进时钟，覆盖消费中的超时而不依赖 DuckDB 冷启动耗时。
+    stream = table.iter_select_batches(batch_size=1, timeout_ms=60_000)
     next(stream)
-    time.sleep(0.15)
-    try:
-        next(stream)
-        raise AssertionError('未超时')
-    except TimeoutError:
-        pass
+    with patch.object(time, 'monotonic', return_value=time.monotonic() + 120):
+        try:
+            next(stream)
+            raise AssertionError('未超时')
+        except TimeoutError:
+            pass
     stream = table.iter_select_batches(batch_size=1)
     next(stream)
     stream.close()

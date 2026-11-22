@@ -482,6 +482,24 @@ class Table(DirectoryTable):
             for column, reverse in self._parse_order_by(order_by)
         )
 
+    def _case_can_use_bounds(self, case, type_):
+        # DuckDB 可能先转换列，再比较。例如 BIGINT IN 遇到 DOUBLE 时，
+        # 两个相邻的大整数可能都命中，不能按原始数值排除文件。
+        type_ = _canon_sqlite_type(type_)
+        value = case.value['value']
+        values = value if case.op in ('in', 'between_and') else (value,)
+        if type_ == 'integer':
+            return all(item is None or isinstance(item, numbers.Integral) for item in values)
+        if type_ == 'float':
+            try:
+                return all(item is None or (isinstance(item, numbers.Real) and float(item) == item)
+                           for item in values)
+            except OverflowError:
+                return False
+        if type_ == 'text':
+            return all(item is None or isinstance(item, str) for item in values)
+        return True
+
     def _row_sort_key(self, specs):
         def key(row):
             return tuple(_ParquetSortKey(self._row_sort_value(row, field)[1], reverse)
@@ -510,9 +528,53 @@ class Table(DirectoryTable):
                 for batch in batches:
                     yield from batch
 
-    def _compact_primary_key(self, row, primary_key, table_spec=None):
-        return tuple(_NAN_PRIMARY_KEY if isinstance(value, float) and math.isnan(value) else value
-                     for value in super()._compact_primary_key(row, primary_key, table_spec))
+    @staticmethod
+    def _nan_key(value):
+        return _NAN_PRIMARY_KEY if isinstance(value, float) and math.isnan(value) else value
+
+    def _stored_pk_key(self, row, pk, rules):
+        return tuple(self._nan_key(value) for value in super()._stored_pk_key(row, pk, rules))
+
+    def _latest_symbol_ranks(self, requested, symbols, column, table_spec, rules):
+        if not symbols:
+            return {}
+        sql_type = _sql_type(self._physical_column_types(table_spec)[column])
+        native_type = {'BIGINT': int, 'DOUBLE': float, 'VARCHAR': str, 'BLOB': bytes}[sql_type]
+        if all(value is None or (
+            type(value) is native_type and (native_type is not int or -(2**63) <= value < 2**63)
+        ) for value in requested):
+            ranks = {}
+            for ordinal, value in enumerate(requested):
+                ranks.setdefault(self._nan_key(value), ordinal)
+            return ranks
+
+        # DuckDB 为 IN 的整组操作数选择比较类型。保留每个参数的类型，
+        # 以有类型的 NULL 屏蔽请求后缀，二分找出首次命中的请求序号。
+        # 暂存的只是查询已经返回的 symbol，查询参数直接参与比较。
+        size = len(requested)
+        prefix = ', '.join(f'CASE WHEN mid > {index} THEN ? END' for index in range(size))
+        with self._connection() as conn:
+            conn.execute(f'CREATE TABLE matched (ordinal BIGINT, symbol {sql_type})')
+            conn.executemany('INSERT INTO matched VALUES (?, ?)', [
+                (index, float('nan') if value is _NAN_PRIMARY_KEY else value)
+                for index, value in enumerate(symbols)
+            ])
+            positions = conn.execute(f"""
+                WITH RECURSIVE positions(ordinal, symbol, low, high) AS (
+                    SELECT ordinal, symbol, 0, {size} FROM matched
+                    UNION ALL
+                    SELECT ordinal, symbol,
+                           CASE WHEN hit THEN low ELSE mid END,
+                           CASE WHEN hit THEN mid ELSE high END
+                    FROM (
+                        SELECT *, (low + high) // 2 AS mid,
+                               symbol IN ({prefix}) AS hit
+                        FROM positions WHERE high - low > 1
+                    ) AS step
+                )
+                SELECT ordinal, high - 1 FROM positions WHERE high - low = 1
+            """, requested).fetchall()
+        return {symbols[ordinal]: rank for ordinal, rank in positions}
 
     def _compact_sorted_batches(self, refs, spec):
         """DuckDB 磁盘暂存保留 NaN，排序可落盘，不经 SQLite 值绑定。"""
@@ -549,7 +611,8 @@ class Table(DirectoryTable):
             conn.execute('CREATE TABLE keys (' + ','.join(definitions) + ', ordinal BIGINT)')
             conn.executemany('INSERT INTO keys VALUES (' + ','.join('?' for _ in range(len(pk) + 1)) + ')',
                              [tuple(row[column] for column in pk) + (index,) for index, row in enumerate(rows)])
-            return [tuple(item[:-1]) for item in conn.execute('SELECT * FROM keys ORDER BY ordinal').fetchall()]
+            return [tuple(self._nan_key(value) for value in item[:-1])
+                    for item in conn.execute('SELECT * FROM keys ORDER BY ordinal').fetchall()]
 
     def _scan_rows(self, path, query, batch_size, deadline=None, columns=None):
         with self._read_lease(path, deadline), self._connection(deadline, reserved=True) as conn:

@@ -54,17 +54,9 @@ class TimeseriesQueryMixin:
                     '修复: db.table(..., symbol_column="symbol") 或 '
                     'db.timeseries(..., symbol_column="symbol")'
                 )
-            symbols = query_spec.symbols
-            if isinstance(symbols, str) or not isinstance(symbols, (list, tuple, set)):
-                symbols = [symbols]
-            symbols = list(symbols)
-            if len(symbols) == 1:
-                generated.append({
-                    'field': symbol_column,
-                    'op': '=',
-                    'value': symbols[0],
-                })
-            elif symbols:
+            symbols = self._normalize_symbols(query_spec.symbols)
+            if symbols:
+                # IN 中的每个元素都作为字面量绑定，包括单值 "[[other]]"。
                 generated.append({
                     'field': symbol_column,
                     'op': 'in',

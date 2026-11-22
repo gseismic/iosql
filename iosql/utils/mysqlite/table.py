@@ -9,6 +9,8 @@ from contextlib import contextmanager
 
 import arrow
 
+from . import sql as _sqlite_sql
+from ._numpy_keys import migrate_numpy_blob_keys, primary_key_info
 from .exception import (
     BadArgument,
     NoSuchColumn, 
@@ -30,6 +32,8 @@ from .sql import (
     getsql_query_table, quoted_sql_text, sql_literal,
     group_rows_by_keys,
     normalize_sqlite_parameters,
+    normalize_sqlite_parameter_rows,
+    sqlite_identifier_key,
     _union_fields_of_dictlist,
     suggest_columns
 )
@@ -345,7 +349,7 @@ class Table:
             return
 
         try:
-            cursor.executemany(sql, map(normalize_sqlite_parameters, list_values))
+            cursor.executemany(sql, normalize_sqlite_parameter_rows(list_values))
             self._try_commit_on_connection(conn, commit)
         except sqlite3.Error as e:
             self._handle_error_on_connection(e, conn)
@@ -505,6 +509,13 @@ class Table:
         sql, values = getsqlarg_dict_insert(
             self._table_name, kv, replace=replace, ignore=ignore
         )
+        if any(_sqlite_sql.legacy_numpy_key_blob(value) is not None for value in values):
+            with self.database.transaction() as conn:
+                self._check_legacy_numpy_keys(conn, [kv])
+                self._execute_with_fallback(
+                    sql, commit, kv, ensure_table, ensure_column, params=values, **kwargs,
+                )
+            return
         self._execute_with_fallback(
             sql, commit, kv, ensure_table, ensure_column,
             params=values, **kwargs
@@ -527,19 +538,27 @@ class Table:
         if ensure_table or ensure_column:
             # 在写任何行之前补齐本批结构，避免失败后回滚此前批次，
             # 也避免共享事务内重放已经成功的异构语句组。
-            cursor.execute(f'PRAGMA table_info({quoted_sql_text(self._table_name)})')
-            existing = {item[1].lower() for item in cursor.fetchall()}
+            quoted = quoted_sql_text(self._table_name)
+            cursor.execute(f'PRAGMA table_xinfo({quoted})')
+            existing = {sqlite_identifier_key(item[1]) for item in cursor.fetchall()}
             if not existing and ensure_table:
                 columns = suggest_columns(_union_fields_of_dictlist(batch_data))
                 self._create_table_on_connection(cursor, conn, columns, **kwargs)
-                existing = {item['name'].lower() for item in columns}
+                existing = {sqlite_identifier_key(item['name']) for item in columns}
             if existing and ensure_column:
                 missing_rows = [{field: value for field, value in row.items()
-                                 if field.lower() not in existing} for row in batch_data]
+                                 if sqlite_identifier_key(field) not in existing} for row in batch_data]
                 if any(missing_rows):
+                    missing = _union_fields_of_dictlist(missing_rows)
+                    for field in list(missing):
+                        name = sqlite_identifier_key(field)
+                        if name in ('rowid', '_rowid_', 'oid') and self._has_rowid_alias(cursor, name):
+                            del missing[field]
                     self._ensure_columns_on_connection(
-                        cursor, conn, _union_fields_of_dictlist(missing_rows),
+                        cursor, conn, missing,
                     )
+
+        self._check_legacy_numpy_keys(cursor, batch_data)
 
         # 稳定结构只需按字段分组；类型推断延迟到真实建表/加列的冷路径。
         statements = [
@@ -553,6 +572,72 @@ class Table:
         ]
 
         self._executemany_statements_on_connection(cursor, conn, statements)
+
+    def _has_rowid_alias(self, cursor, name):
+        # 仅编译 INSERT，由 SQLite 确认别名可写，兼容 WITHOUT ROWID 等表。
+        table = quoted_sql_text(self._table_name)
+        try:
+            cursor.execute(f'EXPLAIN INSERT INTO {table} ({name}) VALUES (NULL)')
+        except sqlite3.OperationalError as exc:
+            if 'has no column named' in str(exc):
+                return False
+            raise
+        return True
+
+    def _check_legacy_numpy_keys(self, cursor, rows):
+        if not _sqlite_sql._has_np:
+            return
+        table = quoted_sql_text(self._table_name)
+        pk = [item[1] for item in cursor.execute(f'PRAGMA table_info({table})') if item[5]]
+        if not pk:
+            return
+        comparisons = None
+        for row in rows:
+            if not all(field in row for field in pk):
+                aliases = {sqlite_identifier_key(name): value for name, value in row.items()}
+                if not all(sqlite_identifier_key(field) in aliases for field in pk):
+                    continue
+                values = [aliases[sqlite_identifier_key(field)] for field in pk]
+            else:
+                values = [row[field] for field in pk]
+            blobs = [_sqlite_sql.legacy_numpy_key_blob(value) for value in values]
+            if all(blob is None for blob in blobs):
+                continue
+            if comparisons is None:
+                collations = {name: collation for name, _, collation in primary_key_info(cursor, table)}
+                comparisons = [f'{quoted_sql_text(name)} COLLATE {quoted_sql_text(collations[name])}'
+                               for name in pk]
+
+            # 只比较调用者传入的旧字节表示。BLOB 的来源需要由调用者确认。
+            parts, blob_checks, params, blob_params = [], [], [], []
+            for column, value, blob in zip(comparisons, values, blobs):
+                native = _sqlite_sql.normalize_sqlite_value(value)
+                if blob is None:
+                    parts.append(f'{column} IS ?')
+                    params.append(native)
+                else:
+                    parts.append(f'{column} IN (?, ?)')
+                    params.extend([blob, native])
+                    blob_checks.append(f'{column} = ?')
+                    blob_params.append(blob)
+            predicate = ' AND '.join(parts) + ' AND (' + ' OR '.join(blob_checks) + ')'
+            if cursor.execute(f'SELECT 1 FROM {table} WHERE {predicate} LIMIT 1',
+                              params + blob_params).fetchone():
+                raise BadArgument(
+                    '匹配到旧版 NumPy 参数的 BLOB 主键。'
+                    '请先用 migrate_numpy_blob_keys() 检查并迁移，或显式传入 BLOB 键'
+                )
+
+    def migrate_numpy_blob_keys(self, columns, *, where=None, dry_run=True) -> int:
+        """检查旧 NumPy BLOB 主键，dry_run=False 时在同一事务内迁移。
+
+        columns 指定已确认来源的主键列和原始 NumPy dtype（包含字节序）。
+        where 可进一步限定旧行，返回符合条件的行数。发现键冲突则整次失败。
+        """
+        if not isinstance(dry_run, bool):
+            raise BadArgument('dry_run 必须是 bool')
+        with self.database.transaction(immediate=not dry_run) as conn:
+            return migrate_numpy_blob_keys(conn, self._table_name, columns, where, dry_run)
 
     def _executemany_statements_on_connection(self, cursor: sqlite3.Cursor,
                                               conn: sqlite3.Connection,

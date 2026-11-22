@@ -64,6 +64,22 @@ table.insert_all(
 
 批量写入按连续相同的 key 集合拆分语句，并保留行的输入顺序：行中缺失的列不会由 Python 回填默认值，而是从语句中省略，交由 SQLite 求值列 `DEFAULT`（包括 `CURRENT_TIMESTAMP`、`(datetime('now'))` 等表达式默认值）。`insert({...})` 单行写入同样遵循该语义。
 
+### 升级旧 NumPy 主键
+
+旧版 mysqlite 的参数绑定可能把 NumPy 数值标量保存为 BLOB。升级后，按原 NumPy 参数查询会绑定原生数值。对于同一把键，`insert()` 和 `insert_all()` 如果找到匹配旧参数字节的 BLOB 会报错，避免覆盖写入新增第二行。要读取旧键，可把已知 NumPy 标量用 `memoryview(old_key).tobytes()` 显式绑定为 BLOB。
+
+先在数据库副本上确认哪些行来自旧 NumPy 写入，再指定原始 dtype 和字节序。下面的 `feed` 条件代表已经确认来源的业务字段。
+
+```python
+dtypes = {"order_id": "<i8"}  # 原始写入用小端 int64
+where = "feed = 'legacy_numpy'"
+candidates = table.migrate_numpy_blob_keys(dtypes, where=where)
+if candidates:
+    table.migrate_numpy_blob_keys(dtypes, where=where, dry_run=False)
+```
+
+默认只检查，返回待迁移的行数。候选为指定主键列中与 dtype 大小相符的 BLOB。字节内容无法证明来源，业务 BLOB 和旧 NumPy 键大小相同时，请用 `where` 精确划定范围。支持整数、浮点和布尔 dtype。两种模式均检查新键之间以及新键与已有键之间的冲突。应用转换时保留其他列，约束错误会回滚本次迁移。
+
 ## 查询和修改
 
 ```python

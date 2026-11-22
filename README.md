@@ -1077,6 +1077,9 @@ Parquet 目标迁移后，表目录仍直接位于数据库根目录，与普通
 - 大文件导入优先使用 JSONL/CSV 和 `iosql import --batch-size`；JSON 数组格式保持兼容但不推荐用于数 GB 文件。
 - 配置 `Segment.rows(...)` 后，同一 logical partition 可以拆成多个物理 SQLite 文件；晚到数据会进入新的 active/delta segment，可用 `compact()` 显式整理为新的 sealed generation，再用 `validate(deep=True)` / `cleanup_obsolete()` 释放旧文件。
 - `layout_report()` 只做诊断，不会修改原库；重分区请使用 `repartition_to()` 写入新的目标库。
+- SQLite 按分区列的物理存储值寻址。`table.spec().parts_for(rows)` 按当前物理结构预测默认写入的地址。首次推断会拒绝无法精确保存的整数主键。
+- 升级 SQLite 目录库前先退出旧版写进程。新版第一次写入时会检查可能受亲和性转换影响的历史分区。发现数据文件与主键实际值不一致时，用 `table.validate(deep=True)` 定位，再用 `table.repartition_to(target_uri)` 按现有存储值复制到新表。确认目标数据后再切换。如有物理主键冲突，需先核对应该保留的记录。
+- 单文件 mysqlite 的旧 NumPy BLOB 主键可检查后显式迁移。[升级说明](iosql/utils/mysqlite/README.md#升级旧-numpy-主键)
 - `columns={"col": "type"}` 中声明的列类型在自动建表时优先生效；未声明的列由数据推断。
 - PostgreSQL 可使用不含密码的 URI `postgresql://user@host:port/dbname`，密码由 `PGPASSWORD` 或 `PGPASSFILE` 提供；SQLite 到 PostgreSQL 迁移优先使用 `Database.migrate_to()` / `to_postgresql()` 或 `iosql migrate`，生产迁移建议先 `--dry-run`，再用 `--verify row-count` 校验。
 - PostgreSQL 也可以作为迁移源写回 SQLite；重新打开 PostgreSQL 逻辑表时需要提供同一份 `TableContract`，见 `examples/12_sqlite_postgresql_roundtrip.py`。
@@ -1137,9 +1140,9 @@ bars.create_index(columns=['symbol', 'ts'])  # 等价主键索引会被复用
 
 ### 动态扩列（schema_policy='evolve'）语义
 
-默认策略 `evolve` 允许写入时动态加列（`ALTER TABLE ADD COLUMN`，O(1)），语义契约如下：
+默认策略 `evolve` 允许写入时通过 `ALTER TABLE ADD COLUMN` 动态加列。
 
-1. **列集合单调增长**：只允许加列，不允许删列或改列名。新列补齐到所有既有分区文件，旧分区的缺失行读为 `NULL`（与 SQL `union all + null` 语义一致），`explain_select()` 不视为异常。
+1. **列集合单调增长**：只允许加列。SQLite 补齐各既有分区文件时采用同一套列约束，旧行缺少该列时按声明的默认值读取，未声明默认值则读为 `NULL`。无法应用到所有旧文件的列定义会在预检时拒绝。
 2. **契约回写**：动态加列成功后同步更新持久化契约的 `columns`，`spec().columns` 恒为当前实际 schema 的上确界——重开数据库（零仪式场景）不会漂移。
 3. **类型固化与冲突**：未声明列首次写入时推断类型并固化进契约；同列后续数据类型不兼容时抛 `BadArgument`（错误信息含列名、已固化类型、本次类型与修复建议）。数值 int↔float 互通；数字写入 text 声明列由 SQLite TEXT affinity 转换放行。
 

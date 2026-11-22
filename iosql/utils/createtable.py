@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from ..exception import BadArgument
 from ..logger import default_logger as logger
 
 
@@ -10,8 +11,9 @@ def reorder_by_column_order(column_infos, column_order):
 
     # column_order 必须已经存在
     ordered_column_infos = OrderedDict()
-    for i, column in enumerate(column_order):
-        assert column in column_infos
+    for column in column_order:
+        if column not in column_infos:
+            raise BadArgument(f'column_order 包含未知列: {column!r}')
         ordered_column_infos[column] = column_infos[column]
 
     # [@2021-12-01 15:34:18] FIXED

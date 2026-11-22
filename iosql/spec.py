@@ -1063,6 +1063,9 @@ class TableContract:
         partition = self.to_partition()
         if partition is None:
             return [DEFAULT_LOGICAL_PART if self.segment else None]
+        partition_keys = getattr(self, '_partition_keys', None)
+        if partition_keys is not None:
+            return sorted(set(partition_keys(rows, partition)))
         return sorted({partition.get_key(row) for row in rows})
 
     def to_dict(self) -> Dict[str, Any]:
